@@ -651,39 +651,50 @@ class CycleEngine:
         # Frame rendering — kicked off here so the manifest references the
         # same per-cycle state we're about to emit. Render time is tracked
         # separately so users can see it on /state.json.
+        #
+        # Public mode (Phase C §P1) skips this block entirely: the home crop
+        # and the OSM basemap it draws on exist only to serve /frames/*,
+        # which the public instance hides — ~3.5 s of CPU per cycle plus one
+        # network fetch, for nobody. Everything the public site consumes
+        # (national artifacts, state writing) is below and untouched.
+        # ``render_ms`` stays 0.0, exactly as it does when a render fails.
         render_ms = 0.0
         bearing_compass = _bearing_compass_label(disc_dy_per_min, disc_dx_per_min)
-        try:
-            self._ensure_basemap()
-            now_subline = _build_now_subline(
-                stats_now=stats_now,
-                eta_minutes=eta_minutes,
-                peak_rate=peak_rate,
-                peak_lead=peak_lead,
-            )
-            apng_bytes, render_ms = render_frames(
-                composites=composites,
-                rain_now=rain_now,
-                vy=vy, vx=vx,
-                dt_min=dt_min,
-                frame_age_min=frame_age_min,
-                geo=geo,
-                home_lat=lat, home_lon=lon, radius_km=self.config.home.radius_km,
-                out_dir=self._frames_dir,
-                now_stats_subline=now_subline,
-                disc_motion_dy_per_min=disc_dy_per_min,
-                disc_motion_dx_per_min=disc_dx_per_min,
-                disc_motion_speed_kmh=disc_speed_kmh,
-                disc_motion_bearing_from=bearing_compass,
-                basemap=self._basemap,
-            )
-            # APNG to disk too — served at /frames/loop.png so the HA
-            # image entity can fetch a single self-animating artifact.
-            _atomic_write_bytes(self._frames_dir / "loop.png", apng_bytes)
-        except Exception as exc:  # noqa: BLE001
-            # A render failure shouldn't kill the cycle — state.json still
-            # gets written, the Lovelace card just won't have a fresh loop.
-            _log.warning("render_failed", error=str(exc))
+        if self.config.server.public_mode:
+            _log.debug("render_skipped_public_mode")
+        else:
+            try:
+                self._ensure_basemap()
+                now_subline = _build_now_subline(
+                    stats_now=stats_now,
+                    eta_minutes=eta_minutes,
+                    peak_rate=peak_rate,
+                    peak_lead=peak_lead,
+                )
+                apng_bytes, render_ms = render_frames(
+                    composites=composites,
+                    rain_now=rain_now,
+                    vy=vy, vx=vx,
+                    dt_min=dt_min,
+                    frame_age_min=frame_age_min,
+                    geo=geo,
+                    home_lat=lat, home_lon=lon,
+                    radius_km=self.config.home.radius_km,
+                    out_dir=self._frames_dir,
+                    now_stats_subline=now_subline,
+                    disc_motion_dy_per_min=disc_dy_per_min,
+                    disc_motion_dx_per_min=disc_dx_per_min,
+                    disc_motion_speed_kmh=disc_speed_kmh,
+                    disc_motion_bearing_from=bearing_compass,
+                    basemap=self._basemap,
+                )
+                # APNG to disk too — served at /frames/loop.png so the HA
+                # image entity can fetch a single self-animating artifact.
+                _atomic_write_bytes(self._frames_dir / "loop.png", apng_bytes)
+            except Exception as exc:  # noqa: BLE001
+                # A render failure shouldn't kill the cycle — state.json still
+                # gets written, the Lovelace card just won't have a fresh loop.
+                _log.warning("render_failed", error=str(exc))
 
         # National artifacts (plan §A2). The in-memory products are published
         # for the /forecast lookup (plan §A3) even when the disk write fails —

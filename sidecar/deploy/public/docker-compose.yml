@@ -1,0 +1,72 @@
+# Public instance — the internet-facing sidecar behind the tunnel
+# (website Phase C plan §P1/§P3).
+#
+# Deliberately a SECOND stack next to ../docker-compose.yml, not a variant
+# of it: separate container, separate data volume, separate config, its own
+# DMI polling. The two instances share nothing but the image, so a restart,
+# a bad config or a wiped volume on one cannot touch the other. Two pollers
+# are nothing against DMI's 500 req / 5 s rate limit.
+#
+# What makes it public: ``server.public_mode: true`` in the mounted config
+# (belt-and-braces: also forced via the environment below). Only the static
+# frontend, /healthz, /nowcast/* and /forecast answer; /state.json,
+# /frames/*, /lightning/* and /docs return 404 without the bearer key.
+#
+# Host-specific values come from the environment (docker compose reads a
+# .env file next to this one, or inherits the shell's):
+#   HOST_PORT  published port, default 8082. Set it to an explicit
+#              ``address:port`` (e.g. 192.168.x.y:8082) to publish on the
+#              LAN interface the tunnel container reaches — and only that
+#              one. The tunnel is the only thing that should talk to it.
+#
+# Bring up (from the repo root, AFTER building the frontend — see README):
+#   docker compose -f sidecar/deploy/public/docker-compose.yml up -d --build
+# Tail logs:
+#   docker compose -f sidecar/deploy/public/docker-compose.yml logs -f
+# Reload config:
+#   docker compose -f sidecar/deploy/public/docker-compose.yml restart
+
+services:
+  dmi-nowcast-public:
+    container_name: dmi-nowcast-public
+    build:
+      # Repo root, so the Dockerfile can COPY src/, sidecar/ and the
+      # optional frontend/build/ — the same Dockerfile the LAN stack uses.
+      context: ../../..
+      dockerfile: sidecar/deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8082}:8081"
+    volumes:
+      # Own named volume: state.json, nowcast/ artifacts, composites/
+      # (working cache, LRU-evicted). Nothing is shared with the LAN
+      # instance's dmi_nowcast_data volume.
+      - dmi_public_data:/var/lib/dmi-nowcast
+      # No corpus bind-mount: the public instance sets ``corpus_dir: null``
+      # and archives nothing. The private instance owns the archive.
+      #
+      # Config mounted directly so edits need only a restart, not a rebuild.
+      # Copy config.public.example.yaml → config.public.yaml and edit.
+      - ./config.public.yaml:/app/sidecar/config.yaml:ro
+    environment:
+      DMI_NOWCAST_SERVER__LOG_FORMAT: json
+      DMI_NOWCAST_SERVER__LOG_LEVEL: INFO
+      # Bind every interface INSIDE the container; the published port above
+      # is what constrains the exposure on the host.
+      DMI_NOWCAST_SERVER__HOST: 0.0.0.0
+      # Safety net: env beats YAML in this config loader, so even a wrongly
+      # mounted (private) config.yaml cannot start this container with the
+      # private surface exposed.
+      DMI_NOWCAST_SERVER__PUBLIC_MODE: "true"
+    healthcheck:
+      # /healthz is part of the public surface, so this works with or
+      # without an api_key configured.
+      test: ["CMD", "curl", "-fs", "http://localhost:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  dmi_public_data:
+    name: dmi_nowcast_public_data

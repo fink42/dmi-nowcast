@@ -16,6 +16,44 @@ Auth: write endpoints check ``Authorization: Bearer <key>`` against
 since the HA integration polls them unauthenticated; the §A3 endpoints go
 through the same optional bearer (``require_api_key`` — a no-op under
 LAN trust, enforced when a key is set).
+
+Public mode (website Phase C plan §P1)
+--------------------------------------
+
+``server.public_mode: true`` turns this process into the internet-facing
+instance. One HTTP middleware — :func:`_public_mode_gate`, installed once
+and only in public mode — implements a **default-deny** model over the
+whole route table:
+
+1. The **public surface** is an explicit allow-list, open to everyone
+   with no bearer even when ``server.api_key`` is set (the key exists to
+   unlock the hidden surface, not to lock the public one):
+
+   ``/healthz``, ``/forecast``, anything under ``/nowcast/`` and the
+   static frontend (see :func:`_mount_frontend`).
+
+2. **Everything else that matches a registered route** — ``/state.json``
+   (the configured point's block), ``/frames/*`` (the home crop),
+   ``/lightning/*`` (including the strike-ingest POST and the archive
+   dashboards), ``/docs`` and ``/openapi.json`` — answers ``404 {"detail":
+   "Not Found"}``, byte-identical to the response for a path that was
+   never registered. A request carrying a valid ``Authorization: Bearer
+   <server.api_key>`` passes through and gets the route's normal
+   behaviour, so an operator on the LAN can still reach everything.
+   With ``api_key`` unset in public mode the hidden surface is simply
+   unreachable — the safe default.
+
+3. Paths matching **no** registered route fall through to the static
+   frontend (SPA fallback), exactly as if the gate weren't there.
+
+The route table is snapshotted before the frontend is mounted, so the
+catch-all ``/`` mount never counts as "a registered route" for rule 2 —
+and any route added later is hidden by default, which is the direction
+a security default should fail in.
+
+Public mode also skips the home-crop frame rendering and the OSM basemap
+fetch in the cycle (see ``compute.py``): both exist only to feed
+``/frames/*``, which is hidden here.
 """
 from __future__ import annotations
 
@@ -24,12 +62,17 @@ import math
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Sequence
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import BaseRoute, Match
+from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 
 from dataclasses import asdict
 
@@ -528,11 +571,26 @@ def create_app(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
+    # Public mode: install the default-deny gate over the API route table
+    # BEFORE the frontend is mounted, so the catch-all "/" mount is not part
+    # of the snapshot (see module docstring, rule 3).
+    if config.server.public_mode:
+        install_public_mode_gate(app, list(app.routes))
+
+    # Static frontend, if one is built into the image (Phase C §P2).
+    if config.server.frontend_dir is not None:
+        _mount_frontend(app, Path(config.server.frontend_dir))
+
     _log.info(
         "app_initialized",
         port=config.server.port,
         method=config.forecast.method,
         home=f"{config.home.lat:.4f},{config.home.lon:.4f}",
+        public_mode=config.server.public_mode,
+        frontend_dir=(
+            str(config.server.frontend_dir)
+            if config.server.frontend_dir is not None else None
+        ),
     )
     return app
 
@@ -575,8 +633,15 @@ def require_api_key(request: Request) -> None:
 
     No-op when ``server.api_key`` is unset (LAN trust). When set, requires
     ``Authorization: Bearer <key>``.
+
+    Public mode carves out the allow-listed public surface (``/forecast``,
+    ``/nowcast/*``): those must stay open to anonymous browsers even when a
+    key is configured, because in public mode the key's job is to *unlock*
+    the hidden surface, not to lock the published one.
     """
     config: Config = request.app.state.config
+    if config.server.public_mode and _is_public_path(request.url.path):
+        return
     expected = config.server.api_key
     if expected is None:
         return
@@ -587,6 +652,170 @@ def require_api_key(request: Request) -> None:
     provided = header[len(prefix):]
     if not _consteq(provided, expected):
         raise HTTPException(status_code=401, detail="invalid bearer token")
+
+
+# ---------------------------------------------------------------------------
+# Public mode (website Phase C plan §P1) — see the module docstring
+# ---------------------------------------------------------------------------
+
+# The public surface. Exact paths plus prefixes; the static frontend is not
+# listed because it is never part of the gated route snapshot (rule 3).
+_PUBLIC_PATHS = frozenset({"/healthz", "/forecast"})
+_PUBLIC_PREFIXES = ("/nowcast/",)
+
+# Byte-identical to Starlette's own "no such route" body, so a gated route
+# and a nonexistent one are indistinguishable from outside.
+_NOT_FOUND_BODY = {"detail": "Not Found"}
+
+
+def _is_public_path(path: str) -> bool:
+    """True for the routes public mode serves without any bearer."""
+    return path in _PUBLIC_PATHS or path.startswith(_PUBLIC_PREFIXES)
+
+
+def _has_valid_bearer(config: Config, request: Request) -> bool:
+    """True when the request carries ``Authorization: Bearer <api_key>``.
+
+    False when no key is configured: in public mode that means the hidden
+    surface has no unlock at all, which is the safe direction to fail.
+    """
+    expected = config.server.api_key
+    if not expected:
+        return False
+    header = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not header.startswith(prefix):
+        return False
+    return _consteq(header[len(prefix):], expected)
+
+
+def _matches_any_route(routes: Sequence[BaseRoute], scope: Scope) -> bool:
+    """True when ``scope`` hits one of the snapshotted routes.
+
+    Two subtleties, both about not confirming a route's existence through a
+    status code other than 404:
+
+    - ``Match.PARTIAL`` (path matches, method doesn't) counts, so probing
+      ``GET /lightning/strikes`` gets a 404 rather than a 405.
+    - the slash-toggled path counts too, because Starlette's
+      ``redirect_slashes`` answers ``/state.json/`` with a 307 to
+      ``/state.json`` — a redirect that only exists for real routes.
+    """
+    if _matches_exactly(routes, scope):
+        return True
+    path = scope.get("path", "")
+    toggled = path[:-1] if path.endswith("/") and len(path) > 1 else path + "/"
+    return toggled != path and _matches_exactly(routes, {**scope, "path": toggled})
+
+
+def _matches_exactly(routes: Sequence[BaseRoute], scope: Scope) -> bool:
+    for route in routes:
+        match, _child_scope = route.matches(scope)
+        if match is not Match.NONE:
+            return True
+    return False
+
+
+def install_public_mode_gate(app: FastAPI, gated_routes: Sequence[BaseRoute]) -> None:
+    """Install the single default-deny middleware for public mode.
+
+    ``gated_routes`` is the route snapshot taken before the frontend mount.
+    One middleware for the whole app — never a per-route repetition of the
+    rule, so a route added later cannot forget to be gated.
+    """
+    routes = list(gated_routes)
+
+    @app.middleware("http")
+    async def _public_mode_gate(request: Request, call_next):
+        path = request.url.path
+        if not _is_public_path(path) and _matches_any_route(routes, request.scope):
+            config: Config = request.app.state.config
+            if not _has_valid_bearer(config, request):
+                # Deliberately silent: no log of the probed path at info
+                # level, no hint in the body, no WWW-Authenticate header.
+                return JSONResponse(_NOT_FOUND_BODY, status_code=404)
+        return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Static frontend (website Phase C plan §P2)
+# ---------------------------------------------------------------------------
+
+# SvelteKit's content-hashed build output. Everything under here carries a
+# hash in the filename, so it can never change under a given URL.
+_IMMUTABLE_PREFIXES = ("_app/",)
+_IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+# index.html and the service worker gate every deploy: they must be
+# revalidated, or a stale shell pins old asset URLs after a release.
+_NO_CACHE_FILES = frozenset({"index.html", "service-worker.js", "sw.js"})
+_NO_CACHE = "no-cache"
+# The Protomaps basemap: one large, effectively static file with no hash in
+# its name. A day of caching keeps MapLibre's Range requests off the origin
+# without pinning a stale basemap for a week.
+_PMTILES_CACHE = "public, max-age=86400"
+# Unhashed static assets (icons, web manifest, robots.txt): short cache, so
+# a deploy is picked up within minutes.
+_DEFAULT_CACHE = "public, max-age=300"
+
+
+def _cache_control_for(path: str) -> str:
+    """Cache-Control for one frontend asset, keyed on its build-output path."""
+    name = path.rsplit("/", 1)[-1]
+    if path.startswith(_IMMUTABLE_PREFIXES):
+        return _IMMUTABLE_CACHE
+    if name in _NO_CACHE_FILES or name.endswith(".html"):
+        return _NO_CACHE
+    if name.endswith(".pmtiles"):
+        return _PMTILES_CACHE
+    return _DEFAULT_CACHE
+
+
+class SpaStaticFiles(StaticFiles):
+    """Static files with SPA fallback and per-asset cache headers.
+
+    Range requests are handled by Starlette's own ``FileResponse`` (206 +
+    ``Content-Range``), which the ``.pmtiles`` basemap depends on — MapLibre
+    reads it by byte range and never downloads the whole file.
+
+    Fallback rule: a miss on an *extensionless* path serves ``index.html``
+    (client-side routes like ``/about`` or ``/da/om``, and ``/`` itself,
+    which Starlette normalises to ``"."``), while a miss on a path with a
+    file suffix stays a 404. A missing asset must not come back as 200
+    text/html — that turns a broken deploy into silently corrupt
+    tiles/JSON, and it keeps the gate's 404s in company.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        served = path
+        try:
+            response = await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404 or Path(path).suffix:
+                raise
+            served = "index.html"
+            response = await super().get_response(served, scope)
+        response.headers["Cache-Control"] = _cache_control_for(served)
+        return response
+
+
+def _mount_frontend(app: FastAPI, frontend_dir: Path) -> None:
+    """Mount the built frontend at ``/`` (registered last: it matches all).
+
+    A configured-but-absent directory is a warning, not a crash: the image
+    is built with the frontend optional (see ``sidecar/deploy/Dockerfile``),
+    and an API-only service is far better than a service that won't boot.
+    """
+    if not frontend_dir.is_dir():
+        _log.warning("frontend_dir_missing", path=str(frontend_dir))
+        return
+    if not (frontend_dir / "index.html").is_file():
+        _log.warning("frontend_index_missing", path=str(frontend_dir))
+    app.mount(
+        "/",
+        SpaStaticFiles(directory=frontend_dir, html=False),
+        name="frontend",
+    )
+    _log.info("frontend_mounted", path=str(frontend_dir))
 
 
 _FRAME_NAME_RE = re.compile(r"^(?:frame_\d{2,4}|loop)\.png$")
@@ -630,4 +859,10 @@ def _consteq(a: str, b: str) -> bool:
     return acc == 0
 
 
-__all__ = ["create_app", "require_api_key", "HealthResponse"]
+__all__ = [
+    "create_app",
+    "require_api_key",
+    "install_public_mode_gate",
+    "SpaStaticFiles",
+    "HealthResponse",
+]

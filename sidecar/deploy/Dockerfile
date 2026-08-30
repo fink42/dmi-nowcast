@@ -41,6 +41,25 @@ RUN uv sync --frozen --no-dev
 RUN uv pip install --python /app/sidecar/.venv/bin/python "pyarrow==24.0.0" "duckdb==1.5.5"
 
 # ─────────────────────────────────────────────────────────────────────────
+# Optional built frontend (website Phase C §P2). The SvelteKit package in
+# ``frontend/`` is built by ITS OWN toolchain, not here — node in this image
+# would double its size for a site that releases on its own cadence.
+#
+# Build order:
+#   1. cd frontend && npm ci && npm run build     → frontend/build/
+#   2. docker compose -f sidecar/deploy/public/docker-compose.yml build
+#
+# The copy must not fail when step 1 hasn't run. ``frontend/buil[d]`` is a
+# glob that matches nothing when the directory is absent, and the paired
+# ``pyproject.toml`` (always present) keeps the source set non-empty so
+# COPY can't error out; the RUN below deletes that stand-in again. Result:
+# an image with the site when it was built, and an API-only image when it
+# wasn't — the service logs ``frontend_dir_missing`` and boots either way.
+FROM python:3.12-slim AS frontend
+COPY pyproject.toml frontend/buil[d] /frontend/build/
+RUN rm -f /frontend/build/pyproject.toml
+
+# ─────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
 # Runtime libs only — no compilers in the final image. The manylinux wheels
@@ -67,6 +86,11 @@ WORKDIR /app
 # Copy the entire built /app tree, preserving the build paths so the
 # editable .pth references inside the venv still resolve.
 COPY --from=builder --chown=dmi:dmi /app /app
+
+# The static site, when one was built (see the ``frontend`` stage). Served
+# only by instances whose config sets ``server.frontend_dir`` to this path —
+# the public stack does, the LAN stack doesn't.
+COPY --from=frontend --chown=dmi:dmi /frontend/build /app/frontend/build
 
 USER dmi
 

@@ -39,6 +39,15 @@ server:
   api_key: null           # set a shared secret before exposing this anywhere
   log_format: pretty      # pretty (dev) | json (prod / docker / journald)
   log_level: INFO
+  # Public (internet-facing) mode. false = this LAN instance: every
+  # endpoint open. true = serve ONLY the static frontend, /healthz,
+  # /nowcast/* and /forecast; /state.json, /frames/*, /lightning/* and
+  # /docs return 404 without an api_key bearer, and the cycle skips the
+  # home-crop rendering + basemap fetch. See sidecar/deploy/public/.
+  public_mode: false
+  # Directory of a built static frontend (SvelteKit build/) served at / with
+  # SPA fallback. null = no frontend, API only.
+  frontend_dir: null
 
 storage:
   data_dir: /var/lib/dmi-nowcast

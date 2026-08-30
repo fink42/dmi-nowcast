@@ -171,6 +171,20 @@ class ServerConfig(BaseModel):
     # Pretty (dev) vs JSON (prod) logs.
     log_format: Literal["pretty", "json"] = "pretty"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # Public service mode (website Phase C plan §P1). False keeps the
+    # LAN instance exactly as it is. True turns the process into the
+    # internet-facing instance: only the static frontend, /healthz,
+    # /nowcast/* and /forecast are reachable — every other route
+    # (``/state.json``, ``/frames/*``, ``/lightning/*``, the archive
+    # dashboards, /docs) answers 404 unless a valid ``api_key`` bearer
+    # accompanies the request. See ``app.py``'s docstring for the gate.
+    # It also skips the home-crop rendering + OSM basemap fetch in the
+    # cycle, since both only feed hidden endpoints.
+    public_mode: bool = False
+    # Directory of a built static frontend (SvelteKit ``build/``) served
+    # at ``/`` with SPA fallback semantics. None (default) serves no
+    # frontend at all — the LAN instance is API-only.
+    frontend_dir: Path | None = None
 
 
 class StorageConfig(BaseModel):

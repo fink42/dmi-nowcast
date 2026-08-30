@@ -55,6 +55,19 @@ endpoints (currently `/v1/trigger-refresh`) must include
 `/state.json`, `/frames/*`) stay open so clients can poll them
 unauthenticated.
 
+## Public mode
+
+`server.public_mode: true` turns the process into the internet-facing
+instance: only the static frontend (`server.frontend_dir`), `/healthz`,
+`/nowcast/*` and `/forecast` are served. Everything else — `/state.json`
+(the configured point's block), `/frames/*`, `/lightning/*`, `/docs` —
+answers `404`, indistinguishable from a route that was never registered,
+unless the request carries the `api_key` bearer. The cycle also skips the
+home-crop rendering and the OSM basemap fetch, which only feed the hidden
+`/frames/*`. The default (`false`) leaves this LAN service unchanged.
+
+Deployment assets for that mode live in `deploy/public/` — see its README.
+
 ## Deployment
 
 `deploy/` ships a Dockerfile, a Compose file and an SSH deploy script.

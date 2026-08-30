@@ -1,0 +1,88 @@
+# Public instance config — copy to config.public.yaml and edit.
+#
+# This is the internet-facing instance (website Phase C plan §P1/§P3). It
+# serves the national products and the static site to anyone; it must not
+# serve the per-point state block, the home crop frames, or the lightning
+# endpoints. ``server.public_mode: true`` below is what enforces that.
+#
+# Any field can also be set via env vars with the DMI_NOWCAST_ prefix and
+# __ as the nested separator; env beats YAML (see config.py).
+
+home:
+  # VESTIGIAL on a public instance. Nothing point-specific is published
+  # here: /state.json (the block this point produces) is hidden, and the
+  # site samples every forecast from the national grids instead. The point
+  # still exists because the cycle computes one — its only public-facing
+  # traces are the confidence scalar's intensity-volatility term and the
+  # motion diagnostics, both of which a central point makes "typical
+  # Denmark" rather than one corner of it.
+  #
+  # 56.0 N, 10.0 E — central Denmark (eastern Jutland, near the Kattegat
+  # coast). Deliberately neutral: no one lives at a round coordinate.
+  lat: 56.0
+  lon: 10.0
+  radius_km: 1.0
+
+poll:
+  interval_min: 5         # DMI publishes fullRange composites every ~10 min
+  jitter_sec: 30          # ± jitter so the two instances don't fire together
+
+dmi:
+  base_url: https://opendataapi.dmi.dk/v1/radardata
+  user_agent: dmi-nowcast-sidecar/0.1
+
+forecast:
+  leads_min: [5, 10, 15, 20, 25, 30, 45, 60]
+  method: farneback
+  steps:
+    ensemble_size: 24
+    n_cascade_levels: 6
+  national:
+    # The site's whole payload: probability/ETA/intensity grids + overlays.
+    enabled: true
+    leads_min: [10, 20, 30, 45, 60]
+    keep_cycles: 24
+
+calibration:
+  # Seeded from the copy baked into the image on first boot (entrypoint.sh).
+  curves_path: /var/lib/dmi-nowcast/calibration_curves.json
+  # Pooled national curves — what makes the published probabilities
+  # calibrated. This instance does not fit them (the monthly job runs on the
+  # private instance, which owns the corpus): copy the fitted file into this
+  # volume and restart. Missing file → raw ensemble fractions, truthfully
+  # reported as ``calibrated: false`` in the manifest and on /forecast.
+  national_curves_path: /var/lib/dmi-nowcast/national_curves.json
+
+server:
+  host: 0.0.0.0
+  port: 8081              # inside the container; the host port is HOST_PORT
+  # THE public switch. Serves only the static frontend, /healthz,
+  # /nowcast/*, /forecast; everything else 404s without the bearer below.
+  public_mode: true
+  # Built SvelteKit site inside the image (see sidecar/deploy/Dockerfile).
+  # Absent when the frontend wasn't built before the image: the service logs
+  # ``frontend_dir_missing`` and serves the API only.
+  frontend_dir: /app/frontend/build
+  # Optional operator key. In public_mode it does NOT lock the public
+  # surface — it is the only way to reach the hidden one (/state.json,
+  # /frames/*, /lightning/*, /docs) for debugging. Leave null and the
+  # hidden surface is simply unreachable, which is a fine default for an
+  # instance that is meant to publish and nothing else.
+  api_key: null
+  log_format: json
+  log_level: INFO
+
+storage:
+  data_dir: /var/lib/dmi-nowcast
+  working_cache_max_bytes: 524288000
+  # No corpus archiving on the public instance: no bind-mount, no second
+  # copy of the frames. The private instance owns the archive and the
+  # calibration that derives from it.
+  corpus_dir: null
+
+lightning:
+  # Off entirely. /lightning/* is hidden by public_mode anyway; disabling it
+  # also means no strike buffer in memory and no archive writes (there is no
+  # corpus mount to write to). The lightning layer arrives in Phase E.
+  enabled: false
+  archive_enabled: false
