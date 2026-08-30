@@ -24,9 +24,12 @@
 #                       (default ~$DEPLOY_SSH_USER/dmi-nowcast-corpus)
 #
 # Usage:
-#   sidecar/deploy/deploy.sh
-#   sidecar/deploy/deploy.sh --no-build       # restart only, skip build
-#   sidecar/deploy/deploy.sh --logs           # tail logs after deploy
+#   sidecar/deploy/deploy.sh                       # private stack (default)
+#   sidecar/deploy/deploy.sh --stack public        # public web stack: builds
+#                                                  # frontend/, bundles it, and
+#                                                  # deploys sidecar/deploy/public/
+#   sidecar/deploy/deploy.sh --no-build            # restart only, skip build
+#   sidecar/deploy/deploy.sh --logs                # tail logs after deploy
 
 set -euo pipefail
 
@@ -43,7 +46,7 @@ fi
 : "${DEPLOY_SSH_USER:?DEPLOY_SSH_USER not set}"
 : "${DEPLOY_SSH_KEY:?DEPLOY_SSH_KEY not set}"
 
-REMOTE_DIR="${REMOTE_DIR:-/home/${DEPLOY_SSH_USER}/dmi-nowcast}"
+# REMOTE_DIR default depends on --stack; resolved after arg parsing.
 # ssh uses -p for the port; scp uses -P. Same key, same StrictHostKeyChecking.
 SSH=(ssh -p "$DEPLOY_SSH_PORT" -i "$DEPLOY_SSH_KEY"
      -o StrictHostKeyChecking=accept-new
@@ -53,13 +56,51 @@ SCP=(scp -P "$DEPLOY_SSH_PORT" -i "$DEPLOY_SSH_KEY"
 
 do_build=1
 do_tail=0
-for arg in "$@"; do
-    case "$arg" in
+stack="private"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --no-build) do_build=0;;
         --logs) do_tail=1;;
-        *) echo "unknown arg: $arg"; exit 2;;
+        --stack) stack="${2:?--stack needs a value}"; shift;;
+        --stack=*) stack="${1#*=}";;
+        *) echo "unknown arg: $1"; exit 2;;
     esac
+    shift
 done
+
+# Stack-dependent layout. The two stacks deploy to SEPARATE remote dirs so
+# the private (LAN/HA) and public (internet-facing) instances never share
+# a checkout, config, or compose project.
+if [[ "$stack" == "public" ]]; then
+    REMOTE_DIR="${REMOTE_DIR:-/home/${DEPLOY_SSH_USER}/dmi-nowcast-public}"
+    COMPOSE_DIR="sidecar/deploy/public"
+    SERVICE="dmi-nowcast-public"
+    CONFIG_REL="sidecar/deploy/public/config.public.yaml"
+    CONFIG_EXAMPLE_REL="sidecar/deploy/public/config.public.example.yaml"
+    HEALTH_PORT="${HOST_PORT:-8082}"
+    NEED_CORPUS=0   # public instance archives nothing (corpus_dir: null)
+elif [[ "$stack" == "private" ]]; then
+    REMOTE_DIR="${REMOTE_DIR:-/home/${DEPLOY_SSH_USER}/dmi-nowcast}"
+    COMPOSE_DIR="sidecar/deploy"
+    SERVICE="sidecar"
+    CONFIG_REL="sidecar/deploy/config.yaml"
+    CONFIG_EXAMPLE_REL="sidecar/config.example.yaml"
+    HEALTH_PORT=8081
+    NEED_CORPUS=1
+else
+    echo "unknown --stack: $stack (private|public)"; exit 2
+fi
+
+tar_includes=(./sidecar ./src ./scripts ./sql ./pyproject.toml ./uv.lock ./README.md ./.python-version)
+if [[ "$stack" == "public" ]]; then
+    echo "==> Building frontend"
+    if [[ ! -f frontend/static/basemap.pmtiles ]]; then
+        echo "    basemap.pmtiles missing — fetching once (~150 MB)"
+        (cd frontend && node scripts/fetch-basemap.mjs)
+    fi
+    (cd frontend && npm run build)
+    tar_includes+=(./frontend/build)
+fi
 
 echo "==> Packing sidecar bundle"
 tar_excludes=(
@@ -82,10 +123,10 @@ tar_excludes=(
 COPYFILE_DISABLE=1 tar czf /tmp/dmi-sidecar-bundle.tar.gz \
     "${tar_excludes[@]}" \
     --no-mac-metadata \
-    ./sidecar ./src ./scripts ./sql ./pyproject.toml ./uv.lock ./README.md ./.python-version
+    "${tar_includes[@]}"
 echo "    bundle: $(du -h /tmp/dmi-sidecar-bundle.tar.gz | awk '{print $1}')"
 
-echo "==> Ensuring remote dirs (incl. persistent corpus archive)"
+echo "==> Ensuring remote dirs"
 "${SSH[@]}" "mkdir -p '$REMOTE_DIR'"
 # Persistent corpus archive — bind-mounted into the container (host side
 # $CORPUS_HOST_DIR → container /var/lib/dmi-nowcast-corpus). It defaults to
@@ -94,48 +135,51 @@ echo "==> Ensuring remote dirs (incl. persistent corpus archive)"
 # by 10001; we chown via a throwaway root busybox container — the docker
 # daemon is root, so this needs no host sudo and keeps the whole deploy
 # unattended (important for re-runs from the monthly timer's host).
-CORPUS_HOST="${CORPUS_HOST_DIR:-/home/${DEPLOY_SSH_USER}/dmi-nowcast-corpus}"
-"${SSH[@]}" "mkdir -p '$CORPUS_HOST' && docker run --rm -v '$CORPUS_HOST:/mnt' busybox chown -R 10001:10001 /mnt"
+if [[ "$NEED_CORPUS" == 1 ]]; then
+    CORPUS_HOST="${CORPUS_HOST_DIR:-/home/${DEPLOY_SSH_USER}/dmi-nowcast-corpus}"
+    "${SSH[@]}" "mkdir -p '$CORPUS_HOST' && docker run --rm -v '$CORPUS_HOST:/mnt' busybox chown -R 10001:10001 /mnt"
+fi
 
 echo "==> Copying bundle"
 "${SCP[@]}" /tmp/dmi-sidecar-bundle.tar.gz \
     "${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST}:${REMOTE_DIR}/"
 
-echo "==> Unpacking on the host (preserving the host-edited config.yaml)"
-# ``rm -rf sidecar`` would delete the host's edited config.yaml and the
+echo "==> Unpacking on the host (preserving the host-edited config)"
+# ``rm -rf sidecar`` would delete the host's edited config and the
 # bootstrap below would silently reset it to the example (this bit us:
 # a deploy reverted ensemble_size 16 → 24). Stash it across the wipe.
+STASH=/tmp/dmi-config-keep-$stack.yaml
 "${SSH[@]}" "cd '$REMOTE_DIR' \
-    && { test -f sidecar/deploy/config.yaml && cp sidecar/deploy/config.yaml /tmp/dmi-config-keep.yaml || true; } \
-    && rm -rf sidecar src scripts && tar xzf dmi-sidecar-bundle.tar.gz \
-    && { test -f /tmp/dmi-config-keep.yaml && mv /tmp/dmi-config-keep.yaml sidecar/deploy/config.yaml && echo '    (preserved existing config.yaml)' || true; }"
+    && { test -f '$CONFIG_REL' && cp '$CONFIG_REL' '$STASH' || true; } \
+    && rm -rf sidecar src scripts sql frontend && tar xzf dmi-sidecar-bundle.tar.gz \
+    && { test -f '$STASH' && mv '$STASH' '$CONFIG_REL' && echo '    (preserved existing config)' || true; }"
 
 # First-time bootstrap only: stage the example config if none survived.
-"${SSH[@]}" "test -f '$REMOTE_DIR/sidecar/deploy/config.yaml' || { cp '$REMOTE_DIR/sidecar/config.example.yaml' '$REMOTE_DIR/sidecar/deploy/config.yaml' && echo '    (default config.yaml staged — edit it on the host)'; }"
+"${SSH[@]}" "cd '$REMOTE_DIR' && { test -f '$CONFIG_REL' || { cp '$CONFIG_EXAMPLE_REL' '$CONFIG_REL' && echo '    (default config staged — edit it on the host)'; }; }"
 
 if [[ "$do_build" == 1 ]]; then
     echo "==> Building image + restarting service"
-    "${SSH[@]}" "cd '$REMOTE_DIR/sidecar/deploy' && docker compose up -d --build"
+    "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && docker compose up -d --build"
 else
     echo "==> Restarting service (no rebuild)"
-    "${SSH[@]}" "cd '$REMOTE_DIR/sidecar/deploy' && docker compose restart"
+    "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && docker compose restart"
 fi
 
 echo "==> Waiting for /healthz to come up"
 for i in $(seq 1 60); do
-    if "${SSH[@]}" "curl -fs http://localhost:8081/healthz >/dev/null 2>&1"; then
-        echo "    ✓ sidecar healthy after ${i}s"
-        "${SSH[@]}" "curl -s http://localhost:8081/healthz | python3 -m json.tool"
+    if "${SSH[@]}" "curl -fs http://localhost:${HEALTH_PORT}/healthz >/dev/null 2>&1"; then
+        echo "    ✓ ${SERVICE} healthy after ${i}s"
+        "${SSH[@]}" "curl -s http://localhost:${HEALTH_PORT}/healthz | python3 -m json.tool"
         break
     fi
     sleep 1
     if [[ "$i" == 60 ]]; then
         echo "    ✗ healthz never returned 200; recent logs:"
-        "${SSH[@]}" "cd '$REMOTE_DIR/sidecar/deploy' && docker compose logs --tail 40 sidecar"
+        "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && docker compose logs --tail 40 $SERVICE"
         exit 1
     fi
 done
 
 if [[ "$do_tail" == 1 ]]; then
-    "${SSH[@]}" "cd '$REMOTE_DIR/sidecar/deploy' && docker compose logs -f sidecar"
+    "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && docker compose logs -f $SERVICE"
 fi
