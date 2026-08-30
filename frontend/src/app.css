@@ -1,0 +1,121 @@
+/*
+ * One small stylesheet, mobile first. The primary reader is standing outside
+ * with a phone under a darkening sky, so: big tap targets, high contrast, no
+ * component library, and a dark theme that follows the system setting.
+ */
+
+:root {
+	--ink: #16202a;
+	--muted: #5a6b7b;
+	--surface: #ffffff;
+	--bg: #eef2f5;
+	--map-bg: #dfe6ea;
+	--border: #d6dee4;
+	--track: #e3e9ee;
+	--accent: #0b6bcb;
+	--accent-ink: #ffffff;
+	--warn: #b4530a;
+	--radius: 14px;
+	--shadow: 0 2px 12px rgba(16, 32, 48, 0.14);
+	color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--ink: #e7edf3;
+		--muted: #9aa9b8;
+		--surface: #141a21;
+		--bg: #0d1218;
+		--map-bg: #0d1218;
+		--border: #26313c;
+		--track: #222c36;
+		--accent: #5aa9f5;
+		--accent-ink: #06121f;
+		--warn: #eba25a;
+		--shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+		color-scheme: dark;
+	}
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+}
+
+body {
+	background: var(--bg);
+	color: var(--ink);
+	font-family:
+		system-ui,
+		-apple-system,
+		'Segoe UI',
+		Roboto,
+		'Helvetica Neue',
+		sans-serif;
+	line-height: 1.5;
+	-webkit-text-size-adjust: 100%;
+}
+
+a {
+	color: var(--accent);
+}
+
+button {
+	font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+/* Content pages share one measure and rhythm. */
+.prose {
+	max-width: 38rem;
+	margin: 0 auto;
+	padding: 1.25rem 1.1rem 0.5rem;
+}
+
+.prose h1 {
+	font-size: 1.5rem;
+	margin: 0 0 0.5rem;
+}
+
+.prose h2 {
+	font-size: 1.05rem;
+	margin: 1.6rem 0 0.4rem;
+}
+
+.prose p,
+.prose li {
+	font-size: 0.95rem;
+}
+
+.prose .lead {
+	font-size: 1.05rem;
+	color: var(--ink);
+}
+
+.prose ol,
+.prose ul {
+	padding-left: 1.2rem;
+}
+
+.prose li {
+	margin-bottom: 0.4rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	* {
+		animation-duration: 0.01ms !important;
+		transition-duration: 0.01ms !important;
+	}
+}

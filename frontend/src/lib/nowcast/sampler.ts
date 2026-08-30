@@ -1,0 +1,187 @@
+/**
+ * Client-side point sampling of the national product grids.
+ *
+ * This is the zero-server-cost path the Phase A artifacts were designed for:
+ * the browser already downloaded the quantised PNGs to draw them, so looking
+ * up one point costs a projection and an array index. The server's
+ * `/forecast?lat=&lon=` endpoint is the fallback, and the two must agree —
+ * so the conventions below are copied from the sidecar, not re-derived:
+ *
+ *   col = (x - x_ul_m) / pixel_scale_x_m        [national_artifacts.py]
+ *   row = (y_ul_m - y) / pixel_scale_y_m
+ *   nearest pixel = round(row), round(col)      [app.py /forecast]
+ *   outside [0, rows) × [0, cols) → off coverage (the endpoint's 400)
+ *   value = level * scale + offset              [dequantise()]
+ *   level == nodata (255) → null                [NODATA_LEVEL]
+ *
+ * The manifest's `grid` block already carries the *effective* pixel scale
+ * (native × downsample_factor), so there is no second division by the
+ * downsample factor here — that is exactly what `/forecast` does when it
+ * divides the native index by `f`.
+ */
+import proj4 from 'proj4';
+import type { ArtifactEntry, GridBlock, Manifest } from './manifest';
+import { findArtifact, isCalibrated } from './manifest';
+import type { Gray8Image } from './png';
+
+export interface GridIndex {
+	/** Fractional grid position, before rounding to a pixel. */
+	row: number;
+	col: number;
+}
+
+export interface PixelIndex {
+	row: number;
+	col: number;
+}
+
+/** Cache the proj4 converters — building one parses the proj string. */
+const converters = new Map<string, proj4.Converter>();
+
+function converter(proj: string): proj4.Converter {
+	let c = converters.get(proj);
+	if (!c) {
+		c = proj4('WGS84', proj);
+		converters.set(proj, c);
+	}
+	return c;
+}
+
+/** lon/lat (degrees) → fractional grid position in the manifest's grid. */
+export function lonLatToGrid(grid: GridBlock, lon: number, lat: number): GridIndex {
+	const [x, y] = converter(grid.proj4).forward([lon, lat]);
+	return {
+		col: (x - grid.x_ul_m) / grid.pixel_scale_x_m,
+		row: (grid.y_ul_m - y) / grid.pixel_scale_y_m
+	};
+}
+
+/** Fractional grid position → lon/lat, for placing the grid on the map. */
+export function gridToLonLat(grid: GridBlock, row: number, col: number): [number, number] {
+	const x = grid.x_ul_m + col * grid.pixel_scale_x_m;
+	const y = grid.y_ul_m - row * grid.pixel_scale_y_m;
+	const [lon, lat] = converter(grid.proj4).inverse([x, y]);
+	return [lon, lat];
+}
+
+/**
+ * Nearest pixel, or null when the point falls outside the grid — the case
+ * `/forecast` answers with 400 and the UI must render as "outside radar
+ * coverage" rather than a 0 % probability.
+ *
+ * Note: Python's `round()` breaks ties to even and `Math.round` breaks them
+ * upward. Half-pixel-exact coordinates are a measure-zero case that only
+ * moves the sample one pixel (≈ 2 km) when it happens; everything else is
+ * bit-identical.
+ */
+export function nearestPixel(grid: GridBlock, lon: number, lat: number): PixelIndex | null {
+	const { row, col } = lonLatToGrid(grid, lon, lat);
+	const r = Math.round(row);
+	const c = Math.round(col);
+	const [rows, cols] = grid.shape;
+	if (r < 0 || r >= rows || c < 0 || c >= cols) return null;
+	return { row: r, col: c };
+}
+
+/** True when the point is inside the product grid at all. */
+export const inCoverage = (grid: GridBlock, lon: number, lat: number): boolean =>
+	nearestPixel(grid, lon, lat) !== null;
+
+/**
+ * Dequantise one pixel of a grayscale product: `level * scale + offset`,
+ * with the nodata level (255) becoming null.
+ */
+export function sampleArtifact(
+	image: Gray8Image,
+	entry: ArtifactEntry,
+	pixel: PixelIndex
+): number | null {
+	if (image.width !== entry.shape[1] || image.height !== entry.shape[0]) {
+		throw new Error(
+			`artifact ${entry.filename}: PNG is ${image.height}×${image.width}, manifest says ${entry.shape[0]}×${entry.shape[1]}`
+		);
+	}
+	if (entry.scale === undefined || entry.offset === undefined) {
+		throw new Error(`artifact ${entry.filename} carries no scale/offset`);
+	}
+	const level = image.levels[pixel.row * image.width + pixel.col];
+	if (level === (entry.nodata ?? 255)) return null;
+	return level * entry.scale + entry.offset;
+}
+
+export interface LeadProbability {
+	leadMin: number;
+	/** Probability of rain by this lead, or null where the grid has no value. */
+	pRain: number | null;
+}
+
+export interface PointForecast {
+	lat: number;
+	lon: number;
+	/** Radar timestamp the products were computed from (ISO 8601, UTC). */
+	radarTsUtc: string;
+	perLead: LeadProbability[];
+	/** Minutes until rain arrives; null when no rain within the horizon. */
+	etaMin: number | null;
+	/** Ensemble-median rain rate at the ETA step (mm/h); null without an ETA. */
+	intensityMmH: number | null;
+	/** Global confidence scalar; only the server path can supply it. */
+	confidence: number | null;
+	/** True only when every served lead went through a calibration curve. */
+	calibrated: boolean;
+	/** Where the numbers came from — shown in the panel, honestly. */
+	source: 'client' | 'server';
+}
+
+/** Product grids for one cycle, decoded once and reused for every click. */
+export interface DecodedGrids {
+	pRain: Map<number, { entry: ArtifactEntry; image: Gray8Image }>;
+	eta?: { entry: ArtifactEntry; image: Gray8Image };
+	intensity?: { entry: ArtifactEntry; image: Gray8Image };
+}
+
+/**
+ * Sample every product at one point. Returns null when the point lies outside
+ * the grid, which the caller renders as the off-coverage state.
+ */
+export function samplePoint(
+	manifest: Manifest,
+	grids: DecodedGrids,
+	lat: number,
+	lon: number
+): PointForecast | null {
+	const pixel = nearestPixel(manifest.grid, lon, lat);
+	if (!pixel) return null;
+
+	const perLead: LeadProbability[] = [];
+	for (const lead of manifest.leads_min) {
+		const grid = grids.pRain.get(lead);
+		perLead.push({
+			leadMin: lead,
+			pRain: grid ? sampleArtifact(grid.image, grid.entry, pixel) : null
+		});
+	}
+	return {
+		lat,
+		lon,
+		radarTsUtc: manifest.radar_ts_utc,
+		perLead,
+		etaMin: grids.eta ? sampleArtifact(grids.eta.image, grids.eta.entry, pixel) : null,
+		intensityMmH: grids.intensity
+			? sampleArtifact(grids.intensity.image, grids.intensity.entry, pixel)
+			: null,
+		confidence: null,
+		calibrated: isCalibrated(manifest),
+		source: 'client'
+	};
+}
+
+/** The grayscale artifacts one cycle needs, in fetch order. */
+export function productArtifacts(manifest: Manifest): ArtifactEntry[] {
+	const wanted: (ArtifactEntry | undefined)[] = [
+		...manifest.leads_min.map((lead) => findArtifact(manifest, 'p_rain', lead)),
+		findArtifact(manifest, 'eta'),
+		findArtifact(manifest, 'intensity')
+	];
+	return wanted.filter((a): a is ArtifactEntry => a !== undefined);
+}

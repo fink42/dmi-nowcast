@@ -1,0 +1,37 @@
+{
+	"name": "dmi-nowcast-frontend",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"scripts": {
+		"dev": "vite dev",
+		"build": "vite build",
+		"preview": "vite preview",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"basemap": "node scripts/fetch-basemap.mjs",
+		"icons": "node scripts/make-icons.mjs",
+		"mock-sidecar": "node scripts/mock-sidecar.mjs"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-static": "^3.0.10",
+		"@sveltejs/kit": "^2.63.0",
+		"@sveltejs/vite-plugin-svelte": "^7.1.2",
+		"@types/node": "^26.4.0",
+		"@types/proj4": "^2.5.6",
+		"svelte": "^5.56.1",
+		"svelte-check": "^4.6.0",
+		"typescript": "^6.0.3",
+		"vite": "^8.0.16",
+		"vitest": "^4.1.11"
+	},
+	"dependencies": {
+		"@protomaps/basemaps": "^5.7.2",
+		"maplibre-gl": "^6.6.0",
+		"pmtiles": "^4.5.0",
+		"proj4": "^2.21.0"
+	}
+}

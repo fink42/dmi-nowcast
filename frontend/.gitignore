@@ -1,0 +1,31 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# Build inputs fetched by scripts/fetch-basemap.mjs — a ~147 MB pmtiles
+# archive and ~11 MB of glyphs/sprites. Deployment runs the script; see
+# README.md.
+/static/basemap.pmtiles
+/static/basemap-assets/
+# Cached pmtiles CLI binary used by that script.
+/.cache
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
