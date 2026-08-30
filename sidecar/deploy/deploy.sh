@@ -161,9 +161,13 @@ if [[ "$do_build" == 1 ]]; then
     echo "==> Building image + restarting service"
     COMPOSE_FILES="-f docker-compose.yml"
     REMOTE_ENV=""
-    if [[ "$stack" == "public" && -n "${PUBLIC_SHARED_NETWORK:-}" ]]; then
-        COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.shared-net.yml"
-        REMOTE_ENV="PUBLIC_SHARED_NETWORK='$PUBLIC_SHARED_NETWORK' "
+    if [[ "$stack" == "public" ]]; then
+        # Compose interpolates ${HOST_PORT} in the REMOTE shell — forward it.
+        REMOTE_ENV="HOST_PORT='$HEALTH_PORT' "
+        if [[ -n "${PUBLIC_SHARED_NETWORK:-}" ]]; then
+            COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.shared-net.yml"
+            REMOTE_ENV+="PUBLIC_SHARED_NETWORK='$PUBLIC_SHARED_NETWORK' "
+        fi
     fi
     "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && ${REMOTE_ENV}docker compose $COMPOSE_FILES up -d --build"
 else
