@@ -183,3 +183,39 @@ def test_run_ensemble_downsample_halves_runtime():
         seed=42,
     )
     assert out2.shape == (3, 4, 128, 128), f"got {out2.shape}"
+
+
+def test_aggregate_at_home_subpixel_disc_falls_back_to_nearest_pixel(geo):
+    """A sub-pixel disc whose fractional centre sits near a pixel corner
+    must sample the nearest pixel (the /forecast convention), not raise
+    'outside the grid'. Regression: the public instance's central-DK
+    reference point (56.0, 10.0) hit exactly this on the x4 grid."""
+    import numpy as np
+    from dmi_nowcast_core.probabilistic import aggregate_at_home
+
+    h = geo.composite.reflectivity_dbz.shape[0] // 4
+    w = geo.composite.reflectivity_dbz.shape[1] // 4
+    forecast = np.zeros((4, 6, h, w), dtype=np.float32)
+    forecast[:2, :, :, :] = 5.0  # half the members wet everywhere
+
+    # Pick a lon/lat whose downsampled fractional position lands near a
+    # pixel corner: search a few offsets until the naive disc is empty.
+    from dmi_nowcast_core.sample import disc_pixel_indices
+    target = None
+    for drow in np.linspace(0.45, 0.55, 11):
+        for dcol in np.linspace(0.45, 0.55, 11):
+            rr, cc = disc_pixel_indices((h, w), h // 2 + drow, w // 2 + dcol, 0.5)
+            if rr.size == 0:
+                target = (h // 2 + drow, w // 2 + dcol)
+                break
+        if target:
+            break
+    if target is None:  # implementation includes corners — nothing to test
+        return
+    lon, lat = geo.grid_to_lonlat(target[0] * 4.0, target[1] * 4.0)
+    agg = aggregate_at_home(
+        forecast, geo, lon, lat, radius_m=1000.0,
+        threshold_mm_h=0.5, timestep_min=10.0,
+        leads_min=(10.0, 60.0), downsample_factor=4,
+    )
+    assert agg.probability_by_lead == (0.5, 0.5)

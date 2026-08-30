@@ -248,7 +248,17 @@ def aggregate_at_home(
     home_col = home.col / max(1, downsample_factor)
     rows, cols = disc_pixel_indices((h, w), home_row, home_col, radius_px)
     if rows.size == 0:
-        raise ValueError("home location is outside the grid")
+        # A sub-pixel disc (radius_px < ~0.7 on a downsampled grid) can come
+        # back empty when the fractional centre sits near a pixel CORNER —
+        # the point is still inside the grid. Fall back to the nearest
+        # pixel, the exact ``/forecast`` sampling convention, and reserve
+        # the error for points genuinely outside the grid bounds.
+        r_near, c_near = int(round(home_row)), int(round(home_col))
+        if 0 <= r_near < h and 0 <= c_near < w:
+            rows = np.array([r_near], dtype=np.int64)
+            cols = np.array([c_near], dtype=np.int64)
+        else:
+            raise ValueError("home location is outside the grid")
 
     # max-in-disc per member per timestep
     max_per_member_step = np.zeros((n_members, n_timesteps), dtype=np.float32)
