@@ -159,7 +159,13 @@ STASH=/tmp/dmi-config-keep-$stack.yaml
 
 if [[ "$do_build" == 1 ]]; then
     echo "==> Building image + restarting service"
-    "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && docker compose up -d --build"
+    COMPOSE_FILES="-f docker-compose.yml"
+    REMOTE_ENV=""
+    if [[ "$stack" == "public" && -n "${PUBLIC_SHARED_NETWORK:-}" ]]; then
+        COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.shared-net.yml"
+        REMOTE_ENV="PUBLIC_SHARED_NETWORK='$PUBLIC_SHARED_NETWORK' "
+    fi
+    "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && ${REMOTE_ENV}docker compose $COMPOSE_FILES up -d --build"
 else
     echo "==> Restarting service (no rebuild)"
     "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && docker compose restart"

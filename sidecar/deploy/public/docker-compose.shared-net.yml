@@ -1,0 +1,12 @@
+# Optional override: attach the public stack to an EXISTING docker bridge
+# instead of a fresh per-project one. Some hosts (many compose projects,
+# custom firewall rules) leave freshly created bridges unroutable —
+# symptom: "[Errno 101] Network is unreachable" from inside the container
+# while long-established compose networks work fine.
+#
+# Enable by deploying with PUBLIC_SHARED_NETWORK=<existing-network-name>
+# (deploy.sh --stack public passes it through automatically when set).
+networks:
+  default:
+    name: ${PUBLIC_SHARED_NETWORK}
+    external: true
