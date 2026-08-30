@@ -1,0 +1,1208 @@
+{
+ "version": 2,
+ "generated": "2026-08-29T13:02:41+00:00",
+ "seed": 20260829,
+ "provenance": "Stratified sample: Natural Earth 10m admin-0 Denmark boundary (public domain, data/denmark_boundary.geojson) via DuckDB spatial; strata = 8 region boxes x coast band (10 km) x nearest-DMI-radar band (50/100 km); all points in-grid vs dk.com.202511221750.500_max.h5. v2: the single fixed reference point is the area-weighted centroid of the Fyn polygon of the same boundary file (55.32790 N, 10.32474 E, rounded to 2 decimals), id 'fyn-centroid'; its coast/radar bands were recomputed (14.5 km to coast, 79.4 km to the nearest DMI radar) and land in the same stratum, so the allocation is unchanged.",
+ "points": [
+  {
+   "id": "bornholm-01",
+   "lat": 55.02049,
+   "lon": 15.04472,
+   "region": "Bornholm",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "bornholm-02",
+   "lat": 55.09278,
+   "lon": 14.7654,
+   "region": "Bornholm",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "fyn-01",
+   "lat": 55.46917,
+   "lon": 10.30761,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "fyn-02",
+   "lat": 55.28539,
+   "lon": 9.958,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "fyn-03",
+   "lat": 55.45361,
+   "lon": 10.49444,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "fyn-04",
+   "lat": 55.61246,
+   "lon": 10.31485,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "fyn-05",
+   "lat": 54.92573,
+   "lon": 10.31537,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "fyn-06",
+   "lat": 55.12569,
+   "lon": 10.17172,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "fyn-centroid",
+   "lat": 55.33,
+   "lon": 10.32,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "fyn-07",
+   "lat": 55.34124,
+   "lon": 10.34525,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "fyn-08",
+   "lat": 55.18374,
+   "lon": 10.60246,
+   "region": "Fyn",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "hovedstaden-01",
+   "lat": 55.91536,
+   "lon": 12.08767,
+   "region": "Hovedstaden",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "hovedstaden-02",
+   "lat": 55.90711,
+   "lon": 12.50265,
+   "region": "Hovedstaden",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "hovedstaden-03",
+   "lat": 55.75617,
+   "lon": 12.18328,
+   "region": "Hovedstaden",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "hovedstaden-04",
+   "lat": 55.68522,
+   "lon": 12.24006,
+   "region": "Hovedstaden",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "hovedstaden-05",
+   "lat": 55.71309,
+   "lon": 12.22954,
+   "region": "Hovedstaden",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "hovedstaden-06",
+   "lat": 55.97065,
+   "lon": 12.23596,
+   "region": "Hovedstaden",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "hovedstaden-07",
+   "lat": 55.51618,
+   "lon": 12.00141,
+   "region": "Hovedstaden",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-01",
+   "lat": 56.48118,
+   "lon": 10.50536,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-02",
+   "lat": 56.06286,
+   "lon": 8.39907,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-03",
+   "lat": 56.46051,
+   "lon": 9.28248,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-04",
+   "lat": 56.44544,
+   "lon": 10.79781,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-05",
+   "lat": 56.53565,
+   "lon": 10.40708,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-06",
+   "lat": 56.36841,
+   "lon": 10.38148,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-07",
+   "lat": 56.18005,
+   "lon": 10.50311,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-08",
+   "lat": 56.09949,
+   "lon": 10.22731,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-09",
+   "lat": 56.25468,
+   "lon": 8.27606,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "midtjylland-10",
+   "lat": 56.33578,
+   "lon": 8.17287,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "midtjylland-11",
+   "lat": 56.18739,
+   "lon": 8.20824,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "midtjylland-12",
+   "lat": 56.46084,
+   "lon": 9.20394,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-13",
+   "lat": 56.10358,
+   "lon": 8.46481,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-14",
+   "lat": 56.32046,
+   "lon": 8.51803,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-15",
+   "lat": 56.09893,
+   "lon": 9.14178,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-16",
+   "lat": 56.42436,
+   "lon": 9.51229,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-17",
+   "lat": 55.96536,
+   "lon": 8.53272,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-18",
+   "lat": 56.2447,
+   "lon": 8.63094,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-19",
+   "lat": 56.07637,
+   "lon": 8.89893,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-20",
+   "lat": 56.3874,
+   "lon": 8.55598,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-21",
+   "lat": 56.2158,
+   "lon": 9.18119,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "midtjylland-22",
+   "lat": 56.07249,
+   "lon": 9.3664,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-23",
+   "lat": 56.46989,
+   "lon": 9.93331,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-24",
+   "lat": 56.00574,
+   "lon": 9.53238,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-25",
+   "lat": 56.17521,
+   "lon": 9.95891,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-26",
+   "lat": 56.33117,
+   "lon": 10.21249,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-27",
+   "lat": 56.08788,
+   "lon": 10.00034,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-28",
+   "lat": 56.3449,
+   "lon": 9.83203,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-29",
+   "lat": 56.16116,
+   "lon": 9.59088,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "midtjylland-30",
+   "lat": 56.20076,
+   "lon": 8.32334,
+   "region": "Midtjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "nordjylland-01",
+   "lat": 56.98807,
+   "lon": 9.94595,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-02",
+   "lat": 57.06515,
+   "lon": 9.378,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-03",
+   "lat": 56.99078,
+   "lon": 10.20594,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-04",
+   "lat": 56.9965,
+   "lon": 9.54857,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-05",
+   "lat": 56.90148,
+   "lon": 10.2629,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-06",
+   "lat": 57.03578,
+   "lon": 10.30179,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-07",
+   "lat": 56.72554,
+   "lon": 10.19743,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-08",
+   "lat": 56.85909,
+   "lon": 10.20523,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-09",
+   "lat": 56.97707,
+   "lon": 9.372,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-10",
+   "lat": 57.05246,
+   "lon": 10.06177,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "nordjylland-11",
+   "lat": 57.12115,
+   "lon": 10.023,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "nordjylland-12",
+   "lat": 57.16465,
+   "lon": 9.93623,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "nordjylland-13",
+   "lat": 57.54651,
+   "lon": 10.25779,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "nordjylland-14",
+   "lat": 57.53871,
+   "lon": 10.04426,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "nordjylland-15",
+   "lat": 57.55598,
+   "lon": 9.94175,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "nordjylland-16",
+   "lat": 56.69786,
+   "lon": 8.35312,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "nordjylland-17",
+   "lat": 57.059,
+   "lon": 8.54907,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "nordjylland-18",
+   "lat": 56.67347,
+   "lon": 8.57862,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "nordjylland-19",
+   "lat": 56.78961,
+   "lon": 8.67342,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "nordjylland-20",
+   "lat": 56.73295,
+   "lon": 9.5381,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-21",
+   "lat": 56.82126,
+   "lon": 10.05702,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-22",
+   "lat": 56.8516,
+   "lon": 10.09593,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "nordjylland-23",
+   "lat": 57.41158,
+   "lon": 9.9577,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "nordjylland-24",
+   "lat": 57.38619,
+   "lon": 9.93229,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "nordjylland-25",
+   "lat": 57.32186,
+   "lon": 9.86183,
+   "region": "Nordjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sjaelland-01",
+   "lat": 55.46803,
+   "lon": 11.33217,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-02",
+   "lat": 55.24452,
+   "lon": 11.43834,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-03",
+   "lat": 54.78647,
+   "lon": 11.67529,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-04",
+   "lat": 55.2579,
+   "lon": 11.30249,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-05",
+   "lat": 55.21086,
+   "lon": 11.34805,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-06",
+   "lat": 54.76893,
+   "lon": 11.76465,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-07",
+   "lat": 55.26879,
+   "lon": 11.40951,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-08",
+   "lat": 54.8095,
+   "lon": 11.87427,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-09",
+   "lat": 55.96493,
+   "lon": 11.87345,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-10",
+   "lat": 55.70832,
+   "lon": 11.89749,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-11",
+   "lat": 55.34767,
+   "lon": 12.29844,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sjaelland-12",
+   "lat": 55.19062,
+   "lon": 11.75279,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sjaelland-13",
+   "lat": 55.234,
+   "lon": 12.01059,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sjaelland-14",
+   "lat": 55.24129,
+   "lon": 12.02489,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sjaelland-15",
+   "lat": 54.77664,
+   "lon": 11.12887,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": ">=100km"
+   }
+  },
+  {
+   "id": "sjaelland-16",
+   "lat": 55.54407,
+   "lon": 11.55421,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-17",
+   "lat": 55.57605,
+   "lon": 11.44978,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sjaelland-18",
+   "lat": 55.54328,
+   "lon": 11.84322,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sjaelland-19",
+   "lat": 55.35596,
+   "lon": 11.81942,
+   "region": "Sjælland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-01",
+   "lat": 55.62919,
+   "lon": 8.19526,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-02",
+   "lat": 55.65834,
+   "lon": 8.39596,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-03",
+   "lat": 55.46757,
+   "lon": 9.50042,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-04",
+   "lat": 55.9063,
+   "lon": 8.41047,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-05",
+   "lat": 55.79499,
+   "lon": 9.58554,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-06",
+   "lat": 55.93168,
+   "lon": 10.21747,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-07",
+   "lat": 55.80789,
+   "lon": 10.58045,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-08",
+   "lat": 55.67827,
+   "lon": 9.59721,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-09",
+   "lat": 55.20448,
+   "lon": 8.7922,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-10",
+   "lat": 55.74135,
+   "lon": 8.60155,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-11",
+   "lat": 55.38931,
+   "lon": 9.30786,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-12",
+   "lat": 55.73098,
+   "lon": 9.03691,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-13",
+   "lat": 55.38844,
+   "lon": 9.33026,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-14",
+   "lat": 55.6425,
+   "lon": 8.7318,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-15",
+   "lat": 55.8153,
+   "lon": 8.90461,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-16",
+   "lat": 55.62803,
+   "lon": 8.53203,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-17",
+   "lat": 55.73462,
+   "lon": 8.39994,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "sydjylland-18",
+   "lat": 55.49738,
+   "lon": 8.9928,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-19",
+   "lat": 55.39947,
+   "lon": 9.11819,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-20",
+   "lat": 55.17431,
+   "lon": 8.88577,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-21",
+   "lat": 55.32092,
+   "lon": 9.29155,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "sydjylland-22",
+   "lat": 55.38643,
+   "lon": 9.01488,
+   "region": "Sydjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "soenderjylland-01",
+   "lat": 54.86828,
+   "lon": 9.16707,
+   "region": "Sønderjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "soenderjylland-02",
+   "lat": 54.89317,
+   "lon": 9.5171,
+   "region": "Sønderjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "soenderjylland-03",
+   "lat": 54.89808,
+   "lon": 9.38337,
+   "region": "Sønderjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "soenderjylland-04",
+   "lat": 55.10726,
+   "lon": 8.54855,
+   "region": "Sønderjylland",
+   "strata": {
+    "coast_km_band": "<10km",
+    "radar_km_band": "<50km"
+   }
+  },
+  {
+   "id": "soenderjylland-05",
+   "lat": 54.92583,
+   "lon": 9.37973,
+   "region": "Sønderjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "50-100km"
+   }
+  },
+  {
+   "id": "soenderjylland-06",
+   "lat": 55.10081,
+   "lon": 9.25802,
+   "region": "Sønderjylland",
+   "strata": {
+    "coast_km_band": ">=10km",
+    "radar_km_band": "<50km"
+   }
+  }
+ ]
+}

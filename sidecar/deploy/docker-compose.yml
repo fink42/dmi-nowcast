@@ -1,0 +1,70 @@
+# Single-service compose for the deploy host.
+#
+# Host-specific values come from the environment (docker compose reads a
+# .env file next to this one, or inherits the shell's):
+#   HOST_PORT        published port (default 8081)
+#   CORPUS_HOST_DIR  persistent corpus archive on the host
+#                    (default ~/dmi-nowcast-corpus)
+#
+# Bring up:
+#   docker compose -f sidecar/deploy/docker-compose.yml up -d --build
+# Tail logs:
+#   docker compose -f sidecar/deploy/docker-compose.yml logs -f sidecar
+# Reload config:
+#   docker compose -f sidecar/deploy/docker-compose.yml restart sidecar
+
+services:
+  sidecar:
+    container_name: dmi-nowcast-sidecar
+    build:
+      # Build context is the repo root so the Dockerfile can COPY both
+      # src/ (core lib) and sidecar/ (service code).
+      context: ../..
+      dockerfile: sidecar/deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      # Publish only where you mean to. Set HOST_PORT to an explicit
+      # ``address:port`` (e.g. 127.0.0.1:8081) to bind one interface
+      # instead of every one the host has.
+      - "${HOST_PORT:-8081}:8081"
+    volumes:
+      # Working state: state.json, frames/, basemap/, composites/ (working
+      # cache, LRU-evicted). Named volume — docker manages permissions; can
+      # be wiped with ``docker compose down -v``.
+      - dmi_data:/var/lib/dmi-nowcast
+      # Persistent corpus archive.
+      # HOST bind-mount, NOT a named volume, so the archive survives even
+      # ``docker compose down -v``. Host side lives under the deploy user's
+      # home (``~/dmi-nowcast-corpus``) so provisioning needs no host
+      # root/sudo; ``deploy.sh`` creates it and chowns it to uid 10001 (the
+      # ``dmi`` user inside the container) via a throwaway root container.
+      # The container-internal path stays /var/lib/dmi-nowcast-corpus to
+      # match ``storage.corpus_dir`` in config. Layout inside:
+      #   composites/YYYY/MM/dk.com.YYYYMMDDhhmm.500_max.h5
+      #   manifest.parquet  (built by scripts/build_corpus_manifest.py)
+      - ${CORPUS_HOST_DIR:-~/dmi-nowcast-corpus}:/var/lib/dmi-nowcast-corpus
+      # Mount the config file directly so edits don't require a rebuild —
+      # `docker compose restart` is enough.
+      - ./config.yaml:/app/sidecar/config.yaml:ro
+    environment:
+      # Production-style logging: one JSON line per event, picked up by
+      # the docker daemon and forwarded to journald or whatever the host
+      # log driver is.
+      DMI_NOWCAST_SERVER__LOG_FORMAT: json
+      DMI_NOWCAST_SERVER__LOG_LEVEL: INFO
+      # Bind on all interfaces inside the container — the host-side port
+      # publishing constrains the network exposure.
+      DMI_NOWCAST_SERVER__HOST: 0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  dmi_data:
+    # Named volume rather than a host bind so docker manages permissions
+    # cleanly. To restore from a backup: ``docker run --rm
+    # -v dmi_data:/data -v $(pwd):/backup busybox tar xzf /backup/dmi.tgz -C /``
+    name: dmi_nowcast_data

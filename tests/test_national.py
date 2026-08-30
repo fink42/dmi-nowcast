@@ -1,0 +1,318 @@
+"""Tests for the national forecast products reduction (website Phase A §A1).
+
+Synthetic ensembles with hand-computable exceedance fractions, frame-age
+correction, NaN propagation, and — the A4 acceptance criterion — agreement
+with ``aggregate_at_home`` at an arbitrary pixel.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from dmi_nowcast_core.geo import CompositeGeo
+from dmi_nowcast_core.national import (
+    DEFAULT_LEADS_MIN,
+    NationalProducts,
+    national_products,
+)
+from dmi_nowcast_core.parse import parse_composite
+from dmi_nowcast_core.probabilistic import aggregate_at_home
+from dmi_nowcast_core.sample import disc_pixel_indices
+
+FIXTURE = Path(__file__).parent / "fixtures" / "composite_fullrange.h5"
+COPENHAGEN = (12.5645, 55.6726)
+
+
+@pytest.fixture(scope="module")
+def geo() -> CompositeGeo:
+    return CompositeGeo(parse_composite(FIXTURE))
+
+
+def _staircase_ensemble(
+    n_members: int = 8, n_timesteps: int = 12, h: int = 16, w: int = 16
+) -> np.ndarray:
+    """Member ``m`` rains uniformly at ``m + 1`` mm/h from timestep ``m`` onward.
+
+    Hand-computable: the member-exceedance fraction by timestep ``t`` is
+    ``min(t + 1, n_members) / n_members`` at every pixel.
+    """
+    ens = np.zeros((n_members, n_timesteps, h, w), dtype=np.float32)
+    for m in range(n_members):
+        ens[m, m:] = np.float32(m + 1.0)
+    return ens
+
+
+# ---------------------------------------------------------------------------
+# Exact hand-computed values
+# ---------------------------------------------------------------------------
+
+
+def test_p_rain_exact_fractions_staircase():
+    ens = _staircase_ensemble()
+    result = national_products(ens, leads_min=(10, 20, 30, 45, 60),
+                               timestep_min=5.0, frame_age_min=0.0)
+    # lead -> steps k=ceil(lead/5) -> members 0..k-1 have crossed -> k/8
+    expected = {10: 2 / 8, 20: 4 / 8, 30: 6 / 8, 45: 1.0, 60: 1.0}
+    assert result.leads_min == (10, 20, 30, 45, 60)
+    for lead, value in expected.items():
+        grid = result.p_rain[lead]
+        assert grid.shape == (16, 16)
+        assert grid.dtype == np.float32
+        np.testing.assert_array_equal(grid, np.float32(value))
+
+
+def test_eta_exact_staircase():
+    # Fraction reaches 4/8 = 0.5 first at timestep index 3 -> (3+1)*5 = 20 min.
+    result = national_products(_staircase_ensemble(), timestep_min=5.0,
+                               frame_age_min=0.0)
+    assert result.eta_min.dtype == np.float32
+    np.testing.assert_array_equal(result.eta_min, np.float32(20.0))
+
+
+def test_intensity_exact_staircase():
+    # Raw rates at the ETA step (index 3): members 0..3 -> 1,2,3,4 mm/h,
+    # members 4..7 still dry -> 0. Median of [0,0,0,0,1,2,3,4] = 0.5.
+    result = national_products(_staircase_ensemble(), timestep_min=5.0,
+                               frame_age_min=0.0)
+    assert result.intensity_mm_h.dtype == np.float32
+    np.testing.assert_array_equal(result.intensity_mm_h, np.float32(0.5))
+
+
+def test_spatial_variation_no_axis_mixups():
+    """Left half rains in every member from t=0, right half stays dry."""
+    ens = np.zeros((4, 6, 4, 4), dtype=np.float32)
+    ens[:, :, :, :2] = 2.0
+    result = national_products(ens, leads_min=(10,), timestep_min=5.0)
+    np.testing.assert_array_equal(result.p_rain[10][:, :2], np.float32(1.0))
+    np.testing.assert_array_equal(result.p_rain[10][:, 2:], np.float32(0.0))
+    np.testing.assert_array_equal(result.eta_min[:, :2], np.float32(5.0))
+    assert np.isnan(result.eta_min[:, 2:]).all()
+    np.testing.assert_array_equal(result.intensity_mm_h[:, :2], np.float32(2.0))
+    assert np.isnan(result.intensity_mm_h[:, 2:]).all()
+
+
+def test_lead_beyond_horizon_clamps_to_last_timestep():
+    ens = _staircase_ensemble()
+    result = national_products(ens, leads_min=(600,), timestep_min=5.0)
+    np.testing.assert_array_equal(result.p_rain[600], np.float32(1.0))
+
+
+def test_metadata_fields_roundtrip():
+    result = national_products(_staircase_ensemble(), leads_min=(10, 20),
+                               threshold_mm_h=0.2, timestep_min=5.0,
+                               frame_age_min=3.0, downsample_factor=4)
+    assert isinstance(result, NationalProducts)
+    assert result.leads_min == (10, 20)
+    assert result.threshold_mm_h == 0.2
+    assert result.timestep_min == 5.0
+    assert result.frame_age_min == 3.0
+    assert result.downsample_factor == 4
+    assert result.n_members == 8
+    assert DEFAULT_LEADS_MIN == (10, 20, 30, 45, 60)
+
+
+# ---------------------------------------------------------------------------
+# Frame-age correction
+# ---------------------------------------------------------------------------
+
+
+def test_frame_age_shifts_lead_indexing():
+    """Same ensemble, frame_age 0 vs 4 min: effective lead = lead + 4, so the
+    timestep index moves by ceil and every probability climbs one member."""
+    ens = _staircase_ensemble()
+    fresh = national_products(ens, leads_min=(10, 20, 30, 45, 60),
+                              timestep_min=5.0, frame_age_min=0.0)
+    aged = national_products(ens, leads_min=(10, 20, 30, 45, 60),
+                             timestep_min=5.0, frame_age_min=4.0)
+    # ceil((lead+4)/5): 10->3, 20->5, 30->7, 45->10, 60->13 (clamped to 12)
+    expected_aged = {10: 3 / 8, 20: 5 / 8, 30: 7 / 8, 45: 1.0, 60: 1.0}
+    expected_fresh = {10: 2 / 8, 20: 4 / 8, 30: 6 / 8, 45: 1.0, 60: 1.0}
+    for lead in (10, 20, 30, 45, 60):
+        np.testing.assert_array_equal(fresh.p_rain[lead], np.float32(expected_fresh[lead]))
+        np.testing.assert_array_equal(aged.p_rain[lead], np.float32(expected_aged[lead]))
+
+
+def test_frame_age_shifts_eta_minutes_from_now():
+    aged = national_products(_staircase_ensemble(), timestep_min=5.0,
+                             frame_age_min=4.0)
+    # Crossing timestep unchanged (index 3, radar-relative 20 min); minutes
+    # from now = 20 - 4.
+    np.testing.assert_array_equal(aged.eta_min, np.float32(16.0))
+    # Intensity is taken at the (radar-relative) ETA step -> unchanged.
+    np.testing.assert_array_equal(aged.intensity_mm_h, np.float32(0.5))
+
+
+def test_frame_age_eta_clamped_at_zero():
+    stale = national_products(_staircase_ensemble(), timestep_min=5.0,
+                              frame_age_min=25.0)
+    np.testing.assert_array_equal(stale.eta_min, np.float32(0.0))
+
+
+# ---------------------------------------------------------------------------
+# NaN handling
+# ---------------------------------------------------------------------------
+
+
+def test_all_nan_pixel_is_nan_in_every_product():
+    ens = _staircase_ensemble()
+    ens[:, :, 0, 0] = np.nan
+    result = national_products(ens, leads_min=(10, 60), timestep_min=5.0)
+    for lead in (10, 60):
+        assert np.isnan(result.p_rain[lead][0, 0])
+        assert np.isfinite(result.p_rain[lead][1:, :]).all()
+        assert np.isfinite(result.p_rain[lead][0, 1:]).all()
+    assert np.isnan(result.eta_min[0, 0])
+    assert np.isnan(result.intensity_mm_h[0, 0])
+    assert np.isfinite(result.eta_min[1:, :]).all()
+
+
+def test_partial_member_nan_counts_as_not_exceeding():
+    """A member with NaN at a pixel is a non-exceeder there, never a false
+    positive; the intensity median ignores its NaN."""
+    ens = np.full((4, 6, 2, 2), 3.0, dtype=np.float32)
+    ens[0, :, 0, 0] = np.nan
+    result = national_products(ens, leads_min=(10,), timestep_min=5.0)
+    assert result.p_rain[10][0, 0] == np.float32(3 / 4)
+    np.testing.assert_array_equal(result.p_rain[10][0, 1], np.float32(1.0))
+    # 3/4 >= 0.5 at timestep 0 -> ETA 5 min everywhere.
+    np.testing.assert_array_equal(result.eta_min, np.float32(5.0))
+    # nanmedian([NaN, 3, 3, 3]) = 3.
+    assert result.intensity_mm_h[0, 0] == np.float32(3.0)
+
+
+def test_nan_plus_dry_never_creates_false_positive():
+    ens = np.zeros((4, 6, 3, 3), dtype=np.float32)
+    ens[0] = np.nan  # one member entirely nodata
+    result = national_products(ens, leads_min=(10,), timestep_min=5.0)
+    np.testing.assert_array_equal(result.p_rain[10], np.float32(0.0))
+    assert np.isnan(result.eta_min).all()
+    assert np.isnan(result.intensity_mm_h).all()
+
+
+def test_fully_nan_ensemble_is_all_nan():
+    ens = np.full((3, 4, 2, 2), np.nan, dtype=np.float32)
+    result = national_products(ens, leads_min=(10,), timestep_min=5.0)
+    assert np.isnan(result.p_rain[10]).all()
+    assert np.isnan(result.eta_min).all()
+    assert np.isnan(result.intensity_mm_h).all()
+
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_bad_inputs():
+    ens = _staircase_ensemble(2, 3, 4, 4)
+    with pytest.raises(ValueError, match="n_members"):
+        national_products(np.zeros((3, 4, 4), dtype=np.float32))
+    with pytest.raises(ValueError, match="whole minutes"):
+        national_products(ens, leads_min=(12.5,))
+    with pytest.raises(ValueError, match="frame_age_min"):
+        national_products(ens, frame_age_min=-1.0)
+    with pytest.raises(ValueError, match="timestep_min"):
+        national_products(ens, timestep_min=0.0)
+    with pytest.raises(ValueError, match="downsample_factor"):
+        national_products(ens, downsample_factor=0)
+    with pytest.raises(ValueError, match="must not be empty"):
+        national_products(ens, leads_min=())
+
+
+# ---------------------------------------------------------------------------
+# THE AGREEMENT TEST (A4 criterion): national grids sampled at the home pixel
+# must reproduce aggregate_at_home.
+# ---------------------------------------------------------------------------
+
+
+def _home_block_ensemble(geo: CompositeGeo, downsample_factor: int = 4,
+                         n_members: int = 8, n_timesteps: int = 12) -> np.ndarray:
+    """Staircase ensemble on the downsampled national grid, uniform over a
+    generous block around the home pixel so ``aggregate_at_home``'s
+    max-in-disc equals the single-pixel value the national grids hold."""
+    h_native, w_native = geo.composite.reflectivity_dbz.shape
+    h, w = h_native // downsample_factor, w_native // downsample_factor
+    idx = geo.lonlat_to_grid(*COPENHAGEN)
+    r0 = int(round(idx.row / downsample_factor))
+    c0 = int(round(idx.col / downsample_factor))
+    ens = np.zeros((n_members, n_timesteps, h, w), dtype=np.float32)
+    for m in range(n_members):
+        ens[m, m:, r0 - 8 : r0 + 9, c0 - 8 : c0 + 9] = np.float32(m + 1.0)
+    return ens
+
+
+def _home_pixel(geo: CompositeGeo, shape: tuple[int, int],
+                downsample_factor: int, radius_m: float = 1000.0) -> tuple[int, int]:
+    """The downsampled-grid pixel(s) aggregate_at_home's disc actually samples."""
+    pixel_scale_m = (geo.composite.xscale_m + geo.composite.yscale_m) / 2.0
+    radius_px = radius_m / (pixel_scale_m * downsample_factor)
+    idx = geo.lonlat_to_grid(*COPENHAGEN)
+    rows, cols = disc_pixel_indices(
+        shape, idx.row / downsample_factor, idx.col / downsample_factor, radius_px
+    )
+    assert rows.size >= 1
+    # At x4 the 1 km disc is effectively a single pixel; all disc pixels must
+    # sit inside the uniform block for the equivalence to be exact.
+    r0 = int(round(idx.row / downsample_factor))
+    c0 = int(round(idx.col / downsample_factor))
+    assert (np.abs(rows - r0) <= 8).all() and (np.abs(cols - c0) <= 8).all()
+    return int(rows[0]), int(cols[0])
+
+
+def test_agreement_with_aggregate_at_home(geo):
+    ds = 4
+    leads = (10, 20, 30, 45, 60)
+    ens = _home_block_ensemble(geo, downsample_factor=ds)
+    r, c = _home_pixel(geo, ens.shape[2:], ds)
+
+    national = national_products(ens, leads_min=leads, timestep_min=5.0,
+                                 frame_age_min=0.0, downsample_factor=ds)
+    home = aggregate_at_home(ens, geo, *COPENHAGEN,
+                             leads_min=tuple(float(L) for L in leads),
+                             timestep_min=5.0, downsample_factor=ds)
+
+    # (a) probabilities: exact equality, same reduction on both sides.
+    for i, lead in enumerate(leads):
+        assert float(national.p_rain[lead][r, c]) == home.probability_by_lead[i], (
+            f"lead {lead}: national {national.p_rain[lead][r, c]} != "
+            f"home {home.probability_by_lead[i]}"
+        )
+    # Hand check the shared values: staircase -> k/8 capped at 1.
+    assert home.probability_by_lead == (0.25, 0.5, 0.75, 1.0, 1.0)
+
+    # (b) ETA: within one timestep. National = first step with fraction >= 0.5
+    # (20 min); aggregate's P50 interpolates between member crossings (22.5).
+    assert abs(float(national.eta_min[r, c]) - home.eta_p50_min) <= 5.0
+
+    # Away from the block the national grid is dry -- the agreement is not an
+    # everything-is-constant artefact.
+    assert float(national.p_rain[60][r - 100, c - 100]) == 0.0
+    assert np.isnan(national.eta_min[r - 100, c - 100])
+
+
+def test_agreement_with_aggregate_at_home_frame_aged(geo):
+    """Both sides must speak the frame-age-corrected convention: national
+    applies frame_age_min internally; aggregate_at_home (which has no frame-age
+    parameter) is fed pre-corrected leads. Plan §A0's named bug magnet."""
+    ds = 4
+    frame_age = 5.0
+    leads = (10, 20, 30, 45, 60)
+    corrected = tuple(float(L) + frame_age for L in leads)
+    ens = _home_block_ensemble(geo, downsample_factor=ds)
+    r, c = _home_pixel(geo, ens.shape[2:], ds)
+
+    national = national_products(ens, leads_min=leads, timestep_min=5.0,
+                                 frame_age_min=frame_age, downsample_factor=ds)
+    home = aggregate_at_home(ens, geo, *COPENHAGEN, leads_min=corrected,
+                             timestep_min=5.0, downsample_factor=ds)
+
+    for i, lead in enumerate(leads):
+        assert float(national.p_rain[lead][r, c]) == home.probability_by_lead[i]
+    assert home.probability_by_lead == (0.375, 0.625, 0.875, 1.0, 1.0)
+
+    # National ETA is minutes-from-now (frame age subtracted); aggregate's is
+    # radar-relative. Same frame, then within one timestep.
+    assert abs(
+        (float(national.eta_min[r, c]) + frame_age) - home.eta_p50_min
+    ) <= 5.0

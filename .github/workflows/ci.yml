@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      # --- core library ---------------------------------------------------
+      - name: Sync core environment
+        run: uv sync --all-groups --frozen
+
+      - name: Core suite
+        run: uv run python -m pytest tests/ -q
+
+      # --- sidecar service ------------------------------------------------
+      - name: Sync sidecar environment
+        working-directory: sidecar
+        run: uv sync --all-groups --frozen
+
+      - name: Sidecar suite
+        working-directory: sidecar
+        run: uv run python -m pytest tests/ -q

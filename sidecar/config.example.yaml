@@ -1,0 +1,78 @@
+# Copy to config.yaml and edit.
+#
+# Any field can also be set via env vars with the DMI_NOWCAST_ prefix and
+# __ as the nested separator. Example: DMI_NOWCAST_SERVER__PORT=9000
+
+home:
+  # The reference point this instance nowcasts for — the one whose forecast
+  # /state.json carries, and the centre of the rendered crop. Change it to
+  # the point you care about. The example value is the geometric centroid
+  # of Fyn (the same neutral point the test suite uses).
+  lat: 55.33
+  lon: 10.32
+  radius_km: 1.0          # sampling disc — 1 km matches radar resolution
+
+poll:
+  interval_min: 5         # DMI publishes a new composite every ~5 min
+  jitter_sec: 30          # ± jitter so we don't stampede on the minute boundary
+
+dmi:
+  base_url: https://opendataapi.dmi.dk/v1/radardata
+  user_agent: dmi-nowcast-sidecar/0.1
+
+forecast:
+  leads_min: [5, 10, 15, 20, 25, 30, 45, 60]
+  method: farneback       # farneback (recommended) | tvl1 | mean-motion
+  steps:
+    ensemble_size: 24
+    n_cascade_levels: 6
+
+calibration:
+  # Sidecar looks for fresh curves in the data volume first; falls back to
+  # the curves baked into the image at build time. The monthly
+  # recalibration job (calibrate.sh) writes new curves here.
+  curves_path: /var/lib/dmi-nowcast/calibration_curves.json
+
+server:
+  host: 0.0.0.0
+  port: 8081
+  api_key: null           # set a shared secret before exposing this anywhere
+  log_format: pretty      # pretty (dev) | json (prod / docker / journald)
+  log_level: INFO
+
+storage:
+  data_dir: /var/lib/dmi-nowcast
+  # Working cache (data_dir/composites) is LRU-evicted after each cycle so
+  # disk stays bounded. 500 MB ≈ ~21 days of frames at ~80 KB.
+  working_cache_max_bytes: 524288000
+  # Persistent corpus archive.
+  # Every fetched composite is copied here in addition to the working
+  # cache. Use a host bind-mount in docker-compose.yml so the archive
+  # survives ``docker compose down -v``. Set to null to disable.
+  corpus_dir: /var/lib/dmi-nowcast-corpus
+
+lightning:
+  # Blitzortung lightning-ETA. HA pushes strikes to POST /lightning/strikes;
+  # GET /lightning/eta?lat=&lon=&rings=3,10 returns ETA of the threatening
+  # cell's leading edge to each ring. No DMI radar involved — works anywhere
+  # Blitzortung detects (so the Pixel ETA works outside Denmark too).
+  enabled: true
+  buffer_window_min: 30     # rolling strike buffer depth
+  rings_km: [3.0, 10.0]     # imminent + early-warning rings
+  min_strikes: 6            # below this -> "insufficient_data"
+  cluster_eps_km: 15.0      # single-linkage cell clustering radius
+  relevance_radius_km: 60.0 # ignore strikes/cells beyond this from the target
+  leading_edge_recent_min: 5.0  # "leading edge" = closest of strikes this recent
+  min_closing_kmh: 5.0      # below this closing speed -> "stalled"
+  min_fit_span_min: 3.0     # min time spread for a trusted velocity fit
+  max_buffer: 2000          # hard cap on buffered strikes
+  # Cross-cycle EMA smoothing of the ETA (closing speed + leading edge) per
+  # target — damps the whipsaw from refitting sparse strikes each cycle.
+  # Applied only to /lightning/eta (sensors/alerts); the debug map stays raw.
+  smoothing_enabled: true
+  smoothing_tau_min: 3.0    # EMA time constant (larger = smoother/slower)
+  smoothing_max_gap_min: 10.0  # reset smoothing if no update for this long
+  # Persist every received strike (append-only NDJSON, one file per UTC day)
+  # on the corpus bind-mount, for later backtesting/calibration.
+  archive_enabled: true
+  archive_dir: /var/lib/dmi-nowcast-corpus/strikes

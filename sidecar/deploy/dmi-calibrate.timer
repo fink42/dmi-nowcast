@@ -1,0 +1,23 @@
+[Unit]
+Description=Run DMI nowcast recalibration once per month
+# Deliberately NO Requires=/Wants=dmi-calibrate.service here. A timer's
+# [Unit] dependencies are ordinary unit dependencies, so `Requires=` makes
+# systemd start the service whenever the *timer* starts — i.e. on every
+# boot, not on the schedule. That regression ran the full 180-day corpus
+# build (~6.5 h, ~5 GB RSS) after each reboot. The timer→service binding
+# is automatic by name; see [Timer] Unit= below if it ever needs to differ.
+
+[Timer]
+# The unit this timer activates. Implicit from the timer's own name, but
+# stated explicitly so nobody reintroduces the dependency in [Unit].
+Unit=dmi-calibrate.service
+# First day of every month at 03:00 local time. Persistent=true reruns
+# the job if the system was off when the trigger should have fired.
+OnCalendar=*-*-01 03:00:00
+Persistent=true
+# Slight randomization so multiple sidecars (future-proofing) don't all
+# wake up at exactly 03:00 and overlap DMI API calls.
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

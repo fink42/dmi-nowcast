@@ -1,0 +1,53 @@
+Vendored subset of pysteps
+==========================
+
+This directory contains a redistribution of code from the pysteps project
+(https://github.com/pySTEPS/pysteps), licensed under the BSD 3-Clause
+License — see LICENSE-pysteps in this directory.
+
+Vendored version
+----------------
+pysteps 1.21.1 (see `_VENDORED_FROM` in __init__.py).
+
+Why vendored
+------------
+pysteps is not installable on Home Assistant OS:
+- No PyPI wheels for `musllinux_*_cp314` (Alpine + CPython 3.14)
+- Source build requires a C toolchain with OpenMP that HA OS does not
+  ship at runtime, only the supervisor's pip-install sandbox
+
+The `dmi_rain_incoming` integration only calls ONE pysteps function —
+`pysteps.nowcasts.steps.forecast` — and an `sys.settrace` audit of the
+upstream test suite identified the strict subset of `.py` files that
+actually execute. None of pysteps' Cython extensions
+(`pysteps.motion._proesmans`, `_vet`) are in that subset; we use
+scikit-image for optical flow instead.
+
+Files vendored
+--------------
+20 source files mirroring the upstream layout, plus minimal subpackage
+__init__.py files that import only the pieces we need (the upstream
+__init__.py files eagerly import all motion estimators including the
+compiled extensions, which is why we couldn't just re-use them).
+
+Modifications from upstream
+---------------------------
+1. All `from pysteps.X import Y` rewritten to
+   `from dmi_nowcast_core._vendor.pysteps_steps.X import Y`
+   (mechanical: a sed pass — no logic changes).
+2. Subpackage `__init__.py` files rewritten to import only the modules
+   STEPS needs. Original upstream `__init__.py`s import many siblings we
+   didn't vendor (cleansing, conversion, dimension, etc.).
+3. `utils/interface.py` reduced to FFT-only dispatch. STEPS only calls
+   `utils.get_method("numpy")` etc.; the upstream dispatcher imported a
+   dozen unrelated utility modules we'd otherwise have to vendor.
+
+If pysteps becomes installable on HA OS (via wheels.home-assistant.io
+or upstream musllinux wheels), this whole directory can be deleted and
+`probabilistic.py` switched back to `from pysteps.nowcasts import steps`.
+
+License
+-------
+BSD 3-Clause — same as upstream. See LICENSE-pysteps.
+Original copyright (c) 2019, PySteps developers.
+Vendoring changes are made available under the same license.

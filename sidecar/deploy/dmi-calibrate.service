@@ -1,0 +1,14 @@
+[Unit]
+Description=DMI nowcast — monthly recalibration job
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Substitute __DEPLOY_DIR__ (the checkout on this host) and __DEPLOY_USER__
+# when installing — see sidecar/README.md "Monthly recalibration".
+WorkingDirectory=__DEPLOY_DIR__/sidecar/deploy
+ExecStart=/bin/bash __DEPLOY_DIR__/sidecar/deploy/calibrate.sh
+User=__DEPLOY_USER__
+StandardOutput=journal
+StandardError=journal
