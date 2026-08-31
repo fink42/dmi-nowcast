@@ -178,6 +178,157 @@ def _to_float32_filled(arr: np.ndarray, fill_value: float) -> np.ndarray:
     return np.nan_to_num(arr, nan=fill_value, posinf=fill_value, neginf=fill_value).astype(np.float32)
 
 
+#: Default e-folding distance for motion-field completion, in km.
+#:
+#: Two scales bracket this. Below: Farnebäck's own reach. Its polynomial
+#: expansion uses ``winsize=31`` over a 3-level pyramid, so a pixel more
+#: than ~15 px (7.5 km) from any echo has echo inside its window only at
+#: the coarse levels, where all that survives is the large-scale motion the
+#: bulk vector already carries. Above: the advection distance we have to
+#: cross. A 60-min lead at 30-60 km/h is 30-60 km of travel, and the weight
+#: has to be small over most of *that* path or the far field never reaches
+#: bulk speed — an e-fold comparable to the travel distance leaves the rain
+#: crawling, which is the bug this whole function exists to fix.
+#:
+#: 10 km (20 px on the 500 m grid) sits between them: weight 0.78 at 5 km
+#: from the echo (local structure kept where the estimate is real), 0.05 at
+#: 30 km (bulk where it is not). Measured over a 60-min lead on the
+#: synthetic of ``tests/test_flow_completion.py``, varying how far the
+#: estimate reaches beyond the echo (6-25 px halo): a 5 km e-fold restores
+#: 89-99 % of the observed rain mass and 94-100 % of the flow-implied
+#: displacement, 10 km gives 69-96 % / 86-98 %, and 25 km only 44-88 % /
+#: 75-95 % — i.e. a 25 km e-fold leaves a sizeable part of the barrier
+#: standing, while 5 km discards near-echo structure a two-system day
+#: needs. The raw field, for scale: 29-77 % / 67-91 %.
+DEFAULT_EFOLD_KM = 10.0
+
+#: Pixels of full-weight halo around the echo. The Farnebäck estimate stays
+#: meaningful just outside the echo edge (the polynomial window straddles
+#: it), and the radar's effective resolution is ~2 px anyway.
+DEFAULT_SUPPORT_DILATION_PX = 3
+
+
+def complete_flow(
+    vy: np.ndarray,
+    vx: np.ndarray,
+    rain_mm_h: np.ndarray,
+    *,
+    pixel_km: float,
+    support_threshold_mm_h: float = 0.5,
+    efold_km: float = DEFAULT_EFOLD_KM,
+    dilation_px: float = DEFAULT_SUPPORT_DILATION_PX,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fill in motion where optical flow has no echo to track.
+
+    Farnebäck (and TV-L1) estimate motion from image gradients. We fill
+    nodata/undetect with a flat ``DEFAULT_FILL_DBZ`` before the estimate, so
+    everywhere without echo is a featureless plateau and the returned flow
+    there is *exactly zero* — on a real DMI composite, 71 % of the grid came
+    back with ``|v| < 0.5`` px/frame, with the median dropping from ~25
+    px/frame near the echo to ~0 beyond 40-60 px. Advecting with that field
+    (however good the integrator) makes rain stall along a stationary line
+    ~20-30 km ahead of the echo, because the destination pixels ahead of the
+    rain have nowhere to come *from*.
+
+    So we blend the estimated field toward the bulk storm motion with
+    distance from the echo::
+
+        v_completed = w·v + (1 - w)·v_bulk,   w = exp(-d / τ)
+
+    where ``d`` is the distance in pixels to the nearest echo pixel (minus a
+    ``dilation_px`` full-weight halo) and ``τ = efold_km / pixel_km``.
+    ``v_bulk`` is the rain-weighted mean of the flow over echo pixels — the
+    same statistic ``compute._disc_motion`` takes around home, but global
+    and without the disc. On the echo ``w = 1``: the estimated field is
+    untouched, including its shear and rotation. Far from it the field tends
+    to uniform storm motion, which is the honest prior — it is what a human
+    reading a radar loop extrapolates with.
+
+    Parameters
+    ----------
+    vy, vx:
+        Flow in pixels per frame, as returned by :func:`dense_flow`.
+    rain_mm_h:
+        Rain rate on the same grid (NaN = nodata) — the echo support.
+    pixel_km:
+        Grid spacing in km (0.5 on the DMI 500 m composite).
+    support_threshold_mm_h:
+        Rain rate a pixel needs to count as echo. Use the same detection
+        threshold the rest of the pipeline uses (config default 0.5 mm/h).
+    efold_km:
+        Distance over which the estimated flow relaxes to bulk motion.
+    dilation_px:
+        Full-weight halo around the echo, in pixels.
+
+    Returns
+    -------
+    ``(vy, vx)`` float32, same shape. **No-echo edge case**: with no pixel
+    above the threshold there is no bulk vector to relax toward, so the
+    input is returned unchanged rather than pulled to zero.
+    """
+    vy_arr = np.asarray(vy, dtype=np.float32)
+    vx_arr = np.asarray(vx, dtype=np.float32)
+    rain = np.asarray(rain_mm_h, dtype=np.float32)
+    if vy_arr.shape != vx_arr.shape or vy_arr.shape != rain.shape:
+        raise ValueError("vy, vx, rain_mm_h must all have the same shape")
+    if pixel_km <= 0:
+        raise ValueError(f"pixel_km must be > 0, got {pixel_km}")
+
+    finite_v = np.isfinite(vy_arr) & np.isfinite(vx_arr)
+    support = np.isfinite(rain) & (rain >= support_threshold_mm_h)
+
+    # Bulk vector: rain-weighted mean over echo pixels with a usable
+    # velocity. Rain weighting (rather than a flat mean) keeps a few
+    # drizzle pixels at the domain edge from out-voting the main band.
+    weights = np.where(support & finite_v, rain, np.float32(0.0))
+    w_sum = float(weights.sum())
+    if not np.isfinite(w_sum) or w_sum <= 0.0:
+        return vy_arr.copy(), vx_arr.copy()
+    vy_clean = np.where(finite_v, vy_arr, np.float32(0.0))
+    vx_clean = np.where(finite_v, vx_arr, np.float32(0.0))
+    bulk_vy = float((vy_clean * weights).sum() / w_sum)
+    bulk_vx = float((vx_clean * weights).sum() / w_sum)
+
+    tau_px = float(efold_km) / float(pixel_km)
+    if tau_px <= 0:
+        # Degenerate e-folding: bulk motion everywhere off the echo.
+        weight = support.astype(np.float32)
+    else:
+        distance_px = _distance_to_support(support)
+        # The dilation is expressed through the distance field: everything
+        # within ``dilation_px`` of an echo pixel keeps weight 1.
+        np.subtract(distance_px, np.float32(max(0.0, dilation_px)), out=distance_px)
+        np.maximum(distance_px, np.float32(0.0), out=distance_px)
+        weight = np.exp(-distance_px / np.float32(tau_px))
+
+    # Non-finite input velocities have no information to preserve: they take
+    # the bulk vector outright (weight 0), not a NaN.
+    weight = np.where(finite_v, weight, np.float32(0.0))
+    out_vy = weight * vy_clean + (np.float32(1.0) - weight) * np.float32(bulk_vy)
+    out_vx = weight * vx_clean + (np.float32(1.0) - weight) * np.float32(bulk_vx)
+    return out_vy.astype(np.float32), out_vx.astype(np.float32)
+
+
+def _distance_to_support(support: np.ndarray) -> np.ndarray:
+    """Euclidean distance (in pixels) from every pixel to the nearest True.
+
+    OpenCV's ``distanceTransform`` when available (~10 ms on the native
+    1728×1984 grid), else scipy's exact EDT. Note the inversion: OpenCV
+    measures the distance from each *non-zero* pixel to the nearest *zero*
+    one, so the echo mask goes in as the zeros.
+    """
+    try:
+        import cv2
+    except ImportError:
+        cv2 = None  # type: ignore[assignment]
+    if cv2 is not None:
+        src = (~support).astype(np.uint8)
+        return cv2.distanceTransform(src, cv2.DIST_L2, 5).astype(np.float32)
+    from scipy.ndimage import distance_transform_edt
+
+    return distance_transform_edt(~support).astype(np.float32)
+
+
 def mean_flow(
     vy: np.ndarray,
     vx: np.ndarray,

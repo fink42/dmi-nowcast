@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 import structlog
 
-from dmi_nowcast_core.advect import advect_field
+from dmi_nowcast_core.advect import advect_field_series
 from dmi_nowcast_core.parse import RadarComposite
 from dmi_nowcast_core.render import LoopFrame, render_loop_png
 from dmi_nowcast_core.transform import dbz_to_rain_rate
@@ -85,14 +85,15 @@ def render_frames(
         ))
 
     # Forecast frames at lead 0, 5, …, 30 min from wall-clock now. The
-    # 0-min lead advects by frame_age so playback lands on "now".
+    # 0-min lead advects by frame_age so playback lands on "now". One
+    # ascending series = one trajectory integration for the whole loop.
     last_lead = LOOP_FORECAST_LEADS_MIN[-1]
-    for lead in LOOP_FORECAST_LEADS_MIN:
-        field = advect_field(
-            rain_now, vy, vx,
-            horizon_minutes=frame_age_min + float(lead),
-            dt_minutes=dt_min,
-        )
+    advected = advect_field_series(
+        rain_now, vy, vx,
+        horizons_minutes=[max(0.0, frame_age_min) + float(lead) for lead in LOOP_FORECAST_LEADS_MIN],
+        dt_minutes=dt_min,
+    )
+    for lead, field in zip(LOOP_FORECAST_LEADS_MIN, advected):
         ts = now_utc + timedelta(minutes=lead)
         if lead == 0:
             label, duration_ms = "now", 1500

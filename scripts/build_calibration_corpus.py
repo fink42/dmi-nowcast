@@ -119,15 +119,17 @@ appended. The fit (package B3) consumes them as relative weights.
     -- settings columns (B0 parity; identical on every row of a corpus) --
     ensemble_size, n_cascade_levels, downsample_factor, n_timesteps  int32
     threshold_mm_h, disc_radius_m, timestep_min                      float64
-    detection_stat, scan_type, leads_min_csv, settings_hash          str
+    detection_stat, scan_type, motion_method                         str
+    leads_min_csv, settings_hash                                     str
     schema_version                                                   int32 (2)
 
 ``settings_hash`` is a stable hash over the sorted settings dict; the
 builder itself refuses to append to an output whose hash differs, and
-the fit refuses a mixed corpus the same way. ``scan_type`` and
-``timestep_min`` are part of the hashed dict, so any pre-fix corpus
-(mixed-type frames, 5-min timestep) hashes differently and the fitter
-refuses it automatically — no manual audit needed.
+the fit refuses a mixed corpus the same way. ``scan_type``,
+``timestep_min`` and ``motion_method`` are part of the hashed dict, so
+any pre-fix corpus (mixed-type frames, 5-min timestep, uncompleted
+motion field) hashes differently and the fitter refuses it
+automatically — no manual audit needed.
 
 Resumable: skips events already present in the output Parquet. Progress
 JSON is written to ``--progress`` after every event for the companion
@@ -198,6 +200,14 @@ FRAME_SPACING_MIN = 10.0
 # STEPS noise seed. Fixed (as at runtime, run_ensemble's default) so
 # reruns of an event reproduce the same ensemble.
 STEPS_SEED = 42
+# Identifier of the motion field STEPS is driven with. Part of the settings
+# hash, exactly like ``scan_type`` / ``timestep_min``: R5 completes the
+# Farnebäck field away from the echo (dmi_nowcast_core.dense_flow.
+# complete_flow) before it reaches STEPS, which changes every advected
+# probability. Corpora built before that fix hash differently and — since
+# they also lack the column entirely — the fitter refuses them structurally.
+# Bump the suffix whenever the motion pipeline changes materially.
+MOTION_METHOD = "farneback_complete_v1"
 # Flush cadence: append (full rewrite, atomic rename) every N events.
 FLUSH_EVERY_EVENTS = 10
 
@@ -237,6 +247,7 @@ class CorpusSettings:
     leads_min: tuple[int, ...]
     scan_type: str = "fullRange"
     timestep_min: float = FRAME_SPACING_MIN
+    motion_method: str = MOTION_METHOD
 
     @property
     def n_timesteps(self) -> int:
@@ -253,6 +264,7 @@ class CorpusSettings:
             "disc_radius_m": float(self.disc_radius_m),
             "detection_stat": str(self.detection_stat),
             "scan_type": str(self.scan_type),
+            "motion_method": str(self.motion_method),
             "leads_min": [int(x) for x in self.leads_min],
             "timestep_min": float(self.timestep_min),
             "n_timesteps": int(self.n_timesteps),
@@ -1001,7 +1013,11 @@ def _process_event(
         # Best-effort motion: skimage / opencv from the integration's own
         # dense_flow module. (If unavailable, fall back to FFT phase
         # correlation.)
-        from dmi_nowcast_core.dense_flow import dense_flow, DenseFlowUnavailable
+        from dmi_nowcast_core.dense_flow import (
+            complete_flow,
+            dense_flow,
+            DenseFlowUnavailable,
+        )
         from dmi_nowcast_core.motion import phase_correlation_shift
 
         rain_prev = dbz_to_rain_rate(composites[-2].reflectivity_dbz)
@@ -1014,6 +1030,15 @@ def _process_event(
             dy, dx = phase_correlation_shift(rain_prev, rain_now)
             vy = np.full(rain_now.shape, dy, dtype=np.float32)
             vx = np.full(rain_now.shape, dx, dtype=np.float32)
+        # Motion completion, in the same place the sidecar does it (before
+        # the clip, so STEPS sees the completed field) — corpus/runtime
+        # parity is the whole point of the settings hash, and
+        # ``motion_method`` in that hash asserts exactly this call.
+        vy, vx = complete_flow(
+            vy, vx, rain_now,
+            pixel_km=float(composite_now.xscale_m) / 1000.0,
+            support_threshold_mm_h=settings.threshold_mm_h,
+        )
         # Per-pixel clip (NOT zero-everything) — the grid-wide mean-abs
         # check would trip on every event because skimage's dense flow
         # fills dry pixels with noisy 50-100 px/frame extrapolations,
@@ -1093,6 +1118,7 @@ def _parquet_schema():
         ("disc_radius_m", pa.float64()),
         ("detection_stat", pa.string()),
         ("scan_type", pa.string()),
+        ("motion_method", pa.string()),
         ("timestep_min", pa.float64()),
         ("n_timesteps", pa.int32()),
         ("leads_min_csv", pa.string()),

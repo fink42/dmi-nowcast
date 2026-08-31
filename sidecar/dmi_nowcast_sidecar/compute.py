@@ -29,7 +29,7 @@ from typing import Any, Iterable
 import numpy as np
 import structlog
 
-from dmi_nowcast_core.advect import advect_field
+from dmi_nowcast_core.advect import advect_field_series
 from dmi_nowcast_core.basemap import build_basemap
 from dmi_nowcast_core.cache import CacheConfig, DiskCache
 from dmi_nowcast_core.calibrate import IsotonicCalibrator, load_calibration_curves
@@ -39,7 +39,11 @@ from dmi_nowcast_core.confidence import (
     motion_divergence,
 )
 from dmi_nowcast_core.corpus import CorpusArchiver
-from dmi_nowcast_core.dense_flow import DenseFlowUnavailable, dense_flow
+from dmi_nowcast_core.dense_flow import (
+    DenseFlowUnavailable,
+    complete_flow,
+    dense_flow,
+)
 from dmi_nowcast_core.fetch import AsyncDMIClient, RadarFeature
 from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.motion import phase_correlation_shift
@@ -555,6 +559,19 @@ class CycleEngine:
             vy = np.full(shape, dy, dtype=np.float32)
             vx = np.full(shape, dx, dtype=np.float32)
 
+        # Motion-field completion (R5). Farnebäck returns exactly zero away
+        # from the echo, which stalls advected rain along a stationary line
+        # ~20-30 km ahead of it; relax the far field toward bulk storm
+        # motion before anything consumes the flow. Deliberately ahead of
+        # the sanitise/clip below so BOTH consumers get the completed field:
+        # the deterministic overlay advection here, and the STEPS velocity
+        # (``_run_steps_ensemble`` downsamples this same array).
+        vy, vx = complete_flow(
+            vy, vx, rain_now,
+            pixel_km=float(composite_now.xscale_m) / 1000.0,
+            support_threshold_mm_h=self._rain_threshold,
+        )
+
         # Sanitize motion.
         vy = np.nan_to_num(vy, nan=0.0).astype(np.float32)
         vx = np.nan_to_num(vx, nan=0.0).astype(np.float32)
@@ -593,14 +610,20 @@ class CycleEngine:
         collect_overlays = ensemble is not None and ensemble.national is not None
         overlay_fields: dict[int, np.ndarray] = {0: rain_now} if collect_overlays else {}
 
-        for lead in self.config.forecast.leads_min:
-            # Project rain forward from radar-frame time, so "lead minutes
-            # from now" must add back the frame age.
-            horizon_from_frame = lead + frame_age_min
-            field = advect_field(
-                rain_now, vy, vx,
-                horizon_minutes=horizon_from_frame, dt_minutes=dt_min,
-            )
+        # Project rain forward from radar-frame time, so "lead minutes from
+        # now" must add back the frame age. ``leads_min`` is validated
+        # ascending, so one integration pass serves every lead: the
+        # trajectory is carried forward between leads rather than being
+        # re-integrated from zero for each. The sub-stepped semi-Lagrangian
+        # scheme costs far more than the old one-shot Euler back-step
+        # (~7 s for 8 leads on the native 1728×1984 grid), and chaining
+        # takes ~20 % off that.
+        advected = advect_field_series(
+            rain_now, vy, vx,
+            horizons_minutes=[lead + frame_age_min for lead in self.config.forecast.leads_min],
+            dt_minutes=dt_min,
+        )
+        for lead, field in zip(self.config.forecast.leads_min, advected):
             if collect_overlays:
                 overlay_fields[int(lead)] = field
             disc = sample_disc(field, geo, lon, lat, radius_m=radius_m)

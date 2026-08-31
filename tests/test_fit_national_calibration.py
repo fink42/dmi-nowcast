@@ -419,6 +419,19 @@ def test_fitter_refuses_missing_sample_weight(tmp_path: Path, capsys):
     assert "sample_weight" in capsys.readouterr().err
 
 
+def test_fitter_refuses_corpus_without_motion_method(tmp_path: Path, capsys):
+    """R5: a corpus built before motion-field completion has no
+    ``motion_method`` column at all, which makes it structurally unusable —
+    the fit must say so rather than quietly calibrate against probabilities
+    produced by a different motion field."""
+    corpus = _write_corpus(
+        tmp_path / "c.parquet", _miscalibrated_rows(), drop_columns=("motion_method",)
+    )
+    rc = fnc.main(["--corpus", str(corpus), "--output", str(tmp_path / "o.json")])
+    assert rc == 2
+    assert "motion_method" in capsys.readouterr().err
+
+
 def test_fitter_refuses_thin_leads(tmp_path: Path, capsys):
     corpus = _write_corpus(tmp_path / "c.parquet", _miscalibrated_rows())
     # Default --min-samples-per-lead is 500; 20 valid rows per lead is thin.

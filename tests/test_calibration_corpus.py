@@ -150,6 +150,7 @@ def test_settings_columns_carry_hash_and_schema_version():
     assert cols["leads_min_csv"] == "5,10,15,20,25,30,45,60"
     assert cols["n_timesteps"] == 6
     assert cols["scan_type"] == "fullRange"
+    assert cols["motion_method"] == "farneback_complete_v1"
     assert cols["timestep_min"] == pytest.approx(10.0)
 
 
@@ -197,12 +198,14 @@ def test_check_existing_corpus_refuses_mismatched_hash(tmp_path: Path):
 @pytest.mark.parametrize("override", [
     {"scan_type": "doppler"},
     {"timestep_min": 5.0},
+    {"motion_method": "farneback_raw"},
 ])
 def test_check_existing_corpus_refuses_scan_type_or_timestep_change(
     tmp_path: Path, override: dict
 ):
-    """C1: resuming a pre-fix corpus under the new scan-type/timestep
-    settings must be refused at the builder — no silent mixing."""
+    """C1/R5: resuming a pre-fix corpus under the new scan-type, timestep
+    or motion-method settings must be refused at the builder — no silent
+    mixing."""
     out = _write_corpus(tmp_path, _settings(**override))
     with pytest.raises(ValueError, match="mixed corpus"):
         bcc.check_existing_corpus(out, _settings().settings_hash)
@@ -890,11 +893,13 @@ def _event_rows(
 @pytest.mark.parametrize("override", [
     {"scan_type": "doppler"},
     {"timestep_min": 5.0},
+    {"motion_method": "farneback_raw"},
 ])
 def test_fitter_refuses_corpus_mixing_scan_type_or_timestep(
     tmp_path: Path, override: dict
 ):
-    """Rows that differ ONLY in scan_type / timestep_min hash differently,
+    """Rows that differ ONLY in scan_type / timestep_min / motion_method hash
+    differently,
     so fit_national_calibration's mixed-hash refusal trips on any file
     that concatenates pre-fix and post-fix rows — automatically."""
     import fit_national_calibration as fnc

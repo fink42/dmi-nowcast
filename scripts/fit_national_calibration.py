@@ -95,6 +95,10 @@ _SETTINGS_COLUMNS = (
     "disc_radius_m",
     "detection_stat",
     "scan_type",
+    # R5: identifies the motion field STEPS was driven with. A corpus built
+    # before motion-field completion has no such column at all, so the
+    # missing-column check rejects it before the hash comparison runs.
+    "motion_method",
     "timestep_min",
     "n_timesteps",
     "leads_min_csv",
