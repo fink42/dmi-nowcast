@@ -16,6 +16,14 @@ import { freshness, type Freshness } from './freshness';
 import { loadGrids } from './grids';
 import { fetchManifest, isCalibrated, NoDataError, type Manifest } from './manifest';
 import { gridToLonLat, samplePoint, type DecodedGrids, type PointForecast } from './sampler';
+import {
+	buildTimeline,
+	clampIndex,
+	frameDelayMs,
+	isBuffering,
+	nextFrameIndex,
+	type TimelineFrame
+} from './timeline';
 
 const POLL_MS = 60_000;
 const CLOCK_MS = 15_000;
@@ -42,7 +50,15 @@ export interface PointState {
 class NowcastStore {
 	manifest = $state<Manifest | null>(null);
 	status = $state<Status>('loading');
+	/** The frames whose bitmaps have arrived — a prefix of `timeline`. */
 	frames = $state<OverlayFrame[]>([]);
+	/**
+	 * Every frame of the cycle, known from the manifest before any of them has
+	 * downloaded. The scrubber is built from this, not from `frames`: the
+	 * track must be its full length from the start, or it grows under the
+	 * viewer's thumb while they are dragging it.
+	 */
+	timeline = $state<TimelineFrame[]>([]);
 	geometry = $state<{ corners: Corners } | null>(null);
 	frameIndex = $state(0);
 	playing = $state(true);
@@ -88,8 +104,32 @@ class NowcastStore {
 		return this.manifest ? isCalibrated(this.manifest) : false;
 	}
 
+	/** The bitmap on the map, or null while the active frame is still loading. */
 	get currentFrame(): OverlayFrame | null {
 		return this.frames[this.frameIndex] ?? null;
+	}
+
+	/** What the active frame *is* — known even before its bitmap arrives. */
+	get activeFrame(): TimelineFrame | null {
+		return this.timeline[this.frameIndex] ?? null;
+	}
+
+	/** Length of the scrubber: every frame of the cycle, loaded or not. */
+	get frameCount(): number {
+		return Math.max(this.timeline.length, this.frames.length);
+	}
+
+	get loadedCount(): number {
+		return this.frames.length;
+	}
+
+	/**
+	 * True when the active frame has no bitmap yet. The map keeps showing the
+	 * previous frame — the alternative is a blank hole in the middle of the
+	 * country — so the controls have to say what is going on.
+	 */
+	get buffering(): boolean {
+		return this.frameCount > 0 && isBuffering(this.frameIndex, this.frames.length);
 	}
 
 	/** Start polling and animating. Returns the matching teardown. */
@@ -155,6 +195,12 @@ class NowcastStore {
 		this.#cycle = manifest.cycle;
 		this.manifest = manifest;
 		this.geometry = overlayGeometry(manifest);
+		this.timeline = buildTimeline(manifest);
+		// A new cycle replaces every bitmap. A playing loop restarts at the
+		// oldest frame rather than stalling on an index whose image is a whole
+		// download away; a paused viewer keeps the frame they were reading,
+		// and it buffers visibly until it arrives.
+		this.frameIndex = this.playing ? 0 : clampIndex(this.frameIndex, this.timeline.length);
 
 		const previous = this.frames;
 		const collected: OverlayFrame[] = [];
@@ -175,8 +221,9 @@ class NowcastStore {
 			for await (const frame of loadOverlayFrames(manifest, abort.signal)) {
 				collected.push(frame);
 				// Swap the array in as it grows so the loop can start early.
+				// An index past the end is not corrected here: that is the
+				// buffering state, and it resolves itself as frames arrive.
 				this.frames = [...collected];
-				if (this.frameIndex >= collected.length) this.frameIndex = 0;
 			}
 		} catch (err) {
 			if (!abort.signal.aborted) console.warn('overlay frames failed', err);
@@ -188,7 +235,11 @@ class NowcastStore {
 			return;
 		}
 		for (const frame of previous) frame.bitmap.close();
-		if (this.frameIndex >= this.frames.length) this.frameIndex = 0;
+		// Loading is over, so whatever arrived is all there is: an index past
+		// it would buffer for ever (a cycle whose frames failed part-way).
+		if (this.frames.length > 0 && this.frameIndex >= this.frames.length) {
+			this.frameIndex = this.frames.length - 1;
+		}
 		// Re-sample the selected point against the new cycle.
 		if (this.point) void this.selectPoint(this.point.lat, this.point.lon);
 	}
@@ -209,26 +260,42 @@ class NowcastStore {
 
 	#scheduleFrame(): void {
 		if (this.#frameTimer) clearTimeout(this.#frameTimer);
-		const last = this.frames.length > 0 && this.frameIndex === this.frames.length - 1;
 		this.#frameTimer = setTimeout(
 			() => {
-				if (this.playing && this.frames.length > 0) {
-					this.frameIndex = (this.frameIndex + 1) % this.frames.length;
+				if (this.playing) {
+					this.frameIndex = nextFrameIndex(this.frameIndex, this.frames.length);
 				}
 				this.#scheduleFrame();
 			},
-			last ? LAST_FRAME_HOLD_MS : FRAME_MS
+			frameDelayMs(this.frameIndex, this.frames.length, FRAME_MS, LAST_FRAME_HOLD_MS)
 		);
+	}
+
+	/**
+	 * Restart the frame timer so the frame just landed on gets a full interval
+	 * instead of whatever was left of the previous one. Only meaningful while
+	 * the loop is running — otherwise it would start an orphan timer that
+	 * `stop()` never sees.
+	 */
+	#resyncFrameTimer(): void {
+		if (this.#frameTimer) this.#scheduleFrame();
 	}
 
 	togglePlay(): void {
 		this.playing = !this.playing;
+		this.#resyncFrameTimer();
 	}
 
+	/**
+	 * Move the loop to one frame. Seeking says *where*, not *whether*: a
+	 * playing loop keeps playing from the frame you dropped it on, a paused
+	 * one stays paused. (It used to pause on every scrub, which made the play
+	 * button feel broken.)
+	 */
 	seek(index: number): void {
-		if (this.frames.length === 0) return;
-		this.playing = false;
-		this.frameIndex = Math.max(0, Math.min(this.frames.length - 1, index));
+		if (this.frameCount === 0) return;
+		this.frameIndex = clampIndex(index, this.frameCount);
+		this.#resyncFrameTimer();
 	}
 
 	// --- point forecast ----------------------------------------------------

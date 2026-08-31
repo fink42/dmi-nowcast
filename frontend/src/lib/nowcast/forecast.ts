@@ -50,6 +50,9 @@ export async function fetchPointForecast(
 		perLead: body.per_lead.map((l) => ({ leadMin: l.lead_min, pRain: l.p_rain })),
 		etaMin: body.eta_min,
 		intensityMmH: body.intensity_mm_h,
+		// The endpoint serves no motion vector, and this path exists precisely
+		// because the grids could not be read. Null is the honest answer.
+		motion: null,
 		confidence: body.confidence,
 		calibrated: body.calibrated,
 		source: 'server'

@@ -55,6 +55,8 @@ const PYPROJ_POINTS = [
 const P_RAIN = { lo: 0, hi: 1 };
 const ETA = { lo: 0, hi: 120 };
 const INTENSITY = { lo: 0, hi: 100 };
+/** Cell motion: symmetric about zero, ±MOTION_MAX_ABS_KMH. */
+const MOTION = { lo: -120, hi: 120 };
 const MAX_LEVEL = 254;
 const NODATA_LEVEL = 255;
 
@@ -349,5 +351,96 @@ describe('samplePoint', () => {
 
 		// And a point outside the grid is off-coverage, not p = 0.
 		expect(samplePoint(manifest, grids, 55.0, 12.0)).toBeNull();
+	});
+
+	/**
+	 * Cell motion is the one product that may simply not be there — an older
+	 * cycle, a failed download, or a pixel too far from any echo for an honest
+	 * estimate. Each of those has to reach the panel as "no motion", never as
+	 * an arrow pointing somewhere plausible.
+	 */
+	describe('cell motion', () => {
+		/** p_rain/eta/intensity, all nodata: this block is about motion only. */
+		async function baseGrids() {
+			const empty = Array(9).fill(null);
+			return {
+				pRain: new Map([
+					[
+						10,
+						{
+							entry: gridEntry('p_rain_10min_x.png', 'p_rain', 10, P_RAIN, [3, 3]),
+							image: await decoded(empty, P_RAIN)
+						}
+					]
+				]),
+				eta: {
+					entry: gridEntry('eta_x.png', 'eta', null, ETA, [3, 3]),
+					image: await decoded(empty, ETA)
+				}
+			};
+		}
+
+		/** A motion pair whose centre pixel holds (east, north); rest nodata. */
+		async function motionPair(east: number | null, north: number | null) {
+			const centre = (value: number | null) => [...Array(4).fill(null), value, ...Array(4).fill(null)];
+			return {
+				east: {
+					entry: gridEntry('motion_east_kmh_x.png', 'motion_east_kmh', null, MOTION, [3, 3]),
+					image: await decoded(centre(east), MOTION)
+				},
+				north: {
+					entry: gridEntry('motion_north_kmh_x.png', 'motion_north_kmh', null, MOTION, [3, 3]),
+					image: await decoded(centre(north), MOTION)
+				}
+			};
+		}
+
+		it('turns the two component grids into a bearing and a speed', async () => {
+			// Moving 24 km/h east and 24 km/h north: out of the south-west.
+			const grids = { ...(await baseGrids()), motion: await motionPair(24, 24) };
+			const forecast = samplePoint(manifest, grids, 56.0, 10.5666);
+			expect(forecast!.motion).not.toBeNull();
+			expect(forecast!.motion!.compass).toBe('sw');
+			expect(forecast!.motion!.bearingFromDeg).toBeCloseTo(225, 1);
+			// Each component lands within half a quantisation step (0.47 km/h),
+			// so the magnitude is inside one step of the truth.
+			expect(Math.abs(forecast!.motion!.speedKmh - Math.sqrt(2 * 24 * 24))).toBeLessThanOrEqual(
+				scaleOf(MOTION)
+			);
+		});
+
+		it('reads a negative component correctly through the offset', async () => {
+			// Due west at 40 km/h ⇒ coming from the east.
+			const grids = { ...(await baseGrids()), motion: await motionPair(-40, 0) };
+			const forecast = samplePoint(manifest, grids, 56.0, 10.5666);
+			expect(forecast!.motion!.compass).toBe('e');
+			expect(Math.abs(forecast!.motion!.speedKmh - 40)).toBeLessThanOrEqual(scaleOf(MOTION));
+		});
+
+		it('reports no motion where either component is nodata', async () => {
+			for (const [east, north] of [
+				[null, 24],
+				[24, null],
+				[null, null]
+			] as [number | null, number | null][]) {
+				const grids = { ...(await baseGrids()), motion: await motionPair(east, north) };
+				expect(samplePoint(manifest, grids, 56.0, 10.5666)!.motion).toBeNull();
+			}
+		});
+
+		it('reports no motion at a pixel outside the support radius', async () => {
+			// The neighbouring pixel is nodata in both components — exactly what
+			// the sidecar writes farther than support_radius_km from any echo.
+			const grids = { ...(await baseGrids()), motion: await motionPair(24, 24) };
+			expect(samplePoint(manifest, grids, 56.017, 10.5666)!.motion).toBeNull();
+		});
+
+		it('degrades to no motion when the cycle served no motion grids', async () => {
+			const forecast = samplePoint(manifest, await baseGrids(), 56.0, 10.5666);
+			expect(forecast).not.toBeNull();
+			expect(forecast!.motion).toBeNull();
+			// And the rest of the forecast is unaffected.
+			expect(forecast!.perLead).toHaveLength(2);
+		});
 	});
 });

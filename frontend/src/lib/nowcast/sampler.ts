@@ -22,6 +22,7 @@
 import proj4 from 'proj4';
 import type { ArtifactEntry, GridBlock, Manifest } from './manifest';
 import { findArtifact, isCalibrated } from './manifest';
+import { cellMotion, type CellMotion } from './motion';
 import type { Gray8Image } from './png';
 
 export interface GridIndex {
@@ -125,6 +126,12 @@ export interface PointForecast {
 	etaMin: number | null;
 	/** Ensemble-median rain rate at the ETA step (mm/h); null without an ETA. */
 	intensityMmH: number | null;
+	/**
+	 * Which way the echo over this point is moving. Null whenever there is no
+	 * estimate — a cycle without motion grids, a nodata pixel, or the server
+	 * path, which does not serve motion at all. Never a fabricated arrow.
+	 */
+	motion: CellMotion | null;
 	/** Global confidence scalar; only the server path can supply it. */
 	confidence: number | null;
 	/** True only when every served lead went through a calibration curve. */
@@ -133,11 +140,23 @@ export interface PointForecast {
 	source: 'client' | 'server';
 }
 
+/** One decoded grayscale product: the manifest entry plus its pixels. */
+export interface DecodedGrid {
+	entry: ArtifactEntry;
+	image: Gray8Image;
+}
+
 /** Product grids for one cycle, decoded once and reused for every click. */
 export interface DecodedGrids {
-	pRain: Map<number, { entry: ArtifactEntry; image: Gray8Image }>;
-	eta?: { entry: ArtifactEntry; image: Gray8Image };
-	intensity?: { entry: ArtifactEntry; image: Gray8Image };
+	pRain: Map<number, DecodedGrid>;
+	eta?: DecodedGrid;
+	intensity?: DecodedGrid;
+	/**
+	 * Cell motion, both components or neither — the sidecar writes them as a
+	 * pair and a single component says nothing. Absent on a cycle that served
+	 * no motion grids, which costs the arrow and nothing else.
+	 */
+	motion?: { east: DecodedGrid; north: DecodedGrid };
 }
 
 /**
@@ -170,10 +189,25 @@ export function samplePoint(
 		intensityMmH: grids.intensity
 			? sampleArtifact(grids.intensity.image, grids.intensity.entry, pixel)
 			: null,
+		motion: sampleMotion(grids, pixel),
 		confidence: null,
 		calibrated: isCalibrated(manifest),
 		source: 'client'
 	};
+}
+
+/**
+ * Cell motion at one pixel. Either component reading nodata means the pixel
+ * has no estimate — outside coverage, or too far from any echo — and the
+ * answer is "we don't know", never an arrow pointing at nothing.
+ */
+export function sampleMotion(grids: DecodedGrids, pixel: PixelIndex): CellMotion | null {
+	if (!grids.motion) return null;
+	const { east, north } = grids.motion;
+	return cellMotion(
+		sampleArtifact(east.image, east.entry, pixel),
+		sampleArtifact(north.image, north.entry, pixel)
+	);
 }
 
 /** The grayscale artifacts one cycle needs, in fetch order. */
@@ -184,4 +218,15 @@ export function productArtifacts(manifest: Manifest): ArtifactEntry[] {
 		findArtifact(manifest, 'intensity')
 	];
 	return wanted.filter((a): a is ArtifactEntry => a !== undefined);
+}
+
+/**
+ * The optional cell-motion pair, or null when this cycle served neither. Kept
+ * out of `productArtifacts` on purpose: those are required for the client-side
+ * path to work at all, while a missing arrow is a missing row in a panel.
+ */
+export function motionArtifacts(manifest: Manifest): [ArtifactEntry, ArtifactEntry] | null {
+	const east = findArtifact(manifest, 'motion_east_kmh');
+	const north = findArtifact(manifest, 'motion_north_kmh');
+	return east && north ? [east, north] : null;
 }

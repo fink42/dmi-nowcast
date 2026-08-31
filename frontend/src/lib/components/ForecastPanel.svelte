@@ -20,6 +20,13 @@
 
 	const point = $derived(nowcast.point);
 	const forecast = $derived(point?.forecast ?? null);
+	/**
+	 * Cell motion is null wherever there is no honest estimate — no motion
+	 * grids this cycle, a nodata pixel (outside coverage, or too far from any
+	 * echo), or the server fallback, which serves none. The row then says so
+	 * in words; it never draws an arrow it cannot back up.
+	 */
+	const motion = $derived(forecast?.motion ?? null);
 	const confidence = $derived(forecast?.confidence ?? nowcast.confidence);
 	const ageMin = $derived(nowcast.radarAgeMin);
 	const highlight = $derived(forecast ? probabilityWithin(forecast, 20) : null);
@@ -87,6 +94,35 @@
 						{intensityWord(t(), forecast.intensityMmH)}
 						{#if forecast.intensityMmH !== null && forecast.intensityMmH > 0.05}
 							<span class="muted">({t().panel.intensityValue(forecast.intensityMmH)})</span>
+						{/if}
+					</dd>
+				</div>
+				<div>
+					<dt>{t().panel.motionLabel}</dt>
+					<dd>
+						{#if motion}
+							<!-- The glyph points the way the cell is travelling and the
+							     rotation IS the "coming from" bearing: the arrow is
+							     drawn pointing south at 0°, so "from N" sends it down
+							     the compass rose, towards the viewer. -->
+							<span class="arrow" aria-hidden="true" style:rotate={`${motion.bearingFromDeg}deg`}>
+								<svg viewBox="0 0 24 24">
+									<path
+										d="M12 2v12"
+										fill="none"
+										stroke="currentColor"
+										stroke-width="2.5"
+										stroke-linecap="round"
+									/>
+									<path d="M12 22l-5.5-8h11z" fill="currentColor" />
+								</svg>
+							</span>
+							{t().panel.motionValue(
+								t().panel.compass[motion.compass],
+								Math.round(motion.speedKmh)
+							)}
+						{:else}
+							<span class="muted">{t().panel.motionNone}</span>
 						{/if}
 					</dd>
 				</div>
@@ -251,6 +287,20 @@
 	dd {
 		margin: 0.1rem 0 0;
 		font-size: 0.95rem;
+	}
+
+	.arrow {
+		display: inline-block;
+		width: 0.95rem;
+		height: 0.95rem;
+		vertical-align: -0.1rem;
+		color: var(--accent);
+	}
+
+	.arrow svg {
+		width: 100%;
+		height: 100%;
+		display: block;
 	}
 
 	.badges {

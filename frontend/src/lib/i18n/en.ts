@@ -48,12 +48,15 @@ export const en: Catalog = {
 		pause: 'Pause',
 		now: 'Now',
 		lead: (min: number) => `+${min} min`,
+		lag: (min: number) => `−${min} min`,
 		frameOf: (i: number, n: number) => `Frame ${i} of ${n}`,
 		scrubber: 'Timeline',
-		opacity: 'Opacity',
+		stateObserved: 'observed',
+		stateNow: 'latest observation',
+		stateForecast: 'forecast',
+		buffering: 'loading frame …',
 		radarAge: (min: number) =>
 			min < 1 ? 'Radar data: less than 1 min old' : `Radar data: ${min} min old`,
-		radarTime: (time: string) => `Radar image at ${time}`,
 		pipelineStale: 'The pipeline has stalled — the forecast is not being updated right now',
 		radarOld: 'The radar image is older than usual — no newer one has arrived from DMI yet',
 		noFrames: 'No radar frames available right now'
@@ -76,6 +79,19 @@ export const en: Catalog = {
 		intensityModerate: 'moderate',
 		intensityHeavy: 'heavy',
 		intensityViolent: 'violent',
+		motionLabel: 'Cell motion',
+		motionValue: (from: string, kmh: number) => `Coming from ${from} · ${kmh} km/h`,
+		motionNone: 'No measured cell motion here',
+		compass: {
+			n: 'N',
+			ne: 'NE',
+			e: 'E',
+			se: 'SE',
+			s: 'S',
+			sw: 'SW',
+			w: 'W',
+			nw: 'NW'
+		},
 		probabilityLabel: 'Probability of rain',
 		probabilityValue: (pct: number) => `${pct}%`,
 		probabilityWithin: (min: number, pct: number) =>

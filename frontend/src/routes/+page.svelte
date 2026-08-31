@@ -17,6 +17,8 @@
 	let locationError = $state<string | null>(null);
 	let sheet = $state<HTMLDivElement>();
 	let sheetHeight = $state(0);
+	let dock = $state<HTMLDivElement>();
+	let dockHeight = $state(0);
 	let sidePanel = $state(false);
 
 	onMount(() => nowcast.start());
@@ -39,6 +41,19 @@
 			sheetHeight = entry.contentRect.height;
 		});
 		observer.observe(sheet);
+		return () => observer.disconnect();
+	});
+
+	// The timeline sits *on* the map, so its height is map chrome: it pads the
+	// map, lifts the locate button, and lifts MapLibre's attribution strip —
+	// which has to stay visible whatever the timeline does (see the style
+	// block below and $lib/map/style.ts).
+	$effect(() => {
+		if (!dock) return;
+		const observer = new ResizeObserver(([entry]) => {
+			dockHeight = entry.contentRect.height;
+		});
+		observer.observe(dock);
 		return () => observer.disconnect();
 	});
 
@@ -70,8 +85,8 @@
 </script>
 
 <div class="page">
-	<div class="map-area">
-		<MapView bind:this={mapView} bottomInset={sidePanel ? 0 : sheetHeight} />
+	<div class="map-area" style:--dock-h={`${dockHeight}px`}>
+		<MapView bind:this={mapView} bottomInset={dockHeight + (sidePanel ? 0 : sheetHeight)} />
 
 		<div class="floating">
 			{#if nowcast.status === 'nodata'}
@@ -102,11 +117,16 @@
 				/>
 			</svg>
 		</button>
+
+		<!-- The timeline belongs to the map on every viewport, phone included:
+		     it is the map's own clock, not a panel item. -->
+		<div class="dock" bind:this={dock}>
+			<LoopControls />
+		</div>
 	</div>
 
 	<div class="sheet" bind:this={sheet}>
 		<ForecastPanel />
-		<LoopControls />
 		<SiteFooter />
 	</div>
 </div>
@@ -163,11 +183,27 @@
 		font-weight: 600;
 	}
 
+	.dock {
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		/* Above MapLibre's own control containers (z-index 2). */
+		z-index: 3;
+	}
+
+	/* The attribution rides above the timeline instead of under it: DMI and
+	   OpenStreetMap credit is not optional chrome. */
+	.map-area :global(.maplibregl-ctrl-bottom-left),
+	.map-area :global(.maplibregl-ctrl-bottom-right) {
+		bottom: var(--dock-h, 0px);
+	}
+
 	.locate {
 		position: absolute;
 		right: 0.6rem;
 		/* Clear of MapLibre's attribution strip, which must stay readable. */
-		bottom: 2.9rem;
+		bottom: calc(var(--dock-h, 0px) + 2.9rem);
 		width: 2.75rem;
 		height: 2.75rem;
 		border-radius: 50%;

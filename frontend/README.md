@@ -71,7 +71,8 @@ Both are gitignored. Nothing in the app talks to a third-party tile server.
 
 ```
 src/lib/i18n/          da.ts + en.ts catalogs, types.ts, state.svelte.ts
-src/lib/nowcast/       manifest types, PNG decode, grid sampling, store
+src/lib/nowcast/       manifest types, PNG decode, grid sampling, timeline,
+                       cell-motion bearings, store
 src/lib/map/           MapLibre style, Mercator resampling, overlay frames
 src/lib/components/    MapView, LoopControls, ForecastPanel, LangToggle, footer
 src/routes/            map (/) + about, data, privacy, support

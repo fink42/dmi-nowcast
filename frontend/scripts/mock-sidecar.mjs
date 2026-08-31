@@ -11,6 +11,12 @@
  * georeferencing mistakes obvious — a blob that is not over Copenhagen means
  * the overlay is misplaced.
  *
+ * Schema v2: overlays carry `kind` + `valid_ts_utc`, the manifest references
+ * three prior cycles as observation history (negative leads, blobs rewound),
+ * and the two cell-motion grids are served with nodata everywhere the echoes
+ * are too far away for an estimate — so the timeline and the motion arrow can
+ * both be developed against something that behaves like the real thing.
+ *
  * Usage:
  *   node scripts/mock-sidecar.mjs --port 8099
  *   VITE_SIDECAR_URL=http://localhost:8099 npm run dev
@@ -40,20 +46,47 @@ const BLOBS = [
 ];
 /** Drift per minute of lead, in native pixels (≈ 45 km/h to the ENE). */
 const DRIFT = { col: 1.5, row: -0.6 };
+/** The same drift as a velocity, which is what the motion grids serve. */
+const MOTION_KMH = {
+	east: (DRIFT.col * NATIVE.scale * 60) / 1000,
+	north: (-DRIFT.row * NATIVE.scale * 60) / 1000
+};
+/** No motion estimate farther than this from an echo (manifest `motion`). */
+const MOTION_SUPPORT_KM = 20;
+/** Prior cycles referenced as observation history, at the 10 min cadence. */
+const HISTORY_MIN = [-30, -20, -10];
+/** How old the radar frame already is when the cycle runs (minutes). */
+const FRAME_AGE_MIN = 2.1;
 
 const NODATA = 255;
 const MAX_LEVEL = 254;
-const SPECS = { p_rain: [0, 1], eta: [0, 120], intensity: [0, 100] };
+const SPECS = {
+	p_rain: [0, 1],
+	eta: [0, 120],
+	intensity: [0, 100],
+	motion_east_kmh: [-120, 120],
+	motion_north_kmh: [-120, 120]
+};
 const scaleOf = ([lo, hi]) => (hi - lo) / MAX_LEVEL;
 
-const stamp = () => {
-	const d = new Date(Math.floor(Date.now() / 300_000) * 300_000);
-	const p = (n) => String(n).padStart(2, '0');
-	return {
-		text: `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}`,
-		iso: d.toISOString()
-	};
+const p2 = (n) => String(n).padStart(2, '0');
+const stampText = (d) =>
+	`${d.getUTCFullYear()}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}`;
+
+const stamp = (offsetMin = 0) => {
+	const d = new Date(Math.floor(Date.now() / 300_000) * 300_000 + offsetMin * 60_000);
+	return { text: stampText(d), iso: d.toISOString() };
 };
+
+/** `YYYYMMDDHHMM` → epoch ms, so a history frame knows its own lead. */
+const stampMs = (text) =>
+	Date.UTC(
+		Number(text.slice(0, 4)),
+		Number(text.slice(4, 6)) - 1,
+		Number(text.slice(6, 8)),
+		Number(text.slice(8, 10)),
+		Number(text.slice(10, 12))
+	);
 
 /** Rain rate (mm/h) at a native grid pixel for a given lead. */
 function rainAt(col, row, leadMin) {
@@ -65,6 +98,14 @@ function rainAt(col, row, leadMin) {
 		if (d < 1) value = Math.max(value, 12 * (1 - d) ** 1.5);
 	}
 	return value;
+}
+
+/** Is this native pixel within the motion grids' support of any echo? */
+function withinSupport(col, row) {
+	const supportPx = (MOTION_SUPPORT_KM * 1000) / NATIVE.scale;
+	return BLOBS.some(
+		(blob) => Math.hypot(col - blob.col, row - blob.row) < blob.radius + supportPx
+	);
 }
 
 const quantise = (value, spec) =>
@@ -172,7 +213,16 @@ function productPng(product, leadMin) {
 				const nCol = col * FACTOR;
 				const nRow = row * FACTOR;
 				let value = null;
-				if (product === 'p_rain') {
+				if (product === 'motion_east_kmh' || product === 'motion_north_kmh') {
+					// One uniform drift, but only where there is an echo close
+					// enough to have measured it — everywhere else is nodata, the
+					// case the panel must render as "no measured cell motion".
+					value = withinSupport(nCol, nRow)
+						? product === 'motion_east_kmh'
+							? MOTION_KMH.east
+							: MOTION_KMH.north
+						: null;
+				} else if (product === 'p_rain') {
 					const mm = rainAt(nCol, nRow, leadMin);
 					value = Math.min(1, mm / 4);
 				} else if (product === 'eta') {
@@ -219,18 +269,42 @@ function manifest() {
 	});
 	const productShape = [PRODUCT.rows, PRODUCT.cols];
 	const overlayShape = [NATIVE.rows, NATIVE.cols];
+	/** Overlay entry, v2: every frame says what it is and when it is valid. */
+	const overlayEntry = (filename, lead) => ({
+		filename,
+		product: 'overlay',
+		lead_min: lead,
+		kind: lead > 0 ? 'forecast' : 'observation',
+		// Forecast validity is frame-age corrected the way the sidecar does it:
+		// radar_ts + frame_age + lead. An observation is valid when it was taken.
+		valid_ts_utc: new Date(
+			Date.parse(s.iso) + (lead > 0 ? FRAME_AGE_MIN + lead : lead) * 60_000
+		).toISOString(),
+		encoding: 'rgba8',
+		shape: overlayShape
+	});
 	return {
-		schema_version: 1,
+		schema_version: 2,
 		cycle: s.text,
 		radar_ts_utc: s.iso,
 		generated_at_utc: new Date().toISOString(),
 		threshold_mm_h: 0.1,
 		timestep_min: 5,
-		frame_age_min: 2.1,
+		frame_age_min: FRAME_AGE_MIN,
 		n_members: 24,
 		leads_min: LEADS,
 		grid: gridBlock(PRODUCT.scale, productShape),
 		overlay_grid: gridBlock(NATIVE.scale, overlayShape),
+		motion: {
+			grid: 'product',
+			support_radius_km: MOTION_SUPPORT_KM,
+			max_abs_kmh: 120,
+			convention:
+				'motion_east_kmh / motion_north_kmh are the cell motion in km/h on ' +
+				'the product grid, east- and north-positive. nodata (255) outside ' +
+				'radar coverage and farther than support_radius_km from any echo — ' +
+				'there is no motion estimate there, do not draw an arrow.'
+		},
 		calibration: {
 			fitted_at: '2026-08-01T03:00:00+00:00',
 			calibrated_leads: LEADS,
@@ -258,20 +332,30 @@ function manifest() {
 				productShape,
 				'mm/h'
 			),
-			{
-				filename: `overlay_now_${s.text}.png`,
-				product: 'overlay',
-				lead_min: 0,
-				encoding: 'rgba8',
-				shape: overlayShape
-			},
-			...LEADS.map((lead) => ({
-				filename: `overlay_${lead}min_${s.text}.png`,
-				product: 'overlay',
-				lead_min: lead,
-				encoding: 'rgba8',
-				shape: overlayShape
-			}))
+			gridEntry(
+				`motion_east_kmh_${s.text}.png`,
+				'motion_east_kmh',
+				null,
+				SPECS.motion_east_kmh,
+				productShape,
+				'km/h'
+			),
+			gridEntry(
+				`motion_north_kmh_${s.text}.png`,
+				'motion_north_kmh',
+				null,
+				SPECS.motion_north_kmh,
+				productShape,
+				'km/h'
+			),
+			// Observation history: prior cycles' own "now" overlays, oldest
+			// first, at negative leads. Set HISTORY_MIN to [] to see the
+			// cold-start case the timeline also has to handle.
+			...HISTORY_MIN.map((lead) =>
+				overlayEntry(`overlay_now_${stamp(lead).text}.png`, lead)
+			),
+			overlayEntry(`overlay_now_${s.text}.png`, 0),
+			...LEADS.map((lead) => overlayEntry(`overlay_${lead}min_${s.text}.png`, lead))
 		]
 	};
 }
@@ -289,8 +373,12 @@ createServer((req, res) => {
 	}
 	const artifact = url.pathname.match(/^\/nowcast\/(\w+?)_?(?:(\d+)min|now)?_(\d{12})\.png$/);
 	if (artifact) {
-		const [, product, leadText] = artifact;
-		const lead = leadText ? Number(leadText) : 0;
+		const [, product, leadText, cycleText] = artifact;
+		// A "now" overlay stamped before the current cycle is a history frame:
+		// its lead is negative, and the blobs are rewound to match.
+		const lead = leadText
+			? Number(leadText)
+			: Math.round((stampMs(cycleText) - stampMs(stamp().text)) / 60_000);
 		const png =
 			product === 'overlay' ? overlayPng(lead) : productPng(product, product === 'p_rain' ? lead : 0);
 		return send(200, png, 'image/png', { 'cache-control': 'public, max-age=300, immutable' });

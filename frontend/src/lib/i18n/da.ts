@@ -50,12 +50,15 @@ export const da = {
 		pause: 'Pause',
 		now: 'Nu',
 		lead: (min: number) => `+${min} min`,
+		lag: (min: number) => `−${min} min`,
 		frameOf: (i: number, n: number) => `Billede ${i} af ${n}`,
 		scrubber: 'Tidslinje',
-		opacity: 'Gennemsigtighed',
+		stateObserved: 'observeret',
+		stateNow: 'seneste observation',
+		stateForecast: 'prognose',
+		buffering: 'henter billede …',
 		radarAge: (min: number) =>
 			min < 1 ? 'Radardata: under 1 min gamle' : `Radardata: ${min} min gamle`,
-		radarTime: (time: string) => `Radarbillede kl. ${time}`,
 		pipelineStale: 'Beregningen er sat i stå — prognosen bliver ikke opdateret lige nu',
 		radarOld: 'Radarbilledet er ældre end normalt — der er endnu ikke kommet et nyere fra DMI',
 		noFrames: 'Ingen radarbilleder tilgængelige lige nu'
@@ -78,6 +81,19 @@ export const da = {
 		intensityModerate: 'moderat',
 		intensityHeavy: 'kraftig',
 		intensityViolent: 'voldsom',
+		motionLabel: 'Cellebevægelse',
+		motionValue: (from: string, kmh: number) => `Kommer fra ${from} · ${kmh} km/t`,
+		motionNone: 'Ingen målt cellebevægelse her',
+		compass: {
+			n: 'N',
+			ne: 'NØ',
+			e: 'Ø',
+			se: 'SØ',
+			s: 'S',
+			sw: 'SV',
+			w: 'V',
+			nw: 'NV'
+		},
 		probabilityLabel: 'Sandsynlighed for regn',
 		probabilityValue: (pct: number) => `${pct} %`,
 		probabilityWithin: (min: number, pct: number) =>
