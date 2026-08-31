@@ -13,13 +13,16 @@
 		Map as MapLibreMap,
 		Marker,
 		NavigationControl,
-		type ImageSource
+		type GeoJSONSource,
+		type ImageSource,
+		type LayerSpecification
 	} from 'maplibre-gl';
 	// MapLibre 6 loads its worker by a runtime-built relative URL, which no
 	// bundler can follow. Let Vite bundle the worker and hand us its URL.
 	import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 	import { Protocol } from 'pmtiles';
 	import 'maplibre-gl/dist/maplibre-gl.css';
+	import { emptyArrow, motionArrow, type ArrowCollection } from '$lib/map/arrow';
 	import { buildStyle, preferredTheme, type Theme } from '$lib/map/style';
 	import { nowcast } from '$lib/nowcast/store.svelte';
 	import { t } from '$lib/i18n';
@@ -32,6 +35,11 @@
 
 	const OVERLAY_SOURCE = 'nowcast-overlay';
 	const OVERLAY_LAYER = 'nowcast-overlay-layer';
+	const ARROW_SOURCE = 'nowcast-motion-arrow';
+	/** Bottom to top: white halo, filled head, ink shaft. See `arrowLayers`. */
+	const ARROW_CASING_LAYER = 'nowcast-motion-arrow-casing';
+	const ARROW_HEAD_LAYER = 'nowcast-motion-arrow-head';
+	const ARROW_LINE_LAYER = 'nowcast-motion-arrow-line';
 	/** 1×1 transparent PNG — the placeholder an image source must be born with. */
 	const BLANK_PNG =
 		'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -80,6 +88,7 @@
 		map.on('style.load', () => {
 			styleReady = true;
 			syncOverlay();
+			syncArrow();
 		});
 		map.on('click', (e) => {
 			void nowcast.selectPoint(e.lngLat.lat, e.lngLat.lng);
@@ -100,12 +109,21 @@
 
 		return () => {
 			media.removeEventListener('change', onScheme);
+			removeArrow();
 			marker?.remove();
 			map?.remove();
 			map = null;
 			removeProtocol('pmtiles');
 		};
 	});
+
+	/**
+	 * The lowest label layer. Everything we draw goes underneath it, so place
+	 * names stay readable through the rain and under the arrow.
+	 */
+	function firstSymbolLayerId(): string | undefined {
+		return map?.getStyle().layers.find((l) => l.type === 'symbol')?.id;
+	}
 
 	/** Create or update the image source that carries the current frame. */
 	function syncOverlay() {
@@ -128,10 +146,9 @@
 			coordinates: geometry.corners
 		});
 		(map.getSource(OVERLAY_SOURCE) as ImageSource).updateImage({ image: frame.bitmap });
-		// Under the labels: place names stay readable through the rain.
-		const labelLayer = map
-			.getStyle()
-			.layers.find((l) => l.type === 'symbol')?.id;
+		// Under the labels, and under the motion arrow if that got there first
+		// (a point can be clicked before any frame has downloaded). Whichever
+		// of the two is created first, the radar ends up below the arrow.
 		map.addLayer(
 			{
 				id: OVERLAY_LAYER,
@@ -139,8 +156,108 @@
 				source: OVERLAY_SOURCE,
 				paint: { 'raster-opacity': 0.85, 'raster-fade-duration': 0, 'raster-resampling': 'linear' }
 			},
-			labelLayer
+			map.getLayer(ARROW_CASING_LAYER) ? ARROW_CASING_LAYER : firstSymbolLayerId()
 		);
+	}
+
+	/**
+	 * The three layers of the arrow, bottom to top. The look is the Home
+	 * Assistant card's (`_draw_motion_arrow`): a haloed shaft with ruler ticks
+	 * and a filled head. The card's red becomes theme ink here — red is a rain
+	 * intensity on the radar overlay, and an annotation must not be mistakable
+	 * for data. The halo is what carries it over dark land, bright cells and
+	 * the sea alike; the ink is what makes it legible against the halo.
+	 *
+	 * A `line` layer strokes polygon rings too, so the casing haloes the head
+	 * without a layer of its own, and the ink line then crisps its edge.
+	 */
+	function arrowLayers(): LayerSpecification[] {
+		const dark = theme === 'dark';
+		const ink = dark ? '#f2f5f8' : '#101820';
+		const casing = dark ? 'rgba(8, 12, 18, 0.85)' : 'rgba(255, 255, 255, 0.92)';
+		const round = { 'line-cap': 'round', 'line-join': 'round' } as const;
+		return [
+			{
+				id: ARROW_CASING_LAYER,
+				type: 'line',
+				source: ARROW_SOURCE,
+				layout: round,
+				paint: {
+					'line-color': casing,
+					'line-width': ['interpolate', ['linear'], ['zoom'], 5, 4.5, 12, 7.5]
+				}
+			},
+			{
+				id: ARROW_HEAD_LAYER,
+				type: 'fill',
+				source: ARROW_SOURCE,
+				paint: { 'fill-color': ink, 'fill-opacity': 0.95 }
+			},
+			{
+				id: ARROW_LINE_LAYER,
+				type: 'line',
+				source: ARROW_SOURCE,
+				layout: round,
+				paint: {
+					'line-color': ink,
+					'line-width': ['interpolate', ['linear'], ['zoom'], 5, 2, 12, 3.5]
+				}
+			}
+		];
+	}
+
+	/**
+	 * Arrow geometry for the selected point, or the empty collection.
+	 *
+	 * The one rule for *whether* there is an arrow is `motion === null`, and it
+	 * is not re-decided here: this reads the very same `cellMotion()` result the
+	 * forecast panel prints, so the two cannot disagree. A manifest without a
+	 * timestep costs the ticks and nothing else — the builder drops them.
+	 */
+	function arrowData(): ArrowCollection {
+		const point = nowcast.point;
+		const motion = point?.forecast?.motion;
+		if (!point || !motion) return emptyArrow();
+		return motionArrow({
+			lat: point.lat,
+			lon: point.lon,
+			bearingFromDeg: motion.bearingFromDeg,
+			speedKmh: motion.speedKmh,
+			timestepMin: nowcast.manifest?.timestep_min ?? 0
+		});
+	}
+
+	/**
+	 * Create the arrow's source and layers once per style, then keep them fed
+	 * with `setData`. No point selected is an empty collection, not a teardown:
+	 * clicking around the map should not be churning layers.
+	 *
+	 * Nothing here is announced to screen readers. The arrow restates what the
+	 * forecast panel already says in words ("kommer fra NV · 32 km/t") in an
+	 * `aria-live` region, and a second voice saying the same thing is noise.
+	 */
+	function syncArrow() {
+		if (!map || !styleReady) return;
+		const data = arrowData();
+		const existing = map.getSource(ARROW_SOURCE) as GeoJSONSource | undefined;
+		if (existing) {
+			existing.setData(data);
+			return;
+		}
+		map.addSource(ARROW_SOURCE, { type: 'geojson', data });
+		// Above the radar, below the labels. Each layer is inserted before the
+		// same id, which keeps them in the order `arrowLayers` returns them.
+		const beforeId = firstSymbolLayerId();
+		for (const layer of arrowLayers()) map.addLayer(layer, beforeId);
+	}
+
+	/** Drop the arrow's layers and source — the style outlives them otherwise. */
+	function removeArrow() {
+		if (!map) return;
+		for (const id of [ARROW_LINE_LAYER, ARROW_HEAD_LAYER, ARROW_CASING_LAYER]) {
+			if (map.getLayer(id)) map.removeLayer(id);
+		}
+		if (map.getSource(ARROW_SOURCE)) map.removeSource(ARROW_SOURCE);
 	}
 
 	// Frame changes, cycle changes and style reloads all land here.
@@ -150,6 +267,22 @@
 		void nowcast.geometry;
 		void styleReady;
 		syncOverlay();
+	});
+
+	/**
+	 * The motion arrow redraws whenever the thing it depicts changes: a new
+	 * point (a click, or the store re-sampling the old point against a freshly
+	 * arrived cycle — `point` is replaced wholesale either way), a manifest
+	 * whose cadence changed the tick spacing, a style reload that wiped the
+	 * layers, and a theme flip that changes the ink. Clearing the point empties
+	 * the collection, so the arrow goes with the panel.
+	 */
+	$effect(() => {
+		void nowcast.point;
+		void nowcast.manifest?.timestep_min;
+		void styleReady;
+		void theme;
+		syncArrow();
 	});
 
 	// Switching language re-labels the map too (Protomaps ships localised
