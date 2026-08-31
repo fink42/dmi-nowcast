@@ -49,14 +49,18 @@ RUN uv pip install --python /app/sidecar/.venv/bin/python "pyarrow==24.0.0" "duc
 #   1. cd frontend && npm ci && npm run build     → frontend/build/
 #   2. docker compose -f sidecar/deploy/public/docker-compose.yml build
 #
-# The copy must not fail when step 1 hasn't run. ``frontend/buil[d]`` is a
-# glob that matches nothing when the directory is absent, and the paired
-# ``pyproject.toml`` (always present) keeps the source set non-empty so
-# COPY can't error out; the RUN below deletes that stand-in again. Result:
-# an image with the site when it was built, and an API-only image when it
-# wasn't — the service logs ``frontend_dir_missing`` and boots either way.
+# The copy must not fail when step 1 hasn't run. ``fronten[d]/buil[d]`` is
+# a glob that matches nothing when either directory is absent — BOTH path
+# segments must be patterns, because buildkit lstat()s a literal parent
+# (``frontend/buil[d]`` dies with "lstat /frontend: no such file or
+# directory" against the private-stack bundle, which ships no frontend/
+# at all). The paired ``pyproject.toml`` (always present) keeps the source
+# set non-empty so COPY can't error out; the RUN below deletes that
+# stand-in again. Result: an image with the site when it was built, and an
+# API-only image when it wasn't — the service logs ``frontend_dir_missing``
+# and boots either way.
 FROM python:3.12-slim AS frontend
-COPY pyproject.toml frontend/buil[d] /frontend/build/
+COPY pyproject.toml fronten[d]/buil[d] /frontend/build/
 RUN rm -f /frontend/build/pyproject.toml
 
 # ─────────────────────────────────────────────────────────────────────────
