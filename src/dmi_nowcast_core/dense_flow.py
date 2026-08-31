@@ -294,7 +294,7 @@ def complete_flow(
         # Degenerate e-folding: bulk motion everywhere off the echo.
         weight = support.astype(np.float32)
     else:
-        distance_px = _distance_to_support(support)
+        distance_px = distance_to_support(support)
         # The dilation is expressed through the distance field: everything
         # within ``dilation_px`` of an echo pixel keeps weight 1.
         np.subtract(distance_px, np.float32(max(0.0, dilation_px)), out=distance_px)
@@ -309,8 +309,12 @@ def complete_flow(
     return out_vy.astype(np.float32), out_vx.astype(np.float32)
 
 
-def _distance_to_support(support: np.ndarray) -> np.ndarray:
+def distance_to_support(support: np.ndarray) -> np.ndarray:
     """Euclidean distance (in pixels) from every pixel to the nearest True.
+
+    Public because two consumers need the same notion of "how far is this
+    pixel from any echo": :func:`complete_flow`'s relaxation weight, and
+    ``national.motion_grids_kmh``'s nodata mask.
 
     OpenCV's ``distanceTransform`` when available (~10 ms on the native
     1728×1984 grid), else scipy's exact EDT. Note the inversion: OpenCV

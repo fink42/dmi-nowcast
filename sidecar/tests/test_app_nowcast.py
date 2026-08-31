@@ -233,6 +233,9 @@ def test_safe_nowcast_name_accepts_stamped_artifacts() -> None:
     assert _safe_nowcast_name(f"overlay_now_{STAMP}.png")
     assert _safe_nowcast_name(f"overlay_45min_{STAMP}.png")
     assert _safe_nowcast_name(f"manifest_{STAMP}.json")
+    # R2 motion grids — underscores only, so the existing regex serves them.
+    assert _safe_nowcast_name(f"motion_east_kmh_{STAMP}.png")
+    assert _safe_nowcast_name(f"motion_north_kmh_{STAMP}.png")
 
 
 def test_safe_nowcast_name_rejects_alias_traversal_and_junk() -> None:

@@ -15,6 +15,7 @@ from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.national import (
     DEFAULT_LEADS_MIN,
     NationalProducts,
+    motion_grids_kmh,
     national_products,
 )
 from dmi_nowcast_core.parse import parse_composite
@@ -316,3 +317,113 @@ def test_agreement_with_aggregate_at_home_frame_aged(geo):
     assert abs(
         (float(national.eta_min[r, c]) + frame_age) - home.eta_p50_min
     ) <= 5.0
+
+
+# ---------------------------------------------------------------------------
+# R2 — cell-motion grids (km/h, east/north positive, nodata off the echo)
+# ---------------------------------------------------------------------------
+
+def _uniform_flow(shape, *, vy_px, vx_px):
+    return (np.full(shape, vy_px, np.float32),
+            np.full(shape, vx_px, np.float32))
+
+
+def test_motion_grids_units_pinned_end_to_end():
+    """Hand-computed: +8 px/frame east and 4 px/frame NORTH (vy = -4, rows
+    grow southward) on a 500 m grid at a 10-min frame interval.
+
+    east  = 8 px × 0.5 km = 4 km per 10 min = 24 km/h
+    north = 4 px × 0.5 km = 2 km per 10 min = 12 km/h
+
+    The ×4 downsample must not touch the answer: ``v[::4, ::4] / 4`` on
+    2 km pixels is the same physical speed as ``v`` on 500 m pixels — the
+    ``/f`` and the ``f×`` in the pixel size cancel. Getting only one of the
+    two right is a 16× error, which this test exists to catch.
+    """
+    shape = (32, 32)
+    vy, vx = _uniform_flow(shape, vy_px=-4.0, vx_px=8.0)
+    rain = np.full(shape, 2.0, np.float32)  # echo everywhere → all valid
+
+    east, north = motion_grids_kmh(
+        vy, vx, rain,
+        pixel_km=0.5, timestep_min=10.0, downsample_factor=4,
+        support_threshold_mm_h=0.5,
+    )
+    assert east.shape == north.shape == (8, 8)
+    assert np.allclose(east, 24.0, atol=1e-4)
+    assert np.allclose(north, 12.0, atol=1e-4)
+
+    # Same physical field, no downsample → identical km/h.
+    east1, north1 = motion_grids_kmh(
+        vy, vx, rain,
+        pixel_km=0.5, timestep_min=10.0, downsample_factor=1,
+        support_threshold_mm_h=0.5,
+    )
+    assert np.allclose(east1, 24.0, atol=1e-4)
+    assert np.allclose(north1, 12.0, atol=1e-4)
+
+
+def test_motion_grid_signs_follow_dense_flow_convention():
+    """dense_flow: +vy = southward, +vx = eastward. So published north is
+    -vy and published east is +vx — a sign slip here points every arrow on
+    the website the wrong way."""
+    shape = (16, 16)
+    rain = np.full(shape, 2.0, np.float32)
+    # Moving south-west: vy positive (down/south), vx negative (west).
+    vy, vx = _uniform_flow(shape, vy_px=6.0, vx_px=-6.0)
+    east, north = motion_grids_kmh(
+        vy, vx, rain, pixel_km=0.5, timestep_min=10.0, downsample_factor=1,
+    )
+    assert (east < 0).all(), "westward motion must publish negative east"
+    assert (north < 0).all(), "southward motion must publish negative north"
+
+
+def test_motion_grids_nodata_beyond_support_radius():
+    """Only within 20 km of an echo does a pixel get an arrow; outside the
+    radar composite it never does."""
+    shape = (200, 200)
+    vy, vx = _uniform_flow(shape, vy_px=-4.0, vx_px=8.0)
+    rain = np.zeros(shape, np.float32)
+    rain[100, 100] = 5.0            # single echo pixel
+    rain[:, :10] = np.nan           # off-composite strip
+
+    east, north = motion_grids_kmh(
+        vy, vx, rain,
+        pixel_km=0.5, timestep_min=10.0, downsample_factor=1,
+        support_threshold_mm_h=0.5, support_radius_km=20.0,
+    )
+    assert np.isnan(east).any() and np.isfinite(east).any()
+    assert np.array_equal(np.isnan(east), np.isnan(north))
+
+    # 20 km = 40 px on a 500 m grid.
+    assert np.isfinite(east[100, 100])
+    assert np.isfinite(east[100, 139])     # 19.5 km away
+    assert np.isnan(east[100, 141])        # 20.5 km away
+    assert np.isnan(east[100, 5]), "off-composite pixels never carry motion"
+    # The off-composite strip stays nodata even where it is near the echo.
+    assert np.isnan(east[:, :10]).all()
+
+
+def test_motion_grids_all_nodata_without_echo():
+    shape = (32, 32)
+    vy, vx = _uniform_flow(shape, vy_px=1.0, vx_px=1.0)
+    east, north = motion_grids_kmh(
+        np.asarray(vy), np.asarray(vx), np.zeros(shape, np.float32),
+        pixel_km=0.5, timestep_min=10.0, downsample_factor=4,
+    )
+    assert np.isnan(east).all() and np.isnan(north).all()
+
+
+def test_motion_grids_reject_bad_inputs():
+    shape = (16, 16)
+    vy, vx = _uniform_flow(shape, vy_px=1.0, vx_px=1.0)
+    rain = np.ones(shape, np.float32)
+    with pytest.raises(ValueError, match="share one shape"):
+        motion_grids_kmh(vy, vx[:8], rain, pixel_km=0.5, timestep_min=10.0)
+    with pytest.raises(ValueError, match="pixel_km"):
+        motion_grids_kmh(vy, vx, rain, pixel_km=0.0, timestep_min=10.0)
+    with pytest.raises(ValueError, match="timestep_min"):
+        motion_grids_kmh(vy, vx, rain, pixel_km=0.5, timestep_min=0.0)
+    with pytest.raises(ValueError, match="downsample_factor"):
+        motion_grids_kmh(vy, vx, rain, pixel_km=0.5, timestep_min=10.0,
+                         downsample_factor=0)

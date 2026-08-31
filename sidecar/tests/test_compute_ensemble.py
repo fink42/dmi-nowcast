@@ -650,14 +650,16 @@ def test_cycle_computes_national_products_and_writes_artifacts(
             grid_val = float(products.p_rain[entry.lead_min][centre, centre])
             assert entry.p_ensemble == pytest.approx(grid_val)
 
-    # Artifacts on disk: 5 p_rain + eta + intensity grayscale, overlays for
-    # every deterministic lead + the now frame, stamped + stable manifests.
+    # Artifacts on disk: 5 p_rain + eta + intensity + 2 motion grayscale,
+    # overlays for every deterministic lead + the now frame, stamped +
+    # stable manifests.
     out = _nowcast_dir(engine)
     names = sorted(p.name for p in out.iterdir())
     n_overlays = len(engine.config.forecast.leads_min) + 1
     assert len([n for n in names if n.startswith("p_rain_")]) == 5
     assert len([n for n in names if n.startswith("eta_")]) == 1
     assert len([n for n in names if n.startswith("intensity_")]) == 1
+    assert len([n for n in names if n.startswith("motion_")]) == 2
     assert len([n for n in names if n.startswith("overlay_")]) == n_overlays
     assert "manifest.json" in names
     assert len([n for n in names if n.startswith("manifest_")]) == 1
@@ -665,7 +667,33 @@ def test_cycle_computes_national_products_and_writes_artifacts(
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["n_members"] == 8
     assert manifest["leads_min"] == [10, 20, 30, 45, 60]
-    assert len(manifest["artifacts"]) == 7 + n_overlays
+    assert len(manifest["artifacts"]) == 9 + n_overlays
+
+    # R2: the motion grids ride the product grid the ensemble produced.
+    assert manifest["motion"]["grid"] == "product"
+    motion_entries = [e for e in manifest["artifacts"]
+                      if str(e["product"]).startswith("motion_")]
+    assert {e["product"] for e in motion_entries} == {
+        "motion_east_kmh", "motion_north_kmh",
+    }
+    assert all(e["units"] == "km/h" for e in motion_entries)
+    assert all(e["shape"] == manifest["grid"]["shape"] for e in motion_entries)
+
+    # R1: schema v2 — every overlay says what it depicts and when.
+    assert manifest["schema_version"] == 2
+    overlays = [e for e in manifest["artifacts"] if e["product"] == "overlay"]
+    assert len(overlays) == n_overlays          # cold start → no history yet
+    radar_ts = datetime.fromisoformat(manifest["radar_ts_utc"])
+    for entry in overlays:
+        valid = datetime.fromisoformat(entry["valid_ts_utc"])
+        if entry["lead_min"] == 0:
+            assert entry["kind"] == "observation"
+            assert valid == radar_ts
+        else:
+            assert entry["kind"] == "forecast"
+            assert valid == radar_ts + timedelta(
+                minutes=manifest["frame_age_min"] + entry["lead_min"],
+            )
 
     assert state.diagnostics.national_ms > 0.0
     assert state.diagnostics.artifact_bytes > 0

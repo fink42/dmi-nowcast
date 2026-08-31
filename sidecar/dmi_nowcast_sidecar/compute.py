@@ -47,7 +47,11 @@ from dmi_nowcast_core.dense_flow import (
 from dmi_nowcast_core.fetch import AsyncDMIClient, RadarFeature
 from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.motion import phase_correlation_shift
-from dmi_nowcast_core.national import NationalProducts, national_products
+from dmi_nowcast_core.national import (
+    NationalProducts,
+    motion_grids_kmh,
+    national_products,
+)
 from dmi_nowcast_core.parse import RadarComposite, parse_composite
 from dmi_nowcast_core.probabilistic import (
     aggregate_at_home,
@@ -728,6 +732,21 @@ class CycleEngine:
         if ensemble is not None and ensemble.national is not None:
             self._national_latest = (ensemble.national, composite_now.timestamp_utc)
             t_art = time.perf_counter()
+            # R2 cell-motion grids: the same completed+sanitised flow the
+            # overlays and STEPS ran on, on the product grid, in km/h. A
+            # failure here costs the click-anywhere arrow, not the cycle.
+            motion_east = motion_north = None
+            try:
+                motion_east, motion_north = motion_grids_kmh(
+                    vy, vx, rain_now,
+                    pixel_km=float(composite_now.xscale_m) / 1000.0,
+                    # ``vy``/``vx`` are pixels per inter-frame interval.
+                    timestep_min=dt_min,
+                    downsample_factor=ensemble.national.downsample_factor,
+                    support_threshold_mm_h=self._rain_threshold,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("motion_grids_failed", error=str(exc))
             try:
                 art = write_national_artifacts(
                     ensemble.national,
@@ -737,6 +756,8 @@ class CycleEngine:
                     overlay_fields_mm_h=overlay_fields,
                     out_dir=self._national_dir,
                     keep_cycles=self.config.forecast.national.keep_cycles,
+                    motion_east_kmh=motion_east,
+                    motion_north_kmh=motion_north,
                     # §B4: null when the served grids are raw; otherwise
                     # fitted_at + curve-file echo + calibrated_leads.
                     calibration=self._national_calibration_manifest(ensemble.national),

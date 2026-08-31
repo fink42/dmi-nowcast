@@ -23,7 +23,20 @@ Checks (one row each in the pass/fail table):
   the manifest's scale/offset and sampled at the reference pixel through
   the manifest's grid-geometry block (proj4 + UL corner + pixel scale —
   needs ``pyproj``; the check is SKIPped with a note when it isn't
-  importable), must match /forecast within half a quantisation step.
+  importable), must match /forecast within half a quantisation step,
+- manifest schema version (expects v2),
+- R1 frame validity: every overlay carries ``kind`` + ``valid_ts_utc``;
+  observation frames are strictly ascending and spaced by whole multiples
+  of the manifest's ``timestep_min`` (so a missed cycle is a gap, not a
+  failure); the newest observation is the cycle's own radar frame; each
+  forecast frame is valid at ``radar_ts + frame_age_min + lead`` — the
+  frame-age correction the deterministic advection actually applies,
+- R2 motion grids: both ``motion_*_kmh`` artifacts decode to plausible
+  km/h on the product grid, agree pixel-for-pixel on where they carry
+  nodata, and — at the reference pixel — agree with ``/state.json``'s
+  disc-area motion in magnitude and direction (a loose band: one is a
+  single pixel, the other a rain-weighted disc mean; the band is there to
+  catch a unit slip or a sign flip, not to grade the flow).
 
 It also prints the diagnostics block (``ensemble_ms``, ``national_ms``,
 ``artifact_bytes``, ``cycle_ms``) — the deployment budget gates read from
@@ -55,7 +68,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     import numpy as np
@@ -77,6 +90,9 @@ except ImportError:  # pragma: no cover - environment guard
 DEFAULT_BASE_URL = os.environ.get("DMI_NOWCAST_BASE_URL", "http://localhost:8081")
 NODATA_LEVEL = 255  # quantised-PNG nodata level, per national_artifacts.py
 HTTP_TIMEOUT_S = 15.0
+EXPECTED_SCHEMA_VERSION = 2  # national_artifacts.MANIFEST_SCHEMA_VERSION
+TS_TOLERANCE_S = 90.0        # slack on any declared frame-validity instant
+MOTION_MAX_ABS_KMH = 120.0   # the motion grids' quantisation range
 
 
 class Report:
@@ -280,6 +296,229 @@ def _check_png(report: Report, base_url: str, token: str | None,
     report.add(ok, check, detail)
 
 
+def _check_schema_version(report: Report, manifest: dict) -> None:
+    version = manifest.get("schema_version")
+    report.add(
+        version == EXPECTED_SCHEMA_VERSION,
+        "manifest schema version",
+        f"served v{version}, this validator checks v{EXPECTED_SCHEMA_VERSION}"
+        + ("" if version == EXPECTED_SCHEMA_VERSION
+           else " — sidecar and validator are out of step; deploy or update one"),
+    )
+
+
+def _check_frame_validity(report: Report, manifest: dict) -> None:
+    """R1: every overlay declares what it depicts and when (schema v2)."""
+    overlays = [a for a in manifest.get("artifacts", [])
+                if a.get("product") == "overlay"]
+    if not overlays:
+        report.skip("overlay frame validity",
+                    "no overlay artifacts in the manifest (overlays disabled?)")
+        return
+
+    missing = [a["filename"] for a in overlays
+               if a.get("kind") is None or a.get("valid_ts_utc") is None]
+    if missing:
+        report.add(False, "overlay frame validity",
+                   f"{len(missing)} overlay(s) without kind/valid_ts_utc: "
+                   f"{missing[:3]}")
+        return
+    bad_kind = sorted({a["kind"] for a in overlays}
+                      - {"observation", "forecast"})
+    if bad_kind:
+        report.add(False, "overlay frame validity",
+                   f"unknown kind value(s): {bad_kind}")
+        return
+
+    radar_ts = _parse_ts(manifest["radar_ts_utc"])
+    frame_age_min = float(manifest.get("frame_age_min") or 0.0)
+    timestep_min = float(manifest.get("timestep_min") or 0.0)
+
+    obs = sorted((_parse_ts(a["valid_ts_utc"]) for a in overlays
+                  if a["kind"] == "observation"))
+    detail = f"{len(obs)} observed + {len(overlays) - len(obs)} forecast frames"
+    if not obs:
+        report.add(False, "observation frames ascending",
+                   "no observation frame — the loop has no 'now'")
+    else:
+        gaps = [(b - a).total_seconds() / 60.0 for a, b in zip(obs, obs[1:])]
+        ascending = all(g > 0 for g in gaps)
+        # "10 min apart modulo gaps": every step is a whole multiple of the
+        # measured frame spacing, so a missed cycle reads as 20 min, not as
+        # a broken history.
+        if timestep_min > 0:
+            on_cadence = all(
+                abs(g - round(g / timestep_min) * timestep_min) * 60.0
+                <= TS_TOLERANCE_S and round(g / timestep_min) >= 1
+                for g in gaps
+            )
+        else:
+            on_cadence = True
+        newest_is_radar = (
+            abs((obs[-1] - radar_ts).total_seconds()) <= TS_TOLERANCE_S
+        )
+        report.add(
+            ascending and on_cadence and newest_is_radar,
+            "observation frames ascending",
+            f"{detail}; gaps {[round(g, 1) for g in gaps]} min "
+            f"(cadence {timestep_min} min); newest = radar_ts: {newest_is_radar}",
+        )
+
+    # Forecast validity carries the frame-age correction: the advection
+    # horizon is lead + frame_age from radar-frame time, so a forecast
+    # frame depicts radar_ts + frame_age + lead, NOT radar_ts + lead.
+    errors = []
+    for entry in overlays:
+        if entry["kind"] != "forecast":
+            continue
+        expected = radar_ts + timedelta(
+            minutes=frame_age_min + float(entry["lead_min"]),
+        )
+        off_s = abs((_parse_ts(entry["valid_ts_utc"]) - expected).total_seconds())
+        if off_s > TS_TOLERANCE_S:
+            errors.append(f"{entry['filename']} off by {off_s:.0f}s")
+    report.add(
+        not errors,
+        "forecast frames = radar_ts + frame_age + lead",
+        f"frame_age {frame_age_min:.2f} min; "
+        + ("all consistent" if not errors else "; ".join(errors[:3])),
+    )
+
+
+def _decode_grid(base_url: str, token: str | None, entry: dict) -> np.ndarray:
+    """Fetch one grayscale artifact and dequantise it (255 → NaN)."""
+    png = _fetch(base_url, f"/nowcast/{entry['filename']}", token)
+    levels = np.asarray(Image.open(io.BytesIO(png)))
+    values = levels.astype("float64") * entry["scale"] + entry["offset"]
+    values[levels == entry.get("nodata", NODATA_LEVEL)] = math.nan
+    return values
+
+
+def _check_motion_grids(report: Report, base_url: str, token: str | None,
+                        manifest: dict, state: dict,
+                        lat: float, lon: float) -> None:
+    """R2: the two cell-motion grids decode to plausible, honest km/h."""
+    check = "motion grids decode"
+    entries = {
+        a["product"]: a for a in manifest.get("artifacts", [])
+        if a.get("product") in ("motion_east_kmh", "motion_north_kmh")
+    }
+    if len(entries) != 2:
+        report.add(
+            False, check,
+            f"expected both motion grids, manifest has {sorted(entries)} "
+            "(check the sidecar log for motion_grids_failed)",
+        )
+        return
+    if manifest.get("motion") is None:
+        report.add(False, check, "motion grids served without a motion block")
+        return
+
+    grids = {p: _decode_grid(base_url, token, e) for p, e in entries.items()}
+    east, north = grids["motion_east_kmh"], grids["motion_north_kmh"]
+    shape = tuple(manifest["grid"]["shape"])
+    problems = []
+    if east.shape != shape or north.shape != shape:
+        problems.append(f"shapes {east.shape}/{north.shape} != grid {shape}")
+    if not np.array_equal(np.isnan(east), np.isnan(north)):
+        problems.append("east/north disagree on where they carry nodata")
+    finite = ~np.isnan(east)
+    n_finite = int(finite.sum())
+    if n_finite == 0:
+        # Legal on a bone-dry day; say so rather than failing the deploy.
+        report.add(True, check,
+                   "all nodata — no echo anywhere in the composite "
+                   "(units/bounds unverifiable this cycle)")
+        return
+    if finite.all():
+        problems.append("no nodata anywhere — the support mask never applied "
+                        "(the composite corners are always off-radar)")
+    speed = np.hypot(east[finite], north[finite])
+    if float(speed.max()) > MOTION_MAX_ABS_KMH * math.sqrt(2) + 1.0:
+        problems.append(f"max speed {speed.max():.0f} km/h exceeds the range")
+    saturated = float(
+        (np.abs(east[finite]) >= MOTION_MAX_ABS_KMH - 1.0).mean()
+    )
+    if saturated > 0.01:
+        problems.append(f"{saturated:.1%} of east values pinned at the ±120 "
+                        "km/h range edge — quantisation range too small")
+    report.add(
+        not problems,
+        check,
+        f"{n_finite / east.size:.0%} of the grid carries motion; speed "
+        f"median {np.median(speed):.0f} / p99 {np.percentile(speed, 99):.0f} "
+        f"km/h (support radius {manifest['motion']['support_radius_km']} km)"
+        + ("" if not problems else "; " + "; ".join(problems)),
+    )
+
+    _check_motion_at_point(report, manifest, state, east, north, lat, lon)
+
+
+def _check_motion_at_point(report: Report, manifest: dict, state: dict,
+                           east: np.ndarray, north: np.ndarray,
+                           lat: float, lon: float) -> None:
+    """Motion grid at the reference pixel vs /state.json's disc motion.
+
+    Deliberately loose. The grid pixel is one 2 km cell; the state vector is
+    a rain-weighted mean over a 120 km disc, so they legitimately differ.
+    The band is sized to catch what actually goes wrong: a missing ``/f``
+    (16×), a px/frame-vs-km/h slip (a factor of ~7 at 500 m / 10 min), or a
+    row-axis sign flip.
+    """
+    check = "motion at reference pixel vs disc motion"
+    motion = state.get("motion") or {}
+    grid = manifest["grid"]
+    index = _grid_index(grid, lat, lon)
+    if index is None:
+        report.skip(check, "pyproj not importable — cannot project lat/lon")
+        return
+    row, col = index
+    h, w = grid["shape"]
+    if not (0 <= row < h and 0 <= col < w):
+        report.add(False, check, f"reference pixel ({row}, {col}) outside {h}x{w}")
+        return
+
+    # State's disc motion is px/min on the NATIVE grid.
+    native_pixel_m = grid["pixel_scale_x_m"] / max(1, grid["downsample_factor"])
+    disc_east = motion.get("dx_px_per_min", 0.0) * native_pixel_m * 60.0 / 1000.0
+    disc_north = -motion.get("dy_px_per_min", 0.0) * native_pixel_m * 60.0 / 1000.0
+    disc_speed = math.hypot(disc_east, disc_north)
+
+    px_east, px_north = float(east[row, col]), float(north[row, col])
+    if math.isnan(px_east):
+        raining = (state.get("now") or {}).get("raining")
+        report.add(
+            not raining, check,
+            f"pixel ({row}, {col}) has no motion estimate "
+            f"(raining={raining}) — expected off the echo, not on it",
+        )
+        return
+
+    px_speed = math.hypot(px_east, px_north)
+    detail = (f"pixel ({row}, {col}) {px_speed:.1f} km/h "
+              f"(E {px_east:+.1f}, N {px_north:+.1f}) vs disc "
+              f"{disc_speed:.1f} km/h (E {disc_east:+.1f}, N {disc_north:+.1f})")
+    if disc_speed < 1.0:
+        report.add(px_speed <= 20.0, check,
+                   detail + " — disc nearly stationary, magnitude only")
+        return
+    ratio = px_speed / disc_speed
+    detail += f", ratio {ratio:.2f}"
+    # Per-component sign agreement catches an inverted axis even when the
+    # other component dominates (a half-plane / cosine test does not).
+    # Only components big enough to have a meaningful sign take part.
+    flipped = [
+        name for name, px_v, disc_v in (
+            ("east", px_east, disc_east), ("north", px_north, disc_north),
+        )
+        if abs(px_v) > 5.0 and abs(disc_v) > 5.0 and (px_v > 0) != (disc_v > 0)
+    ]
+    if flipped:
+        detail += (f"; {'/'.join(flipped)} points the opposite way to the "
+                   "disc vector — axis sign convention?")
+    report.add(0.2 <= ratio <= 5.0 and not flipped, check, detail)
+
+
 def _check_calibration(report: Report, state: dict, forecast: dict,
                        manifest: dict) -> None:
     """Calibration story consistent across state/forecast/manifest (§B5).
@@ -445,6 +684,12 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _check_eta(report, state, forecast, timestep_min=float(ts_min))
     _check_png(report, args.base_url, args.token, manifest, forecast, lat, lon)
+
+    # R1 / R2 — the website's animation history and click-anywhere motion.
+    _check_schema_version(report, manifest)
+    _check_frame_validity(report, manifest)
+    _check_motion_grids(report, args.base_url, args.token, manifest, state,
+                        lat, lon)
 
     print(report.render())
     _print_diagnostics(state)

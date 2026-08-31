@@ -16,15 +16,18 @@ Quantisation ranges (fixed, documented, stable across cycles so browser
 consumers can hard-code expectations; the authoritative per-artifact
 scale/offset still travels in the manifest):
 
-===============  ==========  ============================================
-product          range       rationale
-===============  ==========  ============================================
-``p_rain``       0 – 1       probability is naturally [0, 1]
-``eta``          0 – 120 min covers any ETA the 60-min STEPS horizon can
-                             produce, with headroom for longer horizons
-``intensity``    0 – 100     mm/h — the Z–R rain-rate cap (CLAUDE.md
-                             contract), values above are clamped upstream
-===============  ==========  ============================================
+=================  ============  ==========================================
+product            range         rationale
+=================  ============  ==========================================
+``p_rain``         0 – 1         probability is naturally [0, 1]
+``eta``            0 – 120 min   covers any ETA the 60-min STEPS horizon can
+                                 produce, with headroom for longer horizons
+``intensity``      0 – 100       mm/h — the Z–R rain-rate cap (CLAUDE.md
+                                 contract), values above are clamped upstream
+``motion_*_kmh``   −120 – +120   km/h — the flow is clipped to 30 px/frame
+                                 upstream, i.e. ±90 km/h at 500 m / 10 min;
+                                 ±120 leaves headroom for a shorter cadence
+=================  ============  ==========================================
 
 Levels 0…254 span the range linearly (``value = level * scale + offset``),
 so the worst-case round-trip error is half a step: ½ · range/254.
@@ -39,7 +42,18 @@ would create a cycle).
 
 A pruner runs after each write and keeps the newest ``keep_cycles`` cycles
 (decided: 24 ≈ 2 h at the 5-min cadence), parsing stamps out of filenames
-and ignoring anything that doesn't carry one — foreign files survive.
+and ignoring anything that doesn't carry one — foreign files survive. Any
+stamp the manifest just written *references* is protected on top of that,
+so the observation history below can never outlive its own files.
+
+Schema v2 — animation history + frame validity (R1). Every overlay entry
+carries ``valid_ts_utc`` (the instant the frame depicts) and ``kind``
+(``"observation"`` | ``"forecast"``), and the manifest additionally lists
+the up-to-``history_frames`` most recent PRIOR cycles' ``overlay_now``
+PNGs so the loop can start 30 min in the past. History is pure
+reference — those files were written by earlier cycles and are neither
+re-encoded nor re-counted here — and only files present on disk at write
+time are listed, so a cold start simply has a shorter (or empty) history.
 
 Grid geometry: the manifest's ``grid`` block serialises everything a Phase C
 browser needs to sample the product grids client-side. The ×4 downsample in
@@ -60,20 +74,33 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import structlog
 
 from dmi_nowcast_core.geo import CompositeGeo
-from dmi_nowcast_core.national import NationalProducts
+from dmi_nowcast_core.national import (
+    DEFAULT_MOTION_SUPPORT_RADIUS_KM,
+    NationalProducts,
+)
 from dmi_nowcast_core.render import _apply_colormap
 
 _log = structlog.get_logger(__name__)
 
 # Manifest schema version — bump on any breaking change to the JSON layout.
-MANIFEST_SCHEMA_VERSION = 1
+# v2 (R1/R2): overlay entries gained ``valid_ts_utc`` + ``kind``, the
+# manifest gained trailing observation-history entries, a ``motion`` block
+# and the two ``motion_*_kmh`` product grids.
+MANIFEST_SCHEMA_VERSION = 2
+
+# Trailing observed frames referenced by each manifest — 3 prior cycles is
+# ~30 min at the 10-min fullRange cadence.
+DEFAULT_HISTORY_FRAMES = 3
+
+# Prior cycles' "now" overlays, the only artifact the history references.
+_OVERLAY_NOW_RE = re.compile(r"^overlay_now_(\d{12})\.png$")
 
 # Stable alias for the newest cycle's manifest; served by A3's
 # ``GET /nowcast/manifest.json``. Never pruned (carries no cycle stamp).
@@ -104,11 +131,16 @@ class QuantSpec:
         return self.lo
 
 
+# Motion grids are symmetric about zero; ±120 km/h (see module docstring).
+MOTION_MAX_ABS_KMH = 120.0
+
 # The documented, fixed quantisation ranges (see module docstring).
 QUANT_SPECS: dict[str, QuantSpec] = {
     "p_rain": QuantSpec(0.0, 1.0),
     "eta": QuantSpec(0.0, 120.0),
     "intensity": QuantSpec(0.0, 100.0),
+    "motion_east_kmh": QuantSpec(-MOTION_MAX_ABS_KMH, MOTION_MAX_ABS_KMH),
+    "motion_north_kmh": QuantSpec(-MOTION_MAX_ABS_KMH, MOTION_MAX_ABS_KMH),
 }
 
 
@@ -162,6 +194,10 @@ def write_national_artifacts(
     out_dir: Path,
     keep_cycles: int = 24,
     calibration: dict | None = None,
+    motion_east_kmh: np.ndarray | None = None,
+    motion_north_kmh: np.ndarray | None = None,
+    motion_support_radius_km: float = DEFAULT_MOTION_SUPPORT_RADIUS_KM,
+    history_frames: int = DEFAULT_HISTORY_FRAMES,
 ) -> NationalArtifactsResult:
     """Write one cycle's national artifacts + manifest into ``out_dir``.
 
@@ -171,6 +207,18 @@ def write_national_artifacts(
     skips the overlays. ``geo`` must be the native composite's geometry —
     the product grids' geometry is derived from it via
     ``products.downsample_factor``.
+
+    ``motion_east_kmh`` / ``motion_north_kmh`` are the R2 cell-motion grids
+    on the **product** grid (same shape as ``products.eta_min``), in km/h,
+    east- and north-positive, NaN where no honest estimate exists — as
+    returned by ``dmi_nowcast_core.national.motion_grids_kmh``. Pass both or
+    neither; ``motion_support_radius_km`` is echoed into the manifest's
+    ``motion`` block so the client can explain the nodata region.
+
+    ``history_frames`` caps how many prior cycles' ``overlay_now`` PNGs the
+    manifest references as observation history (0 disables). Only files
+    still on disk are referenced, and their stamps are protected from this
+    cycle's pruning.
 
     ``calibration`` is the §B4 calibration-metadata block echoed verbatim
     into the manifest (fitted_at, curve-file metadata, ``calibrated_leads``)
@@ -188,6 +236,12 @@ def write_national_artifacts(
         raise ValueError("radar_ts_utc and generated_at_utc must be timezone-aware")
     if keep_cycles < 1:
         raise ValueError(f"keep_cycles must be >= 1, got {keep_cycles}")
+    if history_frames < 0:
+        raise ValueError(f"history_frames must be >= 0, got {history_frames}")
+    if (motion_east_kmh is None) != (motion_north_kmh is None):
+        raise ValueError(
+            "motion_east_kmh and motion_north_kmh must be passed together"
+        )
     radar_utc = radar_ts_utc.astimezone(timezone.utc)
     generated_utc = generated_at_utc.astimezone(timezone.utc)
     stamp = radar_utc.strftime(_STAMP_FMT)
@@ -234,8 +288,39 @@ def write_national_artifacts(
                     products.intensity_mm_h.shape, units="mm/h"),
     )
 
+    # --- R2 cell-motion grids → grayscale PNGs -----------------------------
+    # Same product grid, same quantisation machinery as everything above, so
+    # the browser samples an arrow exactly the way it samples a probability.
+    if motion_east_kmh is not None and motion_north_kmh is not None:
+        product_shape = products.eta_min.shape
+        for product, field in (
+            ("motion_east_kmh", motion_east_kmh),
+            ("motion_north_kmh", motion_north_kmh),
+        ):
+            grid = np.asarray(field)
+            if grid.shape != product_shape:
+                raise ValueError(
+                    f"{product} must be on the product grid {product_shape}, "
+                    f"got {grid.shape}"
+                )
+            spec = QUANT_SPECS[product]
+            _emit(
+                f"{product}_{stamp}.png",
+                _encode_gray_png(quantise(grid, spec)),
+                _grid_entry(f"{product}_{stamp}.png", product, None, spec,
+                            grid.shape, units="km/h"),
+            )
+
     # --- 500 m deterministic overlays → RGBA PNGs --------------------------
+    # Frame validity (schema v2). Lead 0 IS the radar observation, so it is
+    # valid at ``radar_utc``. A forecast lead is "minutes from now", and the
+    # caller advects it by ``lead + frame_age_min`` from radar-frame time
+    # (compute.py's ``advect_field_series`` horizons) — so its validity is
+    # ``radar_utc + frame_age_min + lead``, NOT ``radar_utc + lead``. At the
+    # 10-min fullRange cadence the frame age is a whole animation step, so
+    # the difference is not cosmetic.
     overlay_shape: tuple[int, int] | None = None
+    overlay_start = len(artifacts)
     for lead in sorted((overlay_fields_mm_h or {})):
         field = np.asarray(overlay_fields_mm_h[lead])
         if field.ndim != 2:
@@ -250,6 +335,10 @@ def write_national_artifacts(
         overlay_shape = field.shape
         name = (f"overlay_now_{stamp}.png" if lead == 0
                 else f"overlay_{lead}min_{stamp}.png")
+        observed = int(lead) == 0
+        valid_utc = radar_utc if observed else radar_utc + timedelta(
+            minutes=float(products.frame_age_min) + float(lead),
+        )
         _emit(
             name,
             _encode_rgba_png(_apply_colormap(field)),
@@ -257,10 +346,26 @@ def write_national_artifacts(
                 "filename": name,
                 "product": "overlay",
                 "lead_min": int(lead),
+                "kind": "observation" if observed else "forecast",
+                "valid_ts_utc": valid_utc.isoformat(),
                 "encoding": "rgba8",
                 "shape": [int(field.shape[0]), int(field.shape[1])],
             },
         )
+
+    # --- observation history: reference prior cycles' "now" overlays -------
+    # Zero re-encode, zero new bytes — the animation just gets a past. Only
+    # meaningful alongside a "now" frame, so it rides with the overlays.
+    history: list[dict] = []
+    if overlay_shape is not None and history_frames > 0:
+        history = _history_entries(
+            out_dir,
+            stamp=stamp,
+            radar_utc=radar_utc,
+            shape=overlay_shape,
+            limit=history_frames,
+        )
+        artifacts[overlay_start:overlay_start] = history
 
     # --- manifest (written last, atomically) -------------------------------
     manifest = _build_manifest(
@@ -272,6 +377,21 @@ def write_national_artifacts(
         artifacts=artifacts,
         overlay_shape=overlay_shape,
         calibration=calibration,
+        motion=(
+            {
+                "grid": "product",
+                "support_radius_km": float(motion_support_radius_km),
+                "max_abs_kmh": MOTION_MAX_ABS_KMH,
+                "convention": (
+                    "motion_east_kmh / motion_north_kmh are the cell motion "
+                    "in km/h on the product grid (see \"grid\"), east- and "
+                    "north-positive. nodata (255) outside radar coverage and "
+                    "farther than support_radius_km from any echo — there is "
+                    "no motion estimate there, do not draw an arrow."
+                ),
+            }
+            if motion_east_kmh is not None else None
+        ),
     )
     manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
     manifest_path = out_dir / f"manifest_{stamp}.json"
@@ -284,7 +404,13 @@ def write_national_artifacts(
     bytes_written += len(manifest_bytes)
 
     # --- retention ---------------------------------------------------------
-    pruned_files, pruned_bytes = _prune_old_cycles(out_dir, keep_cycles)
+    # Whatever the just-published manifest points at is off limits, however
+    # small ``keep_cycles`` gets: a manifest referencing a file the same call
+    # deleted is the one failure mode the history feature can introduce.
+    pruned_files, pruned_bytes = _prune_old_cycles(
+        out_dir, keep_cycles,
+        protected_stamps=_referenced_stamps(artifacts) | {stamp},
+    )
 
     _log.info(
         "national_artifacts_written",
@@ -292,6 +418,7 @@ def write_national_artifacts(
         files=len(files_written),
         bytes=bytes_written,
         overlays=len(overlay_fields_mm_h or {}),
+        history=len(history),
         pruned_files=pruned_files,
         pruned_bytes=pruned_bytes,
         write_ms=round((time.perf_counter() - t0) * 1000, 1),
@@ -304,6 +431,83 @@ def write_national_artifacts(
         pruned_files=pruned_files,
         pruned_bytes=pruned_bytes,
     )
+
+
+def _history_entries(
+    out_dir: Path,
+    *,
+    stamp: str,
+    radar_utc: datetime,
+    shape: tuple[int, int],
+    limit: int,
+) -> list[dict]:
+    """Manifest entries for the newest prior cycles' ``overlay_now`` PNGs.
+
+    Reference-only: these files were written (and their bytes counted) by
+    earlier cycles. Discovery is a directory listing, so a file that has
+    been pruned, never written, or removed by hand simply isn't referenced —
+    which is also what makes a cold start valid rather than special-cased.
+
+    Validity time: the cycle stamp IS the radar observation time (the caller
+    passes ``radar_ts_utc=composite.timestamp_utc``), but the stamp is
+    minute-resolution, so the sibling ``manifest_<stamp>.json``'s
+    ``radar_ts_utc`` is preferred when readable — it is the same instant
+    with its seconds intact. The stamp is the fallback, never a guess.
+
+    Entries are oldest-first and carry a NEGATIVE ``lead_min``: minutes of
+    the past relative to this cycle's radar frame. The filename is an
+    existing one, so the ``_STAMP_RE`` / ``_NOWCAST_NAME_RE`` naming contract
+    is untouched.
+    """
+    stamps: list[str] = []
+    try:
+        for path in out_dir.iterdir():
+            if not path.is_file():
+                continue
+            match = _OVERLAY_NOW_RE.match(path.name)
+            if match is not None and match.group(1) < stamp:
+                stamps.append(match.group(1))
+    except OSError as exc:  # pragma: no cover - unreadable dir
+        _log.warning("national_history_scan_failed", error=str(exc))
+        return []
+
+    entries: list[dict] = []
+    for past_stamp in sorted(stamps, reverse=True)[:limit]:
+        valid = _history_valid_ts(out_dir, past_stamp)
+        entries.append({
+            "filename": f"overlay_now_{past_stamp}.png",
+            "product": "overlay",
+            "lead_min": int(round((valid - radar_utc).total_seconds() / 60.0)),
+            "kind": "observation",
+            "valid_ts_utc": valid.isoformat(),
+            "encoding": "rgba8",
+            "shape": [int(shape[0]), int(shape[1])],
+        })
+    entries.reverse()  # oldest first — animation order
+    return entries
+
+
+def _history_valid_ts(out_dir: Path, past_stamp: str) -> datetime:
+    """Radar validity of a past cycle: its own manifest, else its stamp."""
+    manifest_path = out_dir / f"manifest_{past_stamp}.json"
+    try:
+        raw = json.loads(manifest_path.read_text())["radar_ts_utc"]
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return datetime.strptime(past_stamp, _STAMP_FMT).replace(tzinfo=timezone.utc)
+
+
+def _referenced_stamps(artifacts: list[dict]) -> set[str]:
+    """Cycle stamps of every file the manifest points at."""
+    stamps = set()
+    for entry in artifacts:
+        match = _STAMP_RE.match(str(entry.get("filename", "")))
+        if match is not None:
+            stamps.add(match.group(1))
+    return stamps
 
 
 def _grid_entry(
@@ -338,6 +542,7 @@ def _build_manifest(
     artifacts: list[dict],
     overlay_shape: tuple[int, int] | None,
     calibration: dict | None = None,
+    motion: dict | None = None,
 ) -> dict:
     composite = geo.composite
     x_ul, y_ul = geo.projection_origin_m
@@ -375,6 +580,11 @@ def _build_manifest(
         "leads_min": [int(lead) for lead in products.leads_min],
         "grid": grid,
         "overlay_grid": overlay_grid,
+        # R2 motion grids: geometry is the product ``grid`` block above (same
+        # shape, same UL corner, same pixel scale) — not duplicated here.
+        # This block carries only what geometry can't say: the nodata rule.
+        # null when no motion grids were written this cycle.
+        "motion": motion,
         # §B4 calibration metadata: null when the served grids are raw;
         # otherwise fitted_at + curve-file echo + the exact leads whose
         # p_rain grids went through a curve (raw is recoverable by
@@ -415,13 +625,22 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
     tmp.replace(target)
 
 
-def _prune_old_cycles(out_dir: Path, keep_cycles: int) -> tuple[int, int]:
+def _prune_old_cycles(
+    out_dir: Path,
+    keep_cycles: int,
+    *,
+    protected_stamps: set[str] | frozenset[str] = frozenset(),
+) -> tuple[int, int]:
     """Delete artifacts/manifests of all but the newest ``keep_cycles`` cycles.
 
     Cycle membership is parsed from the ``_YYYYMMDDHHMM.png|json`` filename
     stamp; files that don't match (foreign files, the stable
-    ``manifest.json`` alias, ``*.tmp`` leftovers) are left alone. Returns
-    ``(files_deleted, bytes_deleted)``.
+    ``manifest.json`` alias, ``*.tmp`` leftovers) are left alone.
+    ``protected_stamps`` survive regardless of age — the caller passes every
+    stamp the manifest it just wrote references, which makes "the newest
+    manifest never points at a deleted file" an invariant rather than a
+    consequence of ``keep_cycles`` happening to exceed the history depth.
+    Returns ``(files_deleted, bytes_deleted)``.
     """
     by_stamp: dict[str, list[Path]] = {}
     for path in out_dir.iterdir():
@@ -432,7 +651,10 @@ def _prune_old_cycles(out_dir: Path, keep_cycles: int) -> tuple[int, int]:
             continue
         by_stamp.setdefault(match.group(1), []).append(path)
 
-    doomed_stamps = sorted(by_stamp, reverse=True)[keep_cycles:]
+    doomed_stamps = [
+        s for s in sorted(by_stamp, reverse=True)[keep_cycles:]
+        if s not in protected_stamps
+    ]
     files_deleted = 0
     bytes_deleted = 0
     for doomed_stamp in doomed_stamps:

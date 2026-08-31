@@ -9,6 +9,10 @@ forecast grids on the same (downsampled) grid:
 - ``eta_min``: per-pixel ensemble-median time until rain arrives,
 - ``intensity_mm_h``: per-pixel ensemble-median raw rain rate at arrival.
 
+:func:`motion_grids_kmh` adds a fourth, non-ensemble product on the same
+grid: the cell-motion field in km/h (east / north components), nodata away
+from the echo — see its docstring.
+
 This module is pure core: numpy only, no sidecar / FastAPI / homeassistant
 imports (and none of the heavier core deps like pyproj — geolocation stays
 with the caller).
@@ -41,6 +45,14 @@ DEFAULT_THRESHOLD_MM_H = 0.1
 
 # Lead times served on the national products (Phase A plan §A1).
 DEFAULT_LEADS_MIN = (10, 20, 30, 45, 60)
+
+# Motion product (R2): how far from the echo a motion estimate is still
+# published. Beyond it the grids carry nodata and the UI says "no cell
+# motion estimate" — never a fabricated arrow. 20 km is two Farnebäck
+# e-folds (``dense_flow.DEFAULT_EFOLD_KM`` = 10 km): the last distance at
+# which ``complete_flow``'s output still carries measured structure
+# (weight e⁻² ≈ 0.14) rather than being bulk motion in local disguise.
+DEFAULT_MOTION_SUPPORT_RADIUS_KM = 20.0
 
 
 @dataclass(frozen=True)
@@ -211,4 +223,108 @@ def national_products(
         frame_age_min=float(frame_age_min),
         downsample_factor=int(downsample_factor),
         n_members=int(n_members),
+    )
+
+
+def motion_grids_kmh(
+    vy: np.ndarray,
+    vx: np.ndarray,
+    rain_mm_h: np.ndarray,
+    *,
+    pixel_km: float,
+    timestep_min: float,
+    downsample_factor: int = 4,
+    support_threshold_mm_h: float = DEFAULT_THRESHOLD_MM_H,
+    support_radius_km: float = DEFAULT_MOTION_SUPPORT_RADIUS_KM,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cell motion as two physical-unit grids on the ×4 product grid (R2).
+
+    The website's click-anywhere motion arrow samples these two grids the
+    same way it samples ``p_rain`` / ``eta`` / ``intensity`` — so they are
+    published **in km/h**, east- and north-positive, and the browser does no
+    unit algebra and no axis flipping.
+
+    Parameters
+    ----------
+    vy, vx:
+        Native-grid flow in pixels per frame, as consumed by the advection
+        and the STEPS velocity — i.e. **after** ``dense_flow.complete_flow``
+        and the caller's sanitise/clip, so the values inside the echo are
+        the measured field and the far field is not a stalled zero.
+    rain_mm_h:
+        Native-grid rain rate for the same frame (NaN outside the radar
+        composite). Defines the echo support and the coverage mask.
+    pixel_km:
+        NATIVE pixel size in km (0.5 on the DMI 500 m composite).
+    timestep_min:
+        Minutes between the two frames the flow was estimated from — the
+        "per frame" in ``vy``/``vx``'s units (``dt_min``, ~10 min on the
+        fullRange-only feed).
+    downsample_factor:
+        Product-grid stride ``f``. Sampling matches
+        ``probabilistic.run_ensemble``'s velocity handling exactly:
+        ``v[::f, ::f] / f`` — stride-slice, **then divide by f**, because a
+        given physical motion spans ``f`` times fewer pixels once the pixels
+        are ``f`` times bigger. The ``/f`` and the ``f×`` in the pixel size
+        cancel, so the published km/h are the native ones; the pairing is
+        kept explicit rather than cancelled by hand so this function stays
+        readable against ``run_ensemble``.
+
+    Returns
+    -------
+    ``(motion_east_kmh, motion_north_kmh)`` float32 on the downsampled grid.
+    Grid rows grow southward, so north = ``-vy``.
+
+    Nodata (NaN, → level 255 once quantised) wherever an arrow would be a
+    fabrication: outside the radar composite, and farther than
+    ``support_radius_km`` from any pixel at or above
+    ``support_threshold_mm_h``. With no echo anywhere in the composite the
+    whole grid is nodata.
+    """
+    from .dense_flow import distance_to_support
+
+    vy_arr = np.asarray(vy, dtype=np.float32)
+    vx_arr = np.asarray(vx, dtype=np.float32)
+    rain = np.asarray(rain_mm_h, dtype=np.float32)
+    if vy_arr.shape != vx_arr.shape or vy_arr.shape != rain.shape:
+        raise ValueError(
+            "vy, vx and rain_mm_h must share one shape; got "
+            f"{vy_arr.shape}, {vx_arr.shape}, {rain.shape}"
+        )
+    if vy_arr.ndim != 2:
+        raise ValueError(f"motion grids need 2-D inputs, got {vy_arr.ndim}-D")
+    if pixel_km <= 0:
+        raise ValueError(f"pixel_km must be > 0, got {pixel_km}")
+    if timestep_min <= 0:
+        raise ValueError(f"timestep_min must be > 0, got {timestep_min}")
+    if downsample_factor < 1:
+        raise ValueError(f"downsample_factor must be >= 1, got {downsample_factor}")
+
+    f = int(downsample_factor)
+    # Velocity on the product grid, in PRODUCT pixels per frame.
+    vy_ds = vy_arr[::f, ::f] / np.float32(f)
+    vx_ds = vx_arr[::f, ::f] / np.float32(f)
+    rain_ds = rain[::f, ::f]
+    product_pixel_km = float(pixel_km) * f
+
+    # product px/frame → km/h. (product_pixel_km carries the same f the
+    # velocity was divided by, so this equals the native-grid conversion.)
+    to_kmh = np.float32(product_pixel_km * 60.0 / float(timestep_min))
+    east = (vx_ds * to_kmh).astype(np.float32)
+    north = (-vy_ds * to_kmh).astype(np.float32)
+
+    with np.errstate(invalid="ignore"):
+        support = np.isfinite(rain_ds) & (rain_ds >= np.float32(support_threshold_mm_h))
+    if support.any():
+        distance_km = distance_to_support(support) * np.float32(product_pixel_km)
+        valid = np.isfinite(rain_ds) & (distance_km <= np.float32(support_radius_km))
+    else:
+        # No echo in the composite: nothing to attach a motion estimate to.
+        valid = np.zeros(rain_ds.shape, dtype=bool)
+    valid &= np.isfinite(east) & np.isfinite(north)
+
+    nan = np.float32(np.nan)
+    return (
+        np.where(valid, east, nan).astype(np.float32),
+        np.where(valid, north, nan).astype(np.float32),
     )

@@ -10,7 +10,14 @@ Covers:
 - the manifest schema incl. the ``grid`` geometry block verified against
   the synthetic composite,
 - overlay RGBA size + NaN transparency (render.py conventions),
-- retention pruning (>24 cycles → newest 24 survive, foreign files kept),
+- R1: schema-v2 ``kind`` / ``valid_ts_utc`` on every overlay, and the
+  30-min observation history — cold start, missing-file filtering,
+  validity recovered from the prior cycle's manifest,
+- R2: the two motion grids — manifest entries, quantisation round-trip
+  with signs intact, the km/h units pinned end-to-end from a synthetic
+  native flow, and nodata beyond the echo-support radius,
+- retention pruning (>24 cycles → newest 24 survive, foreign files kept,
+  and never a stamp the newest manifest references),
 - write atomicity (temp-then-replace; manifest written last).
 """
 from __future__ import annotations
@@ -27,7 +34,7 @@ from PIL import Image
 from pyproj import CRS, Transformer
 
 from dmi_nowcast_core.geo import CompositeGeo
-from dmi_nowcast_core.national import NationalProducts
+from dmi_nowcast_core.national import NationalProducts, motion_grids_kmh
 from dmi_nowcast_core.parse import parse_composite
 from dmi_nowcast_sidecar import national_artifacts as na
 from dmi_nowcast_sidecar.national_artifacts import (
@@ -234,9 +241,12 @@ def test_manifest_schema_and_geometry(geo: CompositeGeo, tmp_path: Path) -> None
     assert set(manifest) == {
         "schema_version", "cycle", "radar_ts_utc", "generated_at_utc",
         "threshold_mm_h", "timestep_min", "frame_age_min", "n_members",
-        "leads_min", "grid", "overlay_grid", "calibration", "artifacts",
+        "leads_min", "grid", "overlay_grid", "motion", "calibration",
+        "artifacts",
     }
-    assert manifest["schema_version"] == MANIFEST_SCHEMA_VERSION
+    assert manifest["schema_version"] == MANIFEST_SCHEMA_VERSION == 2
+    # No motion grids passed → no motion block.
+    assert manifest["motion"] is None
     # §B4: no calibration block passed → served grids are raw → null.
     assert manifest["calibration"] is None
     assert manifest["cycle"] == STAMP
@@ -299,8 +309,8 @@ def test_manifest_schema_and_geometry(geo: CompositeGeo, tmp_path: Path) -> None
                  "scale", "offset", "nodata", "units", "shape"}
     for name, entry in entries.items():
         if entry["product"] == "overlay":
-            assert set(entry) == {"filename", "product", "lead_min",
-                                  "encoding", "shape"}
+            assert set(entry) == {"filename", "product", "lead_min", "kind",
+                                  "valid_ts_utc", "encoding", "shape"}
             assert entry["encoding"] == "rgba8"
         else:
             assert set(entry) == gray_keys
@@ -312,6 +322,19 @@ def test_manifest_schema_and_geometry(geo: CompositeGeo, tmp_path: Path) -> None
     assert entries[f"intensity_{STAMP}.png"]["lead_min"] is None
     assert entries[f"overlay_now_{STAMP}.png"]["lead_min"] == 0
     assert entries[f"overlay_10min_{STAMP}.png"]["lead_min"] == 10
+
+    # Schema v2 frame validity. The "now" overlay IS the radar frame; a
+    # forecast lead is minutes from NOW, and the caller advected it by
+    # ``lead + frame_age_min`` from radar-frame time — so its validity is
+    # radar_ts + frame_age + lead, not radar_ts + lead.
+    now_entry = entries[f"overlay_now_{STAMP}.png"]
+    assert now_entry["kind"] == "observation"
+    assert datetime.fromisoformat(now_entry["valid_ts_utc"]) == RADAR_TS
+    fc_entry = entries[f"overlay_10min_{STAMP}.png"]
+    assert fc_entry["kind"] == "forecast"
+    assert datetime.fromisoformat(fc_entry["valid_ts_utc"]) == (
+        RADAR_TS + timedelta(minutes=2.5 + 10)   # frame_age_min = 2.5
+    )
 
 
 def test_timestamps_are_normalised_to_utc(geo: CompositeGeo, tmp_path: Path) -> None:
@@ -397,6 +420,286 @@ def test_no_overlays_is_allowed(geo: CompositeGeo, tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# R1 — 30-min observation history in the manifest
+# ---------------------------------------------------------------------------
+
+def _overlays(manifest: dict) -> list[dict]:
+    return [e for e in manifest["artifacts"] if e["product"] == "overlay"]
+
+
+def _write_cycle(geo: CompositeGeo, out_dir: Path, ts: datetime, **overrides):
+    """One full cycle at radar time ``ts`` (overlays on, so it leaves an
+    ``overlay_now`` behind for later cycles to reference)."""
+    return _write(
+        geo, out_dir,
+        radar_ts_utc=ts,
+        generated_at_utc=ts + timedelta(minutes=3),
+        **overrides,
+    )
+
+
+def test_history_is_empty_on_a_cold_start(geo: CompositeGeo, tmp_path: Path) -> None:
+    """First cycle ever: nothing prior on disk, so no history entries — and
+    that is a valid manifest, not a degraded one."""
+    result = _write(geo, tmp_path)
+    manifest = json.loads(result.manifest_path.read_text())
+    kinds = [e["kind"] for e in _overlays(manifest)]
+    assert kinds.count("observation") == 1, "only the current 'now' frame"
+    assert all(e["lead_min"] >= 0 for e in _overlays(manifest))
+
+
+def test_history_references_three_prior_cycles(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """Five cycles at the 10-min fullRange cadence: the newest manifest
+    references the previous THREE observations, zero re-encode."""
+    base = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    for i in range(5):
+        result = _write_cycle(geo, tmp_path, base + timedelta(minutes=10 * i))
+    manifest = json.loads(result.manifest_path.read_text())
+
+    history = [e for e in _overlays(manifest)
+               if e["kind"] == "observation" and e["lead_min"] < 0]
+    assert [e["lead_min"] for e in history] == [-30, -20, -10]
+    assert [e["filename"] for e in history] == [
+        f"overlay_now_{(base + timedelta(minutes=10 * i)).strftime('%Y%m%d%H%M')}.png"
+        for i in (1, 2, 3)
+    ]
+    # Strictly ascending validity, 10 min apart, ending at this cycle's radar ts.
+    valid = [datetime.fromisoformat(e["valid_ts_utc"]) for e in history]
+    assert valid == sorted(valid) and len(set(valid)) == 3
+    assert all(b - a == timedelta(minutes=10) for a, b in zip(valid, valid[1:]))
+    assert valid[-1] + timedelta(minutes=10) == base + timedelta(minutes=40)
+
+    # Pure reference: no history file is (re-)written or re-counted.
+    written = {p.name for p in result.files_written}
+    assert not any(e["filename"] in written for e in history)
+    # Every referenced file is really there — the whole point of the filter.
+    for entry in history:
+        assert (tmp_path / entry["filename"]).is_file()
+    # History frames reuse the existing filenames, so the serving regex holds.
+    for entry in history:
+        assert _STAMP_IN_NAME.search(entry["filename"])
+
+
+def test_history_only_references_files_that_exist(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """A hand-deleted (or already-pruned) frame drops out of the history
+    rather than becoming a 404 in the animation."""
+    base = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    for i in range(4):
+        _write_cycle(geo, tmp_path, base + timedelta(minutes=10 * i))
+    gone = tmp_path / f"overlay_now_{(base + timedelta(minutes=10)).strftime('%Y%m%d%H%M')}.png"
+    gone.unlink()
+
+    result = _write_cycle(geo, tmp_path, base + timedelta(minutes=40))
+    manifest = json.loads(result.manifest_path.read_text())
+    history = [e for e in _overlays(manifest) if e["lead_min"] < 0]
+    assert gone.name not in {e["filename"] for e in history}
+    # It falls back to the next-oldest survivor rather than shrinking to 2.
+    assert [e["lead_min"] for e in history] == [-40, -20, -10]
+    for entry in history:
+        assert (tmp_path / entry["filename"]).is_file()
+
+
+def test_history_validity_comes_from_the_prior_manifest(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """The stamp is minute-resolution; the sibling manifest keeps the
+    seconds. Validity must come from the manifest when it is readable."""
+    odd = datetime(2026, 8, 28, 12, 0, 42, tzinfo=timezone.utc)
+    _write_cycle(geo, tmp_path, odd)
+    result = _write_cycle(geo, tmp_path, odd + timedelta(minutes=10))
+    manifest = json.loads(result.manifest_path.read_text())
+    history = [e for e in _overlays(manifest) if e["lead_min"] < 0]
+    assert len(history) == 1
+    assert datetime.fromisoformat(history[0]["valid_ts_utc"]) == odd
+
+    # Manifest unreadable → the stamp is the documented fallback.
+    (tmp_path / f"manifest_{odd.strftime('%Y%m%d%H%M')}.json").write_text("{oops")
+    result = _write_cycle(geo, tmp_path, odd + timedelta(minutes=20))
+    manifest = json.loads(result.manifest_path.read_text())
+    fallback = [e for e in _overlays(manifest)
+                if e["filename"] == f"overlay_now_{odd.strftime('%Y%m%d%H%M')}.png"]
+    assert datetime.fromisoformat(fallback[0]["valid_ts_utc"]) == odd.replace(second=0)
+
+
+def test_history_frames_can_be_disabled(geo: CompositeGeo, tmp_path: Path) -> None:
+    base = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    _write_cycle(geo, tmp_path, base)
+    result = _write_cycle(geo, tmp_path, base + timedelta(minutes=10),
+                          history_frames=0)
+    manifest = json.loads(result.manifest_path.read_text())
+    assert not [e for e in _overlays(manifest) if e["lead_min"] < 0]
+
+
+def test_no_history_without_a_now_frame(geo: CompositeGeo, tmp_path: Path) -> None:
+    """History is the animation's past; with no overlays written this cycle
+    there is no animation to give a past to."""
+    base = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    _write_cycle(geo, tmp_path, base)
+    result = _write_cycle(geo, tmp_path, base + timedelta(minutes=10),
+                          overlay_fields_mm_h=None)
+    manifest = json.loads(result.manifest_path.read_text())
+    assert not _overlays(manifest)
+
+
+# ---------------------------------------------------------------------------
+# R2 — cell-motion grids
+# ---------------------------------------------------------------------------
+
+def _motion_grids() -> tuple[np.ndarray, np.ndarray]:
+    """Product-grid motion: +24 km/h east, +12 km/h north, with a NaN
+    (no-estimate) corner."""
+    east = np.full((PRODUCT_PX, PRODUCT_PX), 24.0, dtype=np.float32)
+    north = np.full((PRODUCT_PX, PRODUCT_PX), 12.0, dtype=np.float32)
+    east[0, 0] = np.nan
+    north[0, 0] = np.nan
+    return east, north
+
+
+def test_motion_grids_written_with_manifest_entries(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    east, north = _motion_grids()
+    result = _write(geo, tmp_path, motion_east_kmh=east, motion_north_kmh=north)
+    names = {p.name for p in result.files_written}
+    assert f"motion_east_kmh_{STAMP}.png" in names
+    assert f"motion_north_kmh_{STAMP}.png" in names
+    # The serving/pruning naming contract: letters, digits, underscores only.
+    for name in (f"motion_east_kmh_{STAMP}.png", f"motion_north_kmh_{STAMP}.png"):
+        assert na._STAMP_RE.match(name), f"{name} must match the stamp regex"
+
+    manifest = json.loads(result.manifest_path.read_text())
+    entries = {e["filename"]: e for e in manifest["artifacts"]}
+    for product in ("motion_east_kmh", "motion_north_kmh"):
+        entry = entries[f"{product}_{STAMP}.png"]
+        assert entry["product"] == product
+        assert entry["units"] == "km/h"
+        assert entry["encoding"] == "grayscale8"
+        assert entry["nodata"] == NODATA_LEVEL
+        assert entry["lead_min"] is None
+        assert entry["shape"] == [PRODUCT_PX, PRODUCT_PX]
+        assert entry["offset"] == pytest.approx(-120.0)
+        assert entry["scale"] == pytest.approx(240.0 / 254)
+
+    # Provenance: geometry is the shared product grid, not a duplicate block.
+    motion = manifest["motion"]
+    assert motion["grid"] == "product"
+    assert motion["support_radius_km"] == pytest.approx(20.0)
+    assert motion["max_abs_kmh"] == pytest.approx(120.0)
+    assert entries[f"motion_east_kmh_{STAMP}.png"]["shape"] == manifest["grid"]["shape"]
+
+
+def test_motion_grid_round_trip_keeps_sign_and_magnitude(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """Decode with the manifest's scale/offset: east-positive stays east,
+    north-positive stays north, magnitudes within half a step, NaN → 255."""
+    east = np.linspace(-120.0, 120.0, PRODUCT_PX * PRODUCT_PX, dtype=np.float32)
+    east = east.reshape(PRODUCT_PX, PRODUCT_PX)
+    north = -east.copy()
+    east[0, 0] = np.nan
+    north[0, 0] = np.nan
+    result = _write(geo, tmp_path, motion_east_kmh=east, motion_north_kmh=north)
+    manifest = json.loads(result.manifest_path.read_text())
+    entries = {e["filename"]: e for e in manifest["artifacts"]}
+
+    for product, expected in (("motion_east_kmh", east), ("motion_north_kmh", north)):
+        entry = entries[f"{product}_{STAMP}.png"]
+        with Image.open(tmp_path / entry["filename"]) as img:
+            assert img.mode == "L"
+            levels = np.asarray(img)
+        assert levels[0, 0] == NODATA_LEVEL
+        decoded = dequantise(levels, scale=entry["scale"], offset=entry["offset"])
+        finite = ~np.isnan(expected)
+        assert np.array_equal(np.isnan(decoded), np.isnan(expected))
+        err = np.abs(decoded[finite] - expected[finite])
+        assert float(err.max()) <= entry["scale"] / 2 + 1e-4
+        # Signs survive the round trip (a flipped offset would invert them).
+        nonzero = finite & (np.abs(expected) > entry["scale"])
+        assert np.array_equal(
+            np.sign(decoded[nonzero]), np.sign(expected[nonzero]),
+        )
+
+
+def test_motion_grids_are_end_to_end_km_per_hour(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """The units contract, pinned from a synthetic native flow all the way
+    to the decoded PNG: 8 px/frame east and 4 px/frame north on a 500 m grid
+    at a 10-min cadence are 24 and 12 km/h — with the ×4 downsample in the
+    middle (``v[::f, ::f] / f`` against ``f``× bigger pixels)."""
+    native = (PRODUCT_PX * DOWNSAMPLE, PRODUCT_PX * DOWNSAMPLE)
+    vy = np.full(native, -4.0, dtype=np.float32)   # rows grow south → north
+    vx = np.full(native, 8.0, dtype=np.float32)
+    rain = np.full(native, 2.0, dtype=np.float32)
+    east, north = motion_grids_kmh(
+        vy, vx, rain,
+        pixel_km=PIXEL_M / 1000.0, timestep_min=10.0,
+        downsample_factor=DOWNSAMPLE, support_threshold_mm_h=0.5,
+    )
+    result = _write(geo, tmp_path, motion_east_kmh=east, motion_north_kmh=north)
+    manifest = json.loads(result.manifest_path.read_text())
+    entries = {e["filename"]: e for e in manifest["artifacts"]}
+
+    decoded = {}
+    for product in ("motion_east_kmh", "motion_north_kmh"):
+        entry = entries[f"{product}_{STAMP}.png"]
+        with Image.open(tmp_path / entry["filename"]) as img:
+            levels = np.asarray(img)
+        decoded[product] = dequantise(
+            levels, scale=entry["scale"], offset=entry["offset"],
+        )
+    half_step = entries[f"motion_east_kmh_{STAMP}.png"]["scale"] / 2
+    assert np.allclose(decoded["motion_east_kmh"], 24.0, atol=half_step + 1e-4)
+    assert np.allclose(decoded["motion_north_kmh"], 12.0, atol=half_step + 1e-4)
+
+
+def test_motion_nodata_beyond_the_support_radius_survives_the_png(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """A pixel more than 20 km from any echo decodes to NaN — the website
+    says "no cell motion estimate" there instead of drawing an arrow."""
+    native = (PRODUCT_PX * DOWNSAMPLE, PRODUCT_PX * DOWNSAMPLE)
+    vy = np.full(native, -4.0, dtype=np.float32)
+    vx = np.full(native, 8.0, dtype=np.float32)
+    rain = np.zeros(native, dtype=np.float32)
+    rain[0, 0] = 5.0    # one echo pixel in the NW corner
+    east, north = motion_grids_kmh(
+        vy, vx, rain,
+        pixel_km=PIXEL_M / 1000.0, timestep_min=10.0,
+        downsample_factor=DOWNSAMPLE, support_threshold_mm_h=0.5,
+        support_radius_km=20.0,
+    )
+    result = _write(geo, tmp_path, motion_east_kmh=east, motion_north_kmh=north)
+    manifest = json.loads(result.manifest_path.read_text())
+    entry = {e["filename"]: e for e in manifest["artifacts"]}[
+        f"motion_east_kmh_{STAMP}.png"
+    ]
+    with Image.open(tmp_path / entry["filename"]) as img:
+        levels = np.asarray(img)
+    # 2 km product pixels: [0, 0] is on the echo, [15, 15] is ~42 km away.
+    assert levels[0, 0] != NODATA_LEVEL
+    assert levels[PRODUCT_PX - 1, PRODUCT_PX - 1] == NODATA_LEVEL
+    decoded = dequantise(levels, scale=entry["scale"], offset=entry["offset"])
+    assert np.isnan(decoded[PRODUCT_PX - 1, PRODUCT_PX - 1])
+    assert decoded[0, 0] == pytest.approx(24.0, abs=entry["scale"])
+
+
+def test_motion_grids_must_be_passed_together_and_shaped_right(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    east, north = _motion_grids()
+    with pytest.raises(ValueError, match="passed together"):
+        _write(geo, tmp_path, motion_east_kmh=east)
+    with pytest.raises(ValueError, match="product grid"):
+        _write(geo, tmp_path,
+               motion_east_kmh=east[:-1], motion_north_kmh=north[:-1])
+
+
+# ---------------------------------------------------------------------------
 # Pruning
 # ---------------------------------------------------------------------------
 
@@ -438,6 +741,30 @@ def test_pruner_keeps_newest_24_cycles_and_foreign_files(
     # 2 p_rain + eta + intensity + stamped manifest = 5 files.
     assert result.pruned_files == 5
     assert result.pruned_bytes > 0
+
+
+def test_pruning_never_deletes_a_stamp_the_newest_manifest_references(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """The R1 invariant, forced into the open: ``keep_cycles=1`` would
+    normally leave only the current cycle, but the history entries this
+    manifest just published protect their own files."""
+    base = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    for i in range(6):
+        result = _write_cycle(geo, tmp_path, base + timedelta(minutes=10 * i),
+                              keep_cycles=1)
+    manifest = json.loads((tmp_path / LATEST_MANIFEST_NAME).read_text())
+    referenced = {e["filename"] for e in manifest["artifacts"]}
+    assert len([e for e in _overlays(manifest) if e["lead_min"] < 0]) == 3
+    missing = sorted(n for n in referenced if not (tmp_path / n).is_file())
+    assert not missing, f"newest manifest references pruned files: {missing}"
+    # keep_cycles=1 still did its job on everything NOT referenced.
+    surviving = {
+        m.group(1) for p in tmp_path.iterdir() if p.is_file()
+        if (m := _STAMP_IN_NAME.search(p.name))
+    }
+    assert len(surviving) == 4, "current cycle + the 3 it references, nothing else"
+    assert result.pruned_files > 0
 
 
 # ---------------------------------------------------------------------------

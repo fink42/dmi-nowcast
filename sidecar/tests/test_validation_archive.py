@@ -410,3 +410,160 @@ def test_validate_national_script_help_runs_offline() -> None:
     assert "--base-url" in result.stdout
     assert "--lat" in result.stdout and "--lon" in result.stdout
     assert "--token" in result.stdout
+
+
+def _load_validator():
+    """Import ``scripts/validate_national.py`` as a module (it has no
+    package to be imported from)."""
+    import importlib.util
+
+    script = ARCHIVE_DIR.parent / "scripts" / "validate_national.py"
+    spec = importlib.util.spec_from_file_location("validate_national", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _v2_manifest(*, overlays: list[dict]) -> dict:
+    """Minimal schema-v2 manifest carrying only what the frame checks read."""
+    return {
+        "schema_version": 2,
+        "radar_ts_utc": "2026-08-28T12:00:00+00:00",
+        "frame_age_min": 4.0,
+        "timestep_min": 10.0,
+        "artifacts": overlays,
+    }
+
+
+def _overlay(kind: str, lead_min: int, valid: str) -> dict:
+    return {
+        "filename": f"overlay_{kind}_{lead_min}.png",
+        "product": "overlay",
+        "lead_min": lead_min,
+        "kind": kind,
+        "valid_ts_utc": valid,
+        "encoding": "rgba8",
+        "shape": [4, 4],
+    }
+
+
+def test_validator_accepts_a_well_formed_v2_manifest() -> None:
+    """History 10 min apart with a gap, and forecasts carrying the
+    frame-age correction — the contract compute.py actually writes."""
+    module = _load_validator()
+    manifest = _v2_manifest(overlays=[
+        _overlay("observation", -30, "2026-08-28T11:30:00+00:00"),
+        # 11:40 missing — a dropped cycle is a gap, not a failure.
+        _overlay("observation", -20, "2026-08-28T11:40:00+00:00"),
+        _overlay("observation", 0, "2026-08-28T12:00:00+00:00"),
+        # radar 12:00 + frame_age 4 min + lead 10 = 12:14.
+        _overlay("forecast", 10, "2026-08-28T12:14:00+00:00"),
+        _overlay("forecast", 20, "2026-08-28T12:24:00+00:00"),
+    ])
+    report = module.Report()
+    module._check_schema_version(report, manifest)
+    module._check_frame_validity(report, manifest)
+    assert not report.failed, report.render()
+
+
+def test_validator_rejects_forecast_validity_without_the_frame_age() -> None:
+    """``radar_ts + lead`` is the tempting wrong answer: it is off by a
+    whole animation step at the 10-min fullRange cadence."""
+    module = _load_validator()
+    manifest = _v2_manifest(overlays=[
+        _overlay("observation", 0, "2026-08-28T12:00:00+00:00"),
+        _overlay("forecast", 10, "2026-08-28T12:10:00+00:00"),
+    ])
+    report = module.Report()
+    module._check_frame_validity(report, manifest)
+    assert report.failed
+
+
+def test_validator_rejects_history_off_the_radar_cadence() -> None:
+    module = _load_validator()
+    manifest = _v2_manifest(overlays=[
+        _overlay("observation", -7, "2026-08-28T11:53:00+00:00"),
+        _overlay("observation", 0, "2026-08-28T12:00:00+00:00"),
+        _overlay("forecast", 10, "2026-08-28T12:14:00+00:00"),
+    ])
+    report = module.Report()
+    module._check_frame_validity(report, manifest)
+    assert report.failed
+
+
+def test_validator_rejects_v1_overlays_without_kind_or_validity() -> None:
+    module = _load_validator()
+    manifest = _v2_manifest(overlays=[{
+        "filename": "overlay_now_202608281200.png",
+        "product": "overlay",
+        "lead_min": 0,
+        "encoding": "rgba8",
+        "shape": [4, 4],
+    }])
+    manifest["schema_version"] = 1
+    report = module.Report()
+    module._check_schema_version(report, manifest)
+    module._check_frame_validity(report, manifest)
+    assert report.failed
+
+
+def test_validator_motion_point_check_converts_disc_motion_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The state's disc motion is px/min on the NATIVE grid; the manifest's
+    pixel scale is the ×4 product one. Deriving km/h without dividing by
+    ``downsample_factor`` would inflate the disc vector 4× and turn a
+    healthy cycle into a FAIL (and hide a real 16× grid error)."""
+    import numpy as np
+
+    module = _load_validator()
+    manifest = {
+        "grid": {"shape": [8, 8], "pixel_scale_x_m": 2000.0,
+                 "downsample_factor": 4},
+    }
+    # 0.8 px/min east on a 500 m grid = 24 km/h; 0.4 px/min south = 12 km/h
+    # southward, i.e. north = -12.
+    state = {"motion": {"dx_px_per_min": 0.8, "dy_px_per_min": 0.4},
+             "now": {"raining": True}}
+    east = np.full((8, 8), 24.0)
+    north = np.full((8, 8), -12.0)
+    monkeypatch.setattr(module, "_grid_index", lambda *a, **k: (4, 4))
+
+    report = module.Report()
+    module._check_motion_at_point(report, manifest, state, east, north, 55.3, 10.3)
+    assert not report.failed, report.render()
+    assert "ratio 1.00" in report.rows[0][2]
+
+    # Flip the grid's north sign only: same speed, opposite hemisphere.
+    report = module.Report()
+    module._check_motion_at_point(
+        report, manifest, state, east, -north, 55.3, 10.3,
+    )
+    assert report.failed, "a flipped north axis must not pass"
+
+
+def test_validator_motion_nodata_at_a_raining_reference_pixel_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    module = _load_validator()
+    manifest = {"grid": {"shape": [8, 8], "pixel_scale_x_m": 2000.0,
+                         "downsample_factor": 4}}
+    nan_grid = np.full((8, 8), np.nan)
+    monkeypatch.setattr(module, "_grid_index", lambda *a, **k: (4, 4))
+
+    report = module.Report()
+    module._check_motion_at_point(
+        report, manifest, {"motion": {}, "now": {"raining": True}},
+        nan_grid, nan_grid, 55.3, 10.3,
+    )
+    assert report.failed, "raining at home but no motion estimate is a bug"
+
+    report = module.Report()
+    module._check_motion_at_point(
+        report, manifest, {"motion": {}, "now": {"raining": False}},
+        nan_grid, nan_grid, 55.3, 10.3,
+    )
+    assert not report.failed, "dry home legitimately has no arrow"
