@@ -54,7 +54,8 @@ export const en: Catalog = {
 		radarAge: (min: number) =>
 			min < 1 ? 'Radar data: less than 1 min old' : `Radar data: ${min} min old`,
 		radarTime: (time: string) => `Radar image at ${time}`,
-		stale: 'Radar data is stale — the pipeline has stopped updating',
+		pipelineStale: 'The pipeline has stalled — the forecast is not being updated right now',
+		radarOld: 'The radar image is older than usual — no newer one has arrived from DMI yet',
 		noFrames: 'No radar frames available right now'
 	},
 	panel: {
@@ -104,6 +105,7 @@ export const en: Catalog = {
 	status: {
 		loading: 'Loading data …',
 		offline: 'No connection to the service',
+		offlineCached: 'No connection to the service — showing the last data received',
 		noData: 'The service has no data yet. The first cycle takes a few minutes.',
 		retry: 'Try again',
 		updated: (time: string) => `Updated at ${time}`

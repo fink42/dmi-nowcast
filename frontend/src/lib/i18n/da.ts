@@ -56,7 +56,8 @@ export const da = {
 		radarAge: (min: number) =>
 			min < 1 ? 'Radardata: under 1 min gamle' : `Radardata: ${min} min gamle`,
 		radarTime: (time: string) => `Radarbillede kl. ${time}`,
-		stale: 'Radardata er forældede — beregningen er sat i stå',
+		pipelineStale: 'Beregningen er sat i stå — prognosen bliver ikke opdateret lige nu',
+		radarOld: 'Radarbilledet er ældre end normalt — der er endnu ikke kommet et nyere fra DMI',
 		noFrames: 'Ingen radarbilleder tilgængelige lige nu'
 	},
 	panel: {
@@ -106,6 +107,7 @@ export const da = {
 	status: {
 		loading: 'Henter data …',
 		offline: 'Ingen forbindelse til tjenesten',
+		offlineCached: 'Ingen forbindelse til tjenesten — viser de sidst hentede data',
 		noData: 'Tjenesten har endnu ingen data. Første cyklus tager et par minutter.',
 		retry: 'Prøv igen',
 		updated: (time: string) => `Opdateret kl. ${time}`

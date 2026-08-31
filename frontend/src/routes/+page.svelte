@@ -76,6 +76,11 @@
 		<div class="floating">
 			{#if nowcast.status === 'nodata'}
 				<p class="notice">{t().status.noData}</p>
+			{:else if nowcast.offlineWithCachedCycle}
+				<!-- Polls are failing but a cycle is still on the map: say which one
+				     the map belongs to, rather than letting its age creep up in
+				     silence. -->
+				<p class="notice warn">{t().status.offlineCached}</p>
 			{:else if nowcast.status === 'error'}
 				<p class="notice">{t().status.offline}</p>
 			{:else if !nowcast.point}
@@ -151,6 +156,11 @@
 
 	.notice.subtle {
 		color: var(--muted);
+	}
+
+	.notice.warn {
+		color: var(--warn);
+		font-weight: 600;
 	}
 
 	.locate {

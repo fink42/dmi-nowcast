@@ -4,6 +4,10 @@
 	 * with the age of the radar image the whole loop is built from. The age
 	 * matters more than it looks — every frame after "now" is extrapolation
 	 * from an image that is already a few minutes old.
+	 *
+	 * That age is shown always but flagged rarely: on a healthy pipeline it
+	 * sawtooths up to nearly half an hour, so the outage warning hangs off
+	 * pipeline liveness instead (see nowcast/freshness.ts).
 	 */
 	import { t, locale } from '$lib/i18n';
 	import { clockTime } from '$lib/format';
@@ -12,7 +16,8 @@
 	const frames = $derived(nowcast.frames);
 	const index = $derived(nowcast.frameIndex);
 	const current = $derived(frames[index]);
-	const ageMin = $derived(nowcast.radarAgeMin);
+	const fresh = $derived(nowcast.freshness);
+	const ageMin = $derived(fresh.radarAgeMin);
 
 	const label = (leadMin: number) => (leadMin === 0 ? t().loop.now : t().loop.lead(leadMin));
 </script>
@@ -76,11 +81,13 @@
 			{/if}
 			{#if ageMin !== null}
 				<span class="sep">·</span>
-				<span class:warn={nowcast.stale}>{t().loop.radarAge(Math.round(ageMin))}</span>
+				<span class:warn={fresh.state !== 'ok'}>{t().loop.radarAge(Math.round(ageMin))}</span>
 			{/if}
 		</p>
-		{#if nowcast.stale}
-			<p class="warn small">{t().loop.stale}</p>
+		{#if fresh.state === 'pipeline-stale'}
+			<p class="warn small alert">{t().loop.pipelineStale}</p>
+		{:else if fresh.state === 'radar-old'}
+			<p class="warn small">{t().loop.radarOld}</p>
 		{/if}
 	{/if}
 </div>
@@ -182,6 +189,12 @@
 	.small {
 		margin: 0;
 		font-size: 0.75rem;
+	}
+
+	/* The outage reads louder than "the newest image is a bit late": they are
+	   different claims and must not look like the same one. */
+	.alert {
+		font-weight: 600;
 	}
 
 	.muted {

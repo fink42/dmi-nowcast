@@ -3,7 +3,8 @@
  * manifest, its reprojected overlay frames, the decoded product grids, the
  * animation position, and the forecast for whatever point the user picked.
  *
- * Polling is once a minute. The sidecar produces a cycle every ~5 min, and
+ * Polling is once a minute. The sidecar polls DMI every ~5 min for radar
+ * composites that themselves arrive on a 10 min cadence (fullRange), and
  * artifact URLs are cycle-stamped and immutably cacheable, so a poll that
  * finds the same cycle costs one small conditional request and nothing else.
  */
@@ -11,17 +12,23 @@ import { browser } from '$app/environment';
 import { loadOverlayFrames, overlayGeometry, type OverlayFrame } from '$lib/map/overlay';
 import type { Corners } from '$lib/map/warp';
 import { fetchPointForecast } from './forecast';
+import { freshness, type Freshness } from './freshness';
 import { loadGrids } from './grids';
-import { fetchManifest, isCalibrated, NoDataError, radarAgeMin, type Manifest } from './manifest';
+import { fetchManifest, isCalibrated, NoDataError, type Manifest } from './manifest';
 import { gridToLonLat, samplePoint, type DecodedGrids, type PointForecast } from './sampler';
 
 const POLL_MS = 60_000;
 const CLOCK_MS = 15_000;
+/**
+ * Background tabs get their timers throttled, so a phone coming out of a
+ * pocket can be showing an age that is minutes wrong. Becoming visible
+ * re-polls at once — but not more often than this, or flicking between tabs
+ * turns into a request stream.
+ */
+const VISIBILITY_POLL_GAP_MS = 10_000;
 /** Time each frame is shown, and the extra pause on the last one. */
 const FRAME_MS = 550;
 const LAST_FRAME_HOLD_MS = 1400;
-/** A cycle older than this means the pipeline has stopped. */
-export const STALE_AFTER_MIN = 20;
 
 export type Status = 'loading' | 'ready' | 'nodata' | 'error';
 
@@ -56,14 +63,25 @@ class NowcastStore {
 	#pollTimer: ReturnType<typeof setInterval> | null = null;
 	#clockTimer: ReturnType<typeof setInterval> | null = null;
 	#frameTimer: ReturnType<typeof setTimeout> | null = null;
+	#onVisible: (() => void) | null = null;
+	#lastPollAt = 0;
 
-	get radarAgeMin(): number | null {
-		return this.manifest ? Math.max(0, radarAgeMin(this.manifest, this.now)) : null;
+	/** Radar age and pipeline liveness, kept apart on purpose — see freshness.ts. */
+	get freshness(): Freshness {
+		return freshness(this.manifest, this.now);
 	}
 
-	get stale(): boolean {
-		const age = this.radarAgeMin;
-		return age !== null && age > STALE_AFTER_MIN;
+	get radarAgeMin(): number | null {
+		return this.freshness.radarAgeMin;
+	}
+
+	/**
+	 * True when the manifest on screen is one we could not refresh: the poll is
+	 * failing, so what is displayed is the last cycle that did arrive. Worth
+	 * saying out loud — otherwise the age simply climbs with no explanation.
+	 */
+	get offlineWithCachedCycle(): boolean {
+		return this.status === 'error' && this.manifest !== null;
 	}
 
 	get calibrated(): boolean {
@@ -80,6 +98,8 @@ class NowcastStore {
 		void this.refresh();
 		this.#pollTimer = setInterval(() => void this.refresh(), POLL_MS);
 		this.#clockTimer = setInterval(() => (this.now = Date.now()), CLOCK_MS);
+		this.#onVisible = () => this.#onBecameVisible();
+		document.addEventListener('visibilitychange', this.#onVisible);
 		this.#scheduleFrame();
 		return () => this.stop();
 	}
@@ -88,12 +108,27 @@ class NowcastStore {
 		if (this.#pollTimer) clearInterval(this.#pollTimer);
 		if (this.#clockTimer) clearInterval(this.#clockTimer);
 		if (this.#frameTimer) clearTimeout(this.#frameTimer);
+		if (this.#onVisible) document.removeEventListener('visibilitychange', this.#onVisible);
 		this.#pollTimer = this.#clockTimer = null;
 		this.#frameTimer = null;
+		this.#onVisible = null;
 		this.#cycleAbort?.abort();
 	}
 
+	/**
+	 * A tab that was in the background has a throttled clock and a poll that
+	 * may not have run for minutes. Re-stamp `now` first, so the age on screen
+	 * is honest within the same frame, then refresh.
+	 */
+	#onBecameVisible(): void {
+		if (document.visibilityState !== 'visible') return;
+		this.now = Date.now();
+		if (this.now - this.#lastPollAt < VISIBILITY_POLL_GAP_MS) return;
+		void this.refresh();
+	}
+
 	async refresh(): Promise<void> {
+		this.#lastPollAt = Date.now();
 		try {
 			const manifest = await fetchManifest();
 			this.now = Date.now();
@@ -104,6 +139,10 @@ class NowcastStore {
 			}
 			this.status = 'ready';
 		} catch (err) {
+			// The old manifest stays on screen — there is nothing better to show —
+			// but `status` flips, and the page says so rather than letting the age
+			// climb unexplained.
+			this.now = Date.now();
 			this.status = err instanceof NoDataError ? 'nodata' : 'error';
 			if (!(err instanceof NoDataError)) console.warn('manifest poll failed', err);
 		}
