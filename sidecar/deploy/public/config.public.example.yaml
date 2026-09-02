@@ -114,7 +114,10 @@ push:
   # so with the leads above this offers 20/30/45/60 min.
   min_lead_min: 20
   threshold_options_pct: [40, 60, 80]
-  default_threshold_pct: 60
+  # 40, not 60: on the first observed event P(<=30 min) crossed 40 %
+  # with a 23 min ETA but crossed 60 % only ~14 min before the rain,
+  # and radar age at compute (13-18 min) eats most of that.
+  default_threshold_pct: 40
   default_lead_min: 30
   default_quiet_start: "22:00"
   default_quiet_end: "07:00"
@@ -124,4 +127,7 @@ push:
   fanout_budget_s: 20.0
   ttl_s: 900
   rearm_after_min: 60
-  persistence_obs: 2
+  # One observation, not two: the calibrated ensemble probability
+  # already aggregates 16 members, and a second 10 min observation on
+  # top of the radar age left no lead time (2026-09-02 event).
+  persistence_obs: 1
