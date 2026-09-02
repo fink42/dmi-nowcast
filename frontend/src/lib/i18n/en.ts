@@ -73,6 +73,7 @@ export const en: Catalog = {
 		headlineUnknown: 'No forecast for this point',
 		etaLabel: 'Expected arrival',
 		etaValue: (min: number) => `in about ${min} min`,
+		etaNow: 'now',
 		etaNone: 'no rain within the horizon',
 		intensityLabel: 'Intensity',
 		intensityValue: (mmH: number) => `${mmH.toFixed(1)} mm/h`,

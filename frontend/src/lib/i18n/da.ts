@@ -75,6 +75,7 @@ export const da = {
 		headlineUnknown: 'Ingen prognose for dette punkt',
 		etaLabel: 'Forventet ankomst',
 		etaValue: (min: number) => `om ca. ${min} min`,
+		etaNow: 'nu',
 		etaNone: 'ingen regn inden for horisonten',
 		intensityLabel: 'Intensitet',
 		intensityValue: (mmH: number) => `${mmH.toFixed(1)} mm/t`,

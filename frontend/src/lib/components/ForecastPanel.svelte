@@ -14,6 +14,7 @@
 	import {
 		clockTime,
 		confidenceWord,
+		countdownEtaMin,
 		headline,
 		headlineKind,
 		intensityWord,
@@ -43,6 +44,17 @@
 	 * in words; it never draws an arrow it cannot back up.
 	 */
 	const motion = $derived(forecast?.motion ?? null);
+	/**
+	 * The ETA counted down to right now. The cycle's own `etaMin` is minutes
+	 * from the moment it was computed, and cycles are 5–10 min apart, so the
+	 * store's 15 s clock is what keeps "rain in 12 min" from still saying 12
+	 * when it is due. Only the headline and the ETA fact use it — the
+	 * probability bars, intensity and motion belong to the cycle, not to the
+	 * viewer's clock.
+	 */
+	const etaNow = $derived(
+		countdownEtaMin(forecast?.etaMin ?? null, nowcast.manifest?.generated_at_utc, nowcast.now)
+	);
 	const confidence = $derived(forecast?.confidence ?? nowcast.confidence);
 	const ageMin = $derived(nowcast.radarAgeMin);
 	const highlight = $derived(forecast ? probabilityWithin(forecast, 20) : null);
@@ -122,8 +134,8 @@
 		{:else if point.status === 'error'}
 			<p class="muted peek">{t().panel.error}</p>
 		{:else if forecast}
-			<p class="headline peek" class:rain={headlineKind(forecast) !== 'no-rain'}>
-				{headline(t(), forecast)}
+			<p class="headline peek" class:rain={headlineKind(etaNow) !== 'no-rain'}>
+				{headline(t(), etaNow)}
 			</p>
 		{/if}
 
@@ -163,9 +175,11 @@
 						<div>
 							<dt>{t().panel.etaLabel}</dt>
 							<dd>
-								{forecast.etaMin === null
+								{etaNow === null
 									? t().panel.etaNone
-									: t().panel.etaValue(Math.round(forecast.etaMin))}
+									: headlineKind(etaNow) === 'raining-now'
+										? t().panel.etaNow
+										: t().panel.etaValue(Math.round(etaNow))}
 							</dd>
 						</div>
 						<div>
