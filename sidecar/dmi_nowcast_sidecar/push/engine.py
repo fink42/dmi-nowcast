@@ -13,7 +13,14 @@ The contract mirrors the Home Assistant integration:
   single frame of clutter can never push.
 - **hysteresis** — a push *disarms* the subscription. It re-arms only
   after 60 consecutive minutes below threshold, measured on the radar
-  clock (not on wall time, and not on the poll cadence).
+  clock (not on wall time, and not on the poll cadence). The arm is
+  settled at the *first observation that finds the dry spell 60 minutes
+  old*, before that observation's own probability is looked at; the
+  observation is then evaluated by the armed rules from a clean slate.
+  So an observation back over the threshold at or after the 60-minute
+  mark re-arms and starts a streak (at ``persistence_obs = 1`` it fires
+  straight away) instead of merely clearing the dry clock. Only an
+  over-threshold observation *before* the mark restarts the spell.
 - **quiet hours defer, they do not disarm.** Delivery is suppressed and
   the machine keeps running, still armed; an event still over threshold
   when the window ends fires then.
@@ -193,37 +200,63 @@ def evaluate(
         return Decision(state, "none")
 
     over = obs.p_rain is not None and obs.p_rain >= threshold_pct / 100
+
+    if not state.armed:
+        # Disarmed. Settle the arm *before* judging this observation: a
+        # dry spell that has reached the re-arm mark has reached it
+        # whether or not the probability came back up at that very
+        # moment.
+        rearmed = (
+            state.below_since_utc is not None
+            and obs.radar_ts_utc - state.below_since_utc
+            >= timedelta(minutes=rules.rearm_after_min)
+        )
+        if not rearmed:
+            # The spell is still too short: an over-threshold observation
+            # restarts the dry clock, a dry one starts or keeps it.
+            return Decision(
+                SubState(
+                    armed=False,
+                    streak=state.streak + 1 if over else 0,
+                    below_since_utc=(
+                        None
+                        if over
+                        else (state.below_since_utc or obs.radar_ts_utc)
+                    ),
+                    last_eval_radar_ts=obs.radar_ts_utc,
+                ),
+                "none",
+            )
+        # Re-armed as of this observation, which now goes through the
+        # armed rules from a clean slate.
+        state = SubState(
+            armed=True,
+            streak=0,
+            below_since_utc=None,
+            last_eval_radar_ts=state.last_eval_radar_ts,
+        )
+
     streak = state.streak + 1 if over else 0
 
-    if state.armed:
-        if streak >= rules.persistence_obs:
-            if in_quiet_hours(now_utc, tz, quiet):
-                # Suppressed, not consumed: still armed, streak intact, so
-                # the first observation after the window can fire.
-                return Decision(
-                    SubState(
-                        armed=True,
-                        streak=streak,
-                        below_since_utc=state.below_since_utc,
-                        last_eval_radar_ts=obs.radar_ts_utc,
-                    ),
-                    "deferred_quiet",
-                )
-            if (
-                obs.eta_min is not None
-                and obs.eta_min <= rules.raining_now_eta_min
-            ):
-                # Rain is already here; "incoming" would be noise. Consume
-                # the arm silently.
-                return Decision(
-                    SubState(
-                        armed=False,
-                        streak=streak,
-                        below_since_utc=None,
-                        last_eval_radar_ts=obs.radar_ts_utc,
-                    ),
-                    "already_raining",
-                )
+    if streak >= rules.persistence_obs:
+        if in_quiet_hours(now_utc, tz, quiet):
+            # Suppressed, not consumed: still armed, streak intact, so
+            # the first observation after the window can fire.
+            return Decision(
+                SubState(
+                    armed=True,
+                    streak=streak,
+                    below_since_utc=state.below_since_utc,
+                    last_eval_radar_ts=obs.radar_ts_utc,
+                ),
+                "deferred_quiet",
+            )
+        if (
+            obs.eta_min is not None
+            and obs.eta_min <= rules.raining_now_eta_min
+        ):
+            # Rain is already here; "incoming" would be noise. Consume
+            # the arm silently.
             return Decision(
                 SubState(
                     armed=False,
@@ -231,20 +264,8 @@ def evaluate(
                     below_since_utc=None,
                     last_eval_radar_ts=obs.radar_ts_utc,
                 ),
-                "notify",
+                "already_raining",
             )
-        return Decision(
-            SubState(
-                armed=True,
-                streak=streak,
-                below_since_utc=state.below_since_utc,
-                last_eval_radar_ts=obs.radar_ts_utc,
-            ),
-            "none",
-        )
-
-    # Disarmed: the only question is whether the dry spell is long enough.
-    if over:
         return Decision(
             SubState(
                 armed=False,
@@ -252,25 +273,13 @@ def evaluate(
                 below_since_utc=None,
                 last_eval_radar_ts=obs.radar_ts_utc,
             ),
-            "none",
-        )
-
-    below_since = state.below_since_utc or obs.radar_ts_utc
-    if obs.radar_ts_utc - below_since >= timedelta(minutes=rules.rearm_after_min):
-        return Decision(
-            SubState(
-                armed=True,
-                streak=0,
-                below_since_utc=None,
-                last_eval_radar_ts=obs.radar_ts_utc,
-            ),
-            "none",
+            "notify",
         )
     return Decision(
         SubState(
-            armed=False,
+            armed=True,
             streak=streak,
-            below_since_utc=below_since,
+            below_since_utc=state.below_since_utc,
             last_eval_radar_ts=obs.radar_ts_utc,
         ),
         "none",

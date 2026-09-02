@@ -218,6 +218,110 @@ def test_over_threshold_while_disarmed_clears_below_since() -> None:
     assert states[4].armed is False
 
 
+def test_over_threshold_at_the_mark_rearms_and_fires_at_persistence_one() -> None:
+    # The arm is settled before the probability is looked at: at +70 the
+    # dry spell that started at +10 is exactly 60 minutes old, so the
+    # subscription re-arms and this same observation — over threshold,
+    # persistence 1 — fires.
+    probs = [0.9] + [0.0] * 6 + [0.9]
+    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1))
+    assert actions == ["notify"] + ["none"] * 6 + ["notify"]
+    assert states[1].below_since_utc == obs[1].radar_ts_utc
+    assert obs[7].radar_ts_utc - obs[1].radar_ts_utc == timedelta(minutes=60)
+    assert states[7].streak == 1
+    assert states[7].armed is False  # consumed by the second push
+    assert states[7].below_since_utc is None
+
+
+def test_over_threshold_before_the_mark_stays_disarmed() -> None:
+    # Ten minutes short of the mark nothing changes: the observation at
+    # +60 finds a 50-minute spell, so it only clears the dry clock — and
+    # with the clock cleared, +70 has nothing to re-arm on either.
+    probs = [0.9] + [0.0] * 5 + [0.9, 0.9]
+    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1))
+    assert actions == ["notify"] + ["none"] * 7
+    assert obs[6].radar_ts_utc - obs[1].radar_ts_utc == timedelta(minutes=50)
+    assert states[6].armed is False
+    assert states[6].below_since_utc is None
+    assert states[7].armed is False
+
+
+def test_over_threshold_at_the_mark_starts_the_streak_at_persistence_two() -> None:
+    # Same re-arm, but persistence 2: the observation at the mark re-arms
+    # from a clean slate and becomes streak 1, and the next wet one fires.
+    probs = [0.9, 0.9] + [0.0] * 6 + [0.9, 0.9]
+    actions, states, obs = _drive(probs)
+    assert actions == ["none", "notify"] + ["none"] * 7 + ["notify"]
+    assert states[2].below_since_utc == obs[2].radar_ts_utc
+    assert obs[8].radar_ts_utc - obs[2].radar_ts_utc == timedelta(minutes=60)
+    assert states[8].armed is True
+    assert states[8].streak == 1
+    assert states[8].below_since_utc is None
+
+
+def test_a_dry_observation_at_the_mark_still_rearms_silently() -> None:
+    # The dry path through the re-arm check is unchanged, persistence 1
+    # included: the observation that finds the spell 60 minutes old
+    # re-arms, and being dry it fires nothing.
+    probs = [0.9] + [0.0] * 7
+    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1))
+    assert actions == ["notify"] + ["none"] * 7
+    assert states[1].below_since_utc == obs[1].radar_ts_utc
+    assert states[6].armed is False  # +60: a 50-minute spell
+    assert states[7].armed is True  # +70: the full hour
+    assert states[7].streak == 0
+    assert states[7].below_since_utc is None
+
+
+def test_regression_the_shower_that_arrived_with_no_push() -> None:
+    # Seen live at the user's point: disarmed at 05:40; dry observations
+    # from 06:00 on, so the re-arm clock started at 06:00; at 07:00 the
+    # calibrated probability crossed the 40 % threshold with the spell
+    # exactly 60 minutes old. The machine used to clear the clock and
+    # stay disarmed, so 07:00, 07:10 and 07:20 could not fire and the
+    # shower reached the point at 07:30 unannounced.
+    rules = Rules(persistence_obs=1)
+    state = SubState(
+        armed=False,
+        streak=1,
+        below_since_utc=None,
+        last_eval_radar_ts=datetime(2026, 8, 31, 5, 40, tzinfo=UTC),
+    )
+    sequence = [
+        (datetime(2026, 8, 31, 6, 0, tzinfo=UTC), 0.05),
+        (datetime(2026, 8, 31, 6, 10, tzinfo=UTC), 0.07),
+        (datetime(2026, 8, 31, 6, 20, tzinfo=UTC), 0.04),
+        (datetime(2026, 8, 31, 6, 30, tzinfo=UTC), 0.11),
+        (datetime(2026, 8, 31, 6, 40, tzinfo=UTC), 0.16),
+        (datetime(2026, 8, 31, 6, 50, tzinfo=UTC), 0.29),
+        (datetime(2026, 8, 31, 7, 0, tzinfo=UTC), 0.62),
+    ]
+    actions: list[str] = []
+    states: list[SubState] = []
+    for radar_ts, p in sequence:
+        decision = evaluate(
+            state,
+            Observation(
+                radar_ts_utc=radar_ts,
+                p_rain=p,
+                eta_min=33.0,
+                intensity_mm_h=0.8,
+            ),
+            threshold_pct=40,
+            quiet=None,
+            tz=CPH,
+            now_utc=radar_ts + timedelta(minutes=2),
+            rules=rules,
+        )
+        state = decision.state
+        actions.append(decision.action)
+        states.append(state)
+
+    assert states[0].below_since_utc == datetime(2026, 8, 31, 6, 0, tzinfo=UTC)
+    assert all(s.armed is False for s in states[:6])
+    assert actions == ["none"] * 6 + ["notify"]
+
+
 # --------------------------------------------------------------------------
 # "Already raining" consumes the arm silently
 # --------------------------------------------------------------------------
@@ -402,19 +506,26 @@ def test_notify_never_repeats_without_a_dry_hour(seed: int) -> None:
         return p is None or p < 0.6
 
     for previous, current in zip(fired, fired[1:]):
-        # Between two pushes there must be a run of consecutive dry
-        # observations spanning at least the full re-arm hour.
+        # Between two pushes there must be a dry spell that reached the
+        # full re-arm hour, measured the way the machine measures it:
+        # from the first dry observation to the observation that finds
+        # the spell 60 minutes old. That observation is the one that
+        # re-arms, and it counts whether it is itself dry or wet — a wet
+        # one re-arms and is then evaluated normally, so it can be
+        # `current` itself. Hence the range runs to `current` inclusive
+        # and the span is taken before the run is broken.
         longest = timedelta(0)
         run_start: int | None = None
-        for i in range(previous + 1, current):
-            if dry(i):
-                if run_start is None:
-                    run_start = i
+        for i in range(previous + 1, current + 1):
+            if run_start is not None:
                 span = (
                     observations[i].radar_ts_utc
                     - observations[run_start].radar_ts_utc
                 )
                 longest = max(longest, span)
+            if dry(i):
+                if run_start is None:
+                    run_start = i
             else:
                 run_start = None
         assert longest >= timedelta(minutes=60), (
