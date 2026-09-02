@@ -118,6 +118,46 @@ export const en: Catalog = {
 		error: 'The forecast could not be loaded. Try again in a moment.',
 		leadAxis: 'Minutes ahead'
 	},
+	push: {
+		title: 'Tell me when rain is coming',
+		enable: 'Notify me here',
+		working: 'Working …',
+		showSettings: 'Settings',
+		hideSettings: 'Hide settings',
+		thresholdLabel: 'Probability at least',
+		thresholdOption: (pct: number) => `${pct} %`,
+		leadLabel: 'Warning time',
+		leadOption: (min: number) => `${min} min`,
+		quietLabel: 'No notifications at night',
+		quietFrom: 'From',
+		quietTo: 'To',
+		save: 'Save',
+		cancel: 'Cancel',
+		edit: 'Change',
+		moveHere: 'Move here',
+		stop: 'Stop notifications',
+		summary: (coordinates: string, leadMin: number, thresholdPct: number) =>
+			`You will be notified at ${coordinates} when the chance of rain within ${leadMin} min is above ${thresholdPct} %.`,
+		summaryQuiet: (start: string, end: string) =>
+			`Nothing will be sent between ${start} and ${end}.`,
+		movedAway: 'Notifications are set for a different point than the one you are looking at.',
+		iosNotInstalled:
+			'On iPhone and iPad the site has to be on your home screen before it may send notifications: tap Share, choose “Add to Home Screen”, and open it from there.',
+		unsupported: 'This browser cannot send notifications about rain.',
+		insecure: 'Notifications need a secure connection (https).',
+		denied:
+			'Notifications are blocked for this site. You can allow them again in your browser settings.',
+		capacity: 'No room for more devices right now. Please try again later.',
+		retry: 'Try again',
+		fallbackTitle: 'Rain radar',
+		fallbackBody: 'New notification',
+		errors: {
+			permission: 'You did not give the browser permission to show notifications.',
+			offCoverage: 'That point is outside radar coverage — nothing can be sent from there.',
+			unavailable: 'The server is not sending notifications at the moment.',
+			failed: 'Notifications could not be turned on. Please try again shortly.'
+		}
+	},
 	status: {
 		loading: 'Loading data …',
 		offline: 'No connection to the service',
@@ -183,6 +223,7 @@ export const en: Catalog = {
 			'No analytics, no trackers, no ads.',
 			'No cookies. The only thing stored in your browser is your language choice (localStorage).',
 			'If you tap “use my location”, the coordinates are used inside your own browser to look up the forecast in grids you already downloaded. They are not sent anywhere.',
+			'Notifications are opt-in. If you turn them on, the server stores your browser’s push address, the point you chose and your settings for as long as the subscription exists. They are deleted when you tap “stop notifications”, or when the push service reports the address as gone. Delivery goes through your browser vendor’s push service (Apple, Google or Mozilla).',
 			'The server keeps ordinary web request logs so it can be operated, and they are used for nothing else.'
 		],
 		contactTitle: 'Questions',

@@ -17,6 +17,7 @@
 		probabilityWithin
 	} from '$lib/format';
 	import { nowcast } from '$lib/nowcast/store.svelte';
+	import NotifyPanel from './NotifyPanel.svelte';
 
 	const point = $derived(nowcast.point);
 	const forecast = $derived(point?.forecast ?? null);
@@ -158,6 +159,11 @@
 					>{forecast.source === 'client' ? t().panel.sourceLocal : t().panel.sourceServer}</span
 				>
 			</p>
+
+			<!-- Only under a forecast that exists: a point with one is a point
+			     inside the composite, which is the same test the subscribe
+			     endpoint applies. -->
+			<NotifyPanel />
 		{/if}
 	</section>
 {/if}

@@ -17,6 +17,11 @@
  * are too far away for an estimate — so the timeline and the motion arrow can
  * both be developed against something that behaves like the real thing.
  *
+ * It also serves `/api/push/*` with an in-memory subscription table and a
+ * syntactically valid (but meaningless) VAPID key, so the notification UI can
+ * be driven end to end without a push service. No message is ever sent — the
+ * browser subscription is real, the delivery half is not.
+ *
  * Usage:
  *   node scripts/mock-sidecar.mjs --port 8099
  *   VITE_SIDECAR_URL=http://localhost:8099 npm run dev
@@ -112,6 +117,55 @@ const quantise = (value, spec) =>
 	value === null || !Number.isFinite(value)
 		? NODATA
 		: Math.round((Math.min(Math.max(value, spec[0]), spec[1]) - spec[0]) / scaleOf(spec));
+
+// --- push --------------------------------------------------------------------
+
+/**
+ * A structurally valid application server key: 65 bytes, uncompressed-point
+ * prefix 0x04, which base64url-encodes to something starting `BA…`. The bytes
+ * behind it are nonsense — nothing here signs or sends anything — but the
+ * browser rejects a key of the wrong shape before it ever gets to the server.
+ */
+const VAPID_PUBLIC_KEY = (() => {
+	const bytes = Buffer.alloc(65);
+	bytes[0] = 0x04;
+	bytes[1] = 0x00;
+	for (let i = 2; i < 65; i++) bytes[i] = (i * 37 + 11) % 256;
+	return bytes.toString('base64url');
+})();
+
+const PUSH_CONFIG = {
+	enabled: true,
+	vapid_public_key: VAPID_PUBLIC_KEY,
+	threshold_options_pct: [40, 60, 80],
+	lead_options_min: [20, 30, 45, 60],
+	defaults: {
+		threshold_pct: 60,
+		lead_min: 30,
+		quiet_hours: { enabled: false, start: '22:00', end: '07:00' }
+	},
+	capacity_reached: false
+};
+
+/** endpoint → the stored row, exactly as the real service would upsert it. */
+const subscriptions = new Map();
+
+/** Roughly the composite's footprint — enough to exercise the 400 path. */
+const inCoverage = (lat, lon) => lat >= 54.0 && lat <= 58.2 && lon >= 7.0 && lon <= 15.8;
+
+const readJson = (req) =>
+	new Promise((resolve) => {
+		let text = '';
+		req.on('data', (chunk) => (text += chunk));
+		req.on('end', () => {
+			try {
+				resolve(JSON.parse(text));
+			} catch {
+				resolve(null);
+			}
+		});
+		req.on('error', () => resolve(null));
+	});
 
 // --- PNG ---------------------------------------------------------------------
 
@@ -360,12 +414,40 @@ function manifest() {
 	};
 }
 
-createServer((req, res) => {
+createServer(async (req, res) => {
 	const url = new URL(req.url, `http://localhost:${PORT}`);
 	const send = (status, body, type, extra = {}) => {
 		res.writeHead(status, { 'content-type': type, 'access-control-allow-origin': '*', ...extra });
 		res.end(body);
 	};
+	const sendJson = (status, body) => send(status, JSON.stringify(body), 'application/json');
+
+	if (url.pathname === '/api/push/config') {
+		return sendJson(200, PUSH_CONFIG);
+	}
+	if (url.pathname === '/api/push/subscribe' && req.method === 'POST') {
+		const body = await readJson(req);
+		const endpoint = body?.subscription?.endpoint;
+		if (!endpoint || typeof body.lat !== 'number' || typeof body.lon !== 'number') {
+			return sendJson(422, { detail: 'invalid subscription payload' });
+		}
+		if (!inCoverage(body.lat, body.lon)) {
+			return sendJson(400, { detail: 'coordinates outside the radar composite grid' });
+		}
+		const created = !subscriptions.has(endpoint);
+		subscriptions.set(endpoint, { ...body, updated_at: new Date().toISOString() });
+		console.log(
+			`[mock-sidecar] ${created ? 'subscribed' : 'updated'} ${body.lat.toFixed(3)},${body.lon.toFixed(3)} ` +
+				`· ${body.threshold_pct} % / ${body.lead_min} min · ${subscriptions.size} device(s)`
+		);
+		return sendJson(200, { ok: true, created });
+	}
+	if (url.pathname === '/api/push/unsubscribe' && req.method === 'POST') {
+		const body = await readJson(req);
+		const deleted = typeof body?.endpoint === 'string' && subscriptions.delete(body.endpoint);
+		console.log(`[mock-sidecar] unsubscribed · ${subscriptions.size} device(s)`);
+		return sendJson(200, { ok: true, deleted });
+	}
 	if (url.pathname === '/nowcast/manifest.json') {
 		return send(200, JSON.stringify(manifest(), null, 2), 'application/json', {
 			'cache-control': 'public, max-age=30'

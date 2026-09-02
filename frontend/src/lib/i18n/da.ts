@@ -120,6 +120,51 @@ export const da = {
 		error: 'Prognosen kunne ikke hentes. Prøv igen om lidt.',
 		leadAxis: 'Minutter frem'
 	},
+	/**
+	 * Notifications. `fallbackTitle` / `fallbackBody` are read by the service
+	 * worker for a push message it cannot parse — the only strings in the
+	 * catalog that are rendered outside the app.
+	 */
+	push: {
+		title: 'Besked når regnen nærmer sig',
+		enable: 'Giv besked her',
+		working: 'Arbejder …',
+		showSettings: 'Indstillinger',
+		hideSettings: 'Skjul indstillinger',
+		thresholdLabel: 'Sandsynlighed mindst',
+		thresholdOption: (pct: number) => `${pct} %`,
+		leadLabel: 'Varsel',
+		leadOption: (min: number) => `${min} min`,
+		quietLabel: 'Ingen beskeder om natten',
+		quietFrom: 'Fra',
+		quietTo: 'Til',
+		save: 'Gem',
+		cancel: 'Fortryd',
+		edit: 'Ændr',
+		moveHere: 'Flyt hertil',
+		stop: 'Stop besked',
+		summary: (coordinates: string, leadMin: number, thresholdPct: number) =>
+			`Du får besked ved ${coordinates}, når sandsynligheden for regn inden for ${leadMin} min er over ${thresholdPct} %.`,
+		summaryQuiet: (start: string, end: string) =>
+			`Du får ingen beskeder mellem ${start} og ${end}.`,
+		movedAway: 'Beskeden er sat ved et andet punkt end det, du kigger på nu.',
+		iosNotInstalled:
+			'På iPhone og iPad skal siden lægges på hjemmeskærmen, før den må sende beskeder: tryk Del, vælg “Føj til hjemmeskærm”, og åbn siden derfra.',
+		unsupported: 'Din browser kan ikke sende beskeder om regn.',
+		insecure: 'Beskeder kræver en sikker forbindelse (https).',
+		denied:
+			'Beskeder er blokeret for denne side. Du kan tillade dem igen i browserens indstillinger.',
+		capacity: 'Der er ikke plads til flere enheder lige nu. Prøv igen senere.',
+		retry: 'Prøv igen',
+		fallbackTitle: 'Regnradar',
+		fallbackBody: 'Ny besked',
+		errors: {
+			permission: 'Du gav ikke browseren lov til at vise beskeder.',
+			offCoverage: 'Punktet ligger uden for radarens dækning — derfra kan der ikke sendes besked.',
+			unavailable: 'Serveren sender ingen beskeder lige nu.',
+			failed: 'Beskeden kunne ikke slås til. Prøv igen om lidt.'
+		}
+	},
 	status: {
 		loading: 'Henter data …',
 		offline: 'Ingen forbindelse til tjenesten',
@@ -185,6 +230,7 @@ export const da = {
 			'Ingen analyseværktøjer, ingen trackere, ingen annoncer.',
 			'Ingen cookies. Det eneste, der gemmes i din browser, er dit valg af sprog (localStorage).',
 			'Trykker du “brug min placering”, bliver koordinaterne brugt i din egen browser til at slå prognosen op i de kort, du allerede har hentet. De sendes ikke videre.',
+			'Beskeder slår du selv til. Gør du det, gemmer serveren din browsers push-adresse, det punkt du valgte og dine indstillinger, så længe beskeden er slået til. De slettes, når du trykker “stop besked”, eller når push-tjenesten melder adressen død. Selve beskeden sendes gennem browserproducentens push-tjeneste (Apple, Google eller Mozilla).',
 			'Serveren logger almindelige webforespørgsler for at kunne drives, og de bruges ikke til andet.'
 		],
 		contactTitle: 'Spørgsmål',

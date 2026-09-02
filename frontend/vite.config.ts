@@ -13,7 +13,8 @@ const sidecar = process.env.VITE_SIDECAR_URL;
 const proxy = sidecar
 	? {
 			'/nowcast': { target: sidecar, changeOrigin: true },
-			'/forecast': { target: sidecar, changeOrigin: true }
+			'/forecast': { target: sidecar, changeOrigin: true },
+			'/api': { target: sidecar, changeOrigin: true }
 		}
 	: undefined;
 

@@ -8,6 +8,8 @@
 	import { t } from '$lib/i18n';
 	import { nowcast } from '$lib/nowcast/store.svelte';
 	import { inCoverage } from '$lib/nowcast/sampler';
+	import { pointFromUrl } from '$lib/push/notification';
+	import { push } from '$lib/push/store.svelte';
 
 	/** Matches the breakpoint where the sheet becomes a side panel (see below). */
 	const SIDE_PANEL = '(min-width: 52rem)';
@@ -21,7 +23,56 @@
 	let dockHeight = $state(0);
 	let sidePanel = $state(false);
 
-	onMount(() => nowcast.start());
+	/**
+	 * A point arriving from outside the page: `/?lat=&lon=` when a
+	 * notification opened a cold tab, and the service worker's `open-point`
+	 * message when it focused a tab that was already there. Both mean the same
+	 * thing — show this point — and both may arrive before the manifest does.
+	 */
+	let deepLink: { lat: number; lon: number } | null = null;
+
+	function openPoint(lat: number, lon: number) {
+		void nowcast.selectPoint(lat, lon);
+		mapView?.flyTo(lat, lon);
+	}
+
+	onMount(() => {
+		const stopNowcast = nowcast.start();
+		void push.init();
+
+		const initial = pointFromUrl(location.search);
+		if (initial) {
+			// `selectPoint` works without grids — it falls back to /forecast —
+			// so the panel fills in straight away and is re-sampled below once
+			// the cycle's grids arrive.
+			openPoint(initial.lat, initial.lon);
+			if (!nowcast.manifest) deepLink = initial;
+		}
+
+		const onMessage = (event: MessageEvent) => {
+			const data = event.data as { type?: string; lat?: number; lon?: number } | null;
+			if (!data || data.type !== 'open-point') return;
+			if (typeof data.lat !== 'number' || typeof data.lon !== 'number') return;
+			openPoint(data.lat, data.lon);
+		};
+		const worker = 'serviceWorker' in navigator ? navigator.serviceWorker : null;
+		worker?.addEventListener('message', onMessage);
+
+		return () => {
+			worker?.removeEventListener('message', onMessage);
+			stopNowcast();
+		};
+	});
+
+	// The deep link landed before the first manifest: re-select once the cycle
+	// is there, so the point is sampled from the grids rather than left on the
+	// server fallback, and the map flies to it now that it can.
+	$effect(() => {
+		if (!nowcast.manifest || !deepLink) return;
+		const point = deepLink;
+		deepLink = null;
+		openPoint(point.lat, point.lon);
+	});
 
 	// The sheet only covers the map when it is *under* it; beside it, the map
 	// needs no bottom padding.

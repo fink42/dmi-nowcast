@@ -73,8 +73,11 @@ Both are gitignored. Nothing in the app talks to a third-party tile server.
 src/lib/i18n/          da.ts + en.ts catalogs, types.ts, state.svelte.ts
 src/lib/nowcast/       manifest types, PNG decode, grid sampling, timeline,
                        cell-motion bearings, store
+src/lib/push/          support detection, prefs + storage, VAPID keys, API,
+                       payload parsing, store
 src/lib/map/           MapLibre style, Mercator resampling, overlay frames
-src/lib/components/    MapView, LoopControls, ForecastPanel, LangToggle, footer
+src/lib/components/    MapView, LoopControls, ForecastPanel, NotifyPanel,
+                       LangToggle, footer
 src/routes/            map (/) + about, data, privacy, support
 scripts/               fetch-basemap, make-icons, mock-sidecar
 ```
@@ -102,10 +105,43 @@ Three pieces deserve a note:
 ## PWA
 
 `static/manifest.webmanifest` plus `src/service-worker.ts`. The worker
-precaches the app shell and **never** caches `/nowcast/*` or `/forecast` (a
-stale rain map is worse than none) nor the basemap archive (too big, and it is
-range-requested). Icons are generated from one raindrop path:
-`node scripts/make-icons.mjs`.
+precaches the app shell and **never** caches `/nowcast/*`, `/forecast` or
+`/api/*` (a stale rain map is worse than none), nor the basemap archive (too
+big, and it is range-requested). It also carries the push and
+`notificationclick` handlers — see below. Icons are generated from one raindrop
+path: `node scripts/make-icons.mjs`.
+
+## Notifications
+
+Opt-in Web Push, per point. The pure half lives in `src/lib/push/`: `support.ts`
+(can this browser do it), `prefs.ts` (threshold / lead / quiet hours, the
+localStorage copy, the POST body), `keys.ts` (VAPID base64url → bytes),
+`api.ts` (`/api/push/config`, `subscribe`, `unsubscribe`) and `notification.ts`
+(payload → notification, notification URL → map point). `store.svelte.ts` holds
+the state the UI reads, and `src/lib/components/NotifyPanel.svelte` sits at the
+bottom of the forecast panel for a point that has a forecast.
+
+The server owns the options: which probability thresholds and lead windows may
+be chosen comes from `/api/push/config`, and the constants in `prefs.ts` only
+cover the moment before that response lands. A sidecar without the feature
+answers that path with the app shell, which reads as "push disabled" rather
+than an error.
+
+The service worker gains a `push` handler (`showNotification`) and a
+`notificationclick` handler that focuses an existing tab and messages it
+`{ type: 'open-point', lat, lon }`, or opens `/?lat=&lon=` if there is none —
+which the map page also handles on a cold start.
+
+`scripts/mock-sidecar.mjs` serves `/api/push/config`, `/api/push/subscribe` and
+`/api/push/unsubscribe` against an in-memory table and a structurally valid
+(but meaningless) VAPID key, so `npm run dev` drives the whole UI. The browser
+subscription is real; nothing is ever delivered.
+
+**iOS needs the app installed.** Safari exposes `PushManager` only to a site
+added to the home screen, so an iPhone in a normal tab gets an explanation of
+the Share → Add to Home Screen step instead of a button that cannot work.
+`detectPushSupport()` covers that, an insecure origin, a browser without push,
+and a permission already refused.
 
 ## Tests
 
@@ -117,6 +153,10 @@ range-requested). Icons are generated from one raindrop path:
 - `src/lib/map/warp.test.ts` — the four-corner error and the mesh's accuracy;
 - `src/lib/i18n/catalog.test.ts` — every key, argument count and list length
   present in both locales;
-- `src/lib/pwa.test.ts` — the web manifest and its icons.
+- `src/lib/pwa.test.ts` — the web manifest and its icons;
+- `src/lib/push/*.test.ts` — support detection per branch, preference
+  normalisation and the storage copy (including storage that throws), the VAPID
+  conversion against fixed vectors, the API layer against a stubbed `fetch`,
+  and push-payload parsing.
 
 CI additionally runs `npm run check` (svelte-check) and `npm run build`.
