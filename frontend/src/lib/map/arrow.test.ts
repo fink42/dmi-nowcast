@@ -1,11 +1,16 @@
 /**
  * The motion arrow's geometry, held to what the arrow *claims*.
  *
- * The claim is specific and falsifiable: the shaft is one hour of travel long,
- * it points at where the rain is coming from, and every tick is one radar
- * timestep of travel further out. So the tests do not compare against the
- * implementation's own arithmetic — they measure the built GeoJSON back with
- * an independent haversine and an independent bearing, and check the metres.
+ * The claim is specific and falsifiable: a mark labelled `minute = m` lies over
+ * the rain that reaches the point m minutes from **wall-clock now**, which on
+ * an image that is `age` minutes old is `speed × (age + m) / 60` km upstream.
+ * So the tests do not compare against the implementation's own arithmetic —
+ * they measure the built GeoJSON back with an independent haversine and an
+ * independent bearing, and check the metres.
+ *
+ * The tests that do not care about latency pass `radarAgeMin: 0`, which is the
+ * old image-time geometry exactly; the age-aware ones live in their own block
+ * at the bottom.
  *
  * `destinationPoint` is checked against the exact rhumb-line destination,
  * because a cell advected at a constant bearing follows a rhumb line; the
@@ -13,6 +18,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+	ARROW_AGE_CAP_MIN,
 	ARROW_HORIZON_MIN,
 	destinationPoint,
 	emptyArrow,
@@ -143,6 +149,9 @@ describe('motionArrow', () => {
 			bearingFromDeg: BEARING,
 			speedKmh: SPEED,
 			timestepMin: 10,
+			// A brand-new image: the arrow is then exactly one hour of travel
+			// long, which is the geometry every test in this block pins.
+			radarAgeMin: 0,
 			...over
 		});
 
@@ -245,7 +254,13 @@ describe('motionArrow', () => {
 
 	it('keeps the head visible on a crawling cell and modest on a racing one', () => {
 		const headLen = (speedKmh: number) => {
-			const fc = motionArrow({ ...HOME, bearingFromDeg: 270, speedKmh, timestepMin: 10 });
+			const fc = motionArrow({
+				...HOME,
+				bearingFromDeg: 270,
+				speedKmh,
+				timestepMin: 10,
+				radarAgeMin: 0
+			});
 			const ring = (byRole(fc, 'head')[0].geometry as { coordinates: number[][][] })
 				.coordinates[0];
 			return haversineKm(ring[0], ring[1]);
@@ -266,5 +281,145 @@ describe('motionArrow', () => {
 		const fc = emptyArrow();
 		expect(fc.type).toBe('FeatureCollection');
 		expect(fc.features).toHaveLength(0);
+	});
+});
+
+/**
+ * Radar latency (issue #3). DMI's newest composite is typically 20–30 min old
+ * on screen, so an arrow measured from the *image* puts its tip an unmarked
+ * half-hour earlier than the clock a reader is holding it against. Everything
+ * here is one claim from two sides: `minute` is wall-clock, and the ground
+ * distance that carries it is `speed × (age + minute) / 60`.
+ */
+describe('motionArrow and radar age', () => {
+	const BEARING = 315;
+	const SPEED = 36; // km/h — 0.6 km per minute, so the arithmetic is legible
+	const TAIL = [HOME.lon, HOME.lat];
+	const build = (radarAgeMin: number, over: Partial<Parameters<typeof motionArrow>[0]> = {}) =>
+		motionArrow({
+			lat: HOME.lat,
+			lon: HOME.lon,
+			bearingFromDeg: BEARING,
+			speedKmh: SPEED,
+			timestepMin: 10,
+			radarAgeMin,
+			...over
+		});
+
+	/** Where a cross-piece (tick or now mark) sits, as a range from the tail. */
+	const rangeOf = (f: { geometry: unknown }): number => {
+		const [a, b] = (f.geometry as { coordinates: number[][] }).coordinates;
+		return haversineKm(TAIL, [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+	};
+	/** How wide it is drawn. */
+	const widthOf = (f: { geometry: unknown }): number => {
+		const [a, b] = (f.geometry as { coordinates: number[][] }).coordinates;
+		return haversineKm(a, b);
+	};
+	const shaftOf = (fc: ArrowCollection) =>
+		(byRole(fc, 'shaft')[0].geometry as { coordinates: number[][] }).coordinates;
+
+	it('stretches the shaft by the age of the image, so the tip is now + 60 min', () => {
+		for (const age of [0, 7, 23.5, 30]) {
+			const coords = shaftOf(build(age));
+			expect(coords[0]).toEqual(TAIL);
+			// The rain at the tip still has to cover the age it already spent
+			// travelling since the scan, plus the hour ahead.
+			expect(haversineKm(coords[0], coords[1])).toBeCloseTo((SPEED * (age + 60)) / 60, 2);
+		}
+	});
+
+	it('puts each tick where the rain arriving that many minutes from now is now', () => {
+		const age = 25;
+		const ticks = byRole(build(age), 'tick');
+		expect(ticks.map((f) => f.properties.minute)).toEqual([10, 20, 30, 40, 50]);
+		for (const tick of ticks) {
+			expect(rangeOf(tick)).toBeCloseTo((SPEED * (age + tick.properties.minute)) / 60, 2);
+		}
+		// Still one radar timestep apart: latency shifts the ruler, it does not
+		// rescale it.
+		const ranges = ticks.map(rangeOf);
+		for (const gap of ranges.slice(1).map((km, i) => km - ranges[i])) {
+			expect(gap).toBeCloseTo(6, 2);
+		}
+	});
+
+	it('marks wall-clock now on the shaft once the image has aged', () => {
+		const age = 25;
+		const now = byRole(build(age), 'now');
+		expect(now).toHaveLength(1);
+		expect(now[0].properties.minute).toBe(0);
+		// Rain 15 km upstream reaches the point exactly at wall-clock now: the
+		// stretch behind the mark has already arrived.
+		expect(rangeOf(now[0])).toBeCloseTo((SPEED * age) / 60, 2);
+		// Double an ordinary tick, so it reads as "you are here" and not as one
+		// more ruler mark.
+		// (Not to the millimetre: the two cross-pieces sit at different
+		// latitudes, and a haversine over their endpoints picks up meridian
+		// convergence. A tenth of a metre is well inside a 500 m radar pixel.)
+		const tick = byRole(build(age), 'tick')[0];
+		expect(widthOf(now[0])).toBeGreaterThan(widthOf(tick));
+		expect(widthOf(now[0])).toBeCloseTo(2 * widthOf(tick), 4);
+	});
+
+	it('leaves the now mark off a fresh image, where it would hide under the marker', () => {
+		expect(byRole(build(0), 'now')).toHaveLength(0);
+		expect(byRole(build(0.5), 'now')).toHaveLength(0);
+		expect(byRole(build(1), 'now')).toHaveLength(1);
+		// The rest of the arrow is unaffected either way.
+		expect(build(0).features).toHaveLength(1 + 1 + 5);
+		expect(build(1).features).toHaveLength(1 + 1 + 5 + 1);
+	});
+
+	it('labels every feature in minutes from now, not minutes from the image', () => {
+		const fc = build(25);
+		expect(byRole(fc, 'now').map((f) => f.properties.minute)).toEqual([0]);
+		expect(byRole(fc, 'tick').map((f) => f.properties.minute)).toEqual([10, 20, 30, 40, 50]);
+		// The horizon is the horizon whatever the image's age; only the ground
+		// distance behind it moved.
+		expect(byRole(fc, 'shaft')[0].properties.minute).toBe(ARROW_HORIZON_MIN);
+		expect(byRole(fc, 'head')[0].properties.minute).toBe(ARROW_HORIZON_MIN);
+	});
+
+	it('reproduces the old image-time geometry exactly at age zero', () => {
+		// Zero age is the pre-issue-#3 arrow to the metre: an hour-long shaft,
+		// ticks every 6 km, and nothing extra on it.
+		const fc = build(0);
+		const shaft = shaftOf(fc);
+		expect(haversineKm(shaft[0], shaft[1])).toBeCloseTo(SPEED, 2);
+		expect(byRole(fc, 'now')).toHaveLength(0);
+		byRole(fc, 'tick').forEach((f, i) =>
+			expect(rangeOf(f)).toBeCloseTo((SPEED * (i + 1) * 10) / 60, 2)
+		);
+	});
+
+	it('caps the age it will absorb, so a stalled feed cannot draw across the sea', () => {
+		expect(ARROW_AGE_CAP_MIN).toBe(60);
+		const capped = build(ARROW_AGE_CAP_MIN);
+		for (const age of [90, 240, 60 * 24]) expect(build(age)).toEqual(capped);
+		// Capped, that is two hours of travel — long, and no longer.
+		const shaft = shaftOf(capped);
+		expect(haversineKm(shaft[0], shaft[1])).toBeCloseTo(2 * SPEED, 2);
+	});
+
+	it('treats an unusable age as no age at all', () => {
+		const fresh = build(0);
+		for (const age of [-1, -0.001, -1000, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(build(age)).toEqual(fresh);
+		}
+		// Not the negative infinity of a clock skew either.
+		expect(build(Number.NEGATIVE_INFINITY)).toEqual(fresh);
+	});
+
+	it('keeps the head on the tip of the stretched shaft', () => {
+		const fc = build(25);
+		const tip = shaftOf(fc)[1];
+		const ring = (byRole(fc, 'head')[0].geometry as { coordinates: number[][][] }).coordinates[0];
+		expect(ring).toHaveLength(4);
+		expect(ring[0]).toEqual(tip);
+		expect(ring[3]).toEqual(ring[0]);
+		// Base corners still behind the apex, on the tail's side.
+		expect(haversineKm(TAIL, ring[1])).toBeLessThan(haversineKm(TAIL, tip));
+		expect(haversineKm(TAIL, ring[2])).toBeLessThan(haversineKm(TAIL, tip));
 	});
 });

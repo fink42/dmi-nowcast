@@ -36,10 +36,11 @@
 	const OVERLAY_SOURCE = 'nowcast-overlay';
 	const OVERLAY_LAYER = 'nowcast-overlay-layer';
 	const ARROW_SOURCE = 'nowcast-motion-arrow';
-	/** Bottom to top: white halo, filled head, ink shaft. See `arrowLayers`. */
+	/** Bottom to top: white halo, filled head, ink shaft, the now mark. See `arrowLayers`. */
 	const ARROW_CASING_LAYER = 'nowcast-motion-arrow-casing';
 	const ARROW_HEAD_LAYER = 'nowcast-motion-arrow-head';
 	const ARROW_LINE_LAYER = 'nowcast-motion-arrow-line';
+	const ARROW_NOW_LAYER = 'nowcast-motion-arrow-now';
 	/** 1×1 transparent PNG — the placeholder an image source must be born with. */
 	const BLANK_PNG =
 		'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -170,6 +171,12 @@
 	 *
 	 * A `line` layer strokes polygon rings too, so the casing haloes the head
 	 * without a layer of its own, and the ink line then crisps its edge.
+	 *
+	 * The one addition is the *now* mark, which the arrow carries when the radar
+	 * image has aged (see `$lib/map/arrow`): the point on the shaft that
+	 * wall-clock now has reached, everything behind it being rain that has
+	 * already arrived. It is drawn in the same ink but heavier, so it separates
+	 * from the ruler ticks it sits among without becoming a second colour.
 	 */
 	function arrowLayers(): LayerSpecification[] {
 		const dark = theme === 'dark';
@@ -197,10 +204,27 @@
 				id: ARROW_LINE_LAYER,
 				type: 'line',
 				source: ARROW_SOURCE,
+				// Everything but the now mark, which the layer above draws
+				// heavier — filtering here keeps it from being painted twice.
+				filter: ['!=', ['get', 'role'], 'now'],
 				layout: round,
 				paint: {
 					'line-color': ink,
 					'line-width': ['interpolate', ['linear'], ['zoom'], 5, 2, 12, 3.5]
+				}
+			},
+			{
+				id: ARROW_NOW_LAYER,
+				type: 'line',
+				source: ARROW_SOURCE,
+				filter: ['==', ['get', 'role'], 'now'],
+				layout: round,
+				paint: {
+					'line-color': ink,
+					// Same ink, roughly half again as thick: the mark is already
+					// twice as wide as a tick, and the weight is what stops a
+					// glance mistaking it for one.
+					'line-width': ['interpolate', ['linear'], ['zoom'], 5, 3, 12, 5.5]
 				}
 			}
 		];
@@ -213,6 +237,12 @@
 	 * is not re-decided here: this reads the very same `cellMotion()` result the
 	 * forecast panel prints, so the two cannot disagree. A manifest without a
 	 * timestep costs the ticks and nothing else — the builder drops them.
+	 *
+	 * `radarAgeMin` is the same number the panel prints as "radar data: N min
+	 * old", and it is what makes the arrow's marks wall-clock minutes rather
+	 * than minutes after a scan that happened half an hour ago. An unknown age
+	 * (no manifest yet) is zero: the arrow then means what it used to, which is
+	 * the right thing to fall back on.
 	 */
 	function arrowData(): ArrowCollection {
 		const point = nowcast.point;
@@ -223,7 +253,8 @@
 			lon: point.lon,
 			bearingFromDeg: motion.bearingFromDeg,
 			speedKmh: motion.speedKmh,
-			timestepMin: nowcast.manifest?.timestep_min ?? 0
+			timestepMin: nowcast.manifest?.timestep_min ?? 0,
+			radarAgeMin: nowcast.radarAgeMin ?? 0
 		});
 	}
 
@@ -254,7 +285,7 @@
 	/** Drop the arrow's layers and source — the style outlives them otherwise. */
 	function removeArrow() {
 		if (!map) return;
-		for (const id of [ARROW_LINE_LAYER, ARROW_HEAD_LAYER, ARROW_CASING_LAYER]) {
+		for (const id of [ARROW_NOW_LAYER, ARROW_LINE_LAYER, ARROW_HEAD_LAYER, ARROW_CASING_LAYER]) {
 			if (map.getLayer(id)) map.removeLayer(id);
 		}
 		if (map.getSource(ARROW_SOURCE)) map.removeSource(ARROW_SOURCE);
@@ -276,10 +307,17 @@
 	 * whose cadence changed the tick spacing, a style reload that wiped the
 	 * layers, and a theme flip that changes the ink. Clearing the point empties
 	 * the collection, so the arrow goes with the panel.
+	 *
+	 * Radar age is in there too, which means the arrow creeps outwards as the
+	 * displayed image ages — every 15 s, on the store's clock tick. That is a
+	 * `setData` with a handful of features and no layer churn — far cheaper
+	 * than the bitmap swap the radar loop already does on every frame — and the
+	 * alternative is a tip that quietly stops meaning "now + 60".
 	 */
 	$effect(() => {
 		void nowcast.point;
 		void nowcast.manifest?.timestep_min;
+		void nowcast.radarAgeMin;
 		void styleReady;
 		void theme;
 		syncArrow();
