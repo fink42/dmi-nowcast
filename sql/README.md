@@ -28,6 +28,15 @@ here as SQL instead of bespoke pandas.
 - **Probability bins**: 10 fixed-width bins,
   `bin = least(floor(raw_prob*10), 9)` — bin k covers
   `[k/10, (k+1)/10)`, with `raw_prob = 1.0` folded into bin 9.
+- **Frame age**: every row carries `frame_age_min`, the event's simulated
+  live compute latency (drawn per event from `frame_age_range_csv`,
+  default 12–18 min). `lead_min` stays the NOMINAL lead — the one the
+  service quotes and the fit groups by — while the row's outcome was
+  verified at `T + ceil((lead_min + frame_age_min)/timestep_min) *
+  timestep_min`, exactly the instant the served probability describes. A
+  corpus without the column was built at zero age and its leads mean
+  something else; don't pool the two (`settings_hash` differs, and both
+  the builder and the fitter refuse the mix).
 
 ## Queries
 

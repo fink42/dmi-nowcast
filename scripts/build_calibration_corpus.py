@@ -29,14 +29,17 @@ Event anchors are sampled on the chosen type's 10-min grid (whole hours
 for fullRange; hh:05 for doppler).
 
 **Verification snapping rule** — a nominal lead ``L`` reads ensemble
-timestep ``ceil(L / timestep_min)`` (frame-age convention below), so the
-verification frame is resolved at that timestep's radar time:
-``T + ceil(L / timestep_min) * timestep_min`` — ``T + lead`` snapped UP
-to the 10-min frame grid. A lead of 5 or 15 therefore verifies against
-the fullRange frame at ``T+10`` / ``T+20``, exactly the instant the
-forecast probability for that lead describes; for the runtime leads (all
-multiples of 5) this equals nearest-grid rounding with ties toward the
-later frame. The usual ±4 min match tolerance applies around the
+timestep ``ceil((L + frame_age_min) / timestep_min)`` (frame-age
+convention below), so the verification frame is resolved at that
+timestep's radar time:
+``T + ceil((L + frame_age_min) / timestep_min) * timestep_min`` —
+``T + lead + age`` snapped UP to the 10-min frame grid. At the default
+12–18 min simulated age, lead 30 therefore always verifies against the
+fullRange frame at ``T+50`` and lead 60 against ``T+80`` — exactly the
+instants the *served* probabilities for those leads describe. Leads
+whose ``L + age`` straddles a grid line (lead 5 at ``T+20`` or ``T+30``,
+depending on the draw) land on either side of it, again exactly as the
+live service does. The usual ±4 min match tolerance applies around the
 *snapped* target; when no frame lands inside tolerance the lead's
 outcome stays null.
 
@@ -67,18 +70,41 @@ calibrates exactly the ``p_rain`` quantity the website serves. Outcomes
 come from the verification frames sampled at each point's disc with the
 runtime detection statistic.
 
-**Frame-age convention** — ``national_products(..., frame_age_min=0.0)``.
-The runtime frame-age correction maps "minutes from ``generated_at``" onto
-ensemble timesteps that count from radar-frame time, because live compute
-happens some minutes after the radar timestamp. In backtest there is no
-such gap by construction: the event's newest input frame *is* "now" (we
-anchor the event at radar-frame time), and the verification frames are
-resolved at ``T + lead`` from that same anchor. Forecast timesteps and
-verification truth therefore share one clock and no correction applies;
-a nominal lead ``L`` selects timestep ``ceil(L / timestep_min)`` exactly
-as the runtime does for a zero-age frame. (The ±4 min frame-matching
-tolerance jitters inputs and verification alike and has no systematic
-direction.)
+**Frame-age convention — the corpus simulates the live latency**
+(``--frame-age-range``, default ``12,18``). The service does not compute
+at radar-frame time: a cycle finishes ~12–18 min after the timestamp of
+its newest frame, and the runtime corrects for that gap. "P(rain within
+``L`` minutes **from now**)" is read from ensemble timestep
+``ceil((L + frame_age) / timestep_min)``, which is valid at radar time
+``T + ceil((L + frame_age) / timestep_min) * timestep_min``.
+
+A corpus built at zero age fits lead ``L`` against timestep
+``ceil(L / timestep_min)`` while the service serves lead ``L`` from a
+LATER timestep: on the 10-min grid, live "lead 30" reads +50 min from
+the image, but a zero-age curve for lead 30 was fitted on +30 min. The
+curve and the quantity it corrects would describe different horizons —
+so the builder simulates the latency instead. Each event draws
+
+    frame_age_min ~ Uniform(LO, HI)
+
+from an RNG seeded on ``(--seed, event time)``, and that age is used
+consistently everywhere for the event: ``national_products(...,
+frame_age_min=age)`` for the forecast, ``T + ceil((L + age) / timestep)
+* timestep`` for the verification instant (snapping rule above), and a
+per-row ``frame_age_min`` column for the record. Fitted and served leads
+then coincide. Because the age is a pure function of the seed and the
+event time, a resumed or appended build redraws exactly the same age for
+the same event; ``n_timesteps`` is grown to ``ceil((max lead + HI) /
+timestep_min)`` so the longest served lead is inside the ensemble
+horizon (8 timesteps = 80 min at the defaults).
+
+``--frame-age-range 0,0`` reproduces the old zero-age convention
+exactly — but under a DIFFERENT ``settings_hash``, because
+``frame_age_range`` is a new key in the hashed settings dict. No
+pre-frame-age corpus can therefore be resumed or appended to; that is
+deliberate, since its rows verify at different instants. (The ±4 min
+frame-matching tolerance jitters inputs and verification alike and has
+no systematic direction.)
 
 **Pixel convention** — identical to the sidecar's ``/forecast`` endpoint:
 ``idx = CompositeGeo.lonlat_to_grid(lon, lat)`` on the native grid, then
@@ -115,21 +141,23 @@ appended. The fit (package B3) consumes them as relative weights.
     raw_prob       float32 (NaN when the forecast failed / out of grid)
     outcome        int8, nullable (null = verification frame missing)
     sample_weight  float64
+    frame_age_min  float32 (this event's simulated frame age, minutes —
+                   constant across the event's rows)
     error          str ("" when clean; per-event diagnostics)
     -- settings columns (B0 parity; identical on every row of a corpus) --
     ensemble_size, n_cascade_levels, downsample_factor, n_timesteps  int32
     threshold_mm_h, disc_radius_m, timestep_min                      float64
     detection_stat, scan_type, motion_method                         str
-    leads_min_csv, settings_hash                                     str
+    leads_min_csv, frame_age_range_csv, settings_hash                str
     schema_version                                                   int32 (2)
 
 ``settings_hash`` is a stable hash over the sorted settings dict; the
 builder itself refuses to append to an output whose hash differs, and
 the fit refuses a mixed corpus the same way. ``scan_type``,
-``timestep_min`` and ``motion_method`` are part of the hashed dict, so
-any pre-fix corpus (mixed-type frames, 5-min timestep, uncompleted
-motion field) hashes differently and the fitter refuses it
-automatically — no manual audit needed.
+``timestep_min``, ``motion_method`` and ``frame_age_range`` are part of
+the hashed dict, so any pre-fix corpus (mixed-type frames, 5-min
+timestep, uncompleted motion field, zero frame age) hashes differently
+and the fitter refuses it automatically — no manual audit needed.
 
 Resumable: skips events already present in the output Parquet. Progress
 JSON is written to ``--progress`` after every event for the companion
@@ -140,7 +168,7 @@ Example::
     python scripts/build_calibration_corpus.py \\
         --points src/dmi_nowcast_core/calibration_points_v2.json \\
         --days-back 125 --n-events 500 \\
-        --wet-bias 0.15 \\
+        --wet-bias 0.15 --frame-age-range 12,18 \\
         --output reports/calibration_corpus.parquet \\
         --progress /tmp/calib_progress.json --workers 3
 
@@ -208,6 +236,16 @@ STEPS_SEED = 42
 # they also lack the column entirely — the fitter refuses them structurally.
 # Bump the suffix whenever the motion pipeline changes materially.
 MOTION_METHOD = "farneback_complete_v1"
+# Simulated frame age, minutes: [LO, HI] of the uniform draw per event.
+# The live cycle finishes ~12-18 min after its newest frame's radar
+# timestamp (fetch + STEPS + render), and the runtime shifts every lead
+# by that age before picking an ensemble timestep — so the corpus must
+# too, or the fitted curve corrects a different horizon than the one
+# served (module docstring, "Frame-age convention").
+DEFAULT_FRAME_AGE_RANGE = (12.0, 18.0)
+# Sanity bound on --frame-age-range. A cycle older than an hour is a
+# broken service, not a latency to calibrate for.
+MAX_FRAME_AGE_MIN = 60.0
 # Flush cadence: append (full rewrite, atomic rename) every N events.
 FLUSH_EVERY_EVENTS = 10
 
@@ -248,11 +286,20 @@ class CorpusSettings:
     scan_type: str = "fullRange"
     timestep_min: float = FRAME_SPACING_MIN
     motion_method: str = MOTION_METHOD
+    #: [LO, HI] minutes of the per-event uniform frame-age draw. Part of
+    #: the hashed settings, so a zero-age corpus can never be mixed with
+    #: (or resumed as) a latency-simulating one.
+    frame_age_range: tuple[float, float] = DEFAULT_FRAME_AGE_RANGE
 
     @property
     def n_timesteps(self) -> int:
-        """Ensemble horizon: enough whole timesteps to span the longest lead."""
-        return max(1, math.ceil(max(self.leads_min) / self.timestep_min))
+        """Ensemble horizon: enough whole timesteps to span the longest
+        EFFECTIVE lead — the longest nominal lead plus the largest frame
+        age the sampler can draw, since the runtime reads lead ``L`` at
+        timestep ``ceil((L + age) / timestep_min)``. 8 timesteps (80 min)
+        at the defaults, against 6 for the old zero-age convention."""
+        longest = max(self.leads_min) + max(self.frame_age_range)
+        return max(1, math.ceil(longest / self.timestep_min))
 
     def to_dict(self) -> dict:
         """Canonical settings dict — the hash input and the Parquet columns."""
@@ -267,6 +314,7 @@ class CorpusSettings:
             "motion_method": str(self.motion_method),
             "leads_min": [int(x) for x in self.leads_min],
             "timestep_min": float(self.timestep_min),
+            "frame_age_range": [float(x) for x in self.frame_age_range],
             "n_timesteps": int(self.n_timesteps),
         }
 
@@ -277,10 +325,18 @@ class CorpusSettings:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
     def settings_columns(self) -> dict:
-        """The per-row Parquet settings columns."""
+        """The per-row Parquet settings columns.
+
+        Parquet columns are scalars, so the two list-valued settings are
+        flattened to CSV strings (``leads_min`` → ``leads_min_csv``,
+        ``frame_age_range`` → ``frame_age_range_csv``). The hash is
+        computed over the LIST form, so the flattening cannot affect it.
+        """
         d = self.to_dict()
         leads = d.pop("leads_min")
         d["leads_min_csv"] = ",".join(str(x) for x in leads)
+        age_range = d.pop("frame_age_range")
+        d["frame_age_range_csv"] = ",".join(f"{float(x):g}" for x in age_range)
         d["settings_hash"] = self.settings_hash
         d["schema_version"] = SCHEMA_VERSION
         return d
@@ -297,6 +353,48 @@ def parse_leads(spec: str) -> tuple[int, ...]:
     if any(x <= 0 for x in leads) or list(leads) != sorted(set(leads)):
         raise ValueError(f"--leads must be strictly ascending positive minutes, got {spec!r}")
     return leads
+
+
+def parse_frame_age_range(spec: str) -> tuple[float, float]:
+    """Parse ``"12,18"`` → ``(12.0, 18.0)``: the uniform frame-age draw's
+    bounds in minutes. Requires ``0 <= LO <= HI <= 60``; ``"0,0"`` is the
+    legal degenerate case (the old zero-age convention)."""
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError(
+            f"--frame-age-range must be 'LO,HI' in minutes, got {spec!r}"
+        )
+    try:
+        lo, hi = float(parts[0]), float(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"--frame-age-range {spec!r} is not numeric") from exc
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise ValueError(f"--frame-age-range {spec!r} must be finite")
+    if not (0.0 <= lo <= hi <= MAX_FRAME_AGE_MIN):
+        raise ValueError(
+            f"--frame-age-range must satisfy 0 <= LO <= HI <= "
+            f"{MAX_FRAME_AGE_MIN:g}, got {spec!r}"
+        )
+    return (lo, hi)
+
+
+def event_frame_age_min(
+    event_time: datetime, seed: int, frame_age_range: tuple[float, float]
+) -> float:
+    """The simulated frame age (minutes) for one event: ``Uniform(LO, HI)``.
+
+    Deterministic in ``(seed, event_time)`` and NOT in the order events
+    are processed, so a resumed, appended or reordered build redraws the
+    identical age for an event that is already in the corpus — the same
+    reproducibility guarantee ``STEPS_SEED`` gives the ensemble. A
+    degenerate range returns its single value without consuming the RNG.
+    """
+    lo, hi = float(frame_age_range[0]), float(frame_age_range[1])
+    if hi <= lo:
+        return lo
+    key = f"{int(seed)}|{_ts_str(event_time)}".encode("utf-8")
+    stream = int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
+    return lo + (hi - lo) * random.Random(stream).random()
 
 
 # ---------------------------------------------------------------------------
@@ -350,20 +448,26 @@ def filter_scan_type(
     return [f for f in feats if feature_matches_scan_type(f, scan_type)]
 
 
-def snap_lead_min(lead_min: int, timestep_min: float) -> int:
-    """Snap a nominal lead onto the frame grid: UP to the next whole
-    timestep, ``ceil(lead / timestep) * timestep``.
+def snap_lead_min(lead_min: float, timestep_min: float) -> int:
+    """Snap a lead onto the frame grid: UP to the next whole timestep,
+    ``ceil(lead / timestep) * timestep``.
 
-    This is the radar time of the ensemble timestep the forecast
-    probability for ``lead_min`` actually reads (``national_products``
-    maps lead L → timestep ``ceil(L / timestep_min)``; frame age 0 in
-    backtest — module docstring), so verification truth and forecast
-    quantity describe the same instant. For leads that are multiples of
-    5 on a 10-min grid this equals nearest-grid rounding with ties
-    toward the later frame (5 → 10, 15 → 20, 20 → 20, …); on a 5-min
-    grid it degenerates to the identity.
+    Callers pass the EFFECTIVE lead — nominal lead + the event's frame
+    age — because that is what the runtime resolves a timestep from
+    (``national_products`` maps lead L → timestep
+    ``ceil((L + frame_age) / timestep_min)``, valid at that many minutes
+    after radar-frame time). Verification truth and forecast quantity
+    therefore describe the same instant. On zero age and the 10-min grid
+    this reduces to the old rule — nearest-grid rounding with ties toward
+    the later frame for leads that are multiples of 5 (5 → 10, 15 → 20,
+    20 → 20, …) — and to the identity on a 5-min grid.
+
+    The epsilon mirrors ``national._steps_in_lead`` (and
+    ``probabilistic.frame_age_corrected_leads``) so float fuzz at an
+    exact timestep multiple can never split verification and forecast
+    into different buckets.
     """
-    return int(math.ceil(lead_min / timestep_min) * timestep_min)
+    return int(math.ceil(lead_min / timestep_min - 1e-9) * timestep_min)
 
 
 # ---------------------------------------------------------------------------
@@ -488,11 +592,15 @@ def build_event_rows(
     raw_by_point: dict[str, dict[int, float]],
     outcomes_by_point: dict[str, dict[int, Optional[int]]],
     error: str = "",
+    frame_age_min: float = 0.0,
 ) -> list[dict]:
     """Assemble the per-(point, lead) base rows for one event.
 
-    ``sample_weight`` and the settings columns are attached by the parent
-    process (they are per-run, not per-worker, concerns).
+    ``frame_age_min`` is the event's simulated frame age and is stamped
+    onto every row of the event (it is a per-event draw, and the forecast
+    and verification instants both derive from it). ``sample_weight`` and
+    the settings columns are attached by the parent process (they are
+    per-run, not per-worker, concerns).
     """
     rows: list[dict] = []
     for point in points:
@@ -508,6 +616,7 @@ def build_event_rows(
                 "lead_min": int(lead),
                 "raw_prob": float(raws.get(lead, float("nan"))),
                 "outcome": outs.get(lead),
+                "frame_age_min": float(frame_age_min),
                 "error": error,
             })
     return rows
@@ -518,9 +627,13 @@ def error_event_rows(
     points: tuple[CalibrationPoint, ...],
     leads_min: tuple[int, ...],
     error: str,
+    frame_age_min: float = 0.0,
 ) -> list[dict]:
     """All-NaN / null rows for a failed event (kept so resume skips it)."""
-    return build_event_rows(event_time_iso, points, leads_min, {}, {}, error=error)
+    return build_event_rows(
+        event_time_iso, points, leads_min, {}, {},
+        error=error, frame_age_min=frame_age_min,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -896,7 +1009,7 @@ def _find_nearest_feature(
 
 
 def _gather_event_frames(
-    event_time: datetime, settings: CorpusSettings
+    event_time: datetime, settings: CorpusSettings, frame_age_min: float = 0.0
 ) -> tuple[list[RadarFeature], dict[int, RadarFeature]]:
     """Return (input_features[3], {lead: verification_feature}).
 
@@ -907,15 +1020,17 @@ def _gather_event_frames(
     doppler frame into a fullRange corpus (or vice versa).
 
     Inputs are spaced at the frame cadence (``timestep_min``): T-20,
-    T-10, T on the 10-min grid. Verification targets are the SNAPPED
-    leads (:func:`snap_lead_min` — module-docstring snapping rule); a
-    lead whose snapped target has no frame within
+    T-10, T on the 10-min grid. Verification targets are the snapped
+    EFFECTIVE leads — ``snap_lead_min(lead + frame_age_min, timestep)``,
+    the module-docstring snapping rule — so the fetch window stretches
+    with the simulated age (out to T+80 at the defaults, from T+60 at
+    zero age); a lead whose snapped target has no frame within
     ``FRAME_TOLERANCE_MIN`` is simply absent from the truth dict, so its
     outcome stays null.
     """
     step = int(round(settings.timestep_min))
     snapped = {
-        lead: snap_lead_min(lead, settings.timestep_min)
+        lead: snap_lead_min(lead + frame_age_min, settings.timestep_min)
         for lead in settings.leads_min
     }
     win_start = event_time - timedelta(minutes=2 * step + FRAME_TOLERANCE_MIN + 1)
@@ -990,17 +1105,26 @@ def _score_outcomes(
 
 
 def _process_event(
-    args: tuple[datetime, Path, Optional[Path], tuple[CalibrationPoint, ...], CorpusSettings]
+    args: tuple[
+        datetime, Path, Optional[Path], tuple[CalibrationPoint, ...],
+        CorpusSettings, float,
+    ]
 ) -> EventResult:
     """One worker iteration: fetch + STEPS + national products + all points.
+
+    The last argument is the event's simulated frame age in minutes,
+    drawn by the parent (:func:`event_frame_age_min`) so the whole run
+    shares one source of truth for it. It reaches the forecast
+    (``national_products``), the verification instants
+    (:func:`_gather_event_frames`) and the rows themselves.
 
     Returns an EventResult; never raises (the caller stamps any error
     onto the result for diagnostics in the dashboard).
     """
-    event_time, cache_dir, corpus_dir, points, settings = args
+    event_time, cache_dir, corpus_dir, points, settings, frame_age_min = args
     event_iso = _ts_str(event_time)
     try:
-        inputs, truth = _gather_event_frames(event_time, settings)
+        inputs, truth = _gather_event_frames(event_time, settings, frame_age_min)
         # Inputs: download + parse + dBZ.
         composites = []
         for f in inputs:
@@ -1062,15 +1186,16 @@ def _process_event(
             pixel_scale_m=composite_now.xscale_m,
             seed=STEPS_SEED,
         )
-        # frame_age_min=0.0: the event's newest input frame IS "now" — the
-        # forecast anchor and the T+lead verification share the radar-frame
-        # clock, so no runtime-style age correction applies (module docstring).
+        # The event's simulated frame age — the SAME value that moved the
+        # verification instants above, so the probability read out here and
+        # the truth it is scored against describe one instant (module
+        # docstring, "Frame-age convention").
         products = national_products(
             forecast,
             leads_min=settings.leads_min,
             threshold_mm_h=settings.threshold_mm_h,
             timestep_min=settings.timestep_min,
-            frame_age_min=0.0,
+            frame_age_min=frame_age_min,
             downsample_factor=settings.downsample_factor,
         )
         raw_by_point = sample_points_from_products(products, geo, points)
@@ -1078,14 +1203,16 @@ def _process_event(
             truth, points, settings, cache_dir, corpus_dir
         )
         rows = build_event_rows(
-            event_iso, points, settings.leads_min, raw_by_point, outcomes_by_point
+            event_iso, points, settings.leads_min, raw_by_point, outcomes_by_point,
+            frame_age_min=frame_age_min,
         )
         return EventResult(event_time=event_iso, rows=rows)
     except Exception as exc:  # noqa: BLE001
         return EventResult(
             event_time=event_iso,
             rows=error_event_rows(
-                event_iso, points, settings.leads_min, f"{type(exc).__name__}: {exc}"
+                event_iso, points, settings.leads_min, f"{type(exc).__name__}: {exc}",
+                frame_age_min=frame_age_min,
             ),
             error=f"{type(exc).__name__}: {exc}",
         )
@@ -1110,6 +1237,9 @@ def _parquet_schema():
         ("raw_prob", pa.float32()),
         ("outcome", pa.int8()),
         ("sample_weight", pa.float64()),
+        # Per-EVENT (constant across the event's rows): the simulated
+        # frame age the forecast and its verification instant both used.
+        ("frame_age_min", pa.float32()),
         ("error", pa.string()),
         ("ensemble_size", pa.int32()),
         ("n_cascade_levels", pa.int32()),
@@ -1122,6 +1252,7 @@ def _parquet_schema():
         ("timestep_min", pa.float64()),
         ("n_timesteps", pa.int32()),
         ("leads_min_csv", pa.string()),
+        ("frame_age_range_csv", pa.string()),
         ("settings_hash", pa.string()),
         ("schema_version", pa.int32()),
     ])
@@ -1244,6 +1375,20 @@ def main() -> int:
         help="Disc statistic tested against the threshold for outcomes "
              "(runtime: forecast.detection_stat).",
     )
+    ap.add_argument(
+        "--frame-age-range", type=str,
+        default="{:g},{:g}".format(*DEFAULT_FRAME_AGE_RANGE),
+        metavar="LO,HI",
+        help="Simulated live frame age in minutes: each event draws "
+             "Uniform(LO, HI) from an RNG seeded on (--seed, event time). "
+             "The runtime computes 12-18 min after its newest frame's "
+             "radar timestamp and shifts every lead by that age before "
+             "picking an ensemble timestep, so the corpus must too — "
+             "otherwise the fitted curve corrects a different horizon "
+             "than the one served. '0,0' reproduces the old zero-age "
+             "convention (under a different settings hash). Joins the "
+             "settings hash and grows n_timesteps to cover max(lead) + HI.",
+    )
     # --- Wet-bias sampling ---
     ap.add_argument(
         "--wet-bias", type=float, default=0.0,
@@ -1303,6 +1448,10 @@ def main() -> int:
         )
     except ValueError as exc:
         ap.error(str(exc))
+    try:
+        frame_age_range = parse_frame_age_range(args.frame_age_range)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     settings = CorpusSettings(
         ensemble_size=args.ensemble_size,
@@ -1315,9 +1464,10 @@ def main() -> int:
         scan_type=args.scan_type,
         # The STEPS timestep follows the single-type frame spacing (10
         # min) — derived, not a CLI tunable: corpus/runtime parity by
-        # construction (n_timesteps = ceil(max lead / timestep) → 6 for
-        # a 60-min horizon).
+        # construction (n_timesteps = ceil((max lead + max frame age) /
+        # timestep) → 8 for a 60-min horizon at the default 12-18 min age).
         timestep_min=FRAME_SPACING_MIN,
+        frame_age_range=frame_age_range,
     )
     settings_cols = settings.settings_columns()
     _LOGGER.info("settings hash: %s  %s", settings.settings_hash, settings.to_dict())
@@ -1340,8 +1490,21 @@ def main() -> int:
         scan_type=args.scan_type,
     )
     weight_by_ts = {_ts_str(t): w for t, w in sampled}
+    # Simulated frame age per event: a pure function of (--seed, event
+    # time), so a resumed run redraws the same age for an event already
+    # in the corpus (module docstring, "Frame-age convention").
+    age_by_ts = {
+        _ts_str(t): event_frame_age_min(t, args.seed, frame_age_range)
+        for t, _w in sampled
+    }
     todo = [t for t, _w in sampled if _ts_str(t) not in existing]
     _LOGGER.info("Will process %d new events (of %d sampled)", len(todo), len(sampled))
+    _LOGGER.info(
+        "simulated frame age: %.4g-%.4g min (mean of draws %.2f min over %d events)",
+        frame_age_range[0], frame_age_range[1],
+        float(np.mean(list(age_by_ts.values()))) if age_by_ts else 0.0,
+        len(age_by_ts),
+    )
 
     rows_per_event = len(points) * len(leads)
     start_ts = time.time()
@@ -1370,7 +1533,8 @@ def main() -> int:
         return 0
 
     worker_args = [
-        (t, args.cache_dir, args.corpus_dir, points, settings) for t in todo
+        (t, args.cache_dir, args.corpus_dir, points, settings, age_by_ts[_ts_str(t)])
+        for t in todo
     ]
 
     new_rows: list[dict] = []

@@ -1,5 +1,7 @@
 """Tests for the multi-point calibration corpus builder (Phase B: B0 + B2,
-plus C1 fullRange-only scan-type filtering, 10-min spacing, and snapping).
+plus C1 fullRange-only scan-type filtering, 10-min spacing, and snapping —
+and the simulated frame age that puts fitted and served leads on the same
+instant).
 
 Pure-function tests only: NO real STEPS, NO network, NO DMI calls. The
 builder is a script, not a package — ``scripts/`` goes on ``sys.path``
@@ -81,6 +83,10 @@ def _products(
 
 
 def _settings(**overrides) -> bcc.CorpusSettings:
+    """Runtime-parity settings. ``frame_age_range`` is deliberately left at
+    the dataclass default (12-18 min — the live compute latency) so the
+    tests exercise the convention the builder actually ships; the
+    zero-age contrast is passed explicitly where it matters."""
     kwargs = dict(
         ensemble_size=16,
         n_cascade_levels=6,
@@ -128,18 +134,30 @@ def test_settings_hash_stable_across_construction_routes():
     # differently — that is what makes the fitter refuse pre-fix corpora.
     {"scan_type": "doppler"},
     {"timestep_min": 5.0},
+    # Frame age: a zero-age corpus verifies at different instants than a
+    # latency-simulating one, so the two must never mix.
+    {"frame_age_range": (0.0, 0.0)},
+    {"frame_age_range": (10.0, 20.0)},
 ])
 def test_settings_hash_changes_when_any_setting_changes(override):
     assert _settings().settings_hash != _settings(**override).settings_hash
 
 
-def test_n_timesteps_spans_longest_lead():
-    # C0/C1 parity: 10-min timestep over a 60-min horizon → 6 timesteps.
-    assert _settings().n_timesteps == 6  # ceil(60 / 10)
-    assert _settings(leads_min=(5, 10, 13)).n_timesteps == 2  # ceil(13 / 10)
+def test_n_timesteps_spans_longest_effective_lead():
+    """The ensemble must reach the longest lead the RUNTIME reads — nominal
+    lead + the largest frame age the sampler can draw."""
+    # 10-min timestep, 60-min horizon, 12-18 min age → ceil(78 / 10) = 8.
+    assert _settings().n_timesteps == 8
+    assert _settings(leads_min=(5, 10, 13)).n_timesteps == 4  # ceil(31 / 10)
+    # Zero age reproduces the old horizon exactly.
+    zero = {"frame_age_range": (0.0, 0.0)}
+    assert _settings(**zero).n_timesteps == 6  # ceil(60 / 10)
+    assert _settings(leads_min=(5, 10, 13), **zero).n_timesteps == 2  # ceil(13 / 10)
     # The derivation is timestep-agnostic (legacy 5-min step for contrast).
-    assert _settings(timestep_min=5.0).n_timesteps == 12
-    assert _settings(leads_min=(5, 10, 13), timestep_min=5.0).n_timesteps == 3
+    assert _settings(timestep_min=5.0, **zero).n_timesteps == 12
+    assert _settings(leads_min=(5, 10, 13), timestep_min=5.0, **zero).n_timesteps == 3
+    # Only the UPPER bound of the range matters — it sets the horizon.
+    assert _settings(frame_age_range=(0.0, 18.0)).n_timesteps == 8
 
 
 def test_settings_columns_carry_hash_and_schema_version():
@@ -148,10 +166,19 @@ def test_settings_columns_carry_hash_and_schema_version():
     assert cols["settings_hash"] == s.settings_hash
     assert cols["schema_version"] == bcc.SCHEMA_VERSION
     assert cols["leads_min_csv"] == "5,10,15,20,25,30,45,60"
-    assert cols["n_timesteps"] == 6
+    assert cols["n_timesteps"] == 8
     assert cols["scan_type"] == "fullRange"
     assert cols["motion_method"] == "farneback_complete_v1"
     assert cols["timestep_min"] == pytest.approx(10.0)
+    # The list-valued setting is flattened to a scalar Parquet column.
+    assert cols["frame_age_range_csv"] == "12,18"
+    assert "frame_age_range" not in cols
+    assert _settings(frame_age_range=(0.0, 0.0)).settings_columns()[
+        "frame_age_range_csv"
+    ] == "0,0"
+    assert _settings(frame_age_range=(12.5, 18.0)).settings_columns()[
+        "frame_age_range_csv"
+    ] == "12.5,18"
 
 
 def test_parse_leads_rejects_bad_specs():
@@ -504,7 +531,8 @@ def test_filter_scan_type_prefers_api_label_over_minute():
 
 def test_snap_lead_up_to_frame_grid():
     # ceil to the next whole timestep — the exact timestep the forecast
-    # probability for that lead reads (national_products convention).
+    # probability for that (effective) lead reads (national_products
+    # convention). Zero-age arguments reproduce the original rule.
     assert bcc.snap_lead_min(5, 10.0) == 10
     assert bcc.snap_lead_min(10, 10.0) == 10
     assert bcc.snap_lead_min(15, 10.0) == 20
@@ -513,6 +541,53 @@ def test_snap_lead_up_to_frame_grid():
     assert bcc.snap_lead_min(60, 10.0) == 60
     # Degenerates to the identity on the legacy 5-min grid.
     assert all(bcc.snap_lead_min(x, 5.0) == x for x in (5, 10, 15, 45, 60))
+
+
+def test_snap_lead_min_snaps_the_effective_lead():
+    """Callers pass lead + frame age; the instant moves with the age.
+
+    The headline case from the frame-age fix: lead 30 with a 15-min frame
+    age on a 10-min grid verifies at T+50 — the timestep the live service
+    actually reads — not at T+30.
+    """
+    assert bcc.snap_lead_min(30 + 15.0, 10.0) == 50
+    assert bcc.snap_lead_min(60 + 18.0, 10.0) == 80   # the longest instant
+    assert bcc.snap_lead_min(5 + 12.0, 10.0) == 20
+    assert bcc.snap_lead_min(5 + 18.0, 10.0) == 30    # straddles a grid line
+    # Float ages must not fall off the grid.
+    assert bcc.snap_lead_min(30 + 12.3456, 10.0) == 50
+    assert bcc.snap_lead_min(30 + 0.0, 10.0) == 30
+
+
+def test_snapped_instant_is_the_timestep_national_products_reads():
+    """Parity with the runtime, through the public API.
+
+    ``national_products`` pools ensemble timesteps 0..k-1 for
+    ``k = ceil((lead + frame_age) / timestep)``, and timestep ``t`` is
+    valid at ``(t + 1) * timestep`` after radar time. So the last
+    timestep the probability sees is exactly ``snap_lead_min(lead + age,
+    timestep)`` minutes out — which is where the corpus verifies. Proven
+    by walking a single-member ensemble's rain arrival across every
+    timestep and checking the probability flips at that instant.
+    """
+    from dmi_nowcast_core.national import national_products
+
+    timestep, age, lead, n_steps = 10.0, 15.0, 30, 8
+    instant = bcc.snap_lead_min(lead + age, timestep)
+    assert instant == 50
+    flips = []
+    for arrival in range(n_steps):
+        ensemble = np.zeros((1, n_steps, 1, 1), dtype=np.float32)
+        ensemble[0, arrival:, 0, 0] = 5.0  # rain from this timestep on
+        products = national_products(
+            ensemble, leads_min=(lead,), threshold_mm_h=0.5,
+            timestep_min=timestep, frame_age_min=age, downsample_factor=1,
+        )
+        p = float(products.p_rain[lead][0, 0])
+        assert p == pytest.approx(float((arrival + 1) * timestep <= instant))
+        flips.append(p)
+    # Sanity: the walk really did straddle the boundary (5 in, 3 out).
+    assert flips == [1.0] * 5 + [0.0] * 3
 
 
 def _mixed_listing(start: datetime, end: datetime) -> list[RadarFeature]:
@@ -604,6 +679,281 @@ def test_gather_event_frames_missing_input_raises(monkeypatch):
     monkeypatch.setattr(bcc, "list_in_window", fake_list)
     with pytest.raises(RuntimeError, match="no fullRange input frame"):
         bcc._gather_event_frames(event, _settings(leads_min=(10,)))
+
+
+# ---------------------------------------------------------------------------
+# Frame age — the corpus simulates the live compute latency
+# ---------------------------------------------------------------------------
+
+
+def test_parse_frame_age_range():
+    assert bcc.parse_frame_age_range("12,18") == (12.0, 18.0)
+    assert bcc.parse_frame_age_range(" 12.5 , 18 ") == (12.5, 18.0)
+    assert bcc.parse_frame_age_range("0,0") == (0.0, 0.0)   # old convention
+    assert bcc.parse_frame_age_range("15,15") == (15.0, 15.0)  # fixed age
+    assert bcc.parse_frame_age_range("0,60") == (0.0, 60.0)  # bounds inclusive
+
+
+@pytest.mark.parametrize("spec", [
+    "", "12", "12,18,20", "a,b", "-1,18", "18,12", "0,61", "nan,18", "12,inf",
+])
+def test_parse_frame_age_range_rejects_bad_specs(spec: str):
+    with pytest.raises(ValueError):
+        bcc.parse_frame_age_range(spec)
+
+
+def test_default_frame_age_range_matches_the_live_latency():
+    # The live cycle finishes 12-18 min after its newest frame's radar
+    # timestamp; the CLI default and the dataclass default agree.
+    assert bcc.DEFAULT_FRAME_AGE_RANGE == (12.0, 18.0)
+    assert _settings().frame_age_range == bcc.DEFAULT_FRAME_AGE_RANGE
+
+
+EVENT_T = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def test_event_frame_age_is_inside_the_range():
+    events = [EVENT_T + timedelta(hours=h) for h in range(200)]
+    ages = [bcc.event_frame_age_min(t, 42, (12.0, 18.0)) for t in events]
+    assert all(12.0 <= a <= 18.0 for a in ages)
+    # It is a real draw, not a constant: the range is actually explored.
+    assert len(set(ages)) > 150
+    assert min(ages) < 13.0 and max(ages) > 17.0
+    assert np.mean(ages) == pytest.approx(15.0, abs=0.5)
+
+
+def test_zero_frame_age_range_gives_zero_everywhere():
+    """``--frame-age-range 0,0`` reproduces the old zero-age convention."""
+    for h in range(50):
+        assert bcc.event_frame_age_min(
+            EVENT_T + timedelta(hours=h), 42, (0.0, 0.0)
+        ) == 0.0
+    # A degenerate non-zero range is the same idea: one fixed age.
+    assert bcc.event_frame_age_min(EVENT_T, 42, (15.0, 15.0)) == 15.0
+
+
+def test_event_frame_age_is_reproducible_per_event_and_seed():
+    """The resume guarantee: same (seed, event) → same age, whatever else
+    the process has done to the global RNG or the order of calls."""
+    import random as _random
+
+    a = bcc.event_frame_age_min(EVENT_T, 42, (12.0, 18.0))
+    _random.seed(0)
+    [_random.random() for _ in range(17)]  # disturb the global RNG
+    bcc.event_frame_age_min(EVENT_T + timedelta(hours=3), 42, (12.0, 18.0))
+    assert bcc.event_frame_age_min(EVENT_T, 42, (12.0, 18.0)) == a
+    # A different seed or a different event draws a different age.
+    assert bcc.event_frame_age_min(EVENT_T, 43, (12.0, 18.0)) != a
+    assert bcc.event_frame_age_min(
+        EVENT_T + timedelta(minutes=10), 42, (12.0, 18.0)
+    ) != a
+
+
+def test_event_frame_age_is_reproducible_in_a_fresh_process():
+    """A resumed build is a NEW process, possibly with a different hash
+    seed — the draw must survive both (hence sha256, not ``hash()``)."""
+    import os
+    import subprocess
+
+    code = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from datetime import datetime, timezone\n"
+        "import build_calibration_corpus as bcc\n"
+        "t = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)\n"
+        "print(repr(bcc.event_frame_age_min(t, 42, (12.0, 18.0))))\n"
+    ) % str(SCRIPTS)
+    env = {**os.environ, "PYTHONHASHSEED": "1"}
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        check=True, env=env,
+    ).stdout.strip()
+    assert float(out) == bcc.event_frame_age_min(EVENT_T, 42, (12.0, 18.0))
+
+
+def test_settings_hash_covers_the_frame_age_key_itself():
+    """Not just the VALUE: a hash computed over a settings dict without the
+    key at all (i.e. any pre-frame-age corpus) must differ from both the
+    zero-age and the default-age hash, so no old corpus can be appended to."""
+    import hashlib
+    import json as _json
+
+    zero = _settings(frame_age_range=(0.0, 0.0))
+    aged = _settings()
+    assert zero.settings_hash != aged.settings_hash
+
+    legacy_dict = zero.to_dict()
+    legacy_dict.pop("frame_age_range")
+    legacy_hash = hashlib.sha256(
+        _json.dumps(legacy_dict, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    assert legacy_hash != zero.settings_hash
+    assert legacy_hash != aged.settings_hash
+
+
+def test_gather_event_frames_verifies_at_the_frame_aged_instant(monkeypatch):
+    """L=30, age=15, timestep=10 → the verification frame is T+50, and the
+    fetch window stretches to cover the longest aged instant (T+80)."""
+    event = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    window: dict[str, datetime] = {}
+
+    def fake_list(start, end, *, limit, scan_type=None):
+        window["start"], window["end"] = start, end
+        return _mixed_listing(start, end)
+
+    monkeypatch.setattr(bcc, "list_in_window", fake_list)
+    settings = _settings(leads_min=(5, 30, 60))
+    inputs, truth = bcc._gather_event_frames(event, settings, 15.0)
+
+    # Inputs are unaffected — they are anchored at radar-frame time.
+    assert [f.datetime_utc for f in inputs] == [
+        event - timedelta(minutes=20),
+        event - timedelta(minutes=10),
+        event,
+    ]
+    # ceil((30 + 15) / 10) * 10 = 50; ceil((60 + 15) / 10) * 10 = 80.
+    assert truth[30].datetime_utc == event + timedelta(minutes=50)
+    assert truth[60].datetime_utc == event + timedelta(minutes=80)
+    assert truth[5].datetime_utc == event + timedelta(minutes=20)
+    # The prefetch window must reach the latest instant (+ tolerance).
+    assert window["end"] >= event + timedelta(minutes=80)
+    assert window["start"] <= event - timedelta(minutes=20)
+
+    # Zero age is the old behaviour, unchanged.
+    _, truth0 = bcc._gather_event_frames(event, settings, 0.0)
+    assert truth0[30].datetime_utc == event + timedelta(minutes=30)
+    assert truth0[60].datetime_utc == event + timedelta(minutes=60)
+
+
+def test_frame_age_is_recorded_on_every_row(tmp_path: Path):
+    points = bcc.load_points(_write_points(tmp_path, POINTS_V2))
+    rows = bcc.build_event_rows(
+        "2026-08-01T12:00:00+00:00", points, (5, 10),
+        {p.id: {5: 0.25, 10: 0.5} for p in points},
+        {p.id: {5: 1, 10: 0} for p in points},
+        frame_age_min=14.25,
+    )
+    assert all(r["frame_age_min"] == pytest.approx(14.25) for r in rows)
+    # Failed events keep the age too — the row still says what was tried.
+    err = bcc.error_event_rows(
+        "2026-08-01T12:00:00+00:00", points, (5, 10), "boom", frame_age_min=17.5
+    )
+    assert all(r["frame_age_min"] == pytest.approx(17.5) for r in err)
+
+
+def test_frame_age_column_survives_the_parquet_roundtrip(tmp_path: Path):
+    s = _settings(leads_min=(5, 10))
+    points = bcc.load_points(_write_points(tmp_path, POINTS_V2))
+    rows = bcc.build_event_rows(
+        "2026-08-01T12:00:00+00:00", points, (5, 10),
+        {p.id: {5: 0.25, 10: 0.5} for p in points},
+        {p.id: {5: 1, 10: 0} for p in points},
+        frame_age_min=13.5,
+    )
+    for row in rows:
+        row["sample_weight"] = 1.0
+        row.update(s.settings_columns())
+
+    out = tmp_path / "corpus.parquet"
+    bcc._append_rows(out, rows)
+    table = pq.read_table(out)
+
+    assert "frame_age_min" in table.schema.names
+    assert table.schema.field("frame_age_min").type == pa.float32()
+    got = table.to_pylist()
+    assert all(r["frame_age_min"] == pytest.approx(13.5) for r in got)
+    assert all(r["frame_age_range_csv"] == "12,18" for r in got)
+
+
+# ---------------------------------------------------------------------------
+# Frame age — the whole per-event path (national_products + rows)
+# ---------------------------------------------------------------------------
+
+
+class _FakeComposite:
+    """The handful of attributes ``_process_event`` touches on a composite."""
+
+    reflectivity_dbz = np.zeros((4, 4), dtype=np.float32)
+    zr_a, zr_b, xscale_m = 200.0, 1.6, 500.0
+
+
+def test_process_event_uses_the_events_age_for_products_and_rows(
+    tmp_path: Path, monkeypatch
+):
+    """Spy on the whole per-event path: the age the parent drew must reach
+    ``national_products`` (the forecast), ``_gather_event_frames`` (the
+    verification instants) and every row (the record)."""
+    points = bcc.load_points(_write_points(tmp_path, POINTS_V2))
+    settings = _settings(leads_min=(5, 10))
+    event = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    age = 16.125
+    seen: dict[str, float] = {}
+
+    def fake_gather(event_time, s, frame_age_min=0.0):
+        seen["gather"] = frame_age_min
+        feats = [_feature(event + timedelta(minutes=m)) for m in (-20, -10, 0)]
+        return feats, {}
+
+    def fake_products(forecast, **kwargs):
+        seen["products"] = kwargs["frame_age_min"]
+        grid = np.full((2, 2), 0.4, dtype=np.float32)
+        return _products({5: grid, 10: grid}, downsample_factor=4)
+
+    monkeypatch.setattr(bcc, "_gather_event_frames", fake_gather)
+    monkeypatch.setattr(bcc, "_resolve_frame", lambda *a, **k: Path("x.h5"))
+    monkeypatch.setattr(bcc, "parse_composite", lambda p: _FakeComposite())
+    monkeypatch.setattr(
+        bcc, "CompositeGeo",
+        lambda c: FakeGeo({(p.lon, p.lat): (0.0, 0.0) for p in points}),
+    )
+    monkeypatch.setattr(
+        bcc, "dbz_to_rain_rate",
+        lambda *a, **k: np.zeros((4, 4), dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        "dmi_nowcast_core.dense_flow.dense_flow",
+        lambda a, b: (np.zeros((4, 4), np.float32), np.zeros((4, 4), np.float32)),
+    )
+    monkeypatch.setattr(
+        "dmi_nowcast_core.dense_flow.complete_flow",
+        lambda vy, vx, rain, **k: (vy, vx),
+    )
+    monkeypatch.setattr(bcc, "run_ensemble", lambda *a, **k: np.zeros((1, 8, 2, 2)))
+    monkeypatch.setattr(bcc, "national_products", fake_products)
+    monkeypatch.setattr(
+        bcc, "_score_outcomes",
+        lambda truth, pts, s, cache, corpus: {
+            p.id: {5: 1, 10: 0} for p in pts
+        },
+    )
+
+    result = bcc._process_event(
+        (event, tmp_path, None, points, settings, age)
+    )
+
+    assert result.error is None
+    assert seen["gather"] == pytest.approx(age)
+    assert seen["products"] == pytest.approx(age)
+    assert result.rows and all(
+        r["frame_age_min"] == pytest.approx(age) for r in result.rows
+    )
+
+
+def test_process_event_records_the_age_on_a_failed_event(
+    tmp_path: Path, monkeypatch
+):
+    points = bcc.load_points(_write_points(tmp_path, POINTS_V2))
+    settings = _settings(leads_min=(5, 10))
+
+    def boom(*a, **k):
+        raise RuntimeError("no frames")
+
+    monkeypatch.setattr(bcc, "_gather_event_frames", boom)
+    result = bcc._process_event(
+        (datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+         tmp_path, None, points, settings, 13.75)
+    )
+    assert "no frames" in (result.error or "")
+    assert all(r["frame_age_min"] == pytest.approx(13.75) for r in result.rows)
 
 
 # ---------------------------------------------------------------------------
@@ -930,4 +1280,4 @@ def test_fitter_loads_single_scan_type_corpus(tmp_path: Path):
     corpus = fnc.load_v2_corpus(out)
     assert corpus.settings_hash == s.settings_hash
     assert corpus.settings["timestep_min"] == pytest.approx(10.0)
-    assert corpus.settings["n_timesteps"] == 6
+    assert corpus.settings["n_timesteps"] == 8  # 60-min horizon + 18-min age

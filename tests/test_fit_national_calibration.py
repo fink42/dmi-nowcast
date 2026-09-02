@@ -230,6 +230,11 @@ def _row(
         "raw_prob": float(raw),
         "outcome": outcome,
         "sample_weight": weight,
+        # Per-event simulated frame age. The fit never reads it (it groups
+        # by lead_min alone), but the builder writes it on every row, so the
+        # synthetic corpora must carry it too — this helper doubles as the
+        # drift guard against the builder's Arrow schema.
+        "frame_age_min": 15.0,
         "error": "",
     }
     row.update(SETTINGS_COLS)

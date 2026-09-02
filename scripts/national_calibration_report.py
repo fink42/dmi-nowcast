@@ -85,6 +85,35 @@ def run_query(con, name: str, corpus: Path) -> tuple[list[str], list[tuple]]:
     return cols, res.fetchall()
 
 
+def frame_age_summary(con, corpus: Path) -> Optional[str]:
+    """One-line description of the corpus's simulated frame age.
+
+    ``None`` for a pre-frame-age corpus (no ``frame_age_min`` column):
+    those verify lead ``L`` at ``T + L`` while the service reads
+    ``L + frame_age``, so the distinction belongs in the report header.
+    """
+    quoted = _sql_quote_path(corpus)
+    cols = {
+        row[0]
+        for row in con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet({quoted})"
+        ).fetchall()
+    }
+    if "frame_age_min" not in cols:
+        return None
+    declared_expr = (
+        "min(frame_age_range_csv)" if "frame_age_range_csv" in cols else "NULL"
+    )
+    declared, lo, hi, mean = con.execute(
+        f"SELECT {declared_expr}, min(frame_age_min), max(frame_age_min), "
+        f"avg(frame_age_min) FROM read_parquet({quoted})"
+    ).fetchone()
+    if lo is None:  # empty corpus, or the column is present but all null
+        return f"`{declared}` min (no rows)" if declared else None
+    drawn = f"drawn {float(lo):.1f}-{float(hi):.1f} min, mean {float(mean):.1f}"
+    return f"`{declared}` min ({drawn})" if declared else drawn
+
+
 # ---------------------------------------------------------------------------
 # Regional-split criterion (pure functions — unit-tested directly)
 # ---------------------------------------------------------------------------
@@ -315,6 +344,14 @@ def build_report(corpus: Path, out_dir: Path) -> Path:
         + ("" if n_hashes == 1 else f" — **WARNING: {n_hashes} mixed hashes!**")
     )
     md.append(f"- Leads: {', '.join(f'+{ld} min' for ld in leads)}")
+    frame_age = frame_age_summary(con, corpus)
+    md.append(
+        f"- Simulated frame age: {frame_age}"
+        if frame_age
+        else "- Simulated frame age: none — pre-frame-age corpus, built at "
+             "zero age (lead L verified at T+L, while the service reads "
+             "L + frame age)"
+    )
     md.append("")
     md.append(
         "All frequencies and Brier terms are weighted by `sample_weight` "

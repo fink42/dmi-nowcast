@@ -38,6 +38,16 @@
 #                               "lat,lon;lat,lon;..." (default: the
 #                               builder's five spread national references).
 #                               The set re-keys the wet/dry index cache.
+#   CALIBRATION_FRAME_AGE_RANGE simulated live frame age, "LO,HI" minutes
+#                               (default 12,18). The live cycle finishes
+#                               12-18 min after its newest frame's radar
+#                               timestamp and shifts every lead by that age
+#                               before reading an ensemble timestep, so the
+#                               corpus draws an age per event and verifies
+#                               at the same instant the service serves.
+#                               "0,0" restores the old zero-age convention.
+#                               Joins the settings hash: a corpus built
+#                               under another range cannot be resumed.
 #
 # Usage:
 #   sidecar/deploy/calibrate.sh                                    # use defaults
@@ -52,6 +62,11 @@ days=$((months * 30))
 n_events=${CALIBRATION_N_EVENTS:-4000}
 wet_bias=${CALIBRATION_WET_BIAS:-0.15}
 seed=${CALIBRATION_SEED:-$(date +%j)}
+# Simulated live frame age. Must match the latency the runtime actually
+# has (fetch + STEPS + render after the radar timestamp): the fitted
+# curve corrects the lead the service SERVES only if the corpus verified
+# at the same instant.
+frame_age_range=${CALIBRATION_FRAME_AGE_RANGE:-12,18}
 # Persistent corpus archive — frames are resolved from here first; only
 # gaps are downloaded (straight into the corpus). This is the 51k-frame
 # backfilled archive, so after backfill the monthly run fetches almost
@@ -106,6 +121,7 @@ echo "    settings from live config: ${ensemble_size} members, thr ${threshold} 
 echo "      ds ${downsample}, ${stat}, leads [${leads_csv}], disc ${radius_m} m"
 echo "    wet-bias refs: ${CALIBRATION_WET_REFS:-<builder default: 5 spread national points>}"
 echo "    n_events: ${n_events}   wet_bias: ${wet_bias}   seed: ${seed}"
+echo "    simulated frame age: ${frame_age_range} min (per-event uniform draw)"
 echo "    workers: ${workers}"
 echo "    points → ${points_path}"
 echo "    corpus archive (frame source) → ${corpus_dir}"
@@ -149,6 +165,7 @@ run_in_repo python scripts/build_calibration_corpus.py \
         --detection-stat "$stat" \
         --disc-radius-m "$radius_m" \
         --leads "$leads_csv" \
+        --frame-age-range "$frame_age_range" \
         --output "$corpus_path"
 
 run_in_repo python scripts/fit_national_calibration.py \
