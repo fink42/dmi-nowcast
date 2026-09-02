@@ -39,6 +39,15 @@ Because the blobs sit at known coordinates, the mock also makes
 georeferencing mistakes obvious: a blob that is not over Copenhagen means the
 overlay is misplaced.
 
+It mirrors the sidecar's two lead lists rather than collapsing them into one:
+`OVERLAY_LEADS` (10/20/30/40/50/60, the sidecar's `forecast.leads_min`) is the
+forecast overlay frames the timeline scrubs through, on the radar's own 10 min
+cadence, and `PROB_LEADS` (10/20/30/45/60, `forecast.national.leads_min`) is
+the calibrated probability grids, `leads_min`, `calibrated_leads` and
+`/forecast`'s `per_lead`. The ETA and intensity grids scan a dense 5 min
+`ARRIVAL_SCAN` instead — that is a search for when rain first reaches a pixel,
+not a published lead list.
+
 `VITE_API_BASE` exists as a build-time escape hatch for pointing a deployed
 build at a *different* origin (that origin then has to send CORS headers).
 Leave it unset for the normal one-origin deployment.
@@ -76,8 +85,8 @@ src/lib/nowcast/       manifest types, PNG decode, grid sampling, timeline,
 src/lib/push/          support detection, prefs + storage, VAPID keys, API,
                        payload parsing, store
 src/lib/map/           MapLibre style, Mercator resampling, overlay frames
-src/lib/components/    MapView, LoopControls, ForecastPanel, NotifyPanel,
-                       LangToggle, footer
+src/lib/components/    MapView, LoopControls, ForecastPanel + panel.ts (its
+                       fold rule), NotifyPanel, LangToggle, footer
 src/routes/            map (/) + about, data, privacy, support
 scripts/               fetch-basemap, make-icons, mock-sidecar
 ```
@@ -153,6 +162,9 @@ and a permission already refused.
 - `src/lib/map/warp.test.ts` — the four-corner error and the mesh's accuracy;
 - `src/lib/i18n/catalog.test.ts` — every key, argument count and list length
   present in both locales;
+- `src/lib/components/panel.test.ts` — when a new point unfolds a minimised
+  forecast panel: a *different* place does, the same place re-sampled by the
+  next cycle does not;
 - `src/lib/pwa.test.ts` — the web manifest and its icons;
 - `src/lib/push/*.test.ts` — support detection per branch, preference
   normalisation and the storage copy (including storage that throws), the VAPID

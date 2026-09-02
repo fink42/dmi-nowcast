@@ -32,7 +32,11 @@ dmi:
   user_agent: dmi-nowcast-sidecar/0.1
 
 forecast:
-  leads_min: [5, 10, 15, 20, 25, 30, 45, 60]
+  # The forecast overlay frames the site's timeline shows, kept on the
+  # radar's own 10 min cadence so the scrubber's forecast ticks line up
+  # with its history ticks. These are NOT the calibrated probability
+  # leads: those are ``national.leads_min`` below and stay 10/20/30/45/60.
+  leads_min: [10, 20, 30, 40, 50, 60]
   method: farneback
   steps:
     ensemble_size: 16

@@ -223,6 +223,11 @@ def test_shipped_public_example_config_is_actually_public() -> None:
     assert cfg.lightning.archive_enabled is False
     # The national products are the site's payload — they must stay on.
     assert cfg.forecast.national.enabled is True
+    # Two lead lists with two jobs: the overlay frames the timeline shows
+    # stay on the radar's 10 min cadence, the calibrated probability grids
+    # keep the leads the curves were fitted for.
+    assert cfg.forecast.leads_min == [10, 20, 30, 40, 50, 60]
+    assert cfg.forecast.national.leads_min == [10, 20, 30, 45, 60]
     # Web Push is the public instance's only outbound channel (Phase D).
     # Enabled, with a subject the operator is expected to replace — the
     # model rejects ``enabled`` without one, so this cannot silently ship

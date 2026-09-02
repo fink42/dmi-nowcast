@@ -34,7 +34,22 @@ const portIndex = args.indexOf('--port');
 const PORT = portIndex === -1 ? 8099 : Number(args[portIndex + 1]);
 
 const PROJ4 = '+proj=stere +lat_0=56 +lon_0=10.5666 +lat_ts=56 +ellps=WGS84 +units=m +no_defs';
-const LEADS = [5, 10, 15, 20, 25, 30, 45, 60];
+/**
+ * Two lead lists, because the sidecar has two: `forecast.leads_min` renders
+ * the forecast overlay frames the timeline scrubs through (kept on the
+ * radar's own 10 min cadence, so forecast ticks line up with history ticks),
+ * while `forecast.national.leads_min` drives the calibrated probability
+ * grids — the leads the isotonic curves were actually fitted for.
+ */
+const OVERLAY_LEADS = [10, 20, 30, 40, 50, 60];
+const PROB_LEADS = [10, 20, 30, 45, 60];
+/**
+ * Lead times scanned when asking "when does rain first reach this pixel?"
+ * for the ETA and intensity grids. Neither published list: this is a search
+ * grid, and a dense 5 min scan keeps the ETA field's resolution independent
+ * of how coarse the published frames happen to be.
+ */
+const ARRIVAL_SCAN = Array.from({ length: 13 }, (_, i) => i * 5);
 const NATIVE = { cols: 1984, rows: 1728, scale: 500, xUl: -496000, yUl: 432000 };
 const FACTOR = 4;
 const PRODUCT = {
@@ -282,14 +297,14 @@ function productPng(product, leadMin) {
 				} else if (product === 'eta') {
 					// First lead at which rain reaches the pixel.
 					value = null;
-					for (const lead of [0, ...LEADS]) {
+					for (const lead of ARRIVAL_SCAN) {
 						if (rainAt(nCol, nRow, lead) > 0.5) {
 							value = lead;
 							break;
 						}
 					}
 				} else {
-					const arrival = LEADS.find((lead) => rainAt(nCol, nRow, lead) > 0.5);
+					const arrival = ARRIVAL_SCAN.find((lead) => rainAt(nCol, nRow, lead) > 0.5);
 					value = arrival === undefined ? null : rainAt(nCol, nRow, arrival);
 				}
 				levels[row * cols + col] = quantise(value, SPECS[product]);
@@ -346,7 +361,7 @@ function manifest() {
 		timestep_min: 5,
 		frame_age_min: FRAME_AGE_MIN,
 		n_members: 24,
-		leads_min: LEADS,
+		leads_min: PROB_LEADS,
 		grid: gridBlock(PRODUCT.scale, productShape),
 		overlay_grid: gridBlock(NATIVE.scale, overlayShape),
 		motion: {
@@ -361,13 +376,13 @@ function manifest() {
 		},
 		calibration: {
 			fitted_at: '2026-08-01T03:00:00+00:00',
-			calibrated_leads: LEADS,
+			calibrated_leads: PROB_LEADS,
 			n_samples: 3_800_000,
 			brier_before: 0.191,
 			brier_after: 0.163
 		},
 		artifacts: [
-			...LEADS.map((lead) =>
+			...PROB_LEADS.map((lead) =>
 				gridEntry(
 					`p_rain_${lead}min_${s.text}.png`,
 					'p_rain',
@@ -409,7 +424,7 @@ function manifest() {
 				overlayEntry(`overlay_now_${stamp(lead).text}.png`, lead)
 			),
 			overlayEntry(`overlay_now_${s.text}.png`, 0),
-			...LEADS.map((lead) => overlayEntry(`overlay_${lead}min_${s.text}.png`, lead))
+			...OVERLAY_LEADS.map((lead) => overlayEntry(`overlay_${lead}min_${s.text}.png`, lead))
 		]
 	};
 }
@@ -478,7 +493,7 @@ createServer(async (req, res) => {
 				n_members: 24,
 				calibrated: true,
 				calibration_fitted_at: '2026-08-01T03:00:00+00:00',
-				per_lead: LEADS.map((lead) => ({ lead_min: lead, p_rain: 0.5 })),
+				per_lead: PROB_LEADS.map((lead) => ({ lead_min: lead, p_rain: 0.5 })),
 				eta_min: 18,
 				intensity_mm_h: 2.4,
 				confidence: 0.72
