@@ -58,7 +58,6 @@ fetch in the cycle (see ``compute.py``): both exist only to feed
 from __future__ import annotations
 
 import asyncio
-import math
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -95,6 +94,7 @@ from .config import Config
 from .eta_smoother import EtaSmoother
 from .lightning_schema import LightningEtaResponse, StrikesAccepted, StrikesIn
 from .national_artifacts import LATEST_MANIFEST_NAME
+from .national_sample import finite_or_none, sample_point
 from .scheduler import CycleScheduler
 from .state_schema import ForecastPointLead, ForecastPointResponse
 from .storage import StateStore
@@ -307,24 +307,20 @@ def create_app(
                 detail="no national forecast yet — first national cycle has not completed",
             )
         products, radar_ts = latest
-        # lat/lon → native grid → ÷ downsample factor → nearest product pixel,
-        # exactly the aggregate_at_home convention (home.row / f).
-        idx = geo.lonlat_to_grid(lon, lat)
-        f = products.downsample_factor
-        row = int(round(idx.row / f))
-        col = int(round(idx.col / f))
-        h, w = products.eta_min.shape
-        if not (0 <= row < h and 0 <= col < w):
+        # lat/lon → native grid → ÷ downsample factor → nearest product
+        # pixel (the aggregate_at_home convention, home.row / f). The
+        # arithmetic lives in national_sample.sample_point, shared with the
+        # Web Push decision engine (Phase D) so a notification and the
+        # panel can never disagree about which pixel a point reads.
+        sample = sample_point(products, geo, lat, lon)
+        if sample is None:
             raise HTTPException(
                 status_code=400,
                 detail="coordinates outside the radar composite grid",
             )
         per_lead = [
-            ForecastPointLead(
-                lead_min=int(lead),
-                p_rain=_finite_or_none(products.p_rain[lead][row, col]),
-            )
-            for lead in products.leads_min
+            ForecastPointLead(lead_min=lead, p_rain=p)
+            for lead, p in sample.p_rain.items()
         ]
         # Confidence stays the global scalar in Phase A — sourced from the
         # same store /state.json serves; null before the first state exists.
@@ -352,8 +348,8 @@ def create_app(
                 engine.national_calibration_fitted_at if n_calibrated else None
             ),
             per_lead=per_lead,
-            eta_min=_finite_or_none(products.eta_min[row, col]),
-            intensity_mm_h=_finite_or_none(products.intensity_mm_h[row, col]),
+            eta_min=sample.eta_min,
+            intensity_mm_h=sample.intensity_mm_h,
             confidence=float(state.confidence) if state is not None else None,
         )
 
@@ -843,10 +839,9 @@ def _safe_nowcast_name(name: str) -> bool:
     return bool(_NOWCAST_NAME_RE.match(name))
 
 
-def _finite_or_none(value: Any) -> float | None:
-    """Grid sample → JSON-safe float; NaN/±inf (nodata, off-composite) → None."""
-    v = float(value)
-    return v if math.isfinite(v) else None
+# Kept as a module-level alias: the grid → JSON-safe float rule moved to
+# national_sample.finite_or_none with the sampling arithmetic (Phase D).
+_finite_or_none = finite_or_none
 
 
 def _consteq(a: str, b: str) -> bool:
