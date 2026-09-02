@@ -251,8 +251,26 @@ describe('stored subscription', () => {
 });
 
 describe('resolveTimeZone', () => {
-	it('returns an IANA zone', () => {
-		expect(resolveTimeZone()).toMatch(/^[A-Za-z]+\/[A-Za-z_+-]/);
+	it('returns the zone the runtime resolves', () => {
+		// CI runners resolve to plain `UTC`, which is a valid IANA name too —
+		// the shape is the runtime's business, the contract here is only that
+		// we pass it through unchanged and never return an empty string.
+		const expected = Intl.DateTimeFormat().resolvedOptions().timeZone;
+		expect(resolveTimeZone()).toBe(expected);
+		expect(resolveTimeZone()).not.toBe('');
+	});
+
+	it('falls back to Copenhagen when Intl is unusable', () => {
+		const original = Intl.DateTimeFormat;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(Intl as any).DateTimeFormat = () => {
+			throw new Error('no Intl');
+		};
+		try {
+			expect(resolveTimeZone()).toBe('Europe/Copenhagen');
+		} finally {
+			Intl.DateTimeFormat = original;
+		}
 	});
 });
 
