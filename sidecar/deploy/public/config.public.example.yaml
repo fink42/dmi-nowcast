@@ -86,3 +86,38 @@ lightning:
   # corpus mount to write to). The lightning layer arrives in Phase E.
   enabled: false
   archive_enabled: false
+
+push:
+  # Web Push browser notifications (website Phase D). ENABLED on the public
+  # instance: the site's whole point is telling a visitor when rain is
+  # coming to their point, and a browser notification is the only channel
+  # that works when the tab is closed.
+  enabled: true
+  # REQUIRED when enabled, and the one line you must edit before deploying:
+  # the operator contact push services see in the VAPID JWT. Either
+  # ``mailto:`` or ``https:``. Placeholder below — change it.
+  vapid_subject: mailto:operator@example.com
+  # Key and DB default to <storage.data_dir>/push/, i.e. inside this
+  # stack's named volume:
+  #   /var/lib/dmi-nowcast/push/vapid_private.pem   (0600, auto-generated)
+  #   /var/lib/dmi-nowcast/push/subscriptions.sqlite
+  # Both survive a restart and a re-deploy; both are lost with the volume,
+  # and losing the key forces every subscriber to re-subscribe. Back them
+  # up together.
+  vapid_private_key_file: null
+  db_path: null
+  # Lead options are forecast.national.leads_min at or above min_lead_min,
+  # so with the leads above this offers 20/30/45/60 min.
+  min_lead_min: 20
+  threshold_options_pct: [40, 60, 80]
+  default_threshold_pct: 60
+  default_lead_min: 30
+  default_quiet_start: "22:00"
+  default_quiet_end: "07:00"
+  # Fan-out is sequential inside the cycle, so this is a latency budget as
+  # much as a storage one. Raise both together if it is ever reached.
+  max_subscriptions: 200
+  fanout_budget_s: 20.0
+  ttl_s: 900
+  rearm_after_min: 60
+  persistence_obs: 2

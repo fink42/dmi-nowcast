@@ -12,11 +12,12 @@ directly without touching the filesystem.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -202,6 +203,124 @@ class StorageConfig(BaseModel):
     corpus_dir: Path | None = Path("/var/lib/dmi-nowcast-corpus")
 
 
+# 24-hour ``HH:MM`` wall-clock strings (quiet hours). Local time in the
+# subscriber's own zone — never UTC, never a datetime.
+_HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+class PushConfig(BaseModel):
+    """Web Push notifications (website Phase D).
+
+    Off by default: the LAN instance has Home Assistant for alerting and
+    needs none of this. Turning it on makes the process hold a VAPID
+    private key and a SQLite table of browser push subscriptions, both
+    under ``storage.data_dir/push/`` unless overridden.
+
+    The stored row is deliberately minimal — endpoint, keys, a point, the
+    alert preferences and the per-subscription state machine. No email, no
+    name, no IP address, nothing that identifies a person beyond the
+    coordinate they asked to be warned about.
+    """
+
+    enabled: bool = False
+    # VAPID identity. The private key PEM lives in the data volume and is
+    # auto-generated (mode 0600) on first start when enabled and missing.
+    # None → ``<storage.data_dir>/push/vapid_private.pem``; resolved by
+    # ``push.paths.resolved_key_path`` (this model does not know storage).
+    vapid_private_key_file: Path | None = None
+    # The VAPID ``sub`` claim push services see: an operator contact, either
+    # ``mailto:...`` or ``https://...``. Required when enabled — push
+    # services may reject or rate-limit a JWT without a usable contact.
+    vapid_subject: str | None = None
+    # SQLite subscription store. None → ``<storage.data_dir>/push/
+    # subscriptions.sqlite`` (``push.paths.resolved_db_path``).
+    db_path: Path | None = None
+    # Offered lead times are the national probability leads at or beyond
+    # this. Below ~20 min a browser notification arrives too late to act on.
+    min_lead_min: Annotated[int, Field(ge=0, le=180)] = 20
+    threshold_options_pct: list[int] = Field(default_factory=lambda: [40, 60, 80])
+    default_threshold_pct: Annotated[int, Field(ge=1, le=99)] = 60
+    default_lead_min: Annotated[int, Field(ge=1, le=180)] = 30
+    default_quiet_start: str = "22:00"
+    default_quiet_end: str = "07:00"
+    # Hard cap on stored subscriptions. The fan-out is sequential and runs
+    # inside the 5-minute cycle, so the cap is a latency budget as much as
+    # a storage one.
+    max_subscriptions: Annotated[int, Field(ge=1, le=100_000)] = 200
+    # SSRF guard: the service POSTs to whatever URL a browser hands it, from
+    # a VM that can see the LAN. Only these push services are reachable.
+    allowed_endpoint_host_suffixes: list[str] = Field(
+        default_factory=lambda: [
+            "fcm.googleapis.com",
+            "updates.push.services.mozilla.com",
+            "push.services.mozilla.com",
+            "web.push.apple.com",
+            "notify.windows.com",
+        ],
+    )
+    # Web Push TTL: how long the push service holds an undelivered message.
+    # 15 min — a rain warning that arrives later than that is noise.
+    ttl_s: Annotated[int, Field(ge=0, le=86_400)] = 900
+    # Wall-clock budget for one cycle's sequential fan-out. Anything still
+    # queued when it expires is dropped (and counted), never allowed to
+    # delay the next cycle.
+    fanout_budget_s: Annotated[float, Field(gt=0, le=300)] = 20.0
+    # Decision-engine rules (see ``push.engine``): how long a notified
+    # subscription stays disarmed, and how many consecutive observations
+    # above threshold are required before firing.
+    rearm_after_min: Annotated[int, Field(ge=0, le=1440)] = 60
+    persistence_obs: Annotated[int, Field(ge=1, le=10)] = 2
+
+    @field_validator("threshold_options_pct")
+    @classmethod
+    def _thresholds_valid(cls, v: list[int]) -> list[int]:
+        if not v or v != sorted(v) or len(set(v)) != len(v):
+            raise ValueError(
+                "push threshold_options_pct must be ascending and unique",
+            )
+        if any(p <= 0 or p >= 100 for p in v):
+            raise ValueError("push threshold_options_pct entries must be in (0, 100)")
+        return v
+
+    @field_validator("default_quiet_start", "default_quiet_end")
+    @classmethod
+    def _quiet_hhmm(cls, v: str) -> str:
+        if not _HHMM_RE.match(v):
+            raise ValueError("push quiet hours must be 24-hour 'HH:MM' strings")
+        return v
+
+    @field_validator("allowed_endpoint_host_suffixes")
+    @classmethod
+    def _suffixes_valid(cls, v: list[str]) -> list[str]:
+        out = [s.strip().lower().strip(".") for s in v]
+        if any(not s or "/" in s for s in out):
+            raise ValueError(
+                "push allowed_endpoint_host_suffixes must be bare host suffixes",
+            )
+        return out
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "PushConfig":
+        if self.vapid_subject is not None:
+            subject = self.vapid_subject.strip()
+            if not (subject.startswith("mailto:") or subject.startswith("https:")):
+                raise ValueError(
+                    "push vapid_subject must be a 'mailto:' or 'https:' URI",
+                )
+        if self.enabled and not self.vapid_subject:
+            raise ValueError(
+                "push.enabled requires push.vapid_subject "
+                "(a 'mailto:' or 'https:' operator contact)",
+            )
+        if self.default_threshold_pct not in self.threshold_options_pct:
+            raise ValueError(
+                "push default_threshold_pct must be one of threshold_options_pct",
+            )
+        if self.default_lead_min < self.min_lead_min:
+            raise ValueError("push default_lead_min must be >= push min_lead_min")
+        return self
+
+
 class Config(BaseSettings):
     """Sidecar config root. Env-var overrides via ``DMI_NOWCAST_*``."""
 
@@ -220,6 +339,7 @@ class Config(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     lightning: LightningConfig = Field(default_factory=LightningConfig)
+    push: PushConfig = Field(default_factory=PushConfig)
 
     @classmethod
     def settings_customise_sources(  # noqa: PLR0913

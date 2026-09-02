@@ -85,3 +85,36 @@ lightning:
   # on the corpus bind-mount, for later backtesting/calibration.
   archive_enabled: true
   archive_dir: /var/lib/dmi-nowcast-corpus/strikes
+
+# Web Push browser notifications (website Phase D). Off by default: this
+# LAN instance has Home Assistant for alerting. Turning it on makes the
+# process hold a VAPID private key and a SQLite table of subscriptions,
+# both under storage.data_dir/push/ (0600 / 0700).
+#
+# push:
+#   enabled: true
+#   # Operator contact in the VAPID JWT — required when enabled. Either
+#   # mailto: or https:. Push services may throttle a sender without one.
+#   vapid_subject: mailto:you@example.com
+#   # Both default to <storage.data_dir>/push/. Set only to move them.
+#   vapid_private_key_file: null   # -> /var/lib/dmi-nowcast/push/vapid_private.pem
+#   db_path: null                  # -> /var/lib/dmi-nowcast/push/subscriptions.sqlite
+#   # Offered lead times are forecast.national.leads_min at or above this.
+#   min_lead_min: 20
+#   threshold_options_pct: [40, 60, 80]
+#   default_threshold_pct: 60
+#   default_lead_min: 30
+#   default_quiet_start: "22:00"
+#   default_quiet_end: "07:00"
+#   max_subscriptions: 200
+#   # SSRF guard: the only hosts this service will POST a notification to.
+#   allowed_endpoint_host_suffixes:
+#     - fcm.googleapis.com
+#     - updates.push.services.mozilla.com
+#     - push.services.mozilla.com
+#     - web.push.apple.com
+#     - notify.windows.com
+#   ttl_s: 900              # push service holds an undelivered message this long
+#   fanout_budget_s: 20.0   # per-cycle wall-clock budget for the fan-out
+#   rearm_after_min: 60     # dry minutes before a notified subscription re-arms
+#   persistence_obs: 2      # consecutive over-threshold observations to fire

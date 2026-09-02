@@ -89,3 +89,99 @@ def test_default_config_path_via_env(
     # Pass no path → falls back to env var.
     cfg = load_config()
     assert cfg.home.lat == 55.33
+
+
+# ---------------------------------------------------------------------------
+# Web Push section (website Phase D)
+# ---------------------------------------------------------------------------
+
+def test_push_defaults_are_off(config_yaml: Path) -> None:
+    """Additive config: an existing deployment keeps its behaviour."""
+    cfg = load_config(config_yaml)
+    assert cfg.push.enabled is False
+    assert cfg.push.vapid_subject is None
+    assert cfg.push.vapid_private_key_file is None
+    assert cfg.push.db_path is None
+    assert cfg.push.min_lead_min == 20
+    assert cfg.push.threshold_options_pct == [40, 60, 80]
+    assert cfg.push.default_threshold_pct == 60
+    assert cfg.push.default_lead_min == 30
+    assert cfg.push.max_subscriptions == 200
+    assert cfg.push.persistence_obs == 2
+    assert cfg.push.rearm_after_min == 60
+    assert "fcm.googleapis.com" in cfg.push.allowed_endpoint_host_suffixes
+
+
+def test_push_enabled_without_subject_rejected(tmp_path: Path) -> None:
+    """Push services may throttle a sender with no usable contact, so an
+    enabled feature without one is a config error, not a warning."""
+    p = tmp_path / "push.yaml"
+    p.write_text("home:\n  lat: 55\n  lon: 10\npush:\n  enabled: true\n")
+    with pytest.raises(Exception, match="vapid_subject"):
+        load_config(p)
+
+
+def test_push_subject_scheme_enforced(tmp_path: Path) -> None:
+    p = tmp_path / "push_scheme.yaml"
+    p.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "push:\n  enabled: true\n  vapid_subject: ops@example.com\n"
+    )
+    with pytest.raises(Exception, match="mailto"):
+        load_config(p)
+
+
+def test_push_defaults_must_be_offered_options(tmp_path: Path) -> None:
+    p = tmp_path / "push_opts.yaml"
+    p.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "push:\n  default_threshold_pct: 55\n"
+    )
+    with pytest.raises(Exception, match="threshold_options_pct"):
+        load_config(p)
+
+    p2 = tmp_path / "push_lead.yaml"
+    p2.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "push:\n  min_lead_min: 30\n  default_lead_min: 20\n"
+    )
+    with pytest.raises(Exception, match="min_lead_min"):
+        load_config(p2)
+
+
+def test_push_quiet_hours_must_be_hhmm(tmp_path: Path) -> None:
+    p = tmp_path / "push_quiet.yaml"
+    p.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        'push:\n  default_quiet_start: "25:00"\n'
+    )
+    with pytest.raises(Exception, match="HH:MM"):
+        load_config(p)
+
+
+def test_push_env_overrides(
+    config_yaml: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compose stacks turn push on through the environment."""
+    monkeypatch.setenv("DMI_NOWCAST_PUSH__ENABLED", "true")
+    monkeypatch.setenv("DMI_NOWCAST_PUSH__VAPID_SUBJECT", "mailto:ops@example.com")
+    monkeypatch.setenv("DMI_NOWCAST_PUSH__MAX_SUBSCRIPTIONS", "5")
+    cfg = load_config(config_yaml)
+    assert cfg.push.enabled is True
+    assert cfg.push.vapid_subject == "mailto:ops@example.com"
+    assert cfg.push.max_subscriptions == 5
+
+
+def test_push_paths_resolve_against_the_data_dir(
+    config_yaml: Path, tmp_path: Path,
+) -> None:
+    from dmi_nowcast_sidecar.push.paths import resolved_db_path, resolved_key_path
+
+    cfg = load_config(config_yaml)
+    assert resolved_db_path(cfg) == cfg.storage.data_dir / "push" / "subscriptions.sqlite"
+    assert resolved_key_path(cfg) == cfg.storage.data_dir / "push" / "vapid_private.pem"
+
+    cfg.push.db_path = tmp_path / "elsewhere.sqlite"
+    cfg.push.vapid_private_key_file = tmp_path / "elsewhere.pem"
+    assert resolved_db_path(cfg) == tmp_path / "elsewhere.sqlite"
+    assert resolved_key_path(cfg) == tmp_path / "elsewhere.pem"

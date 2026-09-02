@@ -68,6 +68,89 @@ home-crop rendering and the OSM basemap fetch, which only feed the hidden
 
 Deployment assets for that mode live in `deploy/public/` — see its README.
 
+## Web Push
+
+`push.enabled: true` turns on browser notifications: a visitor subscribes
+with a point, a probability threshold and a lead time, and the service
+pushes them once when the calibrated probability at that point holds over
+the threshold for two consecutive radar observations. Off by default — the
+LAN instance has Home Assistant for alerting.
+
+Enable it in `config.yaml`:
+
+```yaml
+push:
+  enabled: true
+  vapid_subject: mailto:you@example.com   # required when enabled
+```
+
+or through the environment, which is what the compose stacks do:
+
+```bash
+DMI_NOWCAST_PUSH__ENABLED=true
+DMI_NOWCAST_PUSH__VAPID_SUBJECT=mailto:you@example.com
+```
+
+`vapid_subject` must be a `mailto:` or `https:` operator contact; the
+service refuses to start without one when push is enabled.
+
+### Where the state lives
+
+Both files sit in the data volume under `storage.data_dir/push/`
+(override with `push.vapid_private_key_file` / `push.db_path`):
+
+```
+<data_dir>/push/vapid_private.pem        0600, generated on first start
+<data_dir>/push/subscriptions.sqlite     endpoint, keys, point, preferences
+```
+
+The PEM is the service's identity. Rotate it and every existing
+subscription's `applicationServerKey` stops matching, so every subscriber
+has to re-subscribe — back it up together with the SQLite file. Neither is
+ever committed (see the repo `.gitignore`). The table holds no email, no
+name and no IP: an endpoint, its two keys, the coordinate the subscriber
+asked about, their preferences and the per-subscription state machine.
+
+To create the key ahead of the first boot (provisioning a volume, or
+pinning one identity across two instances):
+
+```bash
+uv run --package dmi-nowcast-sidecar \
+  python -m dmi_nowcast_sidecar.push.keygen ./vapid_private.pem
+# prints the public key; refuses to overwrite without --force
+```
+
+### Routes
+
+| Route | Auth | Purpose |
+| --- | --- | --- |
+| `GET /api/push/config` | open | feature flag, VAPID public key, option lists |
+| `POST /api/push/subscribe` | open | store/replace one subscription |
+| `POST /api/push/unsubscribe` | open | forget one endpoint (idempotent) |
+| `POST /api/push/test` | **bearer** | send the canned test notification |
+| `GET /api/push/stats` | **bearer** | counts + the last fan-out summary |
+
+The first three are on the public-mode allow-list; the last two are not,
+so on a public instance they answer `404` without the bearer. All five
+answer `503` while the feature is disabled.
+
+```bash
+# API_KEY is server.api_key (env: DMI_NOWCAST_SERVER__API_KEY).
+# Name one endpoint, or omit the body to reach every subscription.
+curl -fsS -X POST http://localhost:8081/api/push/test \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint": "https://fcm.googleapis.com/fcm/send/..."}'
+# {"sent":1,"failed":0,"removed":0}
+
+curl -fsS http://localhost:8081/api/push/stats \
+  -H "Authorization: Bearer $API_KEY"
+# {"subscriptions":12,"armed":11,"last_evaluated_radar_ts":"...","last_fanout":{...}}
+```
+
+Subscriptions the push service reports as gone (404/410) are deleted
+during the fan-out — that is the only garbage collection the store has.
+
 ## Deployment
 
 `deploy/` ships a Dockerfile, a Compose file and an SSH deploy script.

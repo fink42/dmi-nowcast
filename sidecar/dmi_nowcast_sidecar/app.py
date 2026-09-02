@@ -11,6 +11,12 @@ Website Phase A (§A3) adds the national surface:
 - ``GET /nowcast/{filename}`` — cycle-stamped artifact PNGs / manifests.
 - ``GET /forecast?lat=&lon=`` — point lookup into the national grids.
 
+Website Phase D adds the Web Push surface (see ``push/routes.py``):
+
+- ``GET  /api/push/config`` — feature flag + VAPID public key + options.
+- ``POST /api/push/subscribe`` / ``POST /api/push/unsubscribe``.
+- ``POST /api/push/test`` and ``GET /api/push/stats`` — operator-only.
+
 Auth: write endpoints check ``Authorization: Bearer <key>`` against
 ``config.server.api_key`` when set. Legacy read endpoints are always open
 since the HA integration polls them unauthenticated; the §A3 endpoints go
@@ -29,17 +35,22 @@ whole route table:
    with no bearer even when ``server.api_key`` is set (the key exists to
    unlock the hidden surface, not to lock the public one):
 
-   ``/healthz``, ``/forecast``, anything under ``/nowcast/`` and the
-   static frontend (see :func:`_mount_frontend`).
+   ``/healthz``, ``/forecast``, anything under ``/nowcast/``, the three
+   subscriber-facing push routes (``/api/push/config``,
+   ``/api/push/subscribe``, ``/api/push/unsubscribe``) and the static
+   frontend (see :func:`_mount_frontend`). Note these are *exact* paths,
+   not an ``/api/push/`` prefix: ``/api/push/test`` and
+   ``/api/push/stats`` are operator routes and stay hidden.
 
 2. **Everything else that matches a registered route** — ``/state.json``
    (the configured point's block), ``/frames/*`` (the home crop),
    ``/lightning/*`` (including the strike-ingest POST and the archive
-   dashboards), ``/docs`` and ``/openapi.json`` — answers ``404 {"detail":
-   "Not Found"}``, byte-identical to the response for a path that was
-   never registered. A request carrying a valid ``Authorization: Bearer
-   <server.api_key>`` passes through and gets the route's normal
-   behaviour, so an operator on the LAN can still reach everything.
+   dashboards), ``/api/push/test``, ``/api/push/stats``, ``/docs`` and
+   ``/openapi.json`` — answers ``404 {"detail": "Not Found"}``,
+   byte-identical to the response for a path that was never registered.
+   A request carrying a valid ``Authorization: Bearer <server.api_key>``
+   passes through and gets the route's normal behaviour, so an operator
+   on the LAN can still reach everything.
    With ``api_key`` unset in public mode the hidden surface is simply
    unreachable — the safe default.
 
@@ -95,6 +106,8 @@ from .eta_smoother import EtaSmoother
 from .lightning_schema import LightningEtaResponse, StrikesAccepted, StrikesIn
 from .national_artifacts import LATEST_MANIFEST_NAME
 from .national_sample import finite_or_none, sample_point
+from .push.paths import resolved_db_path, resolved_key_path
+from .push.routes import build_router as build_push_router
 from .scheduler import CycleScheduler
 from .state_schema import ForecastPointLead, ForecastPointResponse
 from .storage import StateStore
@@ -147,6 +160,12 @@ def create_app(
             interval_min=config.poll.interval_min,
             jitter_sec=config.poll.jitter_sec,
             on_cycle_complete=lambda r: _on_cycle_complete(app, r),
+            # Web Push evaluation runs after every cycle (Phase D). None
+            # when the feature is off — the scheduler then behaves exactly
+            # as it did before.
+            after_cycle=(
+                push_service.after_cycle if push_service is not None else None
+            ),
         )
         app.state.scheduler = local_scheduler
         if auto_start_scheduler:
@@ -156,6 +175,14 @@ def create_app(
         finally:
             if auto_start_scheduler:
                 await local_scheduler.shutdown()
+            if push_store is not None:
+                # Close the SQLite handle explicitly; the WAL files are
+                # checkpointed on close, so a restart never inherits a
+                # stale -wal alongside the volume snapshot.
+                try:
+                    push_store.close()
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("push_store_close_failed", error=str(exc))
 
     app = FastAPI(
         title="dmi-nowcast-sidecar",
@@ -164,6 +191,43 @@ def create_app(
         redoc_url=None,
         lifespan=lifespan,
     )
+
+    # Web Push (Phase D). The store and the VAPID key live in the data
+    # volume; the key is generated on first start when missing. Imported
+    # lazily — ``push.service`` pulls in pywebpush/requests, which an
+    # instance with the feature off should never have to load.
+    #
+    # An initialisation failure (unwritable volume, unreadable key) is
+    # logged and degrades to "disabled": the routes answer 503 and the
+    # cycle keeps running. A nowcast service that refuses to boot because
+    # notifications are broken has its priorities backwards.
+    push_service = None
+    push_store = None
+    push_public_key = None
+    if config.push.enabled:
+        try:
+            from .push.service import PushService
+            from .push.store import PushStore
+            from .push.vapid import ensure_private_key, public_key_b64url
+
+            pem = ensure_private_key(resolved_key_path(config))
+            push_public_key = public_key_b64url(pem)
+            push_store = PushStore(resolved_db_path(config))
+            push_service = PushService(
+                config, engine, push_store, pem, push_public_key,
+            )
+            _log.info(
+                "push_enabled",
+                db=str(resolved_db_path(config)),
+                key=str(resolved_key_path(config)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.error("push_init_failed", error=str(exc))
+            push_service = None
+            push_store = None
+            push_public_key = None
+    app.state.push_service = push_service
+    app.state.push_store = push_store
 
     @app.get("/healthz", response_model=HealthResponse, tags=["public"])
     async def healthz(request: Request) -> HealthResponse:
@@ -558,6 +622,17 @@ def create_app(
         return Response(content=html, media_type="text/html",
                         headers={"Cache-Control": "no-store"})
 
+    # Registered before the public-mode snapshot below, so the gate sees
+    # these routes and hides the two operator ones by default.
+    app.include_router(
+        build_push_router(
+            config,
+            store=push_store,
+            public_key=push_public_key,
+            service=push_service,
+        ),
+    )
+
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):  # noqa: ARG001
         # Avoid leaking tracebacks over HTTP.
@@ -631,9 +706,10 @@ def require_api_key(request: Request) -> None:
     ``Authorization: Bearer <key>``.
 
     Public mode carves out the allow-listed public surface (``/forecast``,
-    ``/nowcast/*``): those must stay open to anonymous browsers even when a
-    key is configured, because in public mode the key's job is to *unlock*
-    the hidden surface, not to lock the published one.
+    ``/nowcast/*``, the three subscriber-facing ``/api/push/*`` routes):
+    those must stay open to anonymous browsers even when a key is
+    configured, because in public mode the key's job is to *unlock* the
+    hidden surface, not to lock the published one.
     """
     config: Config = request.app.state.config
     if config.server.public_mode and _is_public_path(request.url.path):
@@ -656,7 +732,16 @@ def require_api_key(request: Request) -> None:
 
 # The public surface. Exact paths plus prefixes; the static frontend is not
 # listed because it is never part of the gated route snapshot (rule 3).
-_PUBLIC_PATHS = frozenset({"/healthz", "/forecast"})
+_PUBLIC_PATHS = frozenset({
+    "/healthz",
+    "/forecast",
+    # Web Push, subscriber-facing only. Exact paths, never an
+    # ``/api/push/`` prefix — ``/api/push/test`` and ``/api/push/stats``
+    # are operator routes and must stay behind the bearer.
+    "/api/push/config",
+    "/api/push/subscribe",
+    "/api/push/unsubscribe",
+})
 _PUBLIC_PREFIXES = ("/nowcast/",)
 
 # Byte-identical to Starlette's own "no such route" body, so a gated route

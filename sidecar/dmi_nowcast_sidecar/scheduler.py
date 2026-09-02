@@ -4,11 +4,18 @@ The scheduler owns no domain logic — it just fires :meth:`CycleEngine.run_cycl
 on the configured cadence and updates ``app.state.last_cycle_at`` so the
 ``/healthz`` endpoint can report freshness. Failures inside the cycle are
 logged but never propagate up; the next firing is the retry.
+
+Two post-cycle hooks, both optional and both isolated from the cycle:
+``on_cycle_complete`` is synchronous and trivial (it stamps app state),
+``after_cycle`` is awaited and may do real work off the loop (Web Push
+evaluation and fan-out, website Phase D). An exception in either is logged
+and swallowed — a notification that fails must never cost the next radar
+cycle.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Awaitable, Callable
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -29,11 +36,13 @@ class CycleScheduler:
         interval_min: int = 5,
         jitter_sec: int = 30,
         on_cycle_complete: Callable[[CycleResult], None] | None = None,
+        after_cycle: Callable[[CycleResult], Awaitable[None]] | None = None,
     ) -> None:
         self.engine = engine
         self.interval_min = interval_min
         self.jitter_sec = jitter_sec
         self._on_complete = on_cycle_complete
+        self._after_cycle = after_cycle
         self._scheduler = AsyncIOScheduler(timezone=timezone.utc)
 
     async def _run_once(self) -> None:
@@ -44,6 +53,11 @@ class CycleScheduler:
                 self._on_complete(result)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("on_cycle_complete_hook_failed", error=str(exc))
+        if self._after_cycle is not None:
+            try:
+                await self._after_cycle(result)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("after_cycle_hook_failed", error=str(exc))
 
     async def start(self, *, run_immediately: bool = True) -> None:
         """Run an initial cycle (optional), then start the recurring trigger."""

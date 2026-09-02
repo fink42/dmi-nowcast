@@ -2,8 +2,9 @@
 
 Doesn't exercise the actual 5-minute trigger (apscheduler's interval
 trigger is well-tested upstream); we just confirm that ``start`` calls
-``run_cycle``, ``shutdown`` is clean, and the on-complete callback
-fires.
+``run_cycle``, ``shutdown`` is clean, and both post-cycle hooks fire —
+the synchronous ``on_cycle_complete`` and the awaited ``after_cycle``
+(Web Push, Phase D) — with an exception in either one contained.
 """
 from __future__ import annotations
 
@@ -84,3 +85,53 @@ async def test_shutdown_closes_engine(minimal_config: Config) -> None:
     await scheduler.start(run_immediately=False)
     await scheduler.shutdown()
     engine.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_after_cycle_hook_is_awaited_after_the_sync_hook(
+    minimal_config: Config,
+) -> None:
+    """The async hook runs once per cycle, with the cycle's result, and
+    after the synchronous one (which stamps app.state)."""
+    engine = CycleEngine(minimal_config)
+    result = CycleResult(state=None, error=None)
+    engine.run_cycle = AsyncMock(return_value=result)  # type: ignore[method-assign]
+    order: list[str] = []
+    seen: list[CycleResult] = []
+
+    async def _after(r: CycleResult) -> None:
+        order.append("after")
+        seen.append(r)
+
+    scheduler = CycleScheduler(
+        engine,
+        on_cycle_complete=lambda _r: order.append("sync"),
+        after_cycle=_after,
+    )
+    try:
+        await scheduler.start(run_immediately=True)
+        assert order == ["sync", "after"]
+        assert seen == [result]
+    finally:
+        await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_after_cycle_hook_failure_does_not_crash_cycle(
+    minimal_config: Config,
+) -> None:
+    """A push fan-out that blows up must cost a notification, never the
+    radar cycle."""
+    engine = CycleEngine(minimal_config)
+    engine.run_cycle = AsyncMock(  # type: ignore[method-assign]
+        return_value=CycleResult(state=None),
+    )
+
+    async def _boom(_r: CycleResult) -> None:
+        raise RuntimeError("push exploded")
+
+    scheduler = CycleScheduler(engine, after_cycle=_boom)
+    try:
+        await scheduler.start(run_immediately=True)  # must not raise
+    finally:
+        await scheduler.shutdown()

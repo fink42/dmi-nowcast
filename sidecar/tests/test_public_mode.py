@@ -66,6 +66,11 @@ HIDDEN_ROUTES: list[tuple[str, str]] = [
     ("GET", "/lightning/archive/summary"),
     ("GET", "/lightning/archive/dashboard.html"),
     ("POST", "/lightning/strikes"),
+    # Web Push operator routes. Exact paths, deliberately not the whole
+    # ``/api/push/`` prefix: /config, /subscribe and /unsubscribe are on
+    # the public allow-list and must keep answering anonymously.
+    ("POST", "/api/push/test"),
+    ("GET", "/api/push/stats"),
     # The OpenAPI surface names every hidden route — hide it too.
     ("GET", "/docs"),
     ("GET", "/openapi.json"),
@@ -218,6 +223,16 @@ def test_shipped_public_example_config_is_actually_public() -> None:
     assert cfg.lightning.archive_enabled is False
     # The national products are the site's payload — they must stay on.
     assert cfg.forecast.national.enabled is True
+    # Web Push is the public instance's only outbound channel (Phase D).
+    # Enabled, with a subject the operator is expected to replace — the
+    # model rejects ``enabled`` without one, so this cannot silently ship
+    # half-configured.
+    assert cfg.push.enabled is True
+    assert cfg.push.vapid_subject is not None
+    assert cfg.push.vapid_subject.startswith(("mailto:", "https:"))
+    # Key and DB default into the data volume, not a bind mount.
+    assert cfg.push.vapid_private_key_file is None
+    assert cfg.push.db_path is None
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +245,12 @@ def test_public_routes_open_without_bearer(
     """The published surface answers anonymously even with a key set."""
     # Before any cycle: honest 503s, never 401/404.
     assert public_client.get("/healthz").status_code == 200
+    # Push is off in this fixture, but the subscriber routes must still be
+    # *reachable* without a bearer — the feature flag answers, not the gate.
+    assert public_client.get("/api/push/config").json() == {"enabled": False}
+    assert public_client.post(
+        "/api/push/unsubscribe", json={"endpoint": "https://example.invalid/x"},
+    ).status_code == 503
     assert public_client.get("/nowcast/manifest.json").status_code == 503
     assert public_client.get(
         "/forecast", params={"lat": HOME_LAT, "lon": HOME_LON},
