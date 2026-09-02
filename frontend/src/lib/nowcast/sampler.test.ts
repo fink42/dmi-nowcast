@@ -428,9 +428,10 @@ describe('samplePoint', () => {
 			}
 		});
 
-		it('reports no motion at a pixel outside the support radius', async () => {
-			// The neighbouring pixel is nodata in both components — exactly what
-			// the sidecar writes farther than support_radius_km from any echo.
+		it('reports no motion at a pixel the grids leave as nodata', async () => {
+			// The neighbouring pixel is nodata in both components — what the
+			// sidecar writes outside radar coverage, and everywhere on a cycle
+			// whose composite holds no echo at all.
 			const grids = { ...(await baseGrids()), motion: await motionPair(24, 24) };
 			expect(samplePoint(manifest, grids, 56.017, 10.5666)!.motion).toBeNull();
 		});

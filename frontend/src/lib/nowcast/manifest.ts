@@ -69,7 +69,16 @@ export interface ArtifactEntry {
  */
 export interface MotionBlock {
 	grid: string;
-	support_radius_km: number;
+	/**
+	 * Null since issue #6: the sidecar no longer cuts the grids off at a
+	 * radius from the echo, it fills coverage with the nearest cells' motion.
+	 * The key stays so older manifests still parse.
+	 */
+	support_radius_km: number | null;
+	/** How the off-echo vectors were filled, e.g. `nearest-cells-v1`. */
+	fill?: string;
+	/** Search scales of that fill, in km, smallest first. */
+	fill_scales_km?: number[];
 	max_abs_kmh: number;
 	convention: string;
 }

@@ -82,7 +82,7 @@ import structlog
 
 from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.national import (
-    DEFAULT_MOTION_SUPPORT_RADIUS_KM,
+    DEFAULT_MOTION_FILL_SCALES_KM,
     NationalProducts,
 )
 from dmi_nowcast_core.render import _apply_colormap
@@ -196,7 +196,6 @@ def write_national_artifacts(
     calibration: dict | None = None,
     motion_east_kmh: np.ndarray | None = None,
     motion_north_kmh: np.ndarray | None = None,
-    motion_support_radius_km: float = DEFAULT_MOTION_SUPPORT_RADIUS_KM,
     history_frames: int = DEFAULT_HISTORY_FRAMES,
 ) -> NationalArtifactsResult:
     """Write one cycle's national artifacts + manifest into ``out_dir``.
@@ -210,10 +209,12 @@ def write_national_artifacts(
 
     ``motion_east_kmh`` / ``motion_north_kmh`` are the R2 cell-motion grids
     on the **product** grid (same shape as ``products.eta_min``), in km/h,
-    east- and north-positive, NaN where no honest estimate exists — as
+    east- and north-positive, NaN outside radar coverage — as
     returned by ``dmi_nowcast_core.national.motion_grids_kmh``. Pass both or
-    neither; ``motion_support_radius_km`` is echoed into the manifest's
-    ``motion`` block so the client can explain the nodata region.
+    neither. The manifest's ``motion`` block describes how they were filled
+    (``fill`` / ``fill_scales_km``) so a client can explain the vectors; as
+    of issue #6 there is no support radius, so ``support_radius_km`` is
+    published as ``null`` and kept only so pinned clients keep parsing.
 
     ``history_frames`` caps how many prior cycles' ``overlay_now`` PNGs the
     manifest references as observation history (0 disables). Only files
@@ -380,14 +381,22 @@ def write_national_artifacts(
         motion=(
             {
                 "grid": "product",
-                "support_radius_km": float(motion_support_radius_km),
+                # Retired with issue #6 (the fill has no cut-off radius);
+                # the key stays, null, because clients pin field paths.
+                "support_radius_km": None,
+                "fill": "nearest-cells-v1",
+                "fill_scales_km": [float(v) for v in DEFAULT_MOTION_FILL_SCALES_KM],
                 "max_abs_kmh": MOTION_MAX_ABS_KMH,
                 "convention": (
                     "motion_east_kmh / motion_north_kmh are the cell motion "
                     "in km/h on the product grid (see \"grid\"), east- and "
-                    "north-positive. nodata (255) outside radar coverage and "
-                    "farther than support_radius_km from any echo — there is "
-                    "no motion estimate there, do not draw an arrow."
+                    "north-positive. nodata (255) outside radar coverage, "
+                    "and everywhere when the composite has no echo at all. "
+                    "On the echo the vector is the measured optical flow; "
+                    "off it, it is the motion of the nearest cells — a "
+                    "rain-weighted average over a search area that starts "
+                    "small and widens (fill_scales_km) until it reaches "
+                    "echo."
                 ),
             }
             if motion_east_kmh is not None else None

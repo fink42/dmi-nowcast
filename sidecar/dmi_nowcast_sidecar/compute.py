@@ -563,6 +563,17 @@ class CycleEngine:
             vy = np.full(shape, dy, dtype=np.float32)
             vx = np.full(shape, dx, dtype=np.float32)
 
+        # Sanitised *raw* estimate, kept for the served motion grids (R2)
+        # only. Same nan→0 and clip as the completed field below, so on the
+        # echo the two agree exactly; off it, ``motion_grids_kmh`` runs its
+        # own nearest-cells completion instead of the bulk one (issue #6).
+        # Two extra float32 native grids (~14 MB each) live until the
+        # artifacts are written, then are dropped.
+        vy_raw = np.nan_to_num(vy, nan=0.0).astype(np.float32)
+        vx_raw = np.nan_to_num(vx, nan=0.0).astype(np.float32)
+        np.clip(vy_raw, -_MAX_PX_PER_FRAME, _MAX_PX_PER_FRAME, out=vy_raw)
+        np.clip(vx_raw, -_MAX_PX_PER_FRAME, _MAX_PX_PER_FRAME, out=vx_raw)
+
         # Motion-field completion (R5). Farnebäck returns exactly zero away
         # from the echo, which stalls advected rain along a stationary line
         # ~20-30 km ahead of it; relax the far field toward bulk storm
@@ -732,15 +743,19 @@ class CycleEngine:
         if ensemble is not None and ensemble.national is not None:
             self._national_latest = (ensemble.national, composite_now.timestamp_utc)
             t_art = time.perf_counter()
-            # R2 cell-motion grids: the same completed+sanitised flow the
-            # overlays and STEPS ran on, on the product grid, in km/h. A
-            # failure here costs the click-anywhere arrow, not the cycle.
+            # R2 cell-motion grids: the display product, on the product
+            # grid, in km/h. Fed the *raw* sanitised flow, not the
+            # bulk-completed one the overlays and STEPS ran on — off the
+            # echo it completes toward the nearest cells rather than the
+            # national bulk, which is what the arrow is asked about
+            # (issue #6). The advection's field is untouched. A failure
+            # here costs the click-anywhere arrow, not the cycle.
             motion_east = motion_north = None
             try:
                 motion_east, motion_north = motion_grids_kmh(
-                    vy, vx, rain_now,
+                    vy_raw, vx_raw, rain_now,
                     pixel_km=float(composite_now.xscale_m) / 1000.0,
-                    # ``vy``/``vx`` are pixels per inter-frame interval.
+                    # ``vy_raw``/``vx_raw`` are pixels per inter-frame interval.
                     timestep_min=dt_min,
                     downsample_factor=ensemble.national.downsample_factor,
                     support_threshold_mm_h=self._rain_threshold,
@@ -766,6 +781,9 @@ class CycleEngine:
             except Exception as exc:  # noqa: BLE001
                 _log.warning("national_artifacts_failed", error=str(exc))
             national_ms += (time.perf_counter() - t_art) * 1000
+
+        # The raw-flow copies exist only for the served motion grids.
+        del vy_raw, vx_raw
 
         # State payload.
         now_utc = datetime.now(timezone.utc)

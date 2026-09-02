@@ -71,8 +71,6 @@ const MOTION_KMH = {
 	east: (DRIFT.col * NATIVE.scale * 60) / 1000,
 	north: (-DRIFT.row * NATIVE.scale * 60) / 1000
 };
-/** No motion estimate farther than this from an echo (manifest `motion`). */
-const MOTION_SUPPORT_KM = 20;
 /** Prior cycles referenced as observation history, at the 10 min cadence. */
 const HISTORY_MIN = [-30, -20, -10];
 /** How old the radar frame already is when the cycle runs (minutes). */
@@ -118,14 +116,6 @@ function rainAt(col, row, leadMin) {
 		if (d < 1) value = Math.max(value, 12 * (1 - d) ** 1.5);
 	}
 	return value;
-}
-
-/** Is this native pixel within the motion grids' support of any echo? */
-function withinSupport(col, row) {
-	const supportPx = (MOTION_SUPPORT_KM * 1000) / NATIVE.scale;
-	return BLOBS.some(
-		(blob) => Math.hypot(col - blob.col, row - blob.row) < blob.radius + supportPx
-	);
 }
 
 const quantise = (value, spec) =>
@@ -283,14 +273,10 @@ function productPng(product, leadMin) {
 				const nRow = row * FACTOR;
 				let value = null;
 				if (product === 'motion_east_kmh' || product === 'motion_north_kmh') {
-					// One uniform drift, but only where there is an echo close
-					// enough to have measured it — everywhere else is nodata, the
-					// case the panel must render as "no measured cell motion".
-					value = withinSupport(nCol, nRow)
-						? product === 'motion_east_kmh'
-							? MOTION_KMH.east
-							: MOTION_KMH.north
-						: null;
+					// One uniform drift, served across the whole coverage: the
+					// blobs exist, so every pixel gets the nearest cells' motion
+					// (issue #6). Nodata only when there is no echo at all.
+					value = product === 'motion_east_kmh' ? MOTION_KMH.east : MOTION_KMH.north;
 				} else if (product === 'p_rain') {
 					const mm = rainAt(nCol, nRow, leadMin);
 					value = Math.min(1, mm / 4);
@@ -366,13 +352,18 @@ function manifest() {
 		overlay_grid: gridBlock(NATIVE.scale, overlayShape),
 		motion: {
 			grid: 'product',
-			support_radius_km: MOTION_SUPPORT_KM,
+			support_radius_km: null,
+			fill: 'nearest-cells-v1',
+			fill_scales_km: [25, 50, 100],
 			max_abs_kmh: 120,
 			convention:
 				'motion_east_kmh / motion_north_kmh are the cell motion in km/h on ' +
 				'the product grid, east- and north-positive. nodata (255) outside ' +
-				'radar coverage and farther than support_radius_km from any echo — ' +
-				'there is no motion estimate there, do not draw an arrow.'
+				'radar coverage, and everywhere when the composite has no echo at ' +
+				'all. On the echo the vector is the measured optical flow; off it, ' +
+				'it is the motion of the nearest cells — a rain-weighted average ' +
+				'over a search area that starts small and widens (fill_scales_km) ' +
+				'until it reaches echo.'
 		},
 		calibration: {
 			fitted_at: '2026-08-01T03:00:00+00:00',

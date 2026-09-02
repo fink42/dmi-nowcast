@@ -378,9 +378,10 @@ def test_motion_grid_signs_follow_dense_flow_convention():
     assert (north < 0).all(), "southward motion must publish negative north"
 
 
-def test_motion_grids_nodata_beyond_support_radius():
-    """Only within 20 km of an echo does a pixel get an arrow; outside the
-    radar composite it never does."""
+def test_motion_grids_nodata_only_outside_radar_coverage():
+    """Issue #6: distance from the echo no longer gates the arrow. Every
+    pixel inside the composite carries a vector once *any* echo exists;
+    only off-composite pixels are nodata."""
     shape = (200, 200)
     vy, vx = _uniform_flow(shape, vy_px=-4.0, vx_px=8.0)
     rain = np.zeros(shape, np.float32)
@@ -390,18 +391,22 @@ def test_motion_grids_nodata_beyond_support_radius():
     east, north = motion_grids_kmh(
         vy, vx, rain,
         pixel_km=0.5, timestep_min=10.0, downsample_factor=1,
-        support_threshold_mm_h=0.5, support_radius_km=20.0,
+        support_threshold_mm_h=0.5,
     )
     assert np.isnan(east).any() and np.isfinite(east).any()
     assert np.array_equal(np.isnan(east), np.isnan(north))
 
-    # 20 km = 40 px on a 500 m grid.
     assert np.isfinite(east[100, 100])
-    assert np.isfinite(east[100, 139])     # 19.5 km away
-    assert np.isnan(east[100, 141])        # 20.5 km away
+    assert np.isfinite(east[100, 139])     # 19.5 km away — was inside the
+    assert np.isfinite(east[100, 141])     # old 20 km radius, this one was not
+    assert np.isfinite(east[199, 199]), "the far corner still gets an arrow"
     assert np.isnan(east[100, 5]), "off-composite pixels never carry motion"
     # The off-composite strip stays nodata even where it is near the echo.
     assert np.isnan(east[:, :10]).all()
+    # The flow is uniform, so the fill reproduces it everywhere.
+    finite = np.isfinite(east)
+    assert np.allclose(east[finite], 24.0, atol=1e-3)
+    assert np.allclose(north[finite], 12.0, atol=1e-3)
 
 
 def test_motion_grids_all_nodata_without_echo():

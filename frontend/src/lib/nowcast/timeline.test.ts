@@ -107,7 +107,9 @@ function manifestV2(history: number[] = [-20, -10]): Manifest {
 		overlay_grid: null,
 		motion: {
 			grid: 'product',
-			support_radius_km: 20,
+			support_radius_km: null,
+			fill: 'nearest-cells-v1',
+			fill_scales_km: [25, 50, 100],
 			max_abs_kmh: 120,
 			convention: 'east- and north-positive; nodata means no estimate'
 		},

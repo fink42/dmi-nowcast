@@ -587,7 +587,9 @@ def test_motion_grids_written_with_manifest_entries(
     # Provenance: geometry is the shared product grid, not a duplicate block.
     motion = manifest["motion"]
     assert motion["grid"] == "product"
-    assert motion["support_radius_km"] == pytest.approx(20.0)
+    assert motion["support_radius_km"] is None  # retired with issue #6
+    assert motion["fill"] == "nearest-cells-v1"
+    assert motion["fill_scales_km"] == [25.0, 50.0, 100.0]
     assert motion["max_abs_kmh"] == pytest.approx(120.0)
     assert entries[f"motion_east_kmh_{STAMP}.png"]["shape"] == manifest["grid"]["shape"]
 
@@ -657,21 +659,22 @@ def test_motion_grids_are_end_to_end_km_per_hour(
     assert np.allclose(decoded["motion_north_kmh"], 12.0, atol=half_step + 1e-4)
 
 
-def test_motion_nodata_beyond_the_support_radius_survives_the_png(
+def test_motion_survives_the_png_far_from_the_echo_but_not_off_coverage(
     geo: CompositeGeo, tmp_path: Path,
 ) -> None:
-    """A pixel more than 20 km from any echo decodes to NaN — the website
-    says "no cell motion estimate" there instead of drawing an arrow."""
+    """Issue #6, end to end: a pixel far from any echo still decodes to a
+    finite vector (the nearest cells\' motion) — only *outside radar
+    coverage* does the PNG carry nodata."""
     native = (PRODUCT_PX * DOWNSAMPLE, PRODUCT_PX * DOWNSAMPLE)
     vy = np.full(native, -4.0, dtype=np.float32)
     vx = np.full(native, 8.0, dtype=np.float32)
     rain = np.zeros(native, dtype=np.float32)
-    rain[0, 0] = 5.0    # one echo pixel in the NW corner
+    rain[0, 0] = 5.0            # one echo pixel in the NW corner
+    rain[-2 * DOWNSAMPLE:, :] = np.nan   # southern strip is off-composite
     east, north = motion_grids_kmh(
         vy, vx, rain,
         pixel_km=PIXEL_M / 1000.0, timestep_min=10.0,
         downsample_factor=DOWNSAMPLE, support_threshold_mm_h=0.5,
-        support_radius_km=20.0,
     )
     result = _write(geo, tmp_path, motion_east_kmh=east, motion_north_kmh=north)
     manifest = json.loads(result.manifest_path.read_text())
@@ -680,12 +683,16 @@ def test_motion_nodata_beyond_the_support_radius_survives_the_png(
     ]
     with Image.open(tmp_path / entry["filename"]) as img:
         levels = np.asarray(img)
-    # 2 km product pixels: [0, 0] is on the echo, [15, 15] is ~42 km away.
+    # 2 km product pixels: [0, 0] is on the echo, [13, 13] is ~37 km away
+    # and inside coverage, [15, 15] is in the off-composite strip.
     assert levels[0, 0] != NODATA_LEVEL
+    assert levels[13, 13] != NODATA_LEVEL, "far-from-echo must not be nodata"
     assert levels[PRODUCT_PX - 1, PRODUCT_PX - 1] == NODATA_LEVEL
     decoded = dequantise(levels, scale=entry["scale"], offset=entry["offset"])
     assert np.isnan(decoded[PRODUCT_PX - 1, PRODUCT_PX - 1])
     assert decoded[0, 0] == pytest.approx(24.0, abs=entry["scale"])
+    # Uniform flow ⇒ the nearest-cells fill reproduces it far away too.
+    assert decoded[13, 13] == pytest.approx(24.0, abs=entry["scale"])
 
 
 def test_motion_grids_must_be_passed_together_and_shaped_right(

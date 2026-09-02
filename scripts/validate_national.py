@@ -447,7 +447,7 @@ def _check_motion_grids(report: Report, base_url: str, token: str | None,
         check,
         f"{n_finite / east.size:.0%} of the grid carries motion; speed "
         f"median {np.median(speed):.0f} / p99 {np.percentile(speed, 99):.0f} "
-        f"km/h (support radius {manifest['motion']['support_radius_km']} km)"
+        f"km/h (fill {manifest['motion'].get('fill') or 'radius ' + str(manifest['motion'].get('support_radius_km')) + ' km'})"
         + ("" if not problems else "; " + "; ".join(problems)),
     )
 
