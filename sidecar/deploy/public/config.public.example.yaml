@@ -24,7 +24,10 @@ home:
   radius_km: 1.0
 
 poll:
-  interval_min: 5         # DMI publishes fullRange composites every ~10 min
+  # 2, not 5: DMI publishes a composite ~12 min after its timestamp and
+  # the poll adds up to one interval on top; the no-new-frame fast path
+  # makes a poll that finds nothing new nearly free (one list call).
+  interval_min: 2
   jitter_sec: 30          # ± jitter so the two instances don't fire together
 
 dmi:
@@ -41,6 +44,15 @@ forecast:
   steps:
     ensemble_size: 16
     n_cascade_levels: 6
+    # 90, not 60: the STEPS horizon counts from the radar frame, while
+    # every lead the site serves counts from now. This instance computes
+    # on a frame that is already 14-18 min old (DMI's ~12 min publication
+    # delay plus the poll interval), so a 60 min horizon left only ~43
+    # honest minutes — P(<=45) and P(<=60) read the same final timestep
+    # and no ETA past ~43 min could exist. 60 min of served lead plus
+    # ~30 min of frame age is the horizon that makes the published leads
+    # mean what they say.
+    horizon_min: 90
   national:
     # The site's whole payload: probability/ETA/intensity grids + overlays.
     enabled: true

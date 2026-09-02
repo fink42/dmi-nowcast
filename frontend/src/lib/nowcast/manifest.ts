@@ -99,6 +99,15 @@ export interface Manifest {
 	threshold_mm_h: number;
 	timestep_min: number;
 	frame_age_min: number;
+	/**
+	 * STEPS horizon in minutes from RADAR-FRAME time. The honest horizon
+	 * from now is `ensemble_horizon_min - frame_age_min`; leads beyond it
+	 * are answered by the ensemble's final timestep rather than by a
+	 * forecast for that lead. Absent on a manifest written before the field
+	 * existed, null when the sidecar did not state one — treat both as
+	 * "unknown", never as zero.
+	 */
+	ensemble_horizon_min?: number | null;
 	n_members: number;
 	leads_min: number[];
 	grid: GridBlock;

@@ -65,11 +65,26 @@ class StepsConfig(BaseModel):
     stride-slices the national grid before STEPS: ×4 turns 1728×1984 @
     500 m into 432×496 @ ~2 km effective, cutting a ~2 min run to ~6 s on
     dev hardware while staying finer than the radar's true resolution.
+
+    ``horizon_min`` is the STEPS horizon measured from **radar-frame
+    time**, not from now — the ensemble's timesteps count from the frame,
+    while every served lead counts from the moment the answer is read. It
+    must therefore cover the longest served lead PLUS the frame age at
+    compute time: DMI publishes a composite ~12 min after its timestamp
+    and the poll adds up to one interval on top, so the live frame age is
+    14–18 min and can reach ~30 min after a missed publication. 90 = the
+    60 min longest served lead + ~30 min of frame age; at 60 the horizon
+    from now collapsed to ~43 min, P(≤45) and P(≤60) clamped onto the same
+    final timestep, and no ETA beyond ~43 min could exist. The step count
+    follows from the measured frame spacing —
+    ``ceil(horizon_min / timestep_min)`` — so raising this raises STEPS
+    cost roughly linearly (9 steps instead of 6 at the 10-min cadence).
     """
     enabled: bool = True
     ensemble_size: Annotated[int, Field(ge=4, le=64)] = 24
     n_cascade_levels: Annotated[int, Field(ge=4, le=8)] = 6
     downsample_factor: Annotated[int, Field(ge=1, le=8)] = 4
+    horizon_min: Annotated[int, Field(ge=30, le=180)] = 90
 
 
 class NationalConfig(BaseModel):

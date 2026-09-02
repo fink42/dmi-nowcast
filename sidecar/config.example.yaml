@@ -26,6 +26,15 @@ forecast:
   steps:
     ensemble_size: 24
     n_cascade_levels: 6
+    # STEPS horizon in minutes, measured from RADAR-FRAME time — not from
+    # now. It must cover the longest lead served above (60) PLUS the frame
+    # age at compute: DMI publishes a composite ~12 min after its
+    # timestamp and the poll adds up to one interval, so the live age is
+    # 14-18 min and can reach ~30 after a missed publication. Hence 60 +
+    # ~30 = 90. Lower it and the last leads collapse onto the ensemble's
+    # final timestep; raise it and STEPS cost grows roughly linearly with
+    # ceil(horizon_min / frame spacing).
+    # horizon_min: 90
 
 calibration:
   # Sidecar looks for fresh curves in the data volume first; falls back to

@@ -240,7 +240,8 @@ def test_manifest_schema_and_geometry(geo: CompositeGeo, tmp_path: Path) -> None
 
     assert set(manifest) == {
         "schema_version", "cycle", "radar_ts_utc", "generated_at_utc",
-        "threshold_mm_h", "timestep_min", "frame_age_min", "n_members",
+        "threshold_mm_h", "timestep_min", "frame_age_min",
+        "ensemble_horizon_min", "n_members",
         "leads_min", "grid", "overlay_grid", "motion", "calibration",
         "artifacts",
     }
@@ -253,6 +254,9 @@ def test_manifest_schema_and_geometry(geo: CompositeGeo, tmp_path: Path) -> None
     assert manifest["threshold_mm_h"] == pytest.approx(0.1)
     assert manifest["timestep_min"] == pytest.approx(5.0)
     assert manifest["frame_age_min"] == pytest.approx(2.5)
+    # No horizon stated by this caller → null, never 0 (which a client
+    # would read as "nothing is forecastable").
+    assert manifest["ensemble_horizon_min"] is None
     assert manifest["n_members"] == 8
     assert manifest["leads_min"] == [10, 20]
 
@@ -335,6 +339,22 @@ def test_manifest_schema_and_geometry(geo: CompositeGeo, tmp_path: Path) -> None
     assert datetime.fromisoformat(fc_entry["valid_ts_utc"]) == (
         RADAR_TS + timedelta(minutes=2.5 + 10)   # frame_age_min = 2.5
     )
+
+
+def test_manifest_publishes_the_ensemble_horizon(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """The horizon the caller ran STEPS to, from radar-frame time. A client
+    subtracts ``frame_age_min`` to get the honest horizon from now."""
+    result = _write(geo, tmp_path, ensemble_horizon_min=90.0)
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["ensemble_horizon_min"] == pytest.approx(90.0)
+    # The products' frame age is 2.5 min here, so the honest horizon from
+    # now is 87.5 — the arithmetic the site performs.
+    honest = manifest["ensemble_horizon_min"] - manifest["frame_age_min"]
+    assert honest == pytest.approx(87.5)
+    # Additive: the field arrived inside schema v2, no bump.
+    assert manifest["schema_version"] == 2
 
 
 def test_timestamps_are_normalised_to_utc(geo: CompositeGeo, tmp_path: Path) -> None:

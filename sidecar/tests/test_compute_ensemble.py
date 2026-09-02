@@ -8,9 +8,12 @@ is far too slow for tests and is already covered on small grids by
 
 Since package C0 (Phase B addendum 2026-08-29, fullRange-only frames) the
 fixtures run at the 10-min fullRange cadence: the STEPS timestep is
-derived from the measured inter-frame spacing (10 min → 6 timesteps for
-the fixed 60-min horizon), and the cycle takes a no-new-frame fast path
-when the newest frame is unchanged from the previous cycle.
+derived from the measured inter-frame spacing, and the cycle takes a
+no-new-frame fast path when the newest frame is unchanged from the
+previous cycle. The horizon is ``forecast.steps.horizon_min`` and counts
+from RADAR-FRAME time, so at the 10-min cadence the default 90 gives 9
+timesteps (60 would give 6) — the extra steps are what the live 14–18 min
+frame age eats before the served leads begin.
 
 Covers:
 - the ``frame_age_corrected_leads`` pure helper (incl. horizon clamping,
@@ -34,6 +37,7 @@ import numpy as np
 import pytest
 from pyproj import CRS, Transformer
 
+from dmi_nowcast_core.national import national_products
 from dmi_nowcast_core.probabilistic import (
     EnsembleUnavailable,
     frame_age_corrected_leads,
@@ -406,8 +410,9 @@ def test_happy_path_wires_config_and_frames_into_run_ensemble(
     assert call["n_cascade_levels"] == steps_cfg.n_cascade_levels
     assert call["downsample_factor"] == steps_cfg.downsample_factor
     # C0: the timestep is DERIVED from the measured 10-min inter-frame
-    # spacing, and the step count keeps the 60-min horizon: ceil(60/10) = 6.
-    assert call["n_timesteps"] == 6
+    # spacing, and the step count keeps the configured horizon:
+    # ceil(90/10) = 9 at the default horizon_min.
+    assert call["n_timesteps"] == 9
     assert call["timestep_min"] == 10.0
     assert call["threshold_mm_h"] == engine.config.forecast.rain_threshold_mm_h
     assert call["pixel_scale_m"] == PIXEL_M
@@ -424,6 +429,102 @@ def test_happy_path_wires_config_and_frames_into_run_ensemble(
     # Native-resolution flow, matching the frame grid.
     assert call["vy"].shape == (GRID_PX, GRID_PX)
     assert call["vx"].shape == (GRID_PX, GRID_PX)
+
+
+# ---------------------------------------------------------------------------
+# STEPS horizon — config-driven, measured from radar-frame time
+# ---------------------------------------------------------------------------
+
+def test_horizon_config_drives_the_step_count(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``n_timesteps = ceil(horizon_min / timestep)`` at the measured 10-min
+    fullRange spacing: 9 steps at the default 90-min horizon, 6 at the old
+    fixed 60. Nothing else about the cycle changes."""
+    calls: list[dict] = []
+    monkeypatch.setattr(compute_mod, "run_ensemble", _make_fake_run_ensemble(calls))
+
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+    assert calls[-1]["timestep_min"] == 10.0
+    assert calls[-1]["n_timesteps"] == 9        # ceil(90 / 10)
+
+    # Same frames, shorter horizon. ``_last_state`` is cleared so the cycle
+    # recomputes instead of taking the no-new-frame fast path.
+    engine.config.forecast.steps.horizon_min = 60
+    engine._last_state = None
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+    assert calls[-1]["timestep_min"] == 10.0
+    assert calls[-1]["n_timesteps"] == 6        # ceil(60 / 10)
+
+    # A horizon shorter than one frame interval still buys one timestep.
+    engine.config.forecast.steps.horizon_min = 30
+    engine._last_state = None
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+    assert calls[-1]["n_timesteps"] == 3
+
+
+def _crossing_staircase(n_timesteps: int) -> np.ndarray:
+    """8 members, member ``m`` wet from timestep ``m`` onward.
+
+    The cumulative member-exceedance fraction at step count ``k`` is
+    ``min(k, 8) / 8`` at every pixel — so which step a lead lands on is
+    directly readable off the probability.
+    """
+    ens = np.zeros((8, n_timesteps, 4, 4), dtype=np.float32)
+    for m in range(8):
+        ens[m, m:] = np.float32(m + 1.0)
+    return ens
+
+
+def test_late_leads_stop_clamping_onto_one_timestep_at_the_new_horizon() -> None:
+    """The bug the horizon change fixes, in the reduction that serves it.
+
+    At the live frame age (17 min) and the 10-min fullRange spacing, the
+    45- and 60-min leads need ceil(62/10) = 7 and ceil(77/10) = 8 ensemble
+    steps. A 6-step ensemble (the old fixed 60-min horizon) has neither, so
+    both clamp onto its final step and the two leads publish the SAME
+    probability. A 9-step ensemble (90-min horizon) has both.
+    """
+    old = national_products(
+        _crossing_staircase(6), leads_min=(45, 60),
+        timestep_min=10.0, frame_age_min=17.0, threshold_mm_h=0.5,
+    )
+    new = national_products(
+        _crossing_staircase(9), leads_min=(45, 60),
+        timestep_min=10.0, frame_age_min=17.0, threshold_mm_h=0.5,
+    )
+
+    # Old: both clamped to step 6 → 6/8, indistinguishable.
+    assert float(old.p_rain[45][0, 0]) == pytest.approx(0.75)
+    assert float(old.p_rain[60][0, 0]) == pytest.approx(0.75)
+    np.testing.assert_array_equal(old.p_rain[45], old.p_rain[60])
+
+    # New: step 7 vs step 8 → 7/8 vs 8/8, a real difference between the leads.
+    assert float(new.p_rain[45][0, 0]) == pytest.approx(0.875)
+    assert float(new.p_rain[60][0, 0]) == pytest.approx(1.0)
+    assert float(new.p_rain[60][0, 0]) > float(new.p_rain[45][0, 0])
+    assert not np.array_equal(new.p_rain[45], new.p_rain[60])
+
+
+def test_cycle_horizon_reaches_the_manifest(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The site needs the horizon to know which leads are honest, so the
+    configured value rides the manifest next to ``frame_age_min``."""
+    calls: list[dict] = []
+    monkeypatch.setattr(compute_mod, "run_ensemble", _make_fake_run_ensemble(calls))
+    engine.config.forecast.steps.horizon_min = 90
+
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+    manifest = json.loads((_nowcast_dir(engine) / "manifest.json").read_text())
+    assert manifest["ensemble_horizon_min"] == pytest.approx(90.0)
+    # The honest horizon from now, the number the site actually shows.
+    honest = manifest["ensemble_horizon_min"] - manifest["frame_age_min"]
+    assert honest > 60.0  # every served lead is inside it
 
 
 def test_aggregate_failure_falls_back(
@@ -596,10 +697,16 @@ def test_steps_config_defaults_and_bounds() -> None:
     assert cfg.ensemble_size == 24
     assert cfg.n_cascade_levels == 6
     assert cfg.downsample_factor == 4
+    # Horizon from radar-frame time: 60 min of served lead + ~30 of frame age.
+    assert cfg.horizon_min == 90
     with pytest.raises(ValueError):
         StepsConfig(downsample_factor=0)
     with pytest.raises(ValueError):
         StepsConfig(downsample_factor=9)
+    with pytest.raises(ValueError):
+        StepsConfig(horizon_min=29)
+    with pytest.raises(ValueError):
+        StepsConfig(horizon_min=181)
 
 
 # ---------------------------------------------------------------------------

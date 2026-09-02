@@ -346,6 +346,9 @@ function manifest() {
 		threshold_mm_h: 0.1,
 		timestep_min: 5,
 		frame_age_min: FRAME_AGE_MIN,
+		// From radar-frame time; honest horizon from now is this minus
+		// frame_age_min.
+		ensemble_horizon_min: 90,
 		n_members: 24,
 		leads_min: PROB_LEADS,
 		grid: gridBlock(PRODUCT.scale, productShape),

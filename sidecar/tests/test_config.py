@@ -92,6 +92,50 @@ def test_default_config_path_via_env(
 
 
 # ---------------------------------------------------------------------------
+# STEPS horizon (measured from radar-frame time)
+# ---------------------------------------------------------------------------
+
+def test_steps_horizon_default_and_env_override(
+    config_yaml: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """90 by default: 60 min of served lead plus the 14-18 min (up to ~30)
+    frame age at compute, so the longest served lead is still a forecast
+    for that lead and not the ensemble's clamped final timestep."""
+    cfg = load_config(config_yaml)
+    assert cfg.forecast.steps.horizon_min == 90
+
+    monkeypatch.setenv("DMI_NOWCAST_FORECAST__STEPS__HORIZON_MIN", "120")
+    assert load_config(config_yaml).forecast.steps.horizon_min == 120
+
+
+def test_steps_horizon_yaml_and_bounds(tmp_path: Path) -> None:
+    p = tmp_path / "horizon.yaml"
+    p.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "forecast:\n  steps:\n    horizon_min: 60\n"
+    )
+    assert load_config(p).forecast.steps.horizon_min == 60
+
+    # Below the floor: a horizon shorter than 30 min cannot outlive the
+    # frame age at compute, so it is a config error, not a tuning choice.
+    too_short = tmp_path / "short.yaml"
+    too_short.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "forecast:\n  steps:\n    horizon_min: 29\n"
+    )
+    with pytest.raises(Exception):
+        load_config(too_short)
+
+    too_long = tmp_path / "long.yaml"
+    too_long.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "forecast:\n  steps:\n    horizon_min: 181\n"
+    )
+    with pytest.raises(Exception):
+        load_config(too_long)
+
+
+# ---------------------------------------------------------------------------
 # Web Push section (website Phase D)
 # ---------------------------------------------------------------------------
 

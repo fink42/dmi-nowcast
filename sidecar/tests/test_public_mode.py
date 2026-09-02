@@ -228,6 +228,13 @@ def test_shipped_public_example_config_is_actually_public() -> None:
     # keep the leads the curves were fitted for.
     assert cfg.forecast.leads_min == [10, 20, 30, 40, 50, 60]
     assert cfg.forecast.national.leads_min == [10, 20, 30, 45, 60]
+    # The STEPS horizon counts from the radar frame, the served leads from
+    # now: 90 must cover the 60 min longest lead plus the frame age at
+    # compute, or the last leads collapse onto one clamped timestep.
+    assert cfg.forecast.steps.horizon_min == 90
+    assert cfg.forecast.steps.horizon_min >= max(
+        cfg.forecast.national.leads_min + cfg.forecast.leads_min
+    ) + 30
     # Web Push is the public instance's only outbound channel (Phase D).
     # Enabled, with a subject the operator is expected to replace — the
     # model rejects ``enabled`` without one, so this cannot silently ship

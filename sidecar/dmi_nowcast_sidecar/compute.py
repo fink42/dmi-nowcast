@@ -93,12 +93,13 @@ _MAX_PX_PER_FRAME = 30.0
 # 8-point compass for the motion arrow caption.
 _COMPASS_LABELS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 
-# STEPS ensemble horizon in minutes from radar-frame time, matching the
-# default deterministic leads_min ceiling (website Phase A plan §A0). The
-# timestep itself is DERIVED per cycle from the measured inter-frame spacing
+# The STEPS ensemble horizon is ``forecast.steps.horizon_min`` (config),
+# measured from RADAR-FRAME time — the ensemble's timesteps count from the
+# frame while every served lead counts from now, so the horizon must cover
+# the longest served lead plus the frame age at compute (14–18 min live).
+# The timestep is DERIVED per cycle from the measured inter-frame spacing
 # (Phase B addendum 2026-08-29: fullRange-only frames arrive every ~10 min),
-# with n_timesteps = ceil(horizon / timestep) keeping the horizon fixed.
-_ENSEMBLE_HORIZON_MIN = 60.0
+# with n_timesteps = ceil(horizon_min / timestep) keeping the horizon fixed.
 
 # Expected spacing between consecutive fullRange composites (DMI publishes
 # fullRange at minutes :x0). Used only as the fallback when the measured
@@ -776,6 +777,12 @@ class CycleEngine:
                     # §B4: null when the served grids are raw; otherwise
                     # fitted_at + curve-file echo + calibrated_leads.
                     calibration=self._national_calibration_manifest(ensemble.national),
+                    # The honest horizon from now is this minus the
+                    # manifest's ``frame_age_min`` — the site needs both
+                    # numbers to know which leads the grids can answer.
+                    ensemble_horizon_min=float(
+                        self.config.forecast.steps.horizon_min
+                    ),
                 )
                 artifact_bytes = art.bytes_written
             except Exception as exc:  # noqa: BLE001
@@ -953,12 +960,18 @@ class CycleEngine:
         # The STEPS timestep follows the measured frame spacing (Phase B
         # addendum: fullRange-only frames arrive every ~10 min, and STEPS'
         # AR(2) model assumes the forecast timestep equals the input frame
-        # spacing). The horizon stays fixed at 60 min, so the step count
-        # adapts: ceil(60 / timestep) — 6 steps at the 10-min cadence.
+        # spacing). The horizon is fixed by config and measured from
+        # radar-frame time, so the step count adapts:
+        # ceil(horizon_min / timestep) — 9 steps at the 10-min cadence for
+        # the default 90 min horizon. That 90 is 60 min of served lead plus
+        # the frame age at compute; at a 60 min horizon the honest horizon
+        # from now was only ~43 min and the last timesteps collapsed
+        # P(<=45)/P(<=60) onto one another.
         # ``dt_min`` arrives sanitised (> 0) from ``_compute_sync``.
         timestep_min = float(dt_min)
+        horizon_min = float(steps_cfg.horizon_min)
         n_timesteps = max(
-            1, math.ceil(_ENSEMBLE_HORIZON_MIN / timestep_min - 1e-9),
+            1, math.ceil(horizon_min / timestep_min - 1e-9),
         )
 
         # ``run_ensemble`` wants velocity in pixels per STEPS timestep; the
@@ -1048,10 +1061,12 @@ class CycleEngine:
             _log.warning("ensemble_aggregate_failed", error=str(exc))
             return None
         finally:
-            # Memory hygiene: ~205 MB float32 at 24 × 12 × 432 × 496. Drop it
-            # as soon as the home + national reductions are done — the
-            # retained products are ~7 MB of derived grids, never the raw
-            # ensemble.
+            # Memory hygiene: the array is
+            # ``n_ens_members × n_timesteps × 432 × 496`` float32, and
+            # n_timesteps now follows ``horizon_min`` — ~154 MB at 24
+            # members × 9 steps (~103 MB at the old 6). Drop it as soon as
+            # the home + national reductions are done: the retained
+            # products are ~7 MB of derived grids, never the raw ensemble.
             del forecast
 
         # ETA quantiles are minutes from radar-frame time → shift to minutes

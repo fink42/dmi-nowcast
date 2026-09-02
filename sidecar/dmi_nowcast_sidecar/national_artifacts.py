@@ -93,6 +93,9 @@ _log = structlog.get_logger(__name__)
 # v2 (R1/R2): overlay entries gained ``valid_ts_utc`` + ``kind``, the
 # manifest gained trailing observation-history entries, a ``motion`` block
 # and the two ``motion_*_kmh`` product grids.
+# ``ensemble_horizon_min`` was added later WITHIN v2: a new key is additive
+# (CLAUDE.md manifest contract), so pinned clients keep parsing and no bump
+# is warranted.
 MANIFEST_SCHEMA_VERSION = 2
 
 # Trailing observed frames referenced by each manifest — 3 prior cycles is
@@ -197,6 +200,7 @@ def write_national_artifacts(
     motion_east_kmh: np.ndarray | None = None,
     motion_north_kmh: np.ndarray | None = None,
     history_frames: int = DEFAULT_HISTORY_FRAMES,
+    ensemble_horizon_min: float | None = None,
 ) -> NationalArtifactsResult:
     """Write one cycle's national artifacts + manifest into ``out_dir``.
 
@@ -226,6 +230,13 @@ def write_national_artifacts(
     — pass ``None`` when the served grids are uncalibrated and the manifest
     carries ``"calibration": null``. This module never applies curves; the
     caller calibrates the grids before handing them over.
+
+    ``ensemble_horizon_min`` is the configured STEPS horizon in minutes
+    **from radar-frame time** (``forecast.steps.horizon_min``), echoed into
+    the manifest so a client can work out the honest horizon from now:
+    ``ensemble_horizon_min - frame_age_min``. ``None`` publishes it as
+    null — a caller that doesn't know its own horizon, not a horizon of
+    zero.
 
     Both datetimes must be timezone-aware; they are converted to UTC for
     the manifest and the filename cycle stamp. Ordering guarantee: every
@@ -378,6 +389,7 @@ def write_national_artifacts(
         artifacts=artifacts,
         overlay_shape=overlay_shape,
         calibration=calibration,
+        ensemble_horizon_min=ensemble_horizon_min,
         motion=(
             {
                 "grid": "product",
@@ -552,6 +564,7 @@ def _build_manifest(
     overlay_shape: tuple[int, int] | None,
     calibration: dict | None = None,
     motion: dict | None = None,
+    ensemble_horizon_min: float | None = None,
 ) -> dict:
     composite = geo.composite
     x_ul, y_ul = geo.projection_origin_m
@@ -585,6 +598,14 @@ def _build_manifest(
         "threshold_mm_h": products.threshold_mm_h,
         "timestep_min": products.timestep_min,
         "frame_age_min": products.frame_age_min,
+        # STEPS horizon from RADAR-FRAME time (config
+        # ``forecast.steps.horizon_min``). The honest horizon from now is
+        # ``ensemble_horizon_min - frame_age_min``: leads beyond it are
+        # answered by the ensemble's final timestep, not by a forecast for
+        # that lead. null when the writer's caller didn't state one.
+        "ensemble_horizon_min": (
+            None if ensemble_horizon_min is None else float(ensemble_horizon_min)
+        ),
         "n_members": products.n_members,
         "leads_min": [int(lead) for lead in products.leads_min],
         "grid": grid,

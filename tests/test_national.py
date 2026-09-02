@@ -15,6 +15,7 @@ from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.national import (
     DEFAULT_LEADS_MIN,
     NationalProducts,
+    _steps_in_lead,
     motion_grids_kmh,
     national_products,
 )
@@ -149,6 +150,68 @@ def test_frame_age_eta_clamped_at_zero():
     stale = national_products(_staircase_ensemble(), timestep_min=5.0,
                               frame_age_min=25.0)
     np.testing.assert_array_equal(stale.eta_min, np.float32(0.0))
+
+
+# ---------------------------------------------------------------------------
+# Horizon length: what a longer ensemble buys the late leads and the ETA
+# ---------------------------------------------------------------------------
+
+
+def test_steps_in_lead_clamps_only_when_the_ensemble_is_too_short():
+    """At the live geometry — 10-min frames, 17-min frame age — the 45- and
+    60-min leads need 7 and 8 timesteps. A 6-step ensemble has neither and
+    clamps both onto its last step; a 9-step one resolves them apart."""
+    assert _steps_in_lead(45, 17.0, 10.0, 6) == 6
+    assert _steps_in_lead(60, 17.0, 10.0, 6) == 6      # same step: the bug
+    assert _steps_in_lead(45, 17.0, 10.0, 9) == 7
+    assert _steps_in_lead(60, 17.0, 10.0, 9) == 8      # distinct: the fix
+    # The clamp itself is unchanged — a lead past the horizon still saturates.
+    assert _steps_in_lead(180, 17.0, 10.0, 9) == 9
+
+
+def test_eta_can_exceed_sixty_minus_frame_age_with_a_longer_ensemble():
+    """ETA is capped by the ensemble's own horizon: ``n_timesteps *
+    timestep - frame_age``. A pixel whose members only cross at the 9th
+    timestep is NaN in a 6-step ensemble (rain never arrives inside it) and
+    73 min — 90 from the frame, 17 of which have already elapsed — in a
+    9-step one."""
+    def late_crossers(n_timesteps: int) -> np.ndarray:
+        # Every member dry until timestep index 8, then wet.
+        ens = np.zeros((8, n_timesteps, 4, 4), dtype=np.float32)
+        if n_timesteps > 8:
+            ens[:, 8:] = 3.0
+        return ens
+
+    short = national_products(late_crossers(6), leads_min=(60,),
+                              timestep_min=10.0, frame_age_min=17.0)
+    assert np.isnan(short.eta_min).all()
+    assert np.isnan(short.intensity_mm_h).all()
+    np.testing.assert_array_equal(short.p_rain[60], np.float32(0.0))
+
+    long = national_products(late_crossers(9), leads_min=(60,),
+                             timestep_min=10.0, frame_age_min=17.0)
+    # (8 + 1) * 10 - 17 = 73 min from now.
+    np.testing.assert_array_equal(long.eta_min, np.float32(73.0))
+    np.testing.assert_array_equal(long.intensity_mm_h, np.float32(3.0))
+    # Lead 60 needs 8 steps (ceil(77/10)); the crossing is at step 9, so the
+    # ETA exists while P(<=60) is still 0 — an arrival past the served leads.
+    np.testing.assert_array_equal(long.p_rain[60], np.float32(0.0))
+
+
+def test_late_leads_separate_once_the_horizon_covers_the_frame_age():
+    """``P(<=45)`` and ``P(<=60)`` at a 17-min frame age: identical in a
+    6-step ensemble (both clamp to its last step), distinct in a 9-step one."""
+    short = national_products(_staircase_ensemble(n_timesteps=6),
+                              leads_min=(45, 60), timestep_min=10.0,
+                              frame_age_min=17.0)
+    np.testing.assert_array_equal(short.p_rain[45], np.float32(6 / 8))
+    np.testing.assert_array_equal(short.p_rain[60], np.float32(6 / 8))
+
+    long = national_products(_staircase_ensemble(n_timesteps=9),
+                             leads_min=(45, 60), timestep_min=10.0,
+                             frame_age_min=17.0)
+    np.testing.assert_array_equal(long.p_rain[45], np.float32(7 / 8))
+    np.testing.assert_array_equal(long.p_rain[60], np.float32(8 / 8))
 
 
 # ---------------------------------------------------------------------------
