@@ -64,6 +64,8 @@ export const en: Catalog = {
 	panel: {
 		title: 'Forecast for this point',
 		close: 'Close forecast',
+		collapse: 'Minimise forecast',
+		expand: 'Show forecast',
 		loading: 'Fetching forecast …',
 		headlineRainingNow: 'It is raining here now',
 		headlineEta: (min: number) => `Rain in about ${min} min`,

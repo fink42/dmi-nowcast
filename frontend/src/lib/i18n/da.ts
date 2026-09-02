@@ -66,6 +66,8 @@ export const da = {
 	panel: {
 		title: 'Prognose for punktet',
 		close: 'Luk prognose',
+		collapse: 'Minimér prognose',
+		expand: 'Vis prognose',
 		loading: 'Henter prognose …',
 		headlineRainingNow: 'Det regner her nu',
 		headlineEta: (min: number) => `Regn om ca. ${min} min`,

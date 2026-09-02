@@ -176,8 +176,10 @@
 		</div>
 	</div>
 
+	<!-- Only the phone sheet folds: it lies on top of the map, so a peek is
+	     the only way to see both. The side panel covers nothing. -->
 	<div class="sheet" bind:this={sheet}>
-		<ForecastPanel />
+		<ForecastPanel collapsible={!sidePanel} />
 		<SiteFooter />
 	</div>
 </div>
@@ -276,16 +278,19 @@
 		height: 1.35rem;
 	}
 
-	/* Wide screens: the sheet becomes a side panel. */
+	/* Wide screens: the sheet becomes a side panel, on the left. Only the
+	   panel moves — the zoom control, the locate button, the notices and the
+	   attribution all live inside .map-area and stay with the map. */
 	@media (min-width: 52rem) {
 		.page {
 			flex-direction: row;
 		}
 
 		.sheet {
+			order: -1;
 			width: 24rem;
 			max-height: none;
-			border-left: 1px solid var(--border);
+			border-right: 1px solid var(--border);
 			display: flex;
 			flex-direction: column;
 		}
