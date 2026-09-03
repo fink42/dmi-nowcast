@@ -255,12 +255,23 @@ systemctl list-timers dmi-calibrate.timer    # confirm next-run
 Run on demand (e.g. after a code change):
 
 ```bash
-sidecar/deploy/calibrate.sh                       # default 12-month window
-CALIBRATION_INPUT_MONTHS=6 sidecar/deploy/calibrate.sh
+sidecar/deploy/calibrate.sh                       # default: the whole archive
+CALIBRATION_INPUT_MONTHS=6 sidecar/deploy/calibrate.sh   # fixed 6-month window
 ```
 
 Notes:
 
+- The window defaults to `CALIBRATION_INPUT_MONTHS=all`, which passes
+  `--days-back 0`: events are sampled from the oldest archived fullRange
+  frame onwards. The corpus builder lists frames from the persistent
+  archive first and only falls back to DMI's items API for windows the
+  archive does not hold, so the calibration window is bounded by the
+  archive's depth, not by DMI's 180-day listing horizon — the archive
+  gains a month every month. Set a number of months for a shorter, fixed
+  window. The actual window is printed by the job and recorded in the
+  progress JSON (`event_window`); it is deliberately not part of the
+  corpus `settings_hash`, so a corpus can be extended backwards across
+  runs.
 - The job uses `scripts/build_calibration_corpus.py` +
   `scripts/fit_national_calibration.py` from the repo. The deploy script
   copies those onto the host; `calibrate.sh` mounts the repo into the

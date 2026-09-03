@@ -1,4 +1,4 @@
-"""Build a multi-point national calibration corpus from the DMI 180-day archive.
+"""Build a multi-point national calibration corpus from the local radar archive.
 
 Every calibration point is sampled from the same ensemble run, so the
 corpus calibrates exactly the quantity the service serves. The old
@@ -27,6 +27,56 @@ filtered by minute-of-hour: ``minute % 10 == 0`` is fullRange,
 ``minute % 10 == 5`` is doppler (:func:`feature_matches_scan_type`).
 Event anchors are sampled on the chosen type's 10-min grid (whole hours
 for fullRange; hh:05 for doppler).
+
+**Archive-first listing (2026-09-02)** — *why*: DMI's items API lists
+only the last **180 days**, so an API-driven build can never reach an
+event older than that no matter what ``--days-back`` says: the listing
+comes back empty, the hour classifies as "unknown", and the event is
+dropped even when its frames are sitting on disk. The persistent corpus
+archive (``--corpus-dir``, ``composites/YYYY/MM/``) has no such bound —
+it only grows — so it, not the API, is the long-term record and is
+consulted FIRST.
+
+Every window listing in this builder — the wet/dry hour classification,
+the event's input frames, and its verification frames — goes through
+:func:`_list_frames_in_window`, whose order is:
+
+1. :class:`dmi_nowcast_core.corpus.ArchiveIndex` — an in-memory
+   ``(time, scan type, path)`` listing built once per process from
+   ``os.scandir`` alone (no stat, no open, no HDF5 parse). A hit resolves
+   straight to the archived path: :func:`_resolve_frame` short-circuits
+   on :class:`~dmi_nowcast_core.corpus.ArchivedFrame`, so an archive hit
+   NEVER touches the network.
+2. DMI's ``list_in_window`` — only when the archive holds no frame at all
+   in that window. Resolution then behaves exactly as before: reuse the
+   canonical slot if present, otherwise download into it (so the archive
+   keeps growing).
+
+A window the archive covers only *partially* is therefore not topped up
+from the API. That is deliberate: past 180 days the API cannot help
+anyway, and inside 180 days a hole in the archive is a gap to repair with
+``sidecar/deploy/backfill_corpus.sh``, not to paper over on every
+calibration run. The cost of a hole is bounded and visible — a missing
+verification frame leaves that lead's outcome null, a missing input frame
+errors the event with "(archive listing)" in the message.
+
+*Scan type from the filename*: an archived frame carries no ``scanType``
+label, so :func:`~dmi_nowcast_core.corpus.scan_type_from_filename` reads
+it off the minute — ``:x0`` is fullRange, ``:x5`` is doppler, anything
+else is ``unknown`` and matches NO product filter. Verified against DMI's
+own ``scanType``-labelled listing for 12 consecutive frames on
+2026-09-02. The index filters by equality against a concrete product, so
+an ``unknown`` frame can never be mistaken for fullRange.
+
+*Window*: ``--days-back 0`` means "as far back as the archive goes" —
+:func:`_candidate_hours` starts the window at the first whole hour at or
+after :meth:`ArchiveIndex.earliest` for the build's scan type (and
+requires ``--corpus-dir``). Any positive value keeps the old meaning.
+Like the wet reference set, the window is a *sampling* choice: it decides
+which hours are candidates, not what quantity a row measures, so it is
+deliberately NOT part of ``settings_hash`` and a corpus can be extended
+backwards across runs. The actual window is logged and recorded in the
+progress JSON (``event_window``) instead.
 
 **Verification snapping rule** — a nominal lead ``L`` reads ensemble
 timestep ``ceil((L + frame_age_min) / timestep_min)`` (frame-age
@@ -192,7 +242,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 
@@ -204,7 +254,13 @@ from dmi_nowcast_core.fetch import (  # noqa: E402
     download,
     list_in_window,
 )
-from dmi_nowcast_core.corpus import archive_path_for  # noqa: E402
+from dmi_nowcast_core.corpus import (  # noqa: E402
+    SCAN_TYPE_DOPPLER,
+    SCAN_TYPE_FULL_RANGE,
+    ArchivedFrame,
+    ArchiveIndex,
+    archive_path_for,
+)
 from dmi_nowcast_core.geo import CompositeGeo  # noqa: E402
 from dmi_nowcast_core.national import NationalProducts, national_products  # noqa: E402
 from dmi_nowcast_core.parse import parse_composite  # noqa: E402
@@ -404,7 +460,7 @@ def event_frame_age_min(
 #: Minute-of-hour offset of each product's 10-min frame grid. DMI
 #: interleaves the two products in one collection; composite filenames
 #: carry no scan-type marker, so the filename minute IS the marker.
-_SCAN_GRID_OFFSET_MIN = {"fullRange": 0, "doppler": 5}
+_SCAN_GRID_OFFSET_MIN = {SCAN_TYPE_FULL_RANGE: 0, SCAN_TYPE_DOPPLER: 5}
 
 
 def scan_grid_offset_min(scan_type: str) -> int:
@@ -418,16 +474,28 @@ def scan_grid_offset_min(scan_type: str) -> int:
         ) from None
 
 
-def feature_matches_scan_type(feature: RadarFeature, scan_type: str) -> bool:
+#: Either kind of listed frame. An ``ArchivedFrame`` is already on disk
+#: (``path``, no ``download_url``); a ``RadarFeature`` came from the DMI
+#: items API. Everything downstream of a listing reads only
+#: ``datetime_utc`` / ``scan_type`` / ``filename``, which both provide.
+Frame = Union[RadarFeature, ArchivedFrame]
+
+
+def feature_matches_scan_type(feature: Frame, scan_type: str) -> bool:
     """Does ``feature`` belong to ``scan_type``?
 
-    API features carry ``scanType`` and are compared directly. Frames
-    resolved locally (from the corpus archive, by filename/timestamp)
-    have no scan-type field — DMI filenames don't encode it — so the
-    minute-of-hour that encodes the interleave decides:
-    ``minute % 10 == 0`` is fullRange, ``minute % 10 == 5`` is doppler.
-    An empty ``scan_type`` disables filtering (legacy mixed behaviour —
-    never reachable from the CLI, which requires a concrete type).
+    API features carry ``scanType`` and are compared directly, as do
+    :class:`~dmi_nowcast_core.corpus.ArchivedFrame` s (the archive index
+    derives the type from the filename minute up front). A frame with an
+    EMPTY scan-type field falls back to the minute-of-hour that encodes
+    the interleave: ``minute % 10 == 0`` is fullRange, ``minute % 10 == 5``
+    is doppler. An empty ``scan_type`` argument disables filtering (legacy
+    mixed behaviour — never reachable from the CLI, which requires a
+    concrete type).
+
+    Note the equality test: an archived frame on neither product's grid
+    is labelled ``"unknown"`` and matches nothing, so it can never be
+    mistaken for fullRange.
     """
     if not scan_type:
         return True
@@ -436,16 +504,45 @@ def feature_matches_scan_type(feature: RadarFeature, scan_type: str) -> bool:
     return feature.datetime_utc.minute % 10 == scan_grid_offset_min(scan_type)
 
 
-def filter_scan_type(
-    feats: list[RadarFeature], scan_type: str
-) -> list[RadarFeature]:
+def filter_scan_type(feats: list[Frame], scan_type: str) -> list[Frame]:
     """Keep only features of ``scan_type``.
 
-    Belt-and-braces on top of the API-side ``scanType`` parameter — and
-    the ONLY filter for frames resolved from the local archive listing,
-    where the filename minute is all we have.
+    Belt-and-braces on top of the API-side ``scanType`` parameter and the
+    archive index's own filter — and the ONLY filter for an unlabeled
+    frame, where the filename minute is all we have.
     """
     return [f for f in feats if feature_matches_scan_type(f, scan_type)]
+
+
+def _list_frames_in_window(
+    start: datetime,
+    end: datetime,
+    *,
+    limit: int,
+    scan_type: str,
+    archive: Optional[ArchiveIndex] = None,
+) -> list[Frame]:
+    """Frames in ``[start, end]`` of ``scan_type`` — archive first, API second.
+
+    The single listing entry point for the whole builder (module
+    docstring, "Archive-first listing"). The archive is unbounded and
+    local; DMI's items API stops at 180 days and costs a request. So:
+    return the archive's frames whenever it has ANY in the window, and
+    only otherwise ask DMI (raising whatever the client raises, exactly as
+    before, so callers keep their existing failure handling).
+
+    Both branches end in :func:`filter_scan_type`; for the archive branch
+    that is a no-op (the index already filtered by equality) kept for the
+    symmetry of one filter in one place.
+    """
+    if archive is not None:
+        frames = archive.list_in_window(start, end, scan_type=scan_type or None)
+        if frames:
+            return filter_scan_type(frames, scan_type)
+    return filter_scan_type(
+        list_in_window(start, end, limit=limit, scan_type=scan_type or None),
+        scan_type,
+    )
 
 
 def snap_lead_min(lead_min: float, timestep_min: float) -> int:
@@ -659,27 +756,81 @@ def stratum_weights(
     return wet_w, dry_w
 
 
-def _candidate_hours(*, days_back: int) -> list[datetime]:
-    """Every whole hour in the (days_back → 2 hours ago) window."""
+def _candidate_hours(
+    *,
+    days_back: int,
+    archive: Optional[ArchiveIndex] = None,
+    scan_type: str = "",
+) -> list[datetime]:
+    """Every whole hour in the event window, ending 2 hours ago.
+
+    ``days_back > 0`` — the last ``days_back`` days, as always.
+
+    ``days_back == 0`` — "as far back as the archive goes": the window
+    starts at the first whole hour at or after the oldest archived frame
+    of ``scan_type``, so extending the window past DMI's 180-day listing
+    horizon needs nothing but a deeper archive. Requires an
+    :class:`ArchiveIndex` (i.e. ``--corpus-dir``), since there is no other
+    way to know how far back "back" goes.
+
+    The window is a sampling choice, not a measured quantity — it is NOT
+    part of ``settings_hash`` (module docstring), so it is logged here
+    instead.
+    """
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    start = now - timedelta(days=days_back)
     end = now - timedelta(hours=2)
-    span = int((end - start).total_seconds() / 3600)
+    if days_back > 0:
+        start = now - timedelta(days=days_back)
+        source = f"--days-back {days_back}"
+    else:
+        if archive is None:
+            raise ValueError(
+                "--days-back 0 means 'the whole corpus archive' and needs "
+                "--corpus-dir to say how far back that is"
+            )
+        oldest = archive.earliest(scan_type or None)
+        if oldest is None:
+            raise ValueError(
+                f"--days-back 0: the archive at {archive.corpus_dir} holds no "
+                f"{scan_type or 'radar'} frame to start the window at"
+            )
+        # Round UP to a whole hour: candidates are whole hours, and the
+        # hour containing the oldest frame may have nothing at its :00.
+        start = oldest.replace(minute=0, second=0, microsecond=0)
+        if start < oldest:
+            start += timedelta(hours=1)
+        source = (
+            f"--days-back 0 → oldest archived {scan_type or 'radar'} frame "
+            f"{oldest.isoformat()}"
+        )
+    span = max(0, int((end - start).total_seconds() / 3600))
+    _LOGGER.info(
+        "event window: %s → %s (%d candidate hours; %s)",
+        start.isoformat(), end.isoformat(), span, source,
+    )
     return [start + timedelta(hours=h) for h in range(span)]
 
 
 def _resolve_frame(
-    feature: RadarFeature, cache_dir: Path, corpus_dir: Optional[Path]
+    feature: Frame, cache_dir: Path, corpus_dir: Optional[Path]
 ) -> Path:
     """Local path to ``feature``'s HDF5, preferring the persistent corpus.
 
-    With ``corpus_dir`` set, look up the canonical ``composites/YYYY/MM``
-    slot first and reuse it on a hit; on a miss, download from DMI straight
-    into that slot so the corpus grows and subsequent runs (and the live
-    sidecar) hit locally — i.e. only genuinely new frames touch the network.
-    Without a ``corpus_dir``, fall back to a flat download into ``cache_dir``
-    (standalone use, preserves the original behaviour).
+    A frame that came out of the :class:`ArchiveIndex` already IS a local
+    path: return it and never touch the network. That is the point of the
+    archive-first listing — for an event outside DMI's 180-day window
+    there is nothing to download.
+
+    Otherwise, with ``corpus_dir`` set, look up the canonical
+    ``composites/YYYY/MM`` slot first and reuse it on a hit; on a miss,
+    download from DMI straight into that slot so the corpus grows and
+    subsequent runs (and the live sidecar) hit locally — i.e. only
+    genuinely new frames touch the network. Without a ``corpus_dir``, fall
+    back to a flat download into ``cache_dir`` (standalone use, preserves
+    the original behaviour).
     """
+    if isinstance(feature, ArchivedFrame):
+        return feature.path
     if corpus_dir is not None:
         dest = archive_path_for(corpus_dir, feature.filename)
         if dest.exists():
@@ -776,6 +927,7 @@ def _classify_hour_wet(
     corpus_dir: Optional[Path] = None,
     threshold_mm_h: float = 0.5, search_km: float = 60.0,
     scan_type: str = "",
+    archive: Optional[ArchiveIndex] = None,
 ) -> Optional[bool]:
     """Wet/dry classification for a single hour: any rain pixel ≥
     ``threshold_mm_h`` within ``search_km`` of ANY reference in ``refs``.
@@ -795,13 +947,18 @@ def _classify_hour_wet(
     settings is never reused. The index defines *strata only* — the
     weights above make the fit correct for whatever stratification was
     actually used.
+
+    ``archive`` is what makes an hour classifiable at all beyond DMI's
+    180-day listing horizon: with an :class:`ArchiveIndex` the ±10 min
+    window is listed from disk and resolved without a request, so an hour
+    whose frames are archived is never returned as ``None`` merely
+    because DMI has forgotten it.
     """
     win_start = hour - timedelta(minutes=10)
     win_end = hour + timedelta(minutes=10)
     try:
-        feats = filter_scan_type(
-            list_in_window(win_start, win_end, limit=6, scan_type=scan_type or None),
-            scan_type,
+        feats = _list_frames_in_window(
+            win_start, win_end, limit=6, scan_type=scan_type, archive=archive,
         )
     except Exception:  # noqa: BLE001
         return None
@@ -841,6 +998,7 @@ def _build_or_load_wet_dry_index(
     cache_dir: Path,
     workers: int = 6, corpus_dir: Optional[Path] = None,
     scan_type: str = "",
+    archive: Optional[ArchiveIndex] = None,
 ) -> dict[str, bool]:
     """Build a {ISO timestamp: is_wet} index for every candidate hour.
 
@@ -852,7 +1010,9 @@ def _build_or_load_wet_dry_index(
     — be reused. Hours newly added since the last run are fetched +
     classified, all parallelised across ``workers`` threads. Uses threads
     (not processes) because the cost is network-bound; httpx already
-    releases the GIL on socket I/O.
+    releases the GIL on socket I/O. With an ``archive`` most hours cost
+    no request at all — the frame is listed and read from disk — which is
+    what lets the index cover hours older than DMI's 180-day listing.
     """
     import concurrent.futures
 
@@ -876,7 +1036,7 @@ def _build_or_load_wet_dry_index(
 
     def _one(h: datetime) -> tuple[str, Optional[bool]]:
         return _ts_str(h), _classify_hour_wet(
-            h, refs, cache_dir, corpus_dir, scan_type=scan_type
+            h, refs, cache_dir, corpus_dir, scan_type=scan_type, archive=archive,
         )
 
     new: dict[str, bool] = {}
@@ -910,6 +1070,7 @@ def _sample_event_times(
     classify_workers: int = 6,
     corpus_dir: Optional[Path] = None,
     scan_type: str = "",
+    archive: Optional[ArchiveIndex] = None,
 ) -> list[tuple[datetime, float]]:
     """Pick ``n_events`` UTC datetimes with their sample weights.
 
@@ -933,9 +1094,16 @@ def _sample_event_times(
     raw=0 → cal=0 and would starve the fit — and corrected for at fit
     time via the weights. ``wet_refs`` defaults to the five spread
     national references (:data:`DEFAULT_WET_REFS`).
+
+    ``archive`` is threaded down to the hour classification (so hours
+    older than DMI's 180-day listing can be classified from disk) and to
+    :func:`_candidate_hours`, which needs it to resolve ``days_back = 0``
+    into "the whole archive".
     """
     rng = random.Random(seed)
-    candidates = _candidate_hours(days_back=days_back)
+    candidates = _candidate_hours(
+        days_back=days_back, archive=archive, scan_type=scan_type,
+    )
     offset = (
         timedelta(minutes=scan_grid_offset_min(scan_type))
         if scan_type else timedelta(0)
@@ -955,7 +1123,7 @@ def _sample_event_times(
     )
     index = _build_or_load_wet_dry_index(
         candidates, wet_refs, cache_dir=cache_dir, workers=classify_workers,
-        corpus_dir=corpus_dir, scan_type=scan_type,
+        corpus_dir=corpus_dir, scan_type=scan_type, archive=archive,
     )
     wet = [h for h in candidates if index.get(_ts_str(h)) is True]
     dry = [h for h in candidates if index.get(_ts_str(h)) is False]
@@ -996,8 +1164,8 @@ class EventResult:
 
 
 def _find_nearest_feature(
-    feats: list[RadarFeature], target: datetime, tol_min: int = FRAME_TOLERANCE_MIN
-) -> Optional[RadarFeature]:
+    feats: list[Frame], target: datetime, tol_min: int = FRAME_TOLERANCE_MIN
+) -> Optional[Frame]:
     """Closest feature to ``target`` within ``tol_min`` minutes."""
     best = None
     best_dt = timedelta(minutes=tol_min + 1)
@@ -1009,15 +1177,19 @@ def _find_nearest_feature(
 
 
 def _gather_event_frames(
-    event_time: datetime, settings: CorpusSettings, frame_age_min: float = 0.0
-) -> tuple[list[RadarFeature], dict[int, RadarFeature]]:
+    event_time: datetime,
+    settings: CorpusSettings,
+    frame_age_min: float = 0.0,
+    archive: Optional[ArchiveIndex] = None,
+) -> tuple[list[Frame], dict[int, Frame]]:
     """Return (input_features[3], {lead: verification_feature}).
 
-    Fetches one window covering every frame the event needs with a
-    single API call, filtered to ``settings.scan_type`` — server-side
-    via the ``scanType`` parameter AND client-side via
-    :func:`filter_scan_type`, so a mixed listing can never leak a
-    doppler frame into a fullRange corpus (or vice versa).
+    Lists ONE window covering every frame the event needs, archive first
+    and DMI second (:func:`_list_frames_in_window`), filtered to
+    ``settings.scan_type`` — the archive index by the filename minute, the
+    API server-side via the ``scanType`` parameter and client-side via
+    :func:`filter_scan_type` — so a mixed listing can never leak a doppler
+    frame into a fullRange corpus (or vice versa).
 
     Inputs are spaced at the frame cadence (``timestep_min``): T-20,
     T-10, T on the 10-min grid. Verification targets are the snapped
@@ -1027,6 +1199,10 @@ def _gather_event_frames(
     zero age); a lead whose snapped target has no frame within
     ``FRAME_TOLERANCE_MIN`` is simply absent from the truth dict, so its
     outcome stays null.
+
+    Every frame this returns is resolved by :func:`_resolve_frame`, which
+    short-circuits on an archived frame — so an event whose window the
+    archive covers runs with zero network I/O, whatever its age.
     """
     step = int(round(settings.timestep_min))
     snapped = {
@@ -1037,25 +1213,25 @@ def _gather_event_frames(
     win_end = event_time + timedelta(
         minutes=max(snapped.values()) + FRAME_TOLERANCE_MIN + 1
     )
-    feats = filter_scan_type(
-        list_in_window(
-            win_start, win_end, limit=50, scan_type=settings.scan_type or None
-        ),
-        settings.scan_type,
+    feats = _list_frames_in_window(
+        win_start, win_end, limit=50,
+        scan_type=settings.scan_type, archive=archive,
     )
+    source = "archive listing" if feats and isinstance(feats[0], ArchivedFrame) else "DMI listing"
 
-    inputs: list[RadarFeature] = []
+    inputs: list[Frame] = []
     for off in (-2 * step, -step, 0):
         f = _find_nearest_feature(feats, event_time + timedelta(minutes=off))
         if f is None:
             raise RuntimeError(
                 f"no {settings.scan_type or 'radar'} input frame within "
                 f"{FRAME_TOLERANCE_MIN} min of "
-                f"{(event_time + timedelta(minutes=off)).isoformat()}"
+                f"{(event_time + timedelta(minutes=off)).isoformat()} "
+                f"({source}, {len(feats)} frame(s) in window)"
             )
         inputs.append(f)
 
-    truth: dict[int, RadarFeature] = {}
+    truth: dict[int, Frame] = {}
     for lead in settings.leads_min:
         f = _find_nearest_feature(
             feats, event_time + timedelta(minutes=snapped[lead])
@@ -1066,7 +1242,7 @@ def _gather_event_frames(
 
 
 def _score_outcomes(
-    truth: dict[int, RadarFeature],
+    truth: dict[int, Frame],
     points: tuple[CalibrationPoint, ...],
     settings: CorpusSettings,
     cache_dir: Path,
@@ -1104,6 +1280,43 @@ def _score_outcomes(
     return outcomes
 
 
+#: Per-process :class:`ArchiveIndex` cache, keyed on the corpus dir.
+#: See :func:`_worker_archive` for why the index is rebuilt in each worker
+#: rather than shipped from the parent.
+_WORKER_ARCHIVES: dict[str, ArchiveIndex] = {}
+
+
+def _worker_archive(corpus_dir: Optional[Path]) -> Optional[ArchiveIndex]:
+    """The archive index for this process, built at most once.
+
+    Deliberately NOT passed in the worker args. ``imap_unordered(...,
+    chunksize=1)`` pickles the args tuple once PER EVENT, so shipping the
+    index would move its whole size per event: measured at 80k frames
+    (~9 months of both products) it pickles to 8.1 MB, i.e. ~32 GB through
+    the pipe over a 4000-event run. A spawned worker instead handles
+    hundreds of events, so building the index once per process — 0.5 s of
+    pure directory reads for those same 80k frames — is a rounding error
+    against a single STEPS run.
+
+    The cache is keyed on the corpus dir so a process is correct even if
+    it were ever handed two different archives.
+    """
+    if corpus_dir is None:
+        return None
+    key = str(corpus_dir)
+    index = _WORKER_ARCHIVES.get(key)
+    if index is None:
+        started = time.time()
+        index = ArchiveIndex(corpus_dir)
+        _WORKER_ARCHIVES[key] = index
+        _LOGGER.info(
+            "worker archive index: %d frames (%d %s) from %s in %.2fs",
+            len(index), index.count(SCAN_TYPE_FULL_RANGE), SCAN_TYPE_FULL_RANGE,
+            key, time.time() - started,
+        )
+    return index
+
+
 def _process_event(
     args: tuple[
         datetime, Path, Optional[Path], tuple[CalibrationPoint, ...],
@@ -1118,13 +1331,19 @@ def _process_event(
     (``national_products``), the verification instants
     (:func:`_gather_event_frames`) and the rows themselves.
 
+    The archive index is NOT an argument — it is rebuilt once per worker
+    process from ``corpus_dir`` (:func:`_worker_archive`).
+
     Returns an EventResult; never raises (the caller stamps any error
     onto the result for diagnostics in the dashboard).
     """
     event_time, cache_dir, corpus_dir, points, settings, frame_age_min = args
     event_iso = _ts_str(event_time)
     try:
-        inputs, truth = _gather_event_frames(event_time, settings, frame_age_min)
+        archive = _worker_archive(corpus_dir)
+        inputs, truth = _gather_event_frames(
+            event_time, settings, frame_age_min, archive=archive,
+        )
         # Inputs: download + parse + dBZ.
         composites = []
         for f in inputs:
@@ -1326,7 +1545,18 @@ def main() -> int:
              "'points': [{'id', 'lat', 'lon', 'region', ...}]}). One STEPS "
              "run per event serves every point.",
     )
-    ap.add_argument("--days-back", type=int, default=125)
+    ap.add_argument(
+        "--days-back", type=int, default=125, metavar="DAYS",
+        help="How far back events are sampled from, ending 2 h ago. "
+             "0 means 'as far back as the corpus archive goes' — the "
+             "window starts at the oldest archived frame of --scan-type "
+             "and needs --corpus-dir. Use it to grow the calibration "
+             "window past DMI's 180-day listing horizon, which no "
+             "positive value can reach. The window is a sampling choice "
+             "(like --wet-ref) and is deliberately NOT in the settings "
+             "hash, so a corpus can be extended backwards across runs; "
+             "the actual window is logged and written to --progress.",
+    )
     ap.add_argument("--n-events", type=int, default=500)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=6)
@@ -1475,6 +1705,30 @@ def main() -> int:
     points = load_points(args.points)
     _LOGGER.info("loaded %d calibration points from %s", len(points), args.points)
 
+    # Archive-first listing (module docstring): one index for the parent,
+    # built before anything lists a window. Workers build their own
+    # (:func:`_worker_archive`) — it is far too big to ship per task.
+    archive: Optional[ArchiveIndex] = None
+    if args.corpus_dir is not None:
+        started = time.time()
+        archive = ArchiveIndex(args.corpus_dir)
+        _LOGGER.info(
+            "archive index: %d frames (%d %s) in %.2fs from %s; "
+            "%s span %s → %s%s",
+            len(archive), archive.count(args.scan_type), args.scan_type,
+            time.time() - started, args.corpus_dir, args.scan_type,
+            archive.earliest(args.scan_type), archive.latest(args.scan_type),
+            f"; {archive.n_malformed} unparseable name(s) skipped"
+            if archive.n_malformed else "",
+        )
+    if args.days_back < 0:
+        ap.error("--days-back must be >= 0 (0 = the whole corpus archive)")
+    if args.days_back == 0 and archive is None:
+        ap.error(
+            "--days-back 0 means 'the whole corpus archive' — pass "
+            "--corpus-dir so the builder knows how far back that is"
+        )
+
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     try:
         existing = check_existing_corpus(args.output, settings.settings_hash)
@@ -1483,11 +1737,28 @@ def main() -> int:
         return 2
     _LOGGER.info("Found %d existing events in %s", len(existing), args.output)
 
-    sampled = _sample_event_times(
-        days_back=args.days_back, n_events=args.n_events, seed=args.seed,
-        wet_bias=args.wet_bias, wet_refs=wet_refs,
-        cache_dir=args.cache_dir, corpus_dir=args.corpus_dir,
-        scan_type=args.scan_type,
+    try:
+        sampled = _sample_event_times(
+            days_back=args.days_back, n_events=args.n_events, seed=args.seed,
+            wet_bias=args.wet_bias, wet_refs=wet_refs,
+            cache_dir=args.cache_dir, corpus_dir=args.corpus_dir,
+            scan_type=args.scan_type, archive=archive,
+        )
+    except ValueError as exc:
+        _LOGGER.error("%s", exc)
+        return 2
+    # The window is not in the settings hash, so it has to be on the
+    # record some other way: the log line and the progress JSON.
+    event_window = {
+        "days_back": args.days_back,
+        "first_event": _ts_str(sampled[0][0]) if sampled else None,
+        "last_event": _ts_str(sampled[-1][0]) if sampled else None,
+        "n_events": len(sampled),
+    }
+    _LOGGER.info(
+        "sampled event window: %s → %s (%d events, --days-back %d)",
+        event_window["first_event"], event_window["last_event"],
+        len(sampled), args.days_back,
     )
     weight_by_ts = {_ts_str(t): w for t, w in sampled}
     # Simulated frame age per event: a pure function of (--seed, event
@@ -1522,6 +1793,9 @@ def main() -> int:
         "rows_per_event": rows_per_event,
         "settings": settings.to_dict(),
         "settings_hash": settings.settings_hash,
+        # Sampling window — NOT part of settings_hash (module docstring),
+        # so it is recorded here for the report and the dashboard.
+        "event_window": event_window,
         "recent": [],  # most recent ~20 events (summaries)
         "lead_summary": {},  # rolling stats per lead, pooled over points
         "args": {k: str(v) for k, v in vars(args).items()},

@@ -449,7 +449,7 @@ def test_sample_event_times_attaches_stratum_weights(tmp_path: Path, monkeypatch
     """
     base = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
     candidates = [base + timedelta(hours=h) for h in range(20)]
-    monkeypatch.setattr(bcc, "_candidate_hours", lambda *, days_back: candidates)
+    monkeypatch.setattr(bcc, "_candidate_hours", lambda **kw: candidates)
 
     # Hours 0-7 wet (8), hours 8-19 dry (12).
     index = {bcc._ts_str(h): (i < 8) for i, h in enumerate(candidates)}
@@ -475,7 +475,7 @@ def test_sample_event_times_attaches_stratum_weights(tmp_path: Path, monkeypatch
 def test_sample_event_times_uniform_weights_are_one(monkeypatch):
     base = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
     candidates = [base + timedelta(hours=h) for h in range(10)]
-    monkeypatch.setattr(bcc, "_candidate_hours", lambda *, days_back: candidates)
+    monkeypatch.setattr(bcc, "_candidate_hours", lambda **kw: candidates)
     sampled = bcc._sample_event_times(days_back=1, n_events=5, seed=3, wet_bias=0.0)
     assert len(sampled) == 5
     assert all(w == 1.0 for _, w in sampled)
@@ -888,7 +888,7 @@ def test_process_event_uses_the_events_age_for_products_and_rows(
     age = 16.125
     seen: dict[str, float] = {}
 
-    def fake_gather(event_time, s, frame_age_min=0.0):
+    def fake_gather(event_time, s, frame_age_min=0.0, archive=None):
         seen["gather"] = frame_age_min
         feats = [_feature(event + timedelta(minutes=m)) for m in (-20, -10, 0)]
         return feats, {}
@@ -978,7 +978,8 @@ def test_wet_dry_index_cache_is_keyed_by_scan_type(tmp_path: Path, monkeypatch):
 
     calls: list[datetime] = []
 
-    def fake_classify(h, refs, cache_dir, corpus_dir=None, scan_type=""):
+    def fake_classify(h, refs, cache_dir, corpus_dir=None, scan_type="",
+                      archive=None):
         calls.append(h)
         return h.hour < 2
 
@@ -1070,7 +1071,8 @@ def test_wet_dry_index_cache_is_keyed_by_reference_set(tmp_path: Path, monkeypat
 
     seen: list[tuple] = []
 
-    def fake_classify(h, refs, cache_dir, corpus_dir=None, scan_type=""):
+    def fake_classify(h, refs, cache_dir, corpus_dir=None, scan_type="",
+                      archive=None):
         seen.append(refs)
         return True
 
@@ -1132,7 +1134,7 @@ def test_sample_event_times_fullrange_uses_typed_index_and_grid(
 ):
     base = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
     candidates = [base + timedelta(hours=h) for h in range(20)]
-    monkeypatch.setattr(bcc, "_candidate_hours", lambda *, days_back: candidates)
+    monkeypatch.setattr(bcc, "_candidate_hours", lambda **kw: candidates)
     monkeypatch.setattr(
         bcc, "_classify_hour_wet",
         lambda *a, **k: pytest.fail("classification must not run — cache present"),
@@ -1165,7 +1167,7 @@ def test_sample_event_times_fullrange_uses_typed_index_and_grid(
 def test_sample_event_times_doppler_grid_offset(monkeypatch):
     base = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
     candidates = [base + timedelta(hours=h) for h in range(10)]
-    monkeypatch.setattr(bcc, "_candidate_hours", lambda *, days_back: candidates)
+    monkeypatch.setattr(bcc, "_candidate_hours", lambda **kw: candidates)
     sampled = bcc._sample_event_times(
         days_back=1, n_events=5, seed=3, wet_bias=0.0, scan_type="doppler",
     )
@@ -1281,3 +1283,342 @@ def test_fitter_loads_single_scan_type_corpus(tmp_path: Path):
     assert corpus.settings_hash == s.settings_hash
     assert corpus.settings["timestep_min"] == pytest.approx(10.0)
     assert corpus.settings["n_timesteps"] == 8  # 60-min horizon + 18-min age
+
+
+# ---------------------------------------------------------------------------
+# Archive-first listing — the local archive outranks DMI's 180-day items API
+# ---------------------------------------------------------------------------
+
+
+from dmi_nowcast_core.corpus import ArchiveIndex, ArchivedFrame  # noqa: E402
+
+
+def _plant_archive(corpus: Path, *timestamps: datetime) -> ArchiveIndex:
+    """Write empty composites into ``composites/YYYY/MM`` and index them."""
+    for ts in timestamps:
+        path = bcc.archive_path_for(corpus, f"dk.com.{ts:%Y%m%d%H%M}.500_max.h5")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+    return ArchiveIndex(corpus)
+
+
+def _plant_every_5_min(
+    corpus: Path, start: datetime, end: datetime
+) -> ArchiveIndex:
+    """A complete 5-min interleave (fullRange :x0 / doppler :x5) on disk."""
+    stamps, t = [], start
+    while t <= end:
+        stamps.append(t)
+        t += timedelta(minutes=5)
+    return _plant_archive(corpus, *stamps)
+
+
+def _no_network(monkeypatch) -> None:
+    """Every route to DMI raises. Any archive-first claim is then provable:
+    if the code under test completes, it never went to the network."""
+    def boom(*a, **k):
+        raise AssertionError("DMI must not be contacted for an archived window")
+
+    monkeypatch.setattr(bcc, "list_in_window", boom)
+    monkeypatch.setattr(bcc, "download", boom)
+
+
+def _fake_radar_parse(monkeypatch, rain: np.ndarray) -> None:
+    """Stub the HDF5 read so planted zero-byte files can stand in for frames."""
+    class _Composite:
+        reflectivity_dbz = np.zeros(rain.shape, dtype=np.float32)
+        zr_a, zr_b, xscale_m = 200.0, 1.6, 500.0
+
+    class _Geo:
+        def lonlat_to_grid(self, lon, lat):
+            return GridIndex(row=10.0, col=10.0)
+
+    monkeypatch.setattr(bcc, "parse_composite", lambda p: _Composite())
+    monkeypatch.setattr(bcc, "CompositeGeo", lambda c: _Geo())
+    monkeypatch.setattr(bcc, "dbz_to_rain_rate", lambda *a, **k: rain)
+
+
+def test_resolve_frame_returns_the_archived_path_without_downloading(
+    tmp_path: Path, monkeypatch
+):
+    """An archived frame IS a local path — the whole point of listing from
+    the archive is that resolution costs nothing."""
+    _no_network(monkeypatch)
+    corpus = tmp_path / "corpus"
+    ts = datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc)
+    index = _plant_archive(corpus, ts)
+    (frame,) = index.list_in_window(ts, ts, "fullRange")
+
+    path = bcc._resolve_frame(frame, tmp_path / "cache", corpus)
+    assert path == bcc.archive_path_for(corpus, frame.filename)
+    assert path.is_file()
+    # …and a corpus_dir is not even needed: the frame carries its own path.
+    assert bcc._resolve_frame(frame, tmp_path / "cache", None) == path
+
+
+def test_classify_hour_wet_uses_the_archive_with_no_network(
+    tmp_path: Path, monkeypatch
+):
+    """The headline fix: an hour older than DMI's 180-day listing classifies
+    from disk instead of coming back None ('unknown') and being dropped."""
+    _no_network(monkeypatch)
+    rain = np.zeros((200, 200), dtype=np.float32)
+    rain[8:13, 8:13] = 3.0  # right on the reference
+    _fake_radar_parse(monkeypatch, rain)
+
+    corpus = tmp_path / "corpus"
+    hour = datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc)  # long past 180 days
+    index = _plant_every_5_min(
+        corpus, hour - timedelta(minutes=10), hour + timedelta(minutes=10)
+    )
+
+    assert bcc._classify_hour_wet(
+        hour, ((55.0, 10.0),), tmp_path / "cache", corpus,
+        search_km=10.0, scan_type="fullRange", archive=index,
+    ) is True
+
+    # Dry hours classify too — "wet or dry", not "wet or unknown".
+    _fake_radar_parse(monkeypatch, np.zeros((200, 200), dtype=np.float32))
+    assert bcc._classify_hour_wet(
+        hour, ((55.0, 10.0),), tmp_path / "cache", corpus,
+        search_km=10.0, scan_type="fullRange", archive=index,
+    ) is False
+
+
+def test_classify_hour_wet_falls_back_to_dmi_when_the_archive_is_empty(
+    tmp_path: Path, monkeypatch
+):
+    """An hour the archive does not hold still works — the API is consulted
+    exactly as before, and the frame lands in the canonical corpus slot."""
+    corpus = tmp_path / "corpus"
+    hour = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+    # Archive holds a DIFFERENT day, so the index exists but the window is empty.
+    index = _plant_archive(corpus, datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc))
+
+    feature = _feature(hour, scan_type="fullRange")
+    listed: list = []
+    monkeypatch.setattr(
+        bcc, "list_in_window",
+        lambda *a, **k: listed.append(k.get("scan_type")) or [feature],
+    )
+    downloaded: list = []
+    monkeypatch.setattr(
+        bcc, "download",
+        lambda f, d: downloaded.append(d) or (d / f.filename),
+    )
+    rain = np.zeros((200, 200), dtype=np.float32)
+    rain[8:13, 8:13] = 3.0
+    _fake_radar_parse(monkeypatch, rain)
+
+    assert bcc._classify_hour_wet(
+        hour, ((55.0, 10.0),), tmp_path / "cache", corpus,
+        search_km=10.0, scan_type="fullRange", archive=index,
+    ) is True
+    assert listed == ["fullRange"]          # API-side filter still requested
+    assert downloaded == [                  # downloaded straight into the archive
+        bcc.archive_path_for(corpus, feature.filename).parent
+    ]
+
+
+def test_doppler_only_archived_hour_is_not_used_for_a_fullrange_build(
+    tmp_path: Path, monkeypatch
+):
+    """An archive that holds only :x5 frames for an hour must NOT satisfy a
+    fullRange build: the index filters by equality, so a doppler frame can
+    never stand in, and the hour falls back to DMI (here: unavailable →
+    'unknown', which the caller drops)."""
+    corpus = tmp_path / "corpus"
+    hour = datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc)
+    index = _plant_archive(
+        corpus,
+        hour - timedelta(minutes=5),   # :55 doppler
+        hour + timedelta(minutes=5),   # :05 doppler
+    )
+    assert len(index) == 2
+    assert index.list_in_window(
+        hour - timedelta(minutes=10), hour + timedelta(minutes=10), "fullRange"
+    ) == []
+
+    _fake_radar_parse(monkeypatch, np.full((200, 200), 3.0, dtype=np.float32))
+    # DMI is where a fullRange-less window goes next; nothing there either.
+    monkeypatch.setattr(bcc, "list_in_window", lambda *a, **k: [])
+
+    assert bcc._classify_hour_wet(
+        hour, ((55.0, 10.0),), tmp_path / "cache", corpus,
+        search_km=10.0, scan_type="fullRange", archive=index,
+    ) is None
+    # The same window classifies fine for a DOPPLER build — proof the frames
+    # are there and it is the type filter, not an empty archive, deciding.
+    assert bcc._classify_hour_wet(
+        hour, ((55.0, 10.0),), tmp_path / "cache", corpus,
+        search_km=10.0, scan_type="doppler", archive=index,
+    ) is True
+
+
+def test_gather_event_frames_resolves_inputs_and_truth_from_the_archive(
+    tmp_path: Path, monkeypatch
+):
+    """Inputs AND verification frames come off disk for an archived event —
+    no listing request, no download, whatever the event's age."""
+    _no_network(monkeypatch)
+    corpus = tmp_path / "corpus"
+    event = datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc)
+    index = _plant_every_5_min(
+        corpus, event - timedelta(minutes=30), event + timedelta(minutes=90)
+    )
+
+    settings = _settings(leads_min=(5, 30, 60))
+    inputs, truth = bcc._gather_event_frames(event, settings, 15.0, archive=index)
+
+    assert all(isinstance(f, ArchivedFrame) for f in inputs)
+    assert [f.datetime_utc for f in inputs] == [
+        event - timedelta(minutes=20), event - timedelta(minutes=10), event,
+    ]
+    # Snapped effective leads, exactly as with an API listing: 30+15 → T+50.
+    assert truth[5].datetime_utc == event + timedelta(minutes=20)
+    assert truth[30].datetime_utc == event + timedelta(minutes=50)
+    assert truth[60].datetime_utc == event + timedelta(minutes=80)
+    # The interleaved doppler frames on disk never leak in.
+    for f in list(inputs) + list(truth.values()):
+        assert f.datetime_utc.minute % 10 == 0
+        assert f.scan_type == "fullRange"
+    # And every one of them resolves to a real file with no network.
+    for f in list(inputs) + list(truth.values()):
+        assert bcc._resolve_frame(f, tmp_path / "cache", corpus).is_file()
+
+
+def test_gather_event_frames_falls_back_to_dmi_for_an_unarchived_window(
+    tmp_path: Path, monkeypatch
+):
+    """An index that holds nothing in the window is not a dead end — the
+    builder lists from DMI exactly as it did before."""
+    corpus = tmp_path / "corpus"
+    event = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    index = _plant_archive(corpus, datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc))
+
+    captured = {}
+
+    def fake_list(start, end, *, limit, scan_type=None):
+        captured["scan_type"] = scan_type
+        return _mixed_listing(start, end)
+
+    monkeypatch.setattr(bcc, "list_in_window", fake_list)
+    inputs, truth = bcc._gather_event_frames(
+        event, _settings(leads_min=(5, 30)), 15.0, archive=index,
+    )
+    assert captured["scan_type"] == "fullRange"
+    assert all(isinstance(f, RadarFeature) for f in inputs)
+    assert [f.datetime_utc for f in inputs] == [
+        event - timedelta(minutes=20), event - timedelta(minutes=10), event,
+    ]
+    assert truth[30].datetime_utc == event + timedelta(minutes=50)
+
+
+def test_gather_event_frames_names_the_listing_source_when_inputs_are_missing(
+    tmp_path: Path, monkeypatch
+):
+    """A hole in the archive must be diagnosable: the error says which
+    listing was consulted and how much it held."""
+    _no_network(monkeypatch)
+    corpus = tmp_path / "corpus"
+    event = datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc)
+    # Everything except the T-10 input frame.
+    index = _plant_every_5_min(
+        corpus, event - timedelta(minutes=30), event + timedelta(minutes=90)
+    )
+    bcc.archive_path_for(
+        corpus, f"dk.com.{event - timedelta(minutes=10):%Y%m%d%H%M}.500_max.h5"
+    ).unlink()
+    index = ArchiveIndex(corpus)
+
+    with pytest.raises(RuntimeError, match="no fullRange input frame.*archive listing"):
+        bcc._gather_event_frames(event, _settings(leads_min=(30,)), 15.0, archive=index)
+
+
+# ---------------------------------------------------------------------------
+# --days-back 0 — the window is the archive's own depth
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_hours_days_back_zero_starts_at_the_archives_earliest(
+    tmp_path: Path
+):
+    """The point of the whole change: the window is bounded by the archive,
+    not by DMI's 180-day listing. And by the earliest frame OF THE BUILD'S
+    SCAN TYPE — an older doppler frame must not pull the window back."""
+    corpus = tmp_path / "corpus"
+    index = _plant_archive(
+        corpus,
+        datetime(2025, 12, 7, 6, 5, tzinfo=timezone.utc),   # doppler, oldest
+        datetime(2025, 12, 7, 6, 10, tzinfo=timezone.utc),  # fullRange, oldest
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc),
+    )
+
+    hours = bcc._candidate_hours(days_back=0, archive=index, scan_type="fullRange")
+    # 06:10 is mid-hour, so the first WHOLE candidate hour is 07:00.
+    assert hours[0] == datetime(2025, 12, 7, 7, 0, tzinfo=timezone.utc)
+    assert all(h.minute == 0 for h in hours)
+    # Window ends 2 h ago, as always, and reaches far past DMI's 180 days.
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    assert hours[-1] <= now - timedelta(hours=2)
+    assert (hours[-1] - hours[0]).days > 180
+
+    # A doppler build starts one 10-min slot earlier — at ITS oldest frame.
+    dopp = bcc._candidate_hours(days_back=0, archive=index, scan_type="doppler")
+    assert dopp[0] == datetime(2025, 12, 7, 7, 0, tzinfo=timezone.utc)
+
+
+def test_candidate_hours_days_back_zero_keeps_an_on_the_hour_start(tmp_path: Path):
+    corpus = tmp_path / "corpus"
+    index = _plant_archive(corpus, datetime(2026, 1, 15, 9, 0, tzinfo=timezone.utc))
+    hours = bcc._candidate_hours(days_back=0, archive=index, scan_type="fullRange")
+    assert hours[0] == datetime(2026, 1, 15, 9, 0, tzinfo=timezone.utc)
+
+
+def test_candidate_hours_positive_days_back_is_unchanged(tmp_path: Path):
+    hours = bcc._candidate_hours(days_back=2)
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    assert hours[0] == now - timedelta(days=2)
+    assert len(hours) == 2 * 24 - 2  # ends 2 h ago
+
+
+def test_candidate_hours_days_back_zero_needs_an_archive(tmp_path: Path):
+    with pytest.raises(ValueError, match="--corpus-dir"):
+        bcc._candidate_hours(days_back=0, scan_type="fullRange")
+    empty = ArchiveIndex(tmp_path / "empty")
+    with pytest.raises(ValueError, match="holds no fullRange frame"):
+        bcc._candidate_hours(days_back=0, archive=empty, scan_type="fullRange")
+
+
+def test_sample_event_times_days_back_zero_spans_the_whole_archive(
+    tmp_path: Path, monkeypatch
+):
+    """End to end through the sampler: the drawn events really do reach back
+    to the archive's earliest frame, well past DMI's listing horizon."""
+    corpus = tmp_path / "corpus"
+    index = _plant_archive(
+        corpus,
+        datetime(2025, 12, 7, 6, 0, tzinfo=timezone.utc),
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc),
+    )
+    sampled = bcc._sample_event_times(
+        days_back=0, n_events=400, seed=7, wet_bias=0.0,
+        scan_type="fullRange", archive=index,
+    )
+    assert len(sampled) == 400
+    assert all(t.minute == 0 for t, _ in sampled)
+    assert min(t for t, _ in sampled) >= datetime(
+        2025, 12, 7, 6, 0, tzinfo=timezone.utc
+    )
+    # Events older than DMI's 180-day listing are in the sample — which is
+    # the entire reason for reading the archive first.
+    horizon = datetime.now(timezone.utc) - timedelta(days=180)
+    assert any(t < horizon for t, _ in sampled)
+
+
+def test_settings_hash_ignores_the_sampling_window():
+    """The window is a sampling choice, like the wet reference set — it must
+    not re-key a corpus, or a run could never extend one backwards."""
+    keys = set(_settings().to_dict())
+    assert "days_back" not in keys
+    assert not any("window" in k for k in keys)

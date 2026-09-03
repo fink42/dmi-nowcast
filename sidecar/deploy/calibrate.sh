@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Monthly NATIONAL recalibration job. Runs on the sidecar host via the
 # dmi-calibrate systemd timer. Builds a multi-point
-# corpus over the last CALIBRATION_INPUT_MONTHS months (default 6 ≈
-# DMI's full archive depth) — one STEPS run per event feeding all ~120
-# calibration points — then fits the pooled, weight-corrected national
-# isotonic curves and writes them to the data volume so the running
-# sidecar serves calibrated probabilities after restart.
+# corpus over the last CALIBRATION_INPUT_MONTHS months (default "all" —
+# the entire persistent archive) — one STEPS run per event feeding all
+# ~120 calibration points — then fits the pooled, weight-corrected
+# national isotonic curves and writes them to the data volume so the
+# running sidecar serves calibrated probabilities after restart.
 #
 # The LEGACY single-point curves (calibration_curves.json, feeding the
 # binary p_calibrated field) are deliberately NOT refitted — that path
@@ -13,17 +13,23 @@
 # settings are read from the RUNNING config so corpus and runtime can
 # never drift.
 #
-# The default window is 6 months because that is the *entire* depth DMI's
-# open-data archive exposes (~180 days). Frames are resolved from the
-# persistent corpus archive first (--corpus-dir), so after the one-time
-# backfill this job downloads only frames newer than the last run.
+# The default window is the WHOLE archive (CALIBRATION_INPUT_MONTHS=all →
+# --days-back 0). The builder lists frames from the persistent corpus
+# archive first (--corpus-dir) and only falls back to DMI's items API for
+# windows the archive does not hold, so the calibration window is bounded
+# by the archive's own depth rather than by DMI's 180-day listing —
+# which is the reason the archive is kept in the first place. It grows by
+# one month every month; a fixed number of months would throw that away.
+# Set CALIBRATION_INPUT_MONTHS=<n> for a shorter, fixed window (e.g. to
+# recalibrate on a recent season only).
 #
 # This script is run on the *host*, not inside the container — it shells
 # into the existing sidecar container via ``docker compose exec`` to
 # reuse the venv and the data volume.
 #
 # Configuration (env or CLI):
-#   CALIBRATION_INPUT_MONTHS    history depth (months; default 6 ≈ DMI's max)
+#   CALIBRATION_INPUT_MONTHS    history depth in months, or "all" for the
+#                               whole corpus archive (default "all")
 #   CALIBRATION_N_EVENTS        events sampled (default 4000)
 #   CALIBRATION_WET_BIAS        oversample wet hours (default 0.15)
 #   CALIBRATION_SEED            random seed (default $(date +%j))
@@ -50,15 +56,28 @@
 #                               under another range cannot be resumed.
 #
 # Usage:
-#   sidecar/deploy/calibrate.sh                                    # use defaults
+#   sidecar/deploy/calibrate.sh                                    # whole archive
 #   CALIBRATION_INPUT_MONTHS=3 sidecar/deploy/calibrate.sh         # 3-month window
+#   CALIBRATION_INPUT_MONTHS=all sidecar/deploy/calibrate.sh       # explicit default
 set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DEPLOY_DIR"
 
-months=${CALIBRATION_INPUT_MONTHS:-6}
-days=$((months * 30))
+# "all" (the default) → --days-back 0, which the builder reads as "start
+# at the oldest archived frame". Any number is still a fixed month window.
+months=${CALIBRATION_INPUT_MONTHS:-all}
+if [[ "$months" == "all" ]]; then
+    days=0
+    window_desc="entire corpus archive (--days-back 0)"
+else
+    if ! [[ "$months" =~ ^[0-9]+$ ]] || [[ "$months" -lt 1 ]]; then
+        echo "CALIBRATION_INPUT_MONTHS must be a positive integer or 'all', got '${months}'" >&2
+        exit 2
+    fi
+    days=$((months * 30))
+    window_desc="${months} months (~${days} days)"
+fi
 n_events=${CALIBRATION_N_EVENTS:-4000}
 wet_bias=${CALIBRATION_WET_BIAS:-0.15}
 seed=${CALIBRATION_SEED:-$(date +%j)}
@@ -67,10 +86,12 @@ seed=${CALIBRATION_SEED:-$(date +%j)}
 # curve corrects the lead the service SERVES only if the corpus verified
 # at the same instant.
 frame_age_range=${CALIBRATION_FRAME_AGE_RANGE:-12,18}
-# Persistent corpus archive — frames are resolved from here first; only
-# gaps are downloaded (straight into the corpus). This is the 51k-frame
-# backfilled archive, so after backfill the monthly run fetches almost
-# nothing from DMI.
+# Persistent corpus archive. Frames are both LISTED and resolved from
+# here first; DMI is only consulted for windows the archive does not
+# hold, and only gaps are downloaded (straight into the corpus). This is
+# also what --days-back 0 measures its window against, so the archive —
+# not DMI's 180-day listing — is what bounds the calibration window.
+# Required for the default "all" window.
 corpus_dir=${CALIBRATION_CORPUS_DIR:-/var/lib/dmi-nowcast-corpus}
 # Small-metadata + gap-download cache. Must be a *writable* container path —
 # /repo is mounted read-only, so the script's default (``radar_archive``
@@ -116,7 +137,7 @@ curves_path=/var/lib/dmi-nowcast/national_curves.json
 report_dir=/var/lib/dmi-nowcast-corpus/calibration_reports/${stamp}
 points_path=/repo/src/dmi_nowcast_core/calibration_points_v2.json
 
-echo "==> National recalibration window: ${months} months (~${days} days)"
+echo "==> National recalibration window: ${window_desc}"
 echo "    settings from live config: ${ensemble_size} members, thr ${threshold} mm/h,"
 echo "      ds ${downsample}, ${stat}, leads [${leads_csv}], disc ${radius_m} m"
 echo "    wet-bias refs: ${CALIBRATION_WET_REFS:-<builder default: 5 spread national points>}"
