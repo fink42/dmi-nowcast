@@ -5,7 +5,9 @@ static, immutable-cacheable artifacts served by the ``/nowcast/`` endpoints
 (package A3):
 
 - each product grid → an 8-bit **grayscale** PNG with linear scale/offset
-  quantisation (value 255 reserved for NaN/nodata),
+  quantisation (value 255 reserved for NaN/nodata) — including
+  ``observed_mm_h``, the only grid that is an observation rather than a
+  forecast (see below),
 - the supplied native-500 m advected rain fields → **colormapped RGBA**
   overlay PNGs (render.py's colormap + NaN-transparency conventions),
 - one JSON manifest per cycle describing every artifact, written **last**
@@ -24,6 +26,8 @@ product            range         rationale
                                  produce, with headroom for longer horizons
 ``intensity``      0 – 100       mm/h — the Z–R rain-rate cap (CLAUDE.md
                                  contract), values above are clamped upstream
+``observed_mm_h``  0 – 100       mm/h — same quantity, same cap, so it shares
+                                 ``intensity``'s spec object exactly
 ``motion_*_kmh``   −120 – +120   km/h — the flow is clipped to 30 px/frame
                                  upstream, i.e. ±90 km/h at 500 m / 10 min;
                                  ±120 leaves headroom for a shorter cadence
@@ -95,7 +99,11 @@ _log = structlog.get_logger(__name__)
 # and the two ``motion_*_kmh`` product grids.
 # ``ensemble_horizon_min`` was added later WITHIN v2: a new key is additive
 # (CLAUDE.md manifest contract), so pinned clients keep parsing and no bump
-# is warranted.
+# is warranted. The ``observed_mm_h`` grid is additive in the same way — a
+# new entry in the existing ``artifacts`` list, in the established
+# grayscale8 shape, with ``lead_min: 0`` because it depicts
+# ``radar_ts_utc`` itself. A client that doesn't know the product simply
+# ignores the entry, so no bump there either.
 MANIFEST_SCHEMA_VERSION = 2
 
 # Trailing observed frames referenced by each manifest — 3 prior cycles is
@@ -137,11 +145,18 @@ class QuantSpec:
 # Motion grids are symmetric about zero; ±120 km/h (see module docstring).
 MOTION_MAX_ABS_KMH = 120.0
 
+# Rain rate in mm/h, capped at the Z-R cap. Forecast intensity and the
+# observed grid are the same quantity on the same grid, so they share ONE
+# spec object: a client that decodes one decodes the other with the same
+# scale/offset, and the two can never drift apart.
+_RAIN_RATE_SPEC = QuantSpec(0.0, 100.0)
+
 # The documented, fixed quantisation ranges (see module docstring).
 QUANT_SPECS: dict[str, QuantSpec] = {
     "p_rain": QuantSpec(0.0, 1.0),
     "eta": QuantSpec(0.0, 120.0),
-    "intensity": QuantSpec(0.0, 100.0),
+    "intensity": _RAIN_RATE_SPEC,
+    "observed_mm_h": _RAIN_RATE_SPEC,
     "motion_east_kmh": QuantSpec(-MOTION_MAX_ABS_KMH, MOTION_MAX_ABS_KMH),
     "motion_north_kmh": QuantSpec(-MOTION_MAX_ABS_KMH, MOTION_MAX_ABS_KMH),
 }
@@ -199,6 +214,7 @@ def write_national_artifacts(
     calibration: dict | None = None,
     motion_east_kmh: np.ndarray | None = None,
     motion_north_kmh: np.ndarray | None = None,
+    observed_mm_h: np.ndarray | None = None,
     history_frames: int = DEFAULT_HISTORY_FRAMES,
     ensemble_horizon_min: float | None = None,
 ) -> NationalArtifactsResult:
@@ -219,6 +235,16 @@ def write_national_artifacts(
     (``fill`` / ``fill_scales_km``) so a client can explain the vectors; as
     of issue #6 there is no support radius, so ``support_radius_km`` is
     published as ``null`` and kept only so pinned clients keep parsing.
+
+    ``observed_mm_h`` is the OBSERVED rain rate on the **product** grid
+    (same shape as ``products.eta_min``), in mm/h, NaN outside radar
+    coverage — ``dmi_nowcast_core.national.observed_rain_grid`` applied to
+    the same ``rain_now`` the "now" overlay is rendered from. ``None``
+    skips it. It is the one grid in the manifest that is not a forecast:
+    its ``lead_min`` is ``0`` because it depicts ``radar_ts_utc`` itself,
+    and it exists because no forecast product can answer "is it raining
+    here right now" (the ensemble's first timestep is already ten minutes
+    out).
 
     ``history_frames`` caps how many prior cycles' ``overlay_now`` PNGs the
     manifest references as observation history (0 disables). Only files
@@ -299,6 +325,25 @@ def write_national_artifacts(
         _grid_entry(f"intensity_{stamp}.png", "intensity", None, int_spec,
                     products.intensity_mm_h.shape, units="mm/h"),
     )
+
+    # --- observed rain (NOT a forecast) → grayscale PNG --------------------
+    # Additive within schema v2: one more grayscale8 entry in ``artifacts``,
+    # decoded with the manifest's scale/offset like every other grid, and
+    # carrying ``lead_min: 0`` because it is valid at ``radar_ts_utc``.
+    if observed_mm_h is not None:
+        obs_spec = QUANT_SPECS["observed_mm_h"]
+        obs_grid = np.asarray(observed_mm_h)
+        if obs_grid.shape != products.eta_min.shape:
+            raise ValueError(
+                "observed_mm_h must be on the product grid "
+                f"{products.eta_min.shape}, got {obs_grid.shape}"
+            )
+        _emit(
+            f"observed_mm_h_{stamp}.png",
+            _encode_gray_png(quantise(obs_grid, obs_spec)),
+            _grid_entry(f"observed_mm_h_{stamp}.png", "observed_mm_h", 0,
+                        obs_spec, obs_grid.shape, units="mm/h"),
+        )
 
     # --- R2 cell-motion grids → grayscale PNGs -----------------------------
     # Same product grid, same quantisation machinery as everything above, so

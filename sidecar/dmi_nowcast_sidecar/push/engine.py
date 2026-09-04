@@ -25,9 +25,16 @@ The contract mirrors the Home Assistant integration:
   the machine keeps running, still armed; an event still over threshold
   when the window ends fires then.
 - **"already raining" consumes the arm silently.** If the trigger fires
-  but the rain is already at the point (ETA at or below
-  ``raining_now_eta_min``), "rain incoming" would be noise: no push, and
-  the subscription disarms as if it had pushed.
+  but the rain is already at the point, "rain incoming" would be noise:
+  no push, and the subscription disarms as if it had pushed. Two
+  independent things count as "already raining": an ETA at or below
+  ``raining_now_eta_min``, *or* an OBSERVED rain rate at or above
+  ``raining_now_mm_h``. The observation is not a refinement of the ETA
+  test, it is the case the ETA cannot see: the ensemble's first timestep
+  is ~10 min out, so a point under a shower that clears within those 10
+  minutes and gets the next cell at +30 reads ETA ≈ 16 min — "rain
+  incoming", sent into falling rain. Two of the first four live pushes
+  were exactly that.
 
 Timestamps are UTC everywhere; the subscriber's IANA time zone is used
 for exactly one thing, the quiet-hours comparison.
@@ -92,6 +99,11 @@ class Observation:
     #: Minutes until rain reaches the point; ``None`` = none within the horizon.
     eta_min: float | None
     intensity_mm_h: float | None
+    #: OBSERVED rain rate at the point right now, mm/h, from the newest
+    #: composite. ``None`` means nodata or an unpublished observed grid —
+    #: never "dry", so an absent observation can only leave the ETA test
+    #: to decide, exactly as before this field existed.
+    observed_mm_h: float | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +116,11 @@ class Rules:
     rearm_after_min: int = 60
     #: An ETA at or below this means the rain is already at the point.
     raining_now_eta_min: float = 1.5
+    #: An OBSERVED rain rate at or above this means the same thing, and
+    #: says it about *now* rather than about the forecast. Default matches
+    #: ``forecast.rain_threshold_mm_h`` — the detection threshold the rest
+    #: of the pipeline (and Home Assistant's ``raining_now``) uses.
+    raining_now_mm_h: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -251,12 +268,17 @@ def evaluate(
                 ),
                 "deferred_quiet",
             )
-        if (
+        already_raining = (
             obs.eta_min is not None
             and obs.eta_min <= rules.raining_now_eta_min
-        ):
-            # Rain is already here; "incoming" would be noise. Consume
-            # the arm silently.
+        ) or (
+            obs.observed_mm_h is not None
+            and obs.observed_mm_h >= rules.raining_now_mm_h
+        )
+        if already_raining:
+            # Rain is already here — forecast to arrive within the next
+            # breath, or measured falling at the point this very frame.
+            # "Incoming" would be noise. Consume the arm silently.
             return Decision(
                 SubState(
                     armed=False,

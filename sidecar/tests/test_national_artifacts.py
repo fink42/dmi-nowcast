@@ -440,6 +440,115 @@ def test_no_overlays_is_allowed(geo: CompositeGeo, tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Observed rain grid — the one artifact that is not a forecast
+# ---------------------------------------------------------------------------
+
+def _observed_grid(h: int = PRODUCT_PX, w: int = PRODUCT_PX) -> np.ndarray:
+    """Product-grid observation: a 0-40 mm/h ramp with a nodata pixel."""
+    g = (np.linspace(0.0, 40.0, h * w, dtype=np.float32).reshape(h, w))
+    g[0, 0] = np.nan
+    return g
+
+
+def test_observed_grid_is_written_with_a_manifest_entry(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    observed = _observed_grid()
+    result = _write(geo, tmp_path, observed_mm_h=observed)
+    assert (tmp_path / f"observed_mm_h_{STAMP}.png").is_file()
+
+    manifest = json.loads(result.manifest_path.read_text())
+    entries = [e for e in manifest["artifacts"] if e["product"] == "observed_mm_h"]
+    assert len(entries) == 1
+    entry = entries[0]
+    # The exact shape a browser consumes — same grayscale8 contract as
+    # every other grid, with lead 0 saying "this depicts radar_ts_utc".
+    assert entry == {
+        "filename": f"observed_mm_h_{STAMP}.png",
+        "product": "observed_mm_h",
+        "lead_min": 0,
+        "encoding": "grayscale8",
+        "scale": QUANT_SPECS["intensity"].scale,
+        "offset": QUANT_SPECS["intensity"].offset,
+        "nodata": NODATA_LEVEL,
+        "units": "mm/h",
+        "shape": [PRODUCT_PX, PRODUCT_PX],
+    }
+    # Additive within schema v2 — no bump, no renamed keys.
+    assert manifest["schema_version"] == MANIFEST_SCHEMA_VERSION == 2
+    # It rides the product grid, so a client samples it like p_rain.
+    assert entry["shape"] == manifest["grid"]["shape"]
+
+
+def test_observed_grid_shares_the_intensity_quantisation(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """Same quantity, same cap, so the browser decodes both grids with one
+    scale/offset — the specs must be the same object, not two that agree
+    today."""
+    assert QUANT_SPECS["observed_mm_h"] is QUANT_SPECS["intensity"]
+
+    result = _write(geo, tmp_path, observed_mm_h=_observed_grid())
+    manifest = json.loads(result.manifest_path.read_text())
+    by_product = {e["product"]: e for e in manifest["artifacts"]
+                  if e["product"] in ("intensity", "observed_mm_h")}
+    assert by_product["observed_mm_h"]["scale"] == by_product["intensity"]["scale"]
+    assert by_product["observed_mm_h"]["offset"] == by_product["intensity"]["offset"]
+
+
+def test_observed_grid_round_trips_through_the_png(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    observed = _observed_grid()
+    result = _write(geo, tmp_path, observed_mm_h=observed)
+    manifest = json.loads(result.manifest_path.read_text())
+    entry = next(e for e in manifest["artifacts"]
+                 if e["product"] == "observed_mm_h")
+
+    with Image.open(tmp_path / entry["filename"]) as img:
+        assert img.mode == "L"
+        levels = np.asarray(img)
+    decoded = dequantise(levels, scale=entry["scale"], offset=entry["offset"])
+    assert decoded.shape == observed.shape
+    assert np.array_equal(np.isnan(decoded), np.isnan(observed))
+    assert levels[0, 0] == NODATA_LEVEL
+    finite = ~np.isnan(observed)
+    err = np.abs(decoded[finite] - observed[finite])
+    assert float(err.max()) <= entry["scale"] / 2 + 1e-4
+
+
+def test_observed_grid_is_optional(geo: CompositeGeo, tmp_path: Path) -> None:
+    """A cycle whose observed reduction failed writes everything else."""
+    result = _write(geo, tmp_path, observed_mm_h=None)
+    assert not list(tmp_path.glob("observed_mm_h_*.png"))
+    manifest = json.loads(result.manifest_path.read_text())
+    assert all(e["product"] != "observed_mm_h" for e in manifest["artifacts"])
+    assert any(e["product"] == "intensity" for e in manifest["artifacts"])
+
+
+def test_observed_grid_must_be_on_the_product_grid(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="product grid"):
+        _write(geo, tmp_path,
+               observed_mm_h=np.zeros((GRID_PX, GRID_PX), np.float32))
+
+
+def test_observed_grid_is_pruned_with_its_cycle(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """It carries the standard cycle stamp, so retention needs no special
+    case — but a silent naming slip would leak one PNG per cycle forever."""
+    for minute in range(4):
+        ts = RADAR_TS + timedelta(minutes=10 * minute)
+        _write(geo, tmp_path, radar_ts_utc=ts,
+               observed_mm_h=_observed_grid(), keep_cycles=2,
+               overlay_fields_mm_h=None, history_frames=0)
+    survivors = sorted(p.name for p in tmp_path.glob("observed_mm_h_*.png"))
+    assert len(survivors) == 2, survivors
+
+
+# ---------------------------------------------------------------------------
 # R1 — 30-min observation history in the manifest
 # ---------------------------------------------------------------------------
 

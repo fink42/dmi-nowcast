@@ -6,6 +6,7 @@ with ``aggregate_at_home`` at an arbitrary pixel.
 """
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from dmi_nowcast_core.national import (
     _steps_in_lead,
     motion_grids_kmh,
     national_products,
+    observed_rain_grid,
 )
 from dmi_nowcast_core.parse import parse_composite
 from dmi_nowcast_core.probabilistic import aggregate_at_home
@@ -495,3 +497,116 @@ def test_motion_grids_reject_bad_inputs():
     with pytest.raises(ValueError, match="downsample_factor"):
         motion_grids_kmh(vy, vx, rain, pixel_km=0.5, timestep_min=10.0,
                          downsample_factor=0)
+
+
+# ---------------------------------------------------------------------------
+# Observed rain grid — the product that looks backwards
+# ---------------------------------------------------------------------------
+
+
+def _block_field(values: list[list[list[float]]], f: int = 4) -> np.ndarray:
+    """Assemble a native field from per-block 1-D value lists (row-major)."""
+    rows = len(values)
+    cols = len(values[0])
+    field = np.empty((rows * f, cols * f), dtype=np.float32)
+    for r, row in enumerate(values):
+        for c, block in enumerate(row):
+            field[r * f:(r + 1) * f, c * f:(c + 1) * f] = (
+                np.asarray(block, dtype=np.float32).reshape(f, f)
+            )
+    return field
+
+
+def test_observed_grid_block_p90_hand_computed():
+    """Each 4×4 block reduces to np.percentile(block, 90) over its values."""
+    ramp = list(np.arange(16, dtype=np.float32))          # 0 .. 15
+    flat = [3.0] * 16
+    mixed = [0.0] * 12 + [4.0, 5.0, 6.0, 7.0]
+    field = _block_field([[ramp, flat], [mixed, flat]])
+
+    out = observed_rain_grid(field, downsample_factor=4)
+
+    assert out.shape == (2, 2)
+    assert out.dtype == np.float32
+    # p90 of 0..15 → virtual index 15 * 0.9 = 13.5 → 13.5 (linear interp).
+    assert float(out[0, 0]) == pytest.approx(13.5)
+    assert float(out[0, 1]) == pytest.approx(3.0)
+    assert float(out[1, 1]) == pytest.approx(3.0)
+    # p90 of twelve 0s then 4,5,6,7 → index 13.5 → between 5 and 6.
+    assert float(out[1, 0]) == pytest.approx(5.5)
+
+
+def test_observed_grid_one_hot_pixel_does_not_wet_a_dry_block():
+    """The whole point of p90 over max: DMI's composite is column-max, so a
+    single clutter/virga pixel must not make a 2×2 km block 'raining'."""
+    block = [0.0] * 15 + [40.0]                # one hot pixel in 16
+    field = _block_field([[block]])
+    out = observed_rain_grid(field, downsample_factor=4)
+    assert float(out[0, 0]) == pytest.approx(0.0)
+
+    # The interpolated index is 13.5, so the wet fraction has to reach
+    # 3/16 before the block reads fully wet: two hot pixels only get half
+    # way there, three or more carry the block.
+    field = _block_field([[[0.0] * 14 + [40.0] * 2]])
+    assert float(observed_rain_grid(field, downsample_factor=4)[0, 0]) == pytest.approx(20.0)
+    field = _block_field([[[0.0] * 13 + [40.0] * 3]])
+    assert float(observed_rain_grid(field, downsample_factor=4)[0, 0]) == pytest.approx(40.0)
+
+
+def test_observed_grid_nan_blocks_and_partial_coverage():
+    """A block is nodata only when every native pixel in it is."""
+    all_nan = [float("nan")] * 16
+    partly = [float("nan")] * 12 + [1.0, 2.0, 3.0, 4.0]
+    field = _block_field([[all_nan, partly]])
+
+    out = observed_rain_grid(field, downsample_factor=4)
+    assert np.isnan(out[0, 0])
+    # p90 over the four present values: index 3 * 0.9 = 2.7 → 3.7.
+    assert float(out[0, 1]) == pytest.approx(3.7)
+
+
+def test_observed_grid_shape_matches_the_stride_sliced_product_grid():
+    """Pixel-for-pixel alignment with p_rain / eta / motion is the contract:
+    they are all ``[::f, ::f]``-shaped, including on a non-divisible grid."""
+    rng = np.random.default_rng(7)
+    for shape in [(64, 64), (17, 23), (9, 4), (33, 7)]:
+        field = rng.normal(size=shape).astype(np.float32)
+        for f in (1, 2, 3, 4, 5):
+            out = observed_rain_grid(field, downsample_factor=f)
+            assert out.shape == field[::f, ::f].shape, (shape, f)
+
+
+def test_observed_grid_f1_is_the_identity():
+    rng = np.random.default_rng(11)
+    field = rng.normal(size=(12, 9)).astype(np.float32)
+    field[3, 4] = np.nan
+    out = observed_rain_grid(field, downsample_factor=1)
+    assert out.shape == field.shape
+    assert np.array_equal(out, field, equal_nan=True)
+    assert out is not field, "the caller's array must not be aliased"
+
+
+def test_observed_grid_agrees_with_numpy_nanpercentile():
+    """The fast sort path IS ``np.nanpercentile(block, 90)``; a divergence
+    here means the served observation stops matching its own docstring."""
+    rng = np.random.default_rng(3)
+    field = rng.gamma(1.5, 2.0, size=(64, 48)).astype(np.float32)
+    field[rng.random(field.shape) < 0.35] = np.nan
+    f = 4
+
+    got = observed_rain_grid(field, downsample_factor=f)
+    blocks = field.reshape(field.shape[0] // f, f, field.shape[1] // f, f)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        expected = np.nanpercentile(blocks, 90, axis=(1, 3)).astype(np.float32)
+
+    assert np.array_equal(np.isnan(got), np.isnan(expected))
+    finite = ~np.isnan(expected)
+    assert np.allclose(got[finite], expected[finite], atol=1e-5)
+
+
+def test_observed_grid_rejects_bad_inputs():
+    with pytest.raises(ValueError, match="2-D"):
+        observed_rain_grid(np.zeros((4, 4, 4), np.float32))
+    with pytest.raises(ValueError, match="downsample_factor"):
+        observed_rain_grid(np.zeros((8, 8), np.float32), downsample_factor=0)

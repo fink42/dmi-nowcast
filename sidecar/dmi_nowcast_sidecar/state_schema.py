@@ -183,6 +183,14 @@ class ForecastPointResponse(BaseModel):
     eta_min: float | None
     # Ensemble-median rain rate at the pixel's ETA step; null with no ETA.
     intensity_mm_h: float | None
+    # OBSERVED rain rate at the pixel right now (p90 over the ~2 km product
+    # block of the newest composite), mm/h. The only non-forecast field
+    # here: no ETA/probability product can say whether it is raining at the
+    # point *at this moment*, because the ensemble's first timestep is
+    # already ~10 min out. Null when the pixel is nodata or the cycle
+    # published no observed grid. Additive (default null), so pinned
+    # clients are unaffected.
+    observed_mm_h: float | None = None
     # Global confidence scalar from the latest ``state.json`` (Phase A keeps
     # confidence global, plan §A1); null when no state is available yet.
     confidence: float | None

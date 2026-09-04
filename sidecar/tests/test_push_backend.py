@@ -42,7 +42,7 @@ from dmi_nowcast_sidecar.app import (
     _safe_nowcast_name,
     create_app,
 )
-from dmi_nowcast_sidecar.compute import CycleEngine, CycleResult
+from dmi_nowcast_sidecar.compute import CycleEngine, CycleResult, NationalSnapshot
 from dmi_nowcast_sidecar.config import Config, PushConfig
 from dmi_nowcast_sidecar.push import fanout as fanout_mod
 from dmi_nowcast_sidecar.push import keygen, vapid
@@ -936,6 +936,68 @@ async def test_service_persistence_then_one_notification(
     assert service.last_fanout["sent"] == 1
     assert service.last_fanout["notified"] == 1
     assert service.last_fanout["subscriptions"] == 2
+
+
+async def test_service_does_not_push_into_rain_already_at_the_point(
+    service: PushService,
+    seeded_engine: CycleEngine,
+    products: NationalProducts,
+    sends: list[dict],
+) -> None:
+    """The live bug: the ETA grid says 6 min (a fresh arrival), but the
+    radar measures 0.9 mm/h falling on the point this very frame. The
+    subscription is consumed silently instead of being told rain is
+    incoming while it rains."""
+    observed = _grid(0.9)  # >= forecast.rain_threshold_mm_h (0.5)
+    seeded_engine._national_latest = NationalSnapshot(
+        products, RADAR_TS, observed,
+    )
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+    seeded_engine._national_latest = NationalSnapshot(
+        products, RADAR_TS2, observed,
+    )
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS2)))
+
+    assert sends == []
+    assert service.last_fanout is not None
+    assert service.last_fanout["notified"] == 0
+    assert service.last_fanout["actions"]["already_raining"] == 1
+    wet = service.store.get(ENDPOINT_A)
+    assert wet is not None
+    assert wet.armed is False           # the arm is consumed, as if pushed
+    assert wet.last_notified_utc is None
+
+
+async def test_service_still_pushes_when_the_point_is_dry_now(
+    service: PushService,
+    seeded_engine: CycleEngine,
+    products: NationalProducts,
+    sends: list[dict],
+) -> None:
+    """An observed grid that says 0 mm/h at the point is the ordinary
+    "rain incoming" case — the new rule must not silence it."""
+    observed = _grid(0.0)
+    seeded_engine._national_latest = NationalSnapshot(
+        products, RADAR_TS, observed,
+    )
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+    seeded_engine._national_latest = NationalSnapshot(
+        products, RADAR_TS2, observed,
+    )
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS2)))
+
+    assert len(sends) == 1
+    assert sends[0]["endpoint"] == ENDPOINT_A
+
+
+def test_service_rules_take_the_pipeline_detection_threshold(
+    service: PushService,
+) -> None:
+    """One threshold for the whole pipeline: what counts as rain falling
+    here is what counts as rain in Home Assistant's ``raining_now`` and in
+    the ensemble exceedance."""
+    service.config.forecast.rain_threshold_mm_h = 1.25
+    assert service._rules().raining_now_mm_h == pytest.approx(1.25)
 
 
 async def test_service_ignores_a_repeated_radar_timestamp(

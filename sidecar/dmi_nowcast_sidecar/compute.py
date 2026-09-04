@@ -51,6 +51,7 @@ from dmi_nowcast_core.national import (
     NationalProducts,
     motion_grids_kmh,
     national_products,
+    observed_rain_grid,
 )
 from dmi_nowcast_core.parse import RadarComposite, parse_composite
 from dmi_nowcast_core.probabilistic import (
@@ -152,6 +153,44 @@ class EnsembleOutcome:
     calibrated_leads: tuple[int, ...] | None = None
 
 
+class NationalSnapshot(tuple):
+    """What ``CycleEngine.national_latest`` publishes: the cycle's national
+    products, their radar timestamp, and the observed-rain grid.
+
+    Deliberately a **2-tuple subclass** rather than a three-field
+    dataclass. ``national_latest`` has pinned readers — ``/forecast``, the
+    push service, the push subscribe route and three test modules all do
+    ``products, radar_ts = engine.national_latest`` — and the observed grid
+    is additive here in the same sense a manifest key is additive: the
+    unpacking and indexing that existed keep working untouched, while
+    readers that want the new grid reach it by name (or, defensively,
+    ``getattr(latest, "observed_mm_h", None)``, which also tolerates a
+    plain tuple).
+
+    Swapped as one object so a reader on another thread can never see a
+    products grid from one cycle paired with an observation from the next.
+    """
+
+    def __new__(
+        cls,
+        products: NationalProducts,
+        radar_ts_utc: datetime,
+        observed_mm_h: np.ndarray | None = None,
+    ) -> "NationalSnapshot":
+        self = super().__new__(cls, (products, radar_ts_utc))
+        # tuple subclasses can't carry __slots__, so this lands in __dict__.
+        self.observed_mm_h = observed_mm_h
+        return self
+
+    @property
+    def products(self) -> NationalProducts:
+        return self[0]
+
+    @property
+    def radar_ts_utc(self) -> datetime:
+        return self[1]
+
+
 @dataclass
 class CycleResult:
     """Outcome of one cycle. ``state`` is None when the cycle failed
@@ -249,10 +288,11 @@ class CycleEngine:
         # National artifacts directory served by /nowcast/* (plan §A2/§A3).
         self._national_dir = config.storage.data_dir / "nowcast"
         self._national_dir.mkdir(parents=True, exist_ok=True)
-        # Latest national products + their radar timestamp, held in memory
-        # for the /forecast point lookup (plan §A3). Swapped as one tuple so
-        # readers on other threads never see a torn pair.
-        self._national_latest: tuple[NationalProducts, datetime] | None = None
+        # Latest national products + their radar timestamp + the observed
+        # rain grid, held in memory for the /forecast point lookup (plan
+        # §A3) and the push decision engine. Swapped as one object so
+        # readers on other threads never see a torn set.
+        self._national_latest: NationalSnapshot | None = None
         # Basemap dir + cached image; lazy-loaded on first cycle.
         self._basemap_dir = config.storage.data_dir / "basemap"
         self._basemap_dir.mkdir(parents=True, exist_ok=True)
@@ -298,11 +338,14 @@ class CycleEngine:
         return self._geo
 
     @property
-    def national_latest(self) -> tuple[NationalProducts, datetime] | None:
-        """Latest national products + their radar timestamp (plan §A3).
+    def national_latest(self) -> NationalSnapshot | None:
+        """Latest national products + radar timestamp + observed grid (§A3).
 
         None until the first successful ensemble cycle with national
-        products enabled. The /forecast endpoint samples these grids."""
+        products enabled. The /forecast endpoint and the push decision
+        engine sample these grids. Unpacks as the ``(products, radar_ts)``
+        pair it has always been; the observed grid is the named
+        ``observed_mm_h`` attribute (see :class:`NationalSnapshot`)."""
         return self._national_latest
 
     @property
@@ -742,8 +785,28 @@ class CycleEngine:
         national_ms = ensemble.national_ms if ensemble is not None else 0.0
         artifact_bytes = 0
         if ensemble is not None and ensemble.national is not None:
-            self._national_latest = (ensemble.national, composite_now.timestamp_utc)
             t_art = time.perf_counter()
+            # OBSERVED rain on the product grid, from the same ``rain_now``
+            # the "now" overlay is rendered from and the same downsample
+            # factor the ensemble reduced with — so it aligns pixel-for-
+            # pixel with p_rain / eta / intensity / motion. This is the
+            # only served grid that answers "is it raining at this point
+            # RIGHT NOW": the ensemble's first timestep is already ~10 min
+            # out, so a point under a shower that clears within 10 min
+            # reads as a fresh arrival on the ETA grid alone. ~17 ms on
+            # the full 1728×1984 composite. A failure costs the observed
+            # grid, not the cycle.
+            observed_grid: np.ndarray | None = None
+            try:
+                observed_grid = observed_rain_grid(
+                    rain_now,
+                    downsample_factor=ensemble.national.downsample_factor,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("observed_grid_failed", error=str(exc))
+            self._national_latest = NationalSnapshot(
+                ensemble.national, composite_now.timestamp_utc, observed_grid,
+            )
             # R2 cell-motion grids: the display product, on the product
             # grid, in km/h. Fed the *raw* sanitised flow, not the
             # bulk-completed one the overlays and STEPS ran on — off the
@@ -774,6 +837,7 @@ class CycleEngine:
                     keep_cycles=self.config.forecast.national.keep_cycles,
                     motion_east_kmh=motion_east,
                     motion_north_kmh=motion_north,
+                    observed_mm_h=observed_grid,
                     # §B4: null when the served grids are raw; otherwise
                     # fitted_at + curve-file echo + calibrated_leads.
                     calibration=self._national_calibration_manifest(ensemble.national),

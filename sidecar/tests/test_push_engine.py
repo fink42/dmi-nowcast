@@ -36,6 +36,7 @@ def _obs(
     *,
     eta: float | None = None,
     mm: float | None = None,
+    observed: float | None = None,
     base: datetime = T0,
 ) -> Observation:
     return Observation(
@@ -43,6 +44,7 @@ def _obs(
         p_rain=p,
         eta_min=eta,
         intensity_mm_h=mm,
+        observed_mm_h=observed,
     )
 
 
@@ -55,6 +57,7 @@ def _drive(
     tz: str = CPH,
     rules: Rules = Rules(),
     eta: float | None = None,
+    observed: float | None = None,
     base: datetime = T0,
     now_at_radar: bool = False,
 ):
@@ -63,7 +66,7 @@ def _drive(
     states: list[SubState] = []
     observations: list[Observation] = []
     for i, p in enumerate(probs):
-        obs = _obs(i, p, eta=eta, base=base)
+        obs = _obs(i, p, eta=eta, observed=observed, base=base)
         now_utc = (
             obs.radar_ts_utc
             if now_at_radar
@@ -355,6 +358,87 @@ def test_already_raining_disarms_for_the_full_hour_too() -> None:
 
 
 # --------------------------------------------------------------------------
+# "Already raining" also means: the radar says it is raining HERE, NOW
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("observed", [0.5, 0.8, 1.49, 12.0])
+def test_observed_rain_at_the_point_is_already_raining(observed: float) -> None:
+    """The ETA is comfortably far out — 16 min, well past the 1.5 min
+    limit — but the radar measures rain falling at the point right now.
+    That is the case the ETA product cannot see: its first ensemble
+    timestep is already ~10 min ahead of the image."""
+    actions, states, _ = _drive([0.9, 0.9], eta=16.0, observed=observed)
+    assert actions == ["none", "already_raining"]
+    assert states[-1].armed is False
+    assert states[-1].below_since_utc is None
+
+
+def test_observed_below_the_threshold_still_notifies() -> None:
+    """0.3 mm/h is under the pipeline's 0.5 detection threshold — drizzle
+    or virga aloft, not the shower the alert is about."""
+    actions, _, _ = _drive([0.9, 0.9], eta=16.0, observed=0.3)
+    assert actions == ["none", "notify"]
+
+
+def test_observed_none_leaves_the_old_behaviour_exactly() -> None:
+    """No observed grid (an older cycle, a failed reduction, a nodata
+    pixel) must decide on the ETA alone, as it always did — an unknown
+    observation is never a wet one, and never a dry one either."""
+    assert _drive([0.9, 0.9], eta=16.0, observed=None)[0] == ["none", "notify"]
+    assert _drive([0.9, 0.9], eta=0.5, observed=None)[0] == ["none", "already_raining"]
+
+
+def test_observed_threshold_is_configurable() -> None:
+    rules = Rules(raining_now_mm_h=2.0)
+    assert _drive([0.9, 0.9], eta=16.0, observed=1.5, rules=rules)[0][-1] == "notify"
+    assert _drive([0.9, 0.9], eta=16.0, observed=2.0, rules=rules)[0][-1] == "already_raining"
+
+
+def test_live_20260904_0620z_case_does_not_push_into_falling_rain() -> None:
+    """Regression on a real push the user received.
+
+    2026-09-04 06:20Z, Odense: p = 0.47 against a 40 % threshold (over),
+    ETA 15.6 min — because the shower overhead was clearing and the NEXT
+    cell was ~30 min out — while the radar measured 1.49 mm/h p90 in the
+    1 km disc at the point. The notification said "rain incoming" into
+    rain that was falling on the user. Two of the first four live pushes
+    were this exact shape.
+    """
+    live = Rules(raining_now_mm_h=0.5)
+    state = SubState(
+        armed=True, streak=1, below_since_utc=None,
+        last_eval_radar_ts=T0 - CADENCE,
+    )
+    obs = Observation(
+        radar_ts_utc=T0,
+        p_rain=0.47,
+        eta_min=15.6,
+        intensity_mm_h=0.9,
+        observed_mm_h=1.49,
+    )
+    decision = evaluate(
+        state, obs, threshold_pct=40, quiet=None, tz=CPH,
+        now_utc=T0 + timedelta(minutes=2), rules=live,
+    )
+    assert decision.action == "already_raining"
+    assert decision.state.armed is False
+
+    # Same frame with the observation absent is the bug as shipped —
+    # pinned so the regression can't be "fixed" by dropping the field.
+    without = evaluate(
+        state,
+        Observation(
+            radar_ts_utc=T0, p_rain=0.47, eta_min=15.6,
+            intensity_mm_h=0.9, observed_mm_h=None,
+        ),
+        threshold_pct=40, quiet=None, tz=CPH,
+        now_utc=T0 + timedelta(minutes=2), rules=live,
+    )
+    assert without.action == "notify"
+
+
+# --------------------------------------------------------------------------
 # Quiet hours defer, they do not disarm
 # --------------------------------------------------------------------------
 
@@ -410,6 +494,15 @@ def test_event_that_ends_inside_the_window_fires_nothing() -> None:
 def test_quiet_hours_take_precedence_over_already_raining() -> None:
     actions, states, _ = _drive(
         [0.9, 0.9], quiet=QUIET, base=T_QUIET, now_at_radar=True, eta=0.2
+    )
+    assert actions == ["none", "deferred_quiet"]
+    assert states[-1].armed is True
+
+
+def test_quiet_hours_take_precedence_over_observed_rain_too() -> None:
+    actions, states, _ = _drive(
+        [0.9, 0.9], quiet=QUIET, base=T_QUIET, now_at_radar=True,
+        eta=16.0, observed=3.0,
     )
     assert actions == ["none", "deferred_quiet"]
     assert states[-1].armed is True

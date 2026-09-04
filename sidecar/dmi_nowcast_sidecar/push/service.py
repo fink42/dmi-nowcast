@@ -13,8 +13,10 @@ the state has been written. From there:
    cycle never swallows a frame.
 
 2. **Evaluate every subscription off the loop.** ``sample_point`` is the
-   same sampler ``/forecast`` uses — a notification and the panel can
-   never disagree about which pixel a point reads.
+   same sampler ``/forecast`` uses, fed the same held grids *including the
+   observed-rain grid* — a notification and the panel can never disagree
+   about which pixel a point reads, nor about whether it is already
+   raining there.
 
 3. **Persist first, send second.** The new state is written before any
    network call, so a crash mid-fan-out can only cost a notification, not
@@ -122,7 +124,14 @@ class PushService:
 
         now_utc = datetime.now(timezone.utc)
         summary = await asyncio.to_thread(
-            self._evaluate_and_send, products, geo, radar_ts, now_utc,
+            self._evaluate_and_send,
+            products,
+            geo,
+            radar_ts,
+            now_utc,
+            # Additive on the snapshot: a cycle whose observed reduction
+            # failed still evaluates, on the ETA test alone.
+            getattr(latest, "observed_mm_h", None),
         )
         self._last_evaluated_radar_ts = radar_ts
         self._last_fanout = summary
@@ -133,6 +142,11 @@ class PushService:
         return Rules(
             persistence_obs=self.config.push.persistence_obs,
             rearm_after_min=self.config.push.rearm_after_min,
+            # One detection threshold for the whole pipeline: what counts
+            # as rain falling at the point here is what counts as rain
+            # everywhere else (Home Assistant's ``raining_now``, the
+            # ensemble exceedance, the motion support mask).
+            raining_now_mm_h=self.config.forecast.rain_threshold_mm_h,
         )
 
     def _evaluate_and_send(
@@ -141,6 +155,7 @@ class PushService:
         geo: Any,
         radar_ts: datetime,
         now_utc: datetime,
+        observed_mm_h: Any = None,
     ) -> dict:
         """Decide for every subscription, persist, then fan out. Blocking."""
         subs = self.store.list()
@@ -150,12 +165,15 @@ class PushService:
         actions: dict[str, int] = {}
 
         for sub in subs:
-            sample = sample_point(products, geo, sub.lat, sub.lon)
+            sample = sample_point(
+                products, geo, sub.lat, sub.lon, observed_mm_h=observed_mm_h,
+            )
             obs = Observation(
                 radar_ts_utc=radar_ts,
                 p_rain=sample.p_rain.get(sub.lead_min) if sample else None,
                 eta_min=sample.eta_min if sample else None,
                 intensity_mm_h=sample.intensity_mm_h if sample else None,
+                observed_mm_h=sample.observed_mm_h if sample else None,
             )
             state = SubState(
                 armed=sub.armed,

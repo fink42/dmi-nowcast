@@ -757,15 +757,16 @@ def test_cycle_computes_national_products_and_writes_artifacts(
             grid_val = float(products.p_rain[entry.lead_min][centre, centre])
             assert entry.p_ensemble == pytest.approx(grid_val)
 
-    # Artifacts on disk: 5 p_rain + eta + intensity + 2 motion grayscale,
-    # overlays for every deterministic lead + the now frame, stamped +
-    # stable manifests.
+    # Artifacts on disk: 5 p_rain + eta + intensity + observed + 2 motion
+    # grayscale, overlays for every deterministic lead + the now frame,
+    # stamped + stable manifests.
     out = _nowcast_dir(engine)
     names = sorted(p.name for p in out.iterdir())
     n_overlays = len(engine.config.forecast.leads_min) + 1
     assert len([n for n in names if n.startswith("p_rain_")]) == 5
     assert len([n for n in names if n.startswith("eta_")]) == 1
     assert len([n for n in names if n.startswith("intensity_")]) == 1
+    assert len([n for n in names if n.startswith("observed_mm_h_")]) == 1
     assert len([n for n in names if n.startswith("motion_")]) == 2
     assert len([n for n in names if n.startswith("overlay_")]) == n_overlays
     assert "manifest.json" in names
@@ -774,7 +775,7 @@ def test_cycle_computes_national_products_and_writes_artifacts(
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["n_members"] == 8
     assert manifest["leads_min"] == [10, 20, 30, 45, 60]
-    assert len(manifest["artifacts"]) == 9 + n_overlays
+    assert len(manifest["artifacts"]) == 10 + n_overlays
 
     # R2: the motion grids ride the product grid the ensemble produced.
     assert manifest["motion"]["grid"] == "product"
@@ -804,6 +805,75 @@ def test_cycle_computes_national_products_and_writes_artifacts(
 
     assert state.diagnostics.national_ms > 0.0
     assert state.diagnostics.artifact_bytes > 0
+
+
+def test_cycle_publishes_the_observed_rain_grid(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The observed grid rides the snapshot, aligned with the forecast
+    grids, and says what the newest composite actually measured."""
+    calls: list[dict] = []
+    monkeypatch.setattr(compute_mod, "run_ensemble", _make_fake_run_ensemble(calls))
+
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+
+    latest = engine.national_latest
+    assert latest is not None
+    observed = latest.observed_mm_h
+    assert observed is not None
+    # Same grid as every forecast product: sampling one samples them all.
+    assert observed.shape == latest.products.eta_min.shape
+    assert observed.dtype == np.float32
+    # The newest synthetic frame is a uniform 31 dBZ → ~3 mm/h everywhere
+    # (Marshall-Palmer, zr_a=200, zr_b=1.6), so the block p90 is that too.
+    assert float(np.nanmin(observed)) == pytest.approx(3.0, abs=0.2)
+    assert float(np.nanmax(observed)) == pytest.approx(3.0, abs=0.2)
+
+
+def test_national_latest_still_unpacks_as_the_products_pair(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``national_latest`` has pinned readers (/forecast, the push service,
+    the subscribe route). Adding the observed grid must not move them."""
+    calls: list[dict] = []
+    monkeypatch.setattr(compute_mod, "run_ensemble", _make_fake_run_ensemble(calls))
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+
+    latest = engine.national_latest
+    products, radar_ts = latest                    # the old two-value shape
+    assert len(latest) == 2
+    assert latest[0] is products and latest[1] == radar_ts
+    assert latest.products is products
+    assert latest.radar_ts_utc == radar_ts
+
+
+def test_observed_grid_failure_does_not_cost_the_cycle(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same policy as the motion grids: warn, publish without it."""
+    calls: list[dict] = []
+    monkeypatch.setattr(compute_mod, "run_ensemble", _make_fake_run_ensemble(calls))
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("observed reduction exploded")
+
+    monkeypatch.setattr(compute_mod, "observed_rain_grid", _boom)
+    state = engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+
+    assert state.probabilistic is not None
+    latest = engine.national_latest
+    assert latest is not None
+    assert latest.observed_mm_h is None
+    # Products and artifacts are still published, minus the observed PNG.
+    names = [p.name for p in _nowcast_dir(engine).iterdir()]
+    assert not [n for n in names if n.startswith("observed_mm_h_")]
+    assert [n for n in names if n.startswith("intensity_")]
 
 
 def test_national_disabled_keeps_home_forecast_and_writes_nothing(

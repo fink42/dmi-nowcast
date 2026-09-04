@@ -15,12 +15,20 @@ it by contract:
 
 ``f`` is the products' ``downsample_factor``; ``round`` is Python's
 banker's rounding, as it always was in ``/forecast``.
+
+The optional observed-rain grid rides the same pixel. It is not part
+of :class:`~dmi_nowcast_core.national.NationalProducts` (it is an
+observation, not an ensemble reduction) but it is on the same grid by
+construction, so it is sampled here rather than through a second path
+that could drift.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from typing import Any
+
+import numpy as np
 
 from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.national import NationalProducts
@@ -35,6 +43,11 @@ class PointSample:
     ``intensity_mm_h`` are ``None`` where the grid is NaN (no ETA within
     the horizon). ``row`` / ``col`` are the product-grid pixel actually
     read, for logging and tests.
+
+    ``observed_mm_h`` is the rain rate measured at the pixel by the newest
+    composite — ``None`` when no observed grid was supplied or the pixel is
+    nodata. It is the only field here that is not a forecast, and the only
+    one that can say "it is raining at this point *now*".
     """
 
     row: int
@@ -42,6 +55,7 @@ class PointSample:
     p_rain: dict[int, float | None]
     eta_min: float | None
     intensity_mm_h: float | None
+    observed_mm_h: float | None = None
 
 
 def product_pixel(
@@ -59,13 +73,30 @@ def product_pixel(
 
 
 def sample_point(
-    products: NationalProducts, geo: CompositeGeo, lat: float, lon: float,
+    products: NationalProducts,
+    geo: CompositeGeo,
+    lat: float,
+    lon: float,
+    *,
+    observed_mm_h: np.ndarray | None = None,
 ) -> PointSample | None:
-    """Read every product at the nearest pixel; ``None`` when off coverage."""
+    """Read every product at the nearest pixel; ``None`` when off coverage.
+
+    ``observed_mm_h`` is the cycle's observed-rain grid, on the same
+    product grid. Absent — or a differently-shaped grid, which would mean
+    a caller paired two different reductions — the sample's
+    ``observed_mm_h`` is ``None``: an unknown observation, never a dry one.
+    """
     pixel = product_pixel(products, geo, lat, lon)
     if pixel is None:
         return None
     row, col = pixel
+    observed: float | None = None
+    if (
+        observed_mm_h is not None
+        and observed_mm_h.shape == products.eta_min.shape
+    ):
+        observed = finite_or_none(observed_mm_h[row, col])
     return PointSample(
         row=row,
         col=col,
@@ -75,6 +106,7 @@ def sample_point(
         },
         eta_min=finite_or_none(products.eta_min[row, col]),
         intensity_mm_h=finite_or_none(products.intensity_mm_h[row, col]),
+        observed_mm_h=observed,
     )
 
 

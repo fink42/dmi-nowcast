@@ -55,6 +55,36 @@ endpoints (currently `/v1/trigger-refresh`) must include
 `/state.json`, `/frames/*`) stay open so clients can poll them
 unauthenticated.
 
+## Observed rain (`observed_mm_h`)
+
+Every other national product is a forecast, and none of them can answer
+"is it raining here *right now*": the STEPS ensemble's first timestep is
+already ~10 minutes ahead of the radar image, so a point under a shower
+that clears within those 10 minutes and gets the next cell at +30 reads an
+ETA of ~16 min — a fresh arrival, while it is raining on you.
+
+So each cycle also publishes the OBSERVED rain rate from the newest
+composite, reduced onto the same ×4 product grid by a block-wise 90th
+percentile (`dmi_nowcast_core.national.observed_rain_grid`). p90 over a
+2 × 2 km block mirrors the Home Assistant `raining_now` rule and, on a
+column-max composite, keeps one clutter or virga pixel from making a block
+look wet.
+
+It appears in three places, all additive:
+
+- `/nowcast/observed_mm_h_<cycle>.png` — grayscale8, quantised with the
+  *same* scale/offset as `intensity` (0–100 mm/h, 255 = nodata), with a
+  manifest entry carrying `"product": "observed_mm_h"`, `"lead_min": 0`
+  (it depicts `radar_ts_utc` itself) and `"units": "mm/h"`. Manifest
+  schema stays at v2 — a client that doesn't know the product ignores the
+  entry.
+- `/forecast?lat=&lon=` — a new `observed_mm_h` field, null when the pixel
+  is nodata or the cycle published no observed grid.
+- the Web Push decision engine — a subscription whose point is measured at
+  or above `forecast.rain_threshold_mm_h` is treated as "already raining":
+  the arm is consumed silently instead of sending "rain incoming" into
+  falling rain.
+
 ## Public mode
 
 `server.public_mode: true` turns the process into the internet-facing

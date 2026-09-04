@@ -376,7 +376,12 @@ def create_app(
         # arithmetic lives in national_sample.sample_point, shared with the
         # Web Push decision engine (Phase D) so a notification and the
         # panel can never disagree about which pixel a point reads.
-        sample = sample_point(products, geo, lat, lon)
+        # ``getattr`` because the snapshot's observed grid is additive: a
+        # cycle whose observed reduction failed publishes the pair alone.
+        sample = sample_point(
+            products, geo, lat, lon,
+            observed_mm_h=getattr(latest, "observed_mm_h", None),
+        )
         if sample is None:
             raise HTTPException(
                 status_code=400,
@@ -414,6 +419,7 @@ def create_app(
             per_lead=per_lead,
             eta_min=sample.eta_min,
             intensity_mm_h=sample.intensity_mm_h,
+            observed_mm_h=sample.observed_mm_h,
             confidence=float(state.confidence) if state is not None else None,
         )
 

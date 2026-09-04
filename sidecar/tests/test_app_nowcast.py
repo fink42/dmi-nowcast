@@ -28,7 +28,7 @@ from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.national import NationalProducts
 from dmi_nowcast_core.parse import parse_composite
 from dmi_nowcast_sidecar.app import _safe_nowcast_name, create_app
-from dmi_nowcast_sidecar.compute import CycleEngine
+from dmi_nowcast_sidecar.compute import CycleEngine, NationalSnapshot
 from dmi_nowcast_sidecar.config import Config
 
 # Same home as ``minimal_config`` (conftest.py); the synthetic grid is built
@@ -45,6 +45,7 @@ DOWNSAMPLE = 4
 GRID_DS = GRID_PX // DOWNSAMPLE           # 16×16 product grids
 CENTRE_DS = (GRID_PX // 2) // DOWNSAMPLE  # home pixel on the product grid
 NAN_PIXEL = (2, 3)                        # downsampled pixel forced to NaN
+OBSERVED_MM_H = 1.25                      # observed rain on the product grid
 
 RADAR_TS = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
 STAMP = "202608281200"
@@ -140,14 +141,23 @@ def geo(tmp_path: Path) -> CompositeGeo:
 
 
 @pytest.fixture
+def observed() -> np.ndarray:
+    """Observed rain on the same product grid; NaN at the same nodata pixel."""
+    return _grid(OBSERVED_MM_H)
+
+
+@pytest.fixture
 def engine(
-    minimal_config: Config, geo: CompositeGeo, products: NationalProducts,
+    minimal_config: Config,
+    geo: CompositeGeo,
+    products: NationalProducts,
+    observed: np.ndarray,
 ) -> CycleEngine:
     """Engine with synthetic geo + national products already 'computed'."""
     eng = CycleEngine(minimal_config)
     eng._basemap_attempted = True  # never fetch OSM
     eng._geo = geo
-    eng._national_latest = (products, RADAR_TS)
+    eng._national_latest = NationalSnapshot(products, RADAR_TS, observed)
     return eng
 
 
@@ -359,6 +369,8 @@ def test_forecast_values_at_known_pixel(client: TestClient) -> None:
     ]
     assert body["eta_min"] == pytest.approx(6.0)
     assert body["intensity_mm_h"] == pytest.approx(2.5)
+    # The observation, on the same pixel as every forecast product.
+    assert body["observed_mm_h"] == pytest.approx(OBSERVED_MM_H)
     # No state.json written yet → confidence is null, not fabricated.
     assert body["confidence"] is None
 
@@ -387,8 +399,26 @@ def test_forecast_nan_pixel_returns_nulls(
     assert [e["p_rain"] for e in body["per_lead"]] == [None, None]
     assert body["eta_min"] is None
     assert body["intensity_mm_h"] is None
+    # A nodata pixel is an UNKNOWN observation, never a dry one.
+    assert body["observed_mm_h"] is None
     # Grid-independent fields still present.
     assert body["n_members"] == 8
+
+
+def test_forecast_without_an_observed_grid_serves_null(
+    minimal_config: Config, engine: CycleEngine, products: NationalProducts,
+) -> None:
+    """A cycle whose observed reduction failed still serves every forecast
+    field — the observation is additive, not load-bearing. The plain tuple
+    is the pre-observation snapshot shape, which must keep working."""
+    engine._national_latest = (products, RADAR_TS)
+    app = create_app(minimal_config, engine=engine, auto_start_scheduler=False)
+    with TestClient(app) as c:
+        r = c.get("/forecast", params={"lat": HOME_LAT, "lon": HOME_LON})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["observed_mm_h"] is None
+    assert body["eta_min"] == pytest.approx(6.0)
 
 
 def test_forecast_out_of_grid_400(client: TestClient) -> None:

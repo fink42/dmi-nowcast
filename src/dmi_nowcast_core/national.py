@@ -14,6 +14,13 @@ grid: the cell-motion field in km/h (east / north components), nodata only
 outside radar coverage (and everywhere when the composite holds no echo at
 all) — see its docstring.
 
+:func:`observed_rain_grid` adds a fifth, and the only one that looks
+backwards rather than forwards: the OBSERVED rain rate from the newest
+composite, block-p90 onto the same grid. The forecast products cannot
+answer "is it raining here right now" — the ensemble's first timestep is
+already minutes into the future — so anything that must not say "rain
+incoming" into falling rain needs this grid as well.
+
 This module is pure core: numpy only, no sidecar / FastAPI / homeassistant
 imports (and none of the heavier core deps like pyproj — geolocation stays
 with the caller).
@@ -234,6 +241,103 @@ def national_products(
         downsample_factor=int(downsample_factor),
         n_members=int(n_members),
     )
+
+
+def observed_rain_grid(
+    rain_mm_h: np.ndarray,
+    *,
+    downsample_factor: int = 4,
+) -> np.ndarray:
+    """OBSERVED rain rate on the ×4 product grid: block-wise 90th percentile.
+
+    The fifth national product, and the only one that is not a forecast.
+    Everything else on the product grid answers "when will it rain here";
+    this one answers "is it raining here **now**", from the newest radar
+    composite, on the same grid and the same pixels — so a caller that
+    samples ``eta_min`` at a point can sample the observation at the very
+    same pixel without a second geometry path.
+
+    Why p90 over the block rather than the block mean, max, or the strided
+    pixel: it mirrors the Home Assistant ``raining_now`` rule, which tests
+    the 90th percentile over a ~1 km disc around the home point (see the
+    ``detection_stat`` config default). ``f = 4`` at 500 m is a 2 × 2 km
+    block, the same order of area. DMI's composite is column-max
+    reflectivity, so a single pixel of clutter, virga or a bright-band
+    speckle over-reads badly; the block max would inherit that, while the
+    block mean would wash out a genuine shower covering a quarter of the
+    block. p90 of 16 values sits between the 13th and 14th sorted value —
+    one hot pixel cannot lift a dry block, and a cell over 3 of the 16
+    native pixels already reads at its full rate.
+
+    Parameters
+    ----------
+    rain_mm_h:
+        Native-grid rain rate (mm/h) for the newest composite, NaN outside
+        the radar coverage — the same ``rain_now`` the overlays and the
+        motion grids are built from.
+    downsample_factor:
+        Product-grid stride ``f``. Must be the factor the products on the
+        same grid were reduced with, or the grids will not align.
+
+    Returns
+    -------
+    float32 grid, shape ``rain_mm_h[::f, ::f].shape`` — the shape
+    convention every other product-grid array uses (``run_ensemble`` and
+    ``motion_grids_kmh`` both stride-slice). A block is NaN only when
+    *every* native pixel in it is NaN, i.e. the block lies wholly outside
+    the composite; a partly-covered edge block reports the percentile of
+    the pixels it does have. Blocks past the last whole ``f × f`` block of
+    a non-divisible grid are padded with NaN, which is what keeps the
+    output the same shape as the stride-slice (cropping instead would drop
+    the final partial block and misalign every product to its right).
+
+    Implementation note: this is ``np.nanpercentile(blocks, 90)`` per
+    block, computed by sorting each block instead of calling
+    ``nanpercentile`` — NumPy's generic path costs 2.75 s on the full
+    1728 × 1984 composite against 17 ms here, and the two agree to float32
+    rounding (pinned by a test). NaN sorts last, so the percentile index
+    is taken over the leading ``n`` non-NaN entries with NumPy's default
+    linear interpolation: virtual index ``(n - 1) · 0.9``.
+    """
+    rain = np.asarray(rain_mm_h, dtype=np.float32)
+    if rain.ndim != 2:
+        raise ValueError(f"rain_mm_h must be 2-D, got {rain.ndim}-D")
+    if downsample_factor < 1:
+        raise ValueError(f"downsample_factor must be >= 1, got {downsample_factor}")
+
+    f = int(downsample_factor)
+    # The shape every other product on this grid has, by construction.
+    product_shape = rain[::f, ::f].shape
+    if f == 1:
+        return rain.astype(np.float32, copy=True)
+
+    rows, cols = rain.shape
+    pad_r, pad_c = (-rows) % f, (-cols) % f
+    if pad_r or pad_c:
+        rain = np.pad(
+            rain, ((0, pad_r), (0, pad_c)), constant_values=np.float32(np.nan),
+        )
+    h, w = rain.shape[0] // f, rain.shape[1] // f
+    # (h, w, f*f): one row per product pixel, holding its native block.
+    blocks = rain.reshape(h, f, w, f).transpose(0, 2, 1, 3).reshape(h, w, f * f)
+
+    ordered = np.sort(blocks, axis=-1)          # NaN sorts to the end
+    n_valid = np.count_nonzero(~np.isnan(blocks), axis=-1)
+    # NumPy's default "linear" percentile over the n valid entries.
+    virtual = np.maximum(n_valid - 1, 0) * 0.9
+    lo = np.floor(virtual).astype(np.intp)
+    hi = np.ceil(virtual).astype(np.intp)
+    frac = (virtual - lo).astype(np.float32)
+    below = np.take_along_axis(ordered, lo[..., None], axis=-1)[..., 0]
+    above = np.take_along_axis(ordered, hi[..., None], axis=-1)[..., 0]
+    p90 = below + frac * (above - below)
+
+    out = np.where(n_valid > 0, p90, np.float32(np.nan)).astype(np.float32)
+    assert out.shape == product_shape, (
+        f"observed grid {out.shape} must match the stride-sliced product "
+        f"grid {product_shape}"
+    )
+    return out
 
 
 def motion_grids_kmh(
