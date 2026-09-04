@@ -55,6 +55,15 @@
 	const etaNow = $derived(
 		countdownEtaMin(forecast?.etaMin ?? null, nowcast.manifest?.generated_at_utc, nowcast.now)
 	);
+	/**
+	 * What the radar measures over the point right now, and the headline that
+	 * follows from it plus the ETA. Kept as one derived value because the
+	 * headline and the arrival row have to agree: if the observation is what
+	 * makes this "raining now", arrival is "now" too, whatever the ETA product
+	 * says about the next cell behind this one.
+	 */
+	const observedMmH = $derived(forecast?.observedMmH ?? null);
+	const kind = $derived(headlineKind(etaNow, observedMmH));
 	const confidence = $derived(forecast?.confidence ?? nowcast.confidence);
 	const ageMin = $derived(nowcast.radarAgeMin);
 	const highlight = $derived(forecast ? probabilityWithin(forecast, 20) : null);
@@ -134,8 +143,8 @@
 		{:else if point.status === 'error'}
 			<p class="muted peek">{t().panel.error}</p>
 		{:else if forecast}
-			<p class="headline peek" class:rain={headlineKind(etaNow) !== 'no-rain'}>
-				{headline(t(), etaNow)}
+			<p class="headline peek" class:rain={kind !== 'no-rain'}>
+				{headline(t(), etaNow, observedMmH)}
 			</p>
 		{/if}
 
@@ -175,10 +184,10 @@
 						<div>
 							<dt>{t().panel.etaLabel}</dt>
 							<dd>
-								{etaNow === null
-									? t().panel.etaNone
-									: headlineKind(etaNow) === 'raining-now'
-										? t().panel.etaNow
+								{kind === 'raining-now'
+									? t().panel.etaNow
+									: etaNow === null
+										? t().panel.etaNone
 										: t().panel.etaValue(Math.round(etaNow))}
 							</dd>
 						</div>

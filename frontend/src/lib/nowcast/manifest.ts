@@ -27,6 +27,14 @@ export type ProductName =
 	| 'eta'
 	| 'intensity'
 	| 'overlay'
+	/**
+	 * The rain the radar measured *now*, on the product grid: the native field
+	 * reduced by block-wise 90th percentile, which is the same "p90 over about
+	 * a kilometre" rule the home-assistant integration calls raining_now.
+	 * Additive in schema v2 — absent from every manifest written before it
+	 * existed, so every reader of it must tolerate `undefined`.
+	 */
+	| 'observed_mm_h'
 	| 'motion_east_kmh'
 	| 'motion_north_kmh';
 

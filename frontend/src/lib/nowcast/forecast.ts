@@ -24,6 +24,12 @@ interface ForecastPointResponse {
 	per_lead: ForecastPointLead[];
 	eta_min: number | null;
 	intensity_mm_h: number | null;
+	/**
+	 * Additive: absent from a sidecar older than the observation product. An
+	 * absent field and an explicit null both mean "no measurement here", which
+	 * is why the mapping below normalises one into the other.
+	 */
+	observed_mm_h?: number | null;
 	confidence: number | null;
 }
 
@@ -50,6 +56,7 @@ export async function fetchPointForecast(
 		perLead: body.per_lead.map((l) => ({ leadMin: l.lead_min, pRain: l.p_rain })),
 		etaMin: body.eta_min,
 		intensityMmH: body.intensity_mm_h,
+		observedMmH: body.observed_mm_h ?? null,
 		// The endpoint serves no motion vector, and this path exists precisely
 		// because the grids could not be read. Null is the honest answer.
 		motion: null,

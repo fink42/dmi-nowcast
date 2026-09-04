@@ -6,7 +6,7 @@
  */
 import { artifactUrl, type ArtifactEntry, type Manifest } from './manifest';
 import { decodeGray8Png, type Gray8Image } from './png';
-import { motionArtifacts, productArtifacts, type DecodedGrids } from './sampler';
+import { motionArtifacts, observedArtifact, productArtifacts, type DecodedGrids } from './sampler';
 
 async function loadArtifact(entry: ArtifactEntry): Promise<Gray8Image> {
 	const res = await fetch(artifactUrl(entry.filename));
@@ -17,7 +17,8 @@ async function loadArtifact(entry: ArtifactEntry): Promise<Gray8Image> {
 /**
  * Decode every grayscale product of a cycle. Throws if a *required* one fails
  * — the caller then falls back to the server's `/forecast` for point lookups.
- * The cell-motion pair is not required and is loaded separately.
+ * The cell-motion pair and the observation grid are not required and are
+ * loaded separately.
  */
 export async function loadGrids(manifest: Manifest): Promise<DecodedGrids> {
 	const entries = productArtifacts(manifest);
@@ -33,7 +34,10 @@ export async function loadGrids(manifest: Manifest): Promise<DecodedGrids> {
 			grids.intensity = { entry, image };
 		}
 	});
-	grids.motion = await loadMotion(manifest);
+	// Both extras are optional and independent, so neither waits on the other.
+	const [motion, observed] = await Promise.all([loadMotion(manifest), loadObserved(manifest)]);
+	grids.motion = motion;
+	grids.observed = observed;
 	return grids;
 }
 
@@ -51,6 +55,23 @@ async function loadMotion(manifest: Manifest): Promise<DecodedGrids['motion']> {
 		return { east: { entry: pair[0], image: east }, north: { entry: pair[1], image: north } };
 	} catch (err) {
 		console.warn('cell-motion grids unavailable', err);
+		return undefined;
+	}
+}
+
+/**
+ * This cycle's observed rain field, when it has one. As forgiving as the
+ * motion pair, and for the same reason: a manifest written before the product
+ * existed and a download that fails both end as "no observation", which costs
+ * the "it is raining here now" headline and leaves the forecast untouched.
+ */
+async function loadObserved(manifest: Manifest): Promise<DecodedGrids['observed']> {
+	const entry = observedArtifact(manifest);
+	if (!entry) return undefined;
+	try {
+		return { entry, image: await loadArtifact(entry) };
+	} catch (err) {
+		console.warn('observed rain grid unavailable', err);
 		return undefined;
 	}
 }

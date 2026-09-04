@@ -82,6 +82,10 @@ const SPECS = {
 	p_rain: [0, 1],
 	eta: [0, 120],
 	intensity: [0, 100],
+	// The observation grid is quantised exactly like intensity — same units,
+	// same range — because it is the same physical quantity, measured rather
+	// than forecast.
+	observed_mm_h: [0, 100],
 	motion_east_kmh: [-120, 120],
 	motion_north_kmh: [-120, 120]
 };
@@ -116,6 +120,26 @@ function rainAt(col, row, leadMin) {
 		if (d < 1) value = Math.max(value, 12 * (1 - d) ** 1.5);
 	}
 	return value;
+}
+
+/**
+ * The rain the radar "measures" at one product pixel: the 90th percentile of
+ * the FACTOR x FACTOR native block behind it, at lead 0. Percentile rather
+ * than max because that is what the sidecar reduces with — the composite is
+ * column-max reflectivity, so a single hot virga pixel would otherwise decide
+ * whether it is raining — and linear interpolation between order statistics
+ * because that is numpy's default and the sidecar is numpy.
+ */
+function observedAt(col, row) {
+	const block = [];
+	for (let dr = 0; dr < FACTOR; dr++) {
+		for (let dc = 0; dc < FACTOR; dc++) block.push(rainAt(col * FACTOR + dc, row * FACTOR + dr, 0));
+	}
+	block.sort((a, b) => a - b);
+	const pos = 0.9 * (block.length - 1);
+	const lo = Math.floor(pos);
+	const hi = Math.min(lo + 1, block.length - 1);
+	return block[lo] + (pos - lo) * (block[hi] - block[lo]);
 }
 
 const quantise = (value, spec) =>
@@ -277,6 +301,10 @@ function productPng(product, leadMin) {
 					// blobs exist, so every pixel gets the nearest cells' motion
 					// (issue #6). Nodata only when there is no echo at all.
 					value = product === 'motion_east_kmh' ? MOTION_KMH.east : MOTION_KMH.north;
+				} else if (product === 'observed_mm_h') {
+					// A measurement, so dry is 0.0 and not nodata: "no rain here"
+					// is something the radar can say, unlike "no arrival".
+					value = observedAt(col, row);
 				} else if (product === 'p_rain') {
 					const mm = rainAt(nCol, nRow, leadMin);
 					value = Math.min(1, mm / 4);
@@ -395,6 +423,15 @@ function manifest() {
 				productShape,
 				'mm/h'
 			),
+			// Observed rain: lead 0, because it is now — not a forecast lead.
+			gridEntry(
+				`observed_mm_h_${s.text}.png`,
+				'observed_mm_h',
+				0,
+				SPECS.observed_mm_h,
+				productShape,
+				'mm/h'
+			),
 			gridEntry(
 				`motion_east_kmh_${s.text}.png`,
 				'motion_east_kmh',
@@ -490,6 +527,13 @@ createServer(async (req, res) => {
 				per_lead: PROB_LEADS.map((lead) => ({ lead_min: lead, p_rain: 0.5 })),
 				eta_min: 18,
 				intensity_mm_h: 2.4,
+				// Fixed, like every other number on this endpoint, and chosen
+				// above the 0.5 mm/h detection threshold on purpose: the server
+				// fallback is otherwise never seen in development, and this is
+				// the case it exists to get right — rain measured here now, with
+				// the next cell's arrival still 18 min out. The client-side path
+				// samples the real synthetic field instead.
+				observed_mm_h: 1.2,
 				confidence: 0.72
 			}),
 			'application/json'

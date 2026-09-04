@@ -16,7 +16,13 @@ import { deflateSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { decodeGray8Png } from './png';
 import type { ArtifactEntry, Manifest } from './manifest';
-import { lonLatToGrid, nearestPixel, sampleArtifact, samplePoint } from './sampler';
+import {
+	lonLatToGrid,
+	nearestPixel,
+	observedArtifact,
+	sampleArtifact,
+	samplePoint
+} from './sampler';
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -55,6 +61,8 @@ const PYPROJ_POINTS = [
 const P_RAIN = { lo: 0, hi: 1 };
 const ETA = { lo: 0, hi: 120 };
 const INTENSITY = { lo: 0, hi: 100 };
+/** The observation grid: mm/h, quantised exactly like intensity. */
+const OBSERVED = { lo: 0, hi: 100 };
 /** Cell motion: symmetric about zero, ±MOTION_MAX_ABS_KMH. */
 const MOTION = { lo: -120, hi: 120 };
 const MAX_LEVEL = 254;
@@ -339,6 +347,9 @@ describe('samplePoint', () => {
 		expect(forecast!.perLead[1].pRain).toBeCloseTo(0.81, 2);
 		expect(forecast!.etaMin).toBeCloseTo(14, 0);
 		expect(forecast!.intensityMmH).toBeCloseTo(2.4, 1);
+		// This cycle served no observation grid, which is null — "we don't
+		// know whether it is raining here", never "it is dry here".
+		expect(forecast!.observedMmH).toBeNull();
 		expect(forecast!.calibrated).toBe(true);
 		expect(forecast!.source).toBe('client');
 		expect(forecast!.radarTsUtc).toBe(manifest.radar_ts_utc);
@@ -442,6 +453,81 @@ describe('samplePoint', () => {
 			expect(forecast!.motion).toBeNull();
 			// And the rest of the forecast is unaffected.
 			expect(forecast!.perLead).toHaveLength(2);
+		});
+	});
+
+	/**
+	 * The observed rain field: what the radar measured over the point, as
+	 * opposed to what the ensemble predicts for it. The panel leads with it,
+	 * so the three ways it can be absent all have to read as "unknown" — a
+	 * null that says "dry" would put "no rain expected" over a downpour.
+	 */
+	describe('observed rain', () => {
+		/** p_rain and eta all nodata; this block is about the observation. */
+		async function baseGrids() {
+			const empty = Array(9).fill(null);
+			return {
+				pRain: new Map([
+					[
+						10,
+						{
+							entry: gridEntry('p_rain_10min_x.png', 'p_rain', 10, P_RAIN, [3, 3]),
+							image: await decoded(empty, P_RAIN)
+						}
+					]
+				]),
+				eta: {
+					entry: gridEntry('eta_x.png', 'eta', null, ETA, [3, 3]),
+					image: await decoded(empty, ETA)
+				}
+			};
+		}
+
+		/** An observation grid whose centre pixel holds `mmH`; rest nodata. */
+		async function observedGrid(mmH: number | null) {
+			return {
+				entry: gridEntry('observed_mm_h_x.png', 'observed_mm_h', 0, OBSERVED, [3, 3]),
+				image: await decoded([...Array(4).fill(null), mmH, ...Array(4).fill(null)], OBSERVED)
+			};
+		}
+
+		it('reads the measured rain rate at a wet pixel', async () => {
+			const grids = { ...(await baseGrids()), observed: await observedGrid(1.8) };
+			const forecast = samplePoint(manifest, grids, 56.0, 10.5666);
+			// 0–100 mm/h over 254 levels: half a step is 0.2 mm/h.
+			expect(forecast!.observedMmH).not.toBeNull();
+			expect(Math.abs((forecast!.observedMmH as number) - 1.8)).toBeLessThanOrEqual(
+				scaleOf(OBSERVED) / 2
+			);
+			// A measured zero is a real answer — dry, not unknown.
+			const dry = { ...(await baseGrids()), observed: await observedGrid(0) };
+			expect(samplePoint(manifest, dry, 56.0, 10.5666)!.observedMmH).toBe(0);
+		});
+
+		it('reports null at a nodata pixel rather than a rain rate', async () => {
+			const grids = { ...(await baseGrids()), observed: await observedGrid(null) };
+			expect(samplePoint(manifest, grids, 56.0, 10.5666)!.observedMmH).toBeNull();
+			// And at a pixel the grid leaves nodata while its centre is wet.
+			const wet = { ...(await baseGrids()), observed: await observedGrid(1.8) };
+			expect(samplePoint(manifest, wet, 56.017, 10.5666)!.observedMmH).toBeNull();
+		});
+
+		it('degrades to null when the cycle served no observation grid', async () => {
+			const forecast = samplePoint(manifest, await baseGrids(), 56.0, 10.5666);
+			expect(forecast).not.toBeNull();
+			expect(forecast!.observedMmH).toBeNull();
+			// A manifest predating the product costs this one field, no more.
+			expect(forecast!.perLead).toHaveLength(2);
+			expect(forecast!.source).toBe('client');
+		});
+
+		it('finds the artifact at lead 0, and nothing on a manifest without one', () => {
+			const entry = gridEntry('observed_mm_h_x.png', 'observed_mm_h', 0, OBSERVED, [3, 3]);
+			expect(observedArtifact({ ...manifest, artifacts: [entry] })).toBe(entry);
+			expect(observedArtifact(manifest)).toBeNull();
+			// Everything else in a cycle is left alone by the lookup.
+			const others = [gridEntry('eta_x.png', 'eta', null, ETA, [3, 3])];
+			expect(observedArtifact({ ...manifest, artifacts: others })).toBeNull();
 		});
 	});
 });

@@ -127,6 +127,14 @@ export interface PointForecast {
 	/** Ensemble-median rain rate at the ETA step (mm/h); null without an ETA. */
 	intensityMmH: number | null;
 	/**
+	 * Rain the radar is measuring at this point *right now* (mm/h), from the
+	 * observation grid — not a forecast. Null when the cycle served no such
+	 * grid (any manifest older than the product) or the pixel is nodata, and
+	 * those two must stay indistinguishable from "we don't know": a null here
+	 * may never be read as "it is dry here".
+	 */
+	observedMmH: number | null;
+	/**
 	 * Which way the echo over this point is moving. Null whenever there is no
 	 * estimate — a cycle without motion grids, a nodata pixel, or the server
 	 * path, which does not serve motion at all. Never a fabricated arrow.
@@ -151,6 +159,12 @@ export interface DecodedGrids {
 	pRain: Map<number, DecodedGrid>;
 	eta?: DecodedGrid;
 	intensity?: DecodedGrid;
+	/**
+	 * This cycle's observed rain field. Optional for the same reason motion is:
+	 * it postdates the manifest schema, and a cycle without it loses the
+	 * "it is raining here now" headline and nothing else.
+	 */
+	observed?: DecodedGrid;
 	/**
 	 * Cell motion, both components or neither — the sidecar writes them as a
 	 * pair and a single component says nothing. Absent on a cycle that served
@@ -189,6 +203,9 @@ export function samplePoint(
 		intensityMmH: grids.intensity
 			? sampleArtifact(grids.intensity.image, grids.intensity.entry, pixel)
 			: null,
+		observedMmH: grids.observed
+			? sampleArtifact(grids.observed.image, grids.observed.entry, pixel)
+			: null,
 		motion: sampleMotion(grids, pixel),
 		confidence: null,
 		calibrated: isCalibrated(manifest),
@@ -218,6 +235,20 @@ export function productArtifacts(manifest: Manifest): ArtifactEntry[] {
 		findArtifact(manifest, 'intensity')
 	];
 	return wanted.filter((a): a is ArtifactEntry => a !== undefined);
+}
+
+/**
+ * The observation grid of this cycle, or null when it served none. Kept out of
+ * `productArtifacts` for the same reason the motion pair is: those are what
+ * the client-side path needs to work at all, whereas a missing observation
+ * only costs one headline. The sidecar stamps it `lead_min: 0` — it is a
+ * measurement of now, not a lead — and a manifest that leaves the lead out is
+ * read the same way.
+ */
+export function observedArtifact(manifest: Manifest): ArtifactEntry | null {
+	return (
+		manifest.artifacts.find((a) => a.product === 'observed_mm_h' && (a.lead_min ?? 0) === 0) ?? null
+	);
 }
 
 /**

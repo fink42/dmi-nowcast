@@ -98,6 +98,11 @@ Three pieces deserve a note:
   the nearest pixel, `value = level * scale + offset`, level 255 → *null*, and
   outside the grid is **off-coverage**, never a 0 % probability. `sampler.test.ts`
   pins this against numbers produced by pyproj on the server side.
+  One of the sampled grids, `observed_mm_h`, is a measurement rather than a
+  forecast — the radar's own rain field, block-p90'd onto the product grid —
+  and the panel leads with it: at or above 0.5 mm/h (the sidecar's
+  `forecast.rain_threshold_mm_h`) the headline is "it is raining here now",
+  whatever the ETA product says about the next cell behind this one.
 - **The overlay is resampled, not stretched (`src/lib/map/warp.ts`).** MapLibre
   interpolates an image source's four corners linearly in Mercator; the radar
   grid is polar stereographic and a thousand kilometres across, and the two do
@@ -165,6 +170,8 @@ and a permission already refused.
 - `src/lib/components/panel.test.ts` — when a new point unfolds a minimised
   forecast panel: a *different* place does, the same place re-sampled by the
   next cycle does not;
+- `src/lib/nowcast/forecast.test.ts` — the server fallback's mapping, including
+  an additive field an older sidecar omits;
 - `src/lib/pwa.test.ts` — the web manifest and its icons;
 - `src/lib/push/*.test.ts` — support detection per branch, preference
   normalisation and the storage copy (including storage that throws), the VAPID

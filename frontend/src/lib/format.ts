@@ -11,6 +11,16 @@ import type { PointForecast } from '$lib/nowcast/sampler';
 /** Below this many minutes an ETA means "it is already raining here". */
 export const RAINING_NOW_MIN = 1.5;
 
+/**
+ * Observed rain rate (mm/h) at or above which the radar is saying it rains
+ * here now. Mirrors the sidecar's `forecast.rain_threshold_mm_h` (default
+ * 0.5 ≈ 18 dBZ, genuine light rain), applied to the same statistic: the
+ * observation grid is the native field reduced by block-wise p90, so this is
+ * the `detection_stat: p90` test the sidecar's own `raining_now` performs.
+ * Change it only together with that setting.
+ */
+export const RAINING_NOW_MM_H = 0.5;
+
 /** Minutes between `iso` and `nowMs`, or null when `iso` is unusable. */
 function minutesSince(iso: string | undefined, nowMs: number): number | null {
 	if (typeof iso !== 'string' || iso.trim() === '') return null;
@@ -53,17 +63,29 @@ export function countdownEtaMin(
 export type Headline = 'raining-now' | 'eta' | 'no-rain';
 
 /**
- * Which sentence the panel leads with, from the ETA *as of now* — pass the
- * `countdownEtaMin` value, not the forecast's own field, or the headline
- * flips to "raining here" a cycle late.
+ * Which sentence the panel leads with.
+ *
+ * The observation wins. The ETA product answers "when does the next shower
+ * reach this pixel", and on the trailing edge of rain that is happily some
+ * *later* cell 16 minutes out — while the radar is showing rain over the
+ * point right now. Telling someone standing in the rain that it starts in a
+ * quarter of an hour is the one way this panel can be obviously, visibly
+ * wrong, so a measurement at or above the detection threshold outranks any
+ * forecast. `observedMmH` null is not dry: a cycle with no observation grid,
+ * a nodata pixel and the server path all land there, and all of them fall
+ * back to the ETA rule rather than asserting anything.
+ *
+ * Otherwise it is the ETA *as of now* — pass the `countdownEtaMin` value, not
+ * the forecast's own field, or the headline flips a cycle late.
  */
-export function headlineKind(etaMin: number | null): Headline {
+export function headlineKind(etaMin: number | null, observedMmH: number | null): Headline {
+	if (observedMmH !== null && observedMmH >= RAINING_NOW_MM_H) return 'raining-now';
 	if (etaMin === null) return 'no-rain';
 	return etaMin <= RAINING_NOW_MIN ? 'raining-now' : 'eta';
 }
 
-export function headline(t: Catalog, etaMin: number | null): string {
-	switch (headlineKind(etaMin)) {
+export function headline(t: Catalog, etaMin: number | null, observedMmH: number | null): string {
+	switch (headlineKind(etaMin, observedMmH)) {
 		case 'raining-now':
 			return t.panel.headlineRainingNow;
 		case 'eta':
