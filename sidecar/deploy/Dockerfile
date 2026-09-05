@@ -31,14 +31,15 @@ COPY sidecar /app/sidecar
 WORKDIR /app/sidecar
 RUN uv sync --frozen --no-dev
 
-# pyarrow is needed at *deploy* time, not by the live server: the corpus
-# manifest builder and the monthly recalibration (build_calibration_corpus.py
-# / fit_calibration.py) read & write Parquet, and run inside this image via
-# ``docker compose run``. It's classified in core's ``dev`` group, so the
-# ``--no-dev`` sync above skips it. Install it explicitly into the synced
-# venv — pinned to the lockfile's resolved version — rather than dropping
-# ``--no-dev`` (which would also pull pytest/matplotlib into the image).
-RUN uv pip install --python /app/sidecar/.venv/bin/python "pyarrow==24.0.0" "duckdb==1.5.5"
+# duckdb is needed at *deploy* time, not by the live server: the corpus
+# reports and the recalibration (national_calibration_report.py) query
+# Parquet with it, inside this image via ``docker compose run``. It is in
+# core's ``dev`` group, so the ``--no-dev`` sync above skips it; install it
+# explicitly rather than dropping ``--no-dev`` (which would also pull
+# pytest/matplotlib into the image). pyarrow is no longer listed here: since
+# Phase F the sidecar itself writes Parquet (gauge store, station eval), so
+# it is a runtime dependency resolved by the lockfile sync.
+RUN uv pip install --python /app/sidecar/.venv/bin/python "duckdb==1.5.5"
 
 # ─────────────────────────────────────────────────────────────────────────
 # Optional built frontend (website Phase C §P2). The SvelteKit package in

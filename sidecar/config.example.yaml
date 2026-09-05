@@ -127,3 +127,59 @@ lightning:
 #   fanout_budget_s: 20.0   # per-cycle wall-clock budget for the fan-out
 #   rearm_after_min: 60     # dry minutes before a notified subscription re-arms
 #   persistence_obs: 2      # consecutive over-threshold observations to fire
+
+# --- Rain-gauge polling (Phase F) -------------------------------------
+# Mirrors DMI metObs station observations into
+# <storage.corpus_dir>/stations/obs/YYYY/MM.parquet, which is the gauge
+# truth scripts/join_gauge_truth.py joins onto the calibration corpus.
+# Without it the benchmark verifies the radar against the radar.
+#
+# ON for this (LAN / private) instance: it is the one that owns the
+# corpus volume and runs the calibration jobs. The public instance MUST
+# leave it off — config load refuses the combination outright, because
+# there is no corpus mount there to write to.
+#
+station_obs:
+  enabled: true
+  # Cadence and window. The 40 min lookback deliberately overlaps four
+  # polls: DMI backfills late station reports into slots that already
+  # passed, and the store dedupes on (station_id, observed_utc,
+  # parameter_id), so re-reading a slot is free and a missed poll heals
+  # itself on the next one. lookback_min must be >= interval_min.
+  interval_min: 10
+  lookback_min: 40
+  # precip_past10min is the amount (0.1 mm resolution, ~112 Danish
+  # stations); precip_dur_past10min is minutes-with-precipitation in the
+  # same slot, which is what rescues drizzle below the amount floor.
+  parameters:
+    - precip_past10min
+    - precip_dur_past10min
+  base_url: https://opendataapi.dmi.dk/v2/metObs
+  # Optional. DMI stopped requiring API keys on opendataapi.dmi.dk on
+  # 2025-12-02, so null is correct by policy, not by luck. Sent as
+  # X-Gravitee-Api-Key when set.
+  api_key: null
+
+# Gauge scoreboard (Phase F). A virtual subscriber at every DMI rain
+# gauge, evaluated once per cycle by the same push decision engine the
+# real subscriptions go through, appended to
+# <corpus_dir>/stations/eval/YYYY/MM.parquet in the same row shape
+# scripts/replay_warnings.py writes for history. Turn it on and the
+# historical replay and the live record become one continuous table.
+#
+# OFF by default. Private instance only: config load refuses the
+# combination with server.public_mode, and requires storage.corpus_dir.
+#
+# station_eval:
+#   enabled: true
+#   # {"version": 2, "points": [{"id": "06180", "lat": ..., "lon": ...}]}
+#   # from scripts/build_station_points.py.
+#   points_file: /var/lib/dmi-nowcast-corpus/stations/station_points.json
+#   # The live subscriber row: warn at 40 % of rain within 30 min, one
+#   # observation of persistence, 60 min disarmed after a warning.
+#   # lead_min must be one of forecast.national.leads_min.
+#   rules:
+#     threshold_pct: 40
+#     lead_min: 30
+#     rearm_after_min: 60
+#     persistence_obs: 1

@@ -260,6 +260,66 @@ Writes `<corpus>/manifest.parquet` — one row per frame with `wet_fraction`,
 `heavy_fraction`, `max_rain_mm_h`, etc. Incremental by default (reuses
 existing rows by path); pass `--rebuild` to re-parse every frame.
 
+### Rain-gauge truth (Phase F)
+
+The corpus's `outcome` column is verified against the radar composite —
+the same instrument the forecast is made from. `station_obs` adds an
+independent truth: DMI's metObs rain gauges, mirrored into the same
+corpus volume.
+
+```
+$CORPUS_HOST_DIR/
+  stations/
+    catalogue.parquet                    294 stations, current version of each
+    obs/YYYY/MM.parquet                  one row per (station, parameter, stamp)
+```
+
+Turn it on in `config.yaml` (off by default, and **refused** together with
+`server.public_mode` — the public stack has no corpus mount):
+
+```yaml
+station_obs:
+  enabled: true
+  interval_min: 10       # poll cadence
+  lookback_min: 40       # re-read window; must be >= interval_min
+  parameters: [precip_past10min, precip_dur_past10min]
+```
+
+The 40-minute lookback deliberately overlaps four polls: DMI backfills
+late station reports into slots that already passed, and the store dedupes
+on `(station_id, observed_utc, parameter_id)`, so a missed poll heals
+itself on the next one.
+
+History (the poller only collects from the moment it starts) comes from a
+one-time backfill — one request per day per parameter, at 2 req/s:
+
+```bash
+python scripts/backfill_station_obs.py \
+    --corpus-dir /var/lib/dmi-nowcast-corpus \
+    --from 2026-06-01 --to 2026-09-05 \
+    --progress /var/lib/dmi-nowcast-corpus/stations/backfill_progress.json
+```
+
+Then pick the stations with usable coverage, and join their gauges onto a
+corpus built over those same points:
+
+```bash
+python scripts/build_station_points.py \
+    --corpus-dir /var/lib/dmi-nowcast-corpus \
+    --from 2026-06-01 --to 2026-09-05 --min-coverage 0.8 \
+    --out station_points.json --availability-md station_availability.md
+
+python scripts/join_gauge_truth.py \
+    --corpus reports/station_corpus.parquet \
+    --corpus-dir /var/lib/dmi-nowcast-corpus \
+    --out reports/station_corpus_gauge.parquet
+```
+
+`sql/reliability_gauge.sql` and `sql/reliability_radar_vs_gauge.sql` read
+the result. Gauge data is DMI Open Data, licence **CC BY 4.0** — attribute
+DMI in anything published from it. API keys are not required on
+`opendataapi.dmi.dk` (dropped 2025-12-02); fair use still applies.
+
 ### Monthly recalibration
 
 A systemd timer rebuilds the calibration corpus and refits curves once

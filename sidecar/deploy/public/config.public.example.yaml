@@ -143,3 +143,22 @@ push:
   # already aggregates 16 members, and a second 10 min observation on
   # top of the radar age left no lead time (2026-09-02 event).
   persistence_obs: 1
+
+station_obs:
+  # OFF, and not optional: config load REFUSES station_obs.enabled
+  # together with server.public_mode. Gauge polling belongs to the
+  # private instance, which owns the corpus volume the observations are
+  # written to — this stack has storage.corpus_dir: null and would spend
+  # DMI's fair-use budget writing into a container filesystem nobody
+  # reads. See sidecar/config.example.yaml for the private instance's
+  # settings.
+  enabled: false
+
+station_eval:
+  # OFF, and not optional either: config load REFUSES
+  # station_eval.enabled together with server.public_mode, for the same
+  # reason as station_obs above. The gauge scoreboard writes decision
+  # rows and its state file under <corpus_dir>/stations/, which this
+  # stack does not have, and it measures the service rather than serving
+  # anyone. It runs on the private instance beside the replay.
+  enabled: false

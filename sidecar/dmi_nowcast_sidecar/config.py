@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
+from dmi_nowcast_core.metobs import DEFAULT_BASE_URL as METOBS_DEFAULT_BASE_URL
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -178,6 +179,60 @@ class LightningConfig(BaseModel):
     archive_dir: Path = Path("/var/lib/dmi-nowcast-corpus/strikes")
 
 
+class StationObsConfig(BaseModel):
+    """DMI metObs rain-gauge polling (Phase F, F1).
+
+    Gauge truth for the benchmark: every ``interval_min`` the service
+    re-reads the last ``lookback_min`` of each parameter and merges it
+    into ``storage.corpus_dir``'s ``stations/obs/YYYY/MM.parquet``. The
+    lookback deliberately overlaps several intervals — DMI backfills late
+    station reports, and the store dedupes on
+    ``(station_id, observed_utc, parameter_id)``, so re-reading a slot is
+    free and a missed cycle heals itself.
+
+    **Off by default.** The LAN instance turns it on; the public instance
+    cannot (see ``Config._station_obs_not_public``). Nothing about this
+    feature is served over HTTP — it only writes to the corpus volume.
+
+    ``api_key`` is optional and normally ``null``: DMI stopped requiring
+    keys on ``opendataapi.dmi.dk`` on 2025-12-02. Fair use still applies,
+    which the 10-minute cadence over a 40-minute window satisfies with
+    room to spare (~3 requests per 10 min).
+
+    Gauge data is DMI Open Data, licence CC BY 4.0.
+    """
+
+    enabled: bool = False
+    interval_min: Annotated[int, Field(ge=1, le=180)] = 10
+    # Must exceed interval_min, or a cycle that slips leaves a hole no
+    # later poll ever revisits.
+    lookback_min: Annotated[int, Field(ge=10, le=1440)] = 40
+    parameters: list[str] = Field(
+        default_factory=lambda: ["precip_past10min", "precip_dur_past10min"],
+    )
+    base_url: str = METOBS_DEFAULT_BASE_URL
+    api_key: str | None = None
+
+    @field_validator("parameters")
+    @classmethod
+    def _parameters_valid(cls, v: list[str]) -> list[str]:
+        out = [p.strip() for p in v]
+        if not out or any(not p for p in out):
+            raise ValueError("station_obs parameters must be non-empty parameterIds")
+        if len(set(out)) != len(out):
+            raise ValueError("station_obs parameters must be unique")
+        return out
+
+    @model_validator(mode="after")
+    def _lookback_covers_interval(self) -> "StationObsConfig":
+        if self.lookback_min < self.interval_min:
+            raise ValueError(
+                "station_obs lookback_min must be >= interval_min, or a slipped "
+                "poll leaves a permanent gap in the gauge archive",
+            )
+        return self
+
+
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: Annotated[int, Field(ge=1, le=65535)] = 8081
@@ -336,6 +391,51 @@ class PushConfig(BaseModel):
         return self
 
 
+class StationEvalRules(BaseModel):
+    """The virtual subscriber every gauge station gets (Phase F).
+
+    Defaults are the live subscriber row the historical replay
+    reproduces: warn at 40 % probability of rain within 30 minutes, one
+    observation of persistence, 60 minutes disarmed after a warning.
+    """
+
+    threshold_pct: Annotated[int, Field(ge=1, le=99)] = 40
+    lead_min: Annotated[int, Field(ge=1, le=180)] = 30
+    rearm_after_min: Annotated[int, Field(ge=0, le=1440)] = 60
+    persistence_obs: Annotated[int, Field(ge=1, le=10)] = 1
+
+
+class StationEvalConfig(BaseModel):
+    """Per-cycle decision evaluation at the rain-gauge stations (Phase F).
+
+    A measurement-grade scoreboard for the push rule: a virtual subscriber
+    at every DMI gauge, evaluated by the same ``push.engine.evaluate`` the
+    real subscriptions go through, appended to the corpus so the
+    historical replay (``scripts/replay_warnings.py``) and the live record
+    form one continuous table.
+
+    Off by default and **private-instance only**: it writes to the corpus
+    volume, which the public stack does not have, and it exists to measure
+    the service rather than to serve anyone. The ``Config`` validator
+    refuses ``enabled`` under ``server.public_mode``, and the step itself
+    checks again at run time.
+    """
+
+    enabled: bool = False
+    #: Station points file (``{"version": 2, "points": [...]}``) from
+    #: ``scripts/build_station_points.py``. Required when enabled.
+    points_file: Path | None = None
+    rules: StationEvalRules = Field(default_factory=StationEvalRules)
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "StationEvalConfig":
+        if self.enabled and self.points_file is None:
+            raise ValueError(
+                "station_eval.enabled requires station_eval.points_file",
+            )
+        return self
+
+
 class Config(BaseSettings):
     """Sidecar config root. Env-var overrides via ``DMI_NOWCAST_*``."""
 
@@ -355,6 +455,62 @@ class Config(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     lightning: LightningConfig = Field(default_factory=LightningConfig)
     push: PushConfig = Field(default_factory=PushConfig)
+    station_obs: StationObsConfig = Field(default_factory=StationObsConfig)
+    station_eval: StationEvalConfig = Field(default_factory=StationEvalConfig)
+
+    @model_validator(mode="after")
+    def _station_obs_not_public(self) -> "Config":
+        """The public stack must never poll metObs.
+
+        The public instance is internet-facing and owns no corpus
+        volume; a gauge poller there would spend DMI's fair-use budget
+        writing to a container filesystem nobody reads. Refusing at
+        config load is the only place this can be caught before it
+        starts making requests.
+        """
+        if self.station_obs.enabled and self.server.public_mode:
+            raise ValueError(
+                "station_obs.enabled is not allowed with server.public_mode: "
+                "gauge polling belongs to the LAN instance that owns the corpus",
+            )
+        if self.station_obs.enabled and self.storage.corpus_dir is None:
+            raise ValueError(
+                "station_obs.enabled requires storage.corpus_dir — the gauge "
+                "archive is written under <corpus_dir>/stations/",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _station_eval_is_private(self) -> "Config":
+        """Refuse the gauge scoreboard on anything but the private instance.
+
+        Same guard as the gauge poller above, for the same reason — the
+        public instance is internet-facing and owns no corpus volume, and
+        ``server.public_mode`` is how this codebase says so. Two more
+        fatal-at-load checks ride along: without a corpus dir the rows and
+        the state file have nowhere to go, and a rule lead the national
+        products never publish would sample ``None`` for ever, quietly
+        recording stations that can never warn.
+        """
+        if not self.station_eval.enabled:
+            return self
+        if self.server.public_mode:
+            raise ValueError(
+                "station_eval.enabled is not allowed with server.public_mode: "
+                "the gauge scoreboard belongs to the LAN instance that owns "
+                "the corpus",
+            )
+        if self.storage.corpus_dir is None:
+            raise ValueError(
+                "station_eval.enabled requires storage.corpus_dir — the eval "
+                "rows and state are written under <corpus_dir>/stations/",
+            )
+        if self.station_eval.rules.lead_min not in self.forecast.national.leads_min:
+            raise ValueError(
+                "station_eval.rules.lead_min must be one of "
+                f"forecast.national.leads_min {self.forecast.national.leads_min}",
+            )
+        return self
 
     @classmethod
     def settings_customise_sources(  # noqa: PLR0913

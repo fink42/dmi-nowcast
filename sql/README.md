@@ -48,3 +48,27 @@ here as SQL instead of bespoke pandas.
 | `base_rate_by_intensity.sql` | base rates per event intensity band (spatial wet-coverage proxy) |
 | `brier_decomposition.sql` | weighted Murphy decomposition: reliability − resolution + uncertainty per lead |
 | `effective_n_by_stratum.sql` | Kish effective N per lead / region / season stratum |
+| `reliability_gauge.sql` | pooled weighted reliability per lead against **gauge** truth (`gauge_outcome`) |
+| `reliability_radar_vs_gauge.sql` | radar vs gauge observed frequency, paired, per lead × bin |
+
+## Gauge truth (Phase F)
+
+The last two queries read a corpus that
+`scripts/join_gauge_truth.py` has widened with three columns —
+`gauge_mm`, `gauge_dur_min`, `gauge_outcome` — taken from DMI's metObs
+rain gauges at the corpus's own points. They only mean anything on a
+corpus built over **station** points
+(`scripts/build_station_points.py`): a `point_id` has to be a
+`stationId` for the join to find a gauge.
+
+- `gauge_outcome` is 1 when the gauge slot at the row's verification
+  instant recorded `precip_past10min >= 0.1 mm` OR
+  `precip_dur_past10min >= 1 min`, 0 when it recorded neither, and NULL
+  when the amount slot is missing. **Filter on it, not on `outcome`** —
+  the two are missing for different reasons (no gauge slot vs no
+  verification composite).
+- The verification instant is the builder's, unchanged:
+  `T + ceil((lead_min + frame_age_min)/timestep_min - 1e-9) *
+  timestep_min`, matched to the 10-minute gauge stamp *ending* at it.
+- Gauge data is DMI Open Data, licence **CC BY 4.0**. Attribute DMI in
+  anything published from these queries.

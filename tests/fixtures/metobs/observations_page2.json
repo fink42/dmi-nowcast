@@ -1,0 +1,69 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "id": "6a0319fb-1151-ebc9-1820-bc38acf35071",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     9.2634,
+     55.2252
+    ]
+   },
+   "properties": {
+    "parameterId": "precip_past10min",
+    "created": "2026-09-01T12:10:31.040868Z",
+    "value": 0.0,
+    "observed": "2026-09-01T12:10:00Z",
+    "stationId": "06110"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "313672f4-4ac1-58a3-379e-c95f2594c1ab",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     9.1674,
+     55.7379
+    ]
+   },
+   "properties": {
+    "parameterId": "precip_past10min",
+    "created": "2026-09-01T12:10:31.044492Z",
+    "value": 0.0,
+    "observed": "2026-09-01T12:10:00Z",
+    "stationId": "06104"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "1437fad0-f2d5-3579-0a15-b95adac514f8",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     8.5627,
+     55.5281
+    ]
+   },
+   "properties": {
+    "parameterId": "precip_past10min",
+    "created": "2026-09-01T12:10:31.048065Z",
+    "value": 0.0,
+    "observed": "2026-09-01T12:10:00Z",
+    "stationId": "06080"
+   }
+  }
+ ],
+ "timeStamp": "2026-09-05T10:35:08Z",
+ "numberReturned": 3,
+ "links": [
+  {
+   "href": "https://opendataapi.dmi.dk/v2/metObs/collections/observation/items?parameterId=precip_past10min&datetime=2026-09-01T12%3A00%3A00Z%2F2026-09-01T12%3A10%3A00Z&limit=6",
+   "rel": "self",
+   "type": "application/geo+json",
+   "title": "This document"
+  }
+ ]
+}

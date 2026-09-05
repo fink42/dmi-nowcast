@@ -1,0 +1,428 @@
+"""Scoring push warnings against gauge observations (Phase F, F3).
+
+Pure functions only: no radar, no store, no pyarrow (the schema helper is
+exercised behind an importorskip). Gauge rows are hand-written dicts in
+exactly the shape ``StationObsStore.read`` returns, so this suite pins the
+scoring contract without depending on the store being built.
+
+The cases that matter are the boundaries — a slot that is unknown rather
+than dry, an onset after *exactly* three dry slots, an onset landing on
+the last second of the tolerance window, and two warnings competing for
+one onset — because every one of them is a way for a scoreboard to
+flatter itself.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from dmi_nowcast_core.warning_score import (
+    DECISION_COLUMNS,
+    PRECIP_DUR_PARAM,
+    PRECIP_PARAM,
+    gauge_slots,
+    onsets,
+    pooled_summary,
+    raining_now_agreement,
+    score_warnings,
+    slot_end_of,
+)
+
+T0 = datetime(2026, 9, 5, 6, 0, tzinfo=timezone.utc)
+
+
+def _row(station: str, minutes: int, param: str, value: float | None) -> dict:
+    return {
+        "station_id": station,
+        "observed_utc": T0 + timedelta(minutes=minutes),
+        "parameter_id": param,
+        "value": value,
+    }
+
+
+def _amount(station: str, minutes: int, mm: float | None) -> dict:
+    return _row(station, minutes, PRECIP_PARAM, mm)
+
+
+def _dur(station: str, minutes: int, m: float | None) -> dict:
+    return _row(station, minutes, PRECIP_DUR_PARAM, m)
+
+
+# ---------------------------------------------------------------------------
+# slot_end_of
+# ---------------------------------------------------------------------------
+
+
+def test_slot_end_keeps_an_exact_boundary() -> None:
+    # 06:10:00 IS the end of (06:00, 06:10]; it must not roll to 06:20.
+    assert slot_end_of(T0 + timedelta(minutes=10)) == T0 + timedelta(minutes=10)
+
+
+def test_slot_end_rounds_an_interior_instant_up() -> None:
+    assert slot_end_of(T0 + timedelta(minutes=3, seconds=1)) == T0 + timedelta(
+        minutes=10
+    )
+    assert slot_end_of(T0 + timedelta(seconds=1)) == T0 + timedelta(minutes=10)
+
+
+def test_slot_end_rejects_naive_datetimes() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        slot_end_of(datetime(2026, 9, 5, 6, 0))
+
+
+# ---------------------------------------------------------------------------
+# gauge_slots
+# ---------------------------------------------------------------------------
+
+
+def test_gauge_slots_wet_by_amount_and_by_duration() -> None:
+    rows = [
+        _amount("A", 10, 0.0), _dur("A", 10, 0.0),      # dry
+        _amount("A", 20, 0.1), _dur("A", 20, 0.0),      # wet: amount arm
+        _amount("A", 30, 0.0), _dur("A", 30, 1.0),      # wet: duration arm
+        _amount("A", 40, 0.09), _dur("A", 40, 0.0),     # below both arms
+    ]
+    slots = gauge_slots(rows, "A")
+    assert [wet for _, wet in slots] == [False, True, True, False]
+    assert [ts for ts, _ in slots] == [
+        T0 + timedelta(minutes=m) for m in (10, 20, 30, 40)
+    ]
+
+
+def test_gauge_slots_trace_sentinel_is_below_the_amount_threshold() -> None:
+    # DMI encodes "trace, less than 0.1 kg/m²" as -0.1. It is not a
+    # negative depth and it is not 0.1 mm of rain.
+    slots = gauge_slots([_amount("A", 10, -0.1)], "A")
+    assert slots == [(T0 + timedelta(minutes=10), False)]
+
+
+def test_gauge_slots_marks_an_unreported_slot_unknown_not_dry() -> None:
+    rows = [_amount("A", 10, 0.0), _amount("A", 30, 0.0)]
+    slots = gauge_slots(rows, "A")
+    assert [wet for _, wet in slots] == [False, None, False]
+
+
+def test_gauge_slots_null_value_leaves_the_slot_unknown() -> None:
+    assert gauge_slots([_amount("A", 10, None)], "A") == []
+    slots = gauge_slots([_amount("A", 10, None)], "A",
+                        start_utc=T0, end_utc=T0 + timedelta(minutes=10))
+    assert [wet for _, wet in slots] == [None, None]
+
+
+def test_gauge_slots_one_reported_parameter_is_enough_to_decide() -> None:
+    # A station reporting only the duration is still scoreable: "nothing
+    # was said" is unknown, "one arm said no" is dry.
+    slots = gauge_slots([_dur("A", 10, 0.0)], "A")
+    assert slots == [(T0 + timedelta(minutes=10), False)]
+
+
+def test_gauge_slots_filters_by_station_and_ignores_other_parameters() -> None:
+    rows = [
+        _amount("A", 10, 5.0),
+        _amount("B", 10, 0.0),
+        _row("A", 20, "temp_dry", 12.3),
+    ]
+    # The unrelated parameter neither wets a slot nor extends the grid.
+    assert gauge_slots(rows, "A") == [(T0 + timedelta(minutes=10), True)]
+    assert gauge_slots(rows, "B") == [(T0 + timedelta(minutes=10), False)]
+
+
+def test_gauge_slots_pins_the_grid_to_an_explicit_window() -> None:
+    slots = gauge_slots(
+        [_amount("A", 20, 1.0)], "A",
+        start_utc=T0, end_utc=T0 + timedelta(minutes=40),
+    )
+    assert [wet for _, wet in slots] == [None, None, True, None, None]
+
+
+def test_gauge_slots_empty_table_is_empty() -> None:
+    assert gauge_slots([], "A") == []
+
+
+def test_gauge_slots_accepts_an_arrow_table() -> None:
+    pa = pytest.importorskip("pyarrow")
+    table = pa.table({
+        "station_id": ["A", "A"],
+        "observed_utc": pa.array(
+            [T0 + timedelta(minutes=10), T0 + timedelta(minutes=20)],
+            type=pa.timestamp("us", tz="UTC"),
+        ),
+        "parameter_id": [PRECIP_PARAM, PRECIP_PARAM],
+        "value": pa.array([0.0, 0.3], type=pa.float32()),
+    })
+    assert [wet for _, wet in gauge_slots(table, "A")] == [False, True]
+
+
+# ---------------------------------------------------------------------------
+# onsets
+# ---------------------------------------------------------------------------
+
+
+def _slots(pattern: str) -> list[tuple[datetime, bool | None]]:
+    """``"ddw?"`` → dry, dry, wet, unknown — one character per slot."""
+    mapping = {"d": False, "w": True, "?": None}
+    return [
+        (T0 + timedelta(minutes=10 * (i + 1)), mapping[ch])
+        for i, ch in enumerate(pattern)
+    ]
+
+
+def test_onset_after_exactly_three_dry_slots() -> None:
+    got = onsets(_slots("dddw"))
+    assert got == [T0 + timedelta(minutes=40)]
+
+
+def test_no_onset_after_only_two_dry_slots() -> None:
+    assert onsets(_slots("ddw")) == []
+
+
+def test_wet_at_the_very_start_is_not_an_onset() -> None:
+    # No evidence about what came before the record.
+    assert onsets(_slots("wwww")) == []
+
+
+def test_only_the_first_wet_slot_of_a_spell_is_an_onset() -> None:
+    assert onsets(_slots("dddwww")) == [T0 + timedelta(minutes=40)]
+
+
+def test_a_second_spell_needs_its_own_dry_run() -> None:
+    assert onsets(_slots("dddwdddw")) == [
+        T0 + timedelta(minutes=40), T0 + timedelta(minutes=80),
+    ]
+    # Only two dry slots between the spells → the second is not an onset.
+    assert onsets(_slots("dddwddw")) == [T0 + timedelta(minutes=40)]
+
+
+def test_unknown_slot_resets_the_dry_run() -> None:
+    # Missing data can never certify a dry spell.
+    assert onsets(_slots("dd?dw")) == []
+    assert onsets(_slots("dd?dddw")) == [T0 + timedelta(minutes=70)]
+
+
+def test_a_hole_in_the_grid_resets_the_dry_run() -> None:
+    slots = _slots("ddd")
+    slots.append((T0 + timedelta(minutes=200), True))  # a seam, not a sequence
+    assert onsets(slots) == []
+
+
+def test_dry_min_is_configurable() -> None:
+    assert onsets(_slots("dw"), dry_min=10) == [T0 + timedelta(minutes=20)]
+    assert onsets(_slots("ddddw"), dry_min=50) == []
+
+
+# ---------------------------------------------------------------------------
+# score_warnings
+# ---------------------------------------------------------------------------
+
+
+def _at(minutes: float) -> datetime:
+    return T0 + timedelta(minutes=minutes)
+
+
+def test_hit_inside_the_window_carries_the_lead_error() -> None:
+    res = score_warnings([(_at(0), 20.0)], [_at(30)])
+    assert res.summary["hits"] == 1
+    assert res.summary["false_alarms"] == 0
+    assert res.summary["misses"] == 0
+    assert res.summary["pod"] == 1.0
+    assert res.summary["far"] == 0.0
+    # ETA 20 min, rain 30 min out: the rain came LATER than promised, so
+    # the warning was early → negative under the eta − actual convention.
+    assert res.warnings[0].lead_error_min == pytest.approx(-10.0)
+    assert res.warnings[0].outcome == "hit"
+    assert res.onsets[0].outcome == "hit"
+
+
+def test_onset_on_the_last_second_of_the_tolerance_is_a_hit() -> None:
+    res = score_warnings([(_at(0), 30.0)], [_at(40)])
+    assert res.summary["hits"] == 1
+
+
+def test_onset_one_minute_past_the_tolerance_is_a_false_alarm_and_a_miss() -> None:
+    res = score_warnings([(_at(0), 30.0)], [_at(41)])
+    assert res.summary == {
+        **res.summary,
+        "hits": 0, "false_alarms": 1, "misses": 1, "far": 1.0, "pod": 0.0,
+    }
+    assert res.warnings[0].outcome == "false_alarm"
+    assert res.onsets[0].outcome == "miss"
+
+
+def test_onset_at_the_send_instant_does_not_count() -> None:
+    # The window is (sent, sent+lead+tol]: rain already falling when the
+    # warning went out is not something the warning predicted.
+    res = score_warnings([(_at(0), 5.0)], [_at(0)])
+    assert res.summary["hits"] == 0
+    assert res.summary["false_alarms"] == 1
+
+
+def test_one_onset_is_claimed_by_at_most_one_warning_earliest_first() -> None:
+    res = score_warnings([(_at(10), 20.0), (_at(0), 30.0)], [_at(35)])
+    assert res.summary["hits"] == 1
+    assert res.summary["false_alarms"] == 1
+    hit = [w for w in res.warnings if w.outcome == "hit"][0]
+    assert hit.sent_utc == _at(0)          # the earlier warning wins
+    assert res.summary["n_onsets"] == 1
+    assert res.summary["misses"] == 0
+
+
+def test_two_onsets_in_one_window_leave_the_second_unclaimed() -> None:
+    res = score_warnings([(_at(0), 10.0)], [_at(5), _at(35)])
+    assert res.summary["hits"] == 1
+    assert res.summary["misses"] == 1
+    assert [o.outcome for o in res.onsets] == ["hit", "miss"]
+
+
+def test_a_miss_is_an_onset_no_warning_preceded() -> None:
+    res = score_warnings([], [_at(120)])
+    assert res.summary["warnings"] == 0
+    assert res.summary["misses"] == 1
+    assert res.summary["pod"] == 0.0
+    assert res.summary["far"] is None      # no warnings → FAR undefined
+
+
+def test_counts_always_balance() -> None:
+    warnings = [(_at(0), 20.0), (_at(90), 25.0), (_at(300), 30.0)]
+    onset_times = [_at(25), _at(200)]
+    res = score_warnings(warnings, onset_times)
+    s = res.summary
+    assert s["hits"] + s["false_alarms"] == s["warnings"] == 3
+    assert s["hits"] + s["misses"] == s["n_onsets"] == 2
+
+
+def test_lead_error_quantiles_are_linear_interpolated() -> None:
+    # Rain 1..5 min later than the ETA → errors of −1..−5, so sorted the
+    # population is −5..−1: p25 = −4, p50 = −3, p75 = −2 (numpy's rule).
+    warnings = []
+    onset_times = []
+    for i, late in enumerate((1, 2, 3, 4, 5)):
+        sent = _at(i * 200)
+        warnings.append((sent, 20.0))
+        onset_times.append(sent + timedelta(minutes=20 + late))
+    q = score_warnings(warnings, onset_times).summary["lead_error_min"]
+    assert q == {"p25": -4.0, "p50": -3.0, "p75": -2.0, "n": 5}
+
+
+def test_a_warning_that_fired_too_late_scores_positive() -> None:
+    """The failure that matters: less lead than the notification promised."""
+    # Promised rain in 30 min; it was falling 12 min later.
+    res = score_warnings([(_at(0), 30.0)], [_at(12)])
+    assert res.warnings[0].lead_error_min == pytest.approx(18.0)
+    assert res.summary["lead_error_min"]["p50"] == pytest.approx(18.0)
+
+
+def test_a_warning_without_an_eta_still_scores_but_adds_no_lead_error() -> None:
+    res = score_warnings([(_at(0), None)], [_at(20)])
+    assert res.summary["hits"] == 1
+    assert res.warnings[0].lead_error_min is None
+    assert res.summary["lead_error_min"]["n"] == 0
+    assert res.summary["lead_error_min"]["p50"] is None
+
+
+def test_summary_echoes_the_definition_it_was_produced_under() -> None:
+    s = score_warnings([], [], lead_min=45, tolerance_min=5, dry_min=60).summary
+    assert (s["lead_min"], s["tolerance_min"], s["dry_min"]) == (45, 5, 60)
+
+
+def test_pooled_summary_recomputes_rather_than_averages() -> None:
+    busy = score_warnings([(_at(0), 20.0)] , [_at(30)])            # 1 hit
+    quiet = score_warnings([(_at(0), 20.0), (_at(500), 20.0)], []) # 2 FAs
+    pooled = pooled_summary([busy, quiet], lead_min=30)
+    assert pooled["warnings"] == 3
+    assert pooled["hits"] == 1
+    assert pooled["false_alarms"] == 2
+    assert pooled["far"] == pytest.approx(2 / 3)
+    assert pooled["lead_error_min"]["n"] == 1
+    assert pooled["lead_min"] == 30
+
+
+# ---------------------------------------------------------------------------
+# raining_now_agreement
+# ---------------------------------------------------------------------------
+
+
+def _decision(minutes: int, forecast: float | None, observed: float | None) -> dict:
+    return {
+        "generated_at": _at(minutes),
+        "station_id": "A",
+        "forecast_now_mm_h": forecast,
+        "observed_mm_h": observed,
+    }
+
+
+def test_agreement_scores_both_series_against_the_same_slot() -> None:
+    slots = {"A": _slots("wwdd")}          # 06:10, 06:20 wet; 06:30, 06:40 dry
+    rows = [
+        _decision(5, 1.0, 1.0),            # slot 06:10 wet — both right
+        _decision(15, 0.0, 2.0),           # slot 06:20 wet — forecast misses
+        _decision(25, 1.0, 0.0),           # slot 06:30 dry — forecast cries wolf
+        _decision(35, 0.0, 0.0),           # slot 06:40 dry — both right
+    ]
+    out = raining_now_agreement(rows, slots)
+    assert out["n_scored"] == 4
+    assert out["gauge_wet_rate"] == 0.5
+    assert out["forecast_now"] == {
+        "n": 4, "agreement": 0.5, "pod": 0.5, "far": 0.5,
+        "hits": 1, "misses": 1, "false_alarms": 1, "correct_negatives": 1,
+    }
+    assert out["observed"]["agreement"] == 1.0
+    assert out["observed"]["far"] == 0.0
+
+
+def test_agreement_threshold_is_inclusive() -> None:
+    out = raining_now_agreement(
+        [_decision(5, 0.5, 0.49)], {"A": _slots("w")}, threshold_mm_h=0.5,
+    )
+    assert out["forecast_now"]["hits"] == 1
+    assert out["observed"]["misses"] == 1
+
+
+def test_agreement_skips_rows_whose_slot_is_unknown() -> None:
+    out = raining_now_agreement([_decision(5, 1.0, 1.0)], {"A": _slots("?")})
+    assert out["n_rows"] == 1
+    assert out["n_scored"] == 0
+    assert out["gauge_wet_rate"] is None
+    assert out["forecast_now"]["n"] == 0
+
+
+def test_agreement_counts_each_series_separately_when_one_is_missing() -> None:
+    # A cycle whose observed reduction failed still contributes its
+    # forecast sample — the two series report their own n.
+    out = raining_now_agreement([_decision(5, 1.0, None)], {"A": _slots("w")})
+    assert out["forecast_now"]["n"] == 1
+    assert out["observed"]["n"] == 0
+    assert out["observed"]["agreement"] is None
+
+
+def test_agreement_accepts_gauge_truth_on_the_row() -> None:
+    row = {**_decision(5, 1.0, 0.0), "gauge_wet": True}
+    out = raining_now_agreement([row])
+    assert out["n_scored"] == 1
+    assert out["forecast_now"]["hits"] == 1
+    assert out["observed"]["misses"] == 1
+
+
+def test_agreement_with_no_rows_is_all_none() -> None:
+    out = raining_now_agreement([], {})
+    assert out["n_rows"] == 0
+    assert out["forecast_now"]["agreement"] is None
+    assert out["observed"]["pod"] is None
+
+
+# ---------------------------------------------------------------------------
+# The shared decision row
+# ---------------------------------------------------------------------------
+
+
+def test_decision_schema_matches_the_declared_columns() -> None:
+    pytest.importorskip("pyarrow")
+    from dmi_nowcast_core.warning_score import decision_schema
+
+    schema = decision_schema()
+    assert tuple(schema.names) == DECISION_COLUMNS
+    # Every forecast field must be nullable: None from the sampler means
+    # "off coverage", which must never round-trip as a dry 0.0.
+    for name in ("p_rain", "eta_min", "intensity_mm_h", "observed_mm_h",
+                 "forecast_now_mm_h"):
+        assert schema.field(name).nullable

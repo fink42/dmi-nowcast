@@ -109,6 +109,7 @@ from .national_sample import finite_or_none, sample_point
 from .push.paths import resolved_db_path, resolved_key_path
 from .push.routes import build_router as build_push_router
 from .scheduler import CycleScheduler
+from .station_obs import StationObsPoller, build_station_obs_poller
 from .state_schema import (
     ForecastPointLead,
     ForecastPointRain,
@@ -127,17 +128,48 @@ class HealthResponse(BaseModel):
     server_time: str
 
 
+def _build_after_cycle(*services):
+    """Chain the optional post-cycle services into one awaitable hook.
+
+    Order is the argument order and it is load-bearing: whatever notifies
+    users runs before whatever merely records what they were sent. Each
+    hook is isolated — the services already swallow their own failures,
+    and this catches anything that escapes so one broken hook cannot cost
+    the next one its turn. Returns ``None`` when nothing is enabled, which
+    is what keeps the scheduler on its original no-hook path.
+    """
+    hooks = [s.after_cycle for s in services if s is not None]
+    if not hooks:
+        return None
+
+    async def _run(result) -> None:
+        for hook in hooks:
+            try:
+                await hook(result)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning(
+                    "after_cycle_hook_failed",
+                    hook=getattr(hook, "__qualname__", repr(hook)),
+                    error=str(exc),
+                )
+
+    return _run
+
+
 def create_app(
     config: Config,
     *,
     engine: CycleEngine | None = None,
     scheduler: CycleScheduler | None = None,
+    station_obs_poller: StationObsPoller | None = None,
     auto_start_scheduler: bool = True,
 ) -> FastAPI:
     """Build the FastAPI app.
 
-    ``engine`` and ``scheduler`` are injected by tests that want to
-    control the cycle directly. The default in-process scheduler can be
+    ``engine``, ``scheduler`` and ``station_obs_poller`` are injected by
+    tests that want to control the cycle (or the gauge poll) directly;
+    the poller is otherwise built from config, and is ``None`` unless
+    ``station_obs.enabled``. The default in-process scheduler can be
     disabled with ``auto_start_scheduler=False`` — useful for unit
     tests that only exercise the HTTP surface.
     """
@@ -164,21 +196,34 @@ def create_app(
             interval_min=config.poll.interval_min,
             jitter_sec=config.poll.jitter_sec,
             on_cycle_complete=lambda r: _on_cycle_complete(app, r),
-            # Web Push evaluation runs after every cycle (Phase D). None
-            # when the feature is off — the scheduler then behaves exactly
-            # as it did before.
-            after_cycle=(
-                push_service.after_cycle if push_service is not None else None
-            ),
+            # Post-cycle hooks, in order: Web Push evaluation and fan-out
+            # (Phase D), then the gauge scoreboard (Phase F) — the
+            # scoreboard measures what the subscribers were sent, so it
+            # must never be able to delay the sending. None when both are
+            # off, and the scheduler then behaves exactly as it did before.
+            after_cycle=_build_after_cycle(push_service, station_eval_service),
         )
         app.state.scheduler = local_scheduler
+        # Gauge-truth poller (Phase F). Its own scheduler on its own
+        # cadence: metObs is not a nowcast input, so a gauge outage must
+        # never be able to delay a radar cycle. None when disabled — which
+        # is the default, and mandatory in public mode.
+        station_poller: StationObsPoller | None = (
+            station_obs_poller if station_obs_poller is not None
+            else build_station_obs_poller(config)
+        )
+        app.state.station_obs_poller = station_poller
         if auto_start_scheduler:
             await local_scheduler.start(run_immediately=True)
+            if station_poller is not None:
+                await station_poller.start(run_immediately=True)
         try:
             yield
         finally:
             if auto_start_scheduler:
                 await local_scheduler.shutdown()
+                if station_poller is not None:
+                    await station_poller.shutdown()
             if push_store is not None:
                 # Close the SQLite handle explicitly; the WAL files are
                 # checkpointed on close, so a restart never inherits a
@@ -232,6 +277,28 @@ def create_app(
             push_public_key = None
     app.state.push_service = push_service
     app.state.push_store = push_store
+
+    # Gauge scoreboard (Phase F): a virtual subscriber at every rain gauge,
+    # evaluated once per cycle after the real fan-out and appended to the
+    # corpus. Imported lazily — it pulls in pyarrow, which an instance with
+    # the feature off should not have to load — and initialised
+    # best-effort: a bad points file logs and degrades to "disabled",
+    # exactly as push does, because a broken scoreboard must not keep the
+    # service from nowcasting.
+    station_eval_service = None
+    if config.station_eval.enabled:
+        try:
+            from .station_eval import StationEvalService
+
+            station_eval_service = StationEvalService(config, engine)
+            _log.info(
+                "station_eval_enabled",
+                points_file=str(config.station_eval.points_file),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.error("station_eval_init_failed", error=str(exc))
+            station_eval_service = None
+    app.state.station_eval_service = station_eval_service
 
     @app.get("/healthz", response_model=HealthResponse, tags=["public"])
     async def healthz(request: Request) -> HealthResponse:
