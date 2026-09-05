@@ -10,6 +10,11 @@ Two files the public instance serves but cannot produce:
     Fitted monthly from the same archive. Copying it here is what makes
     the public instance's probabilities calibrated instead of raw
     ensemble fractions.
+``calibration/push_thresholds.json``
+    Fitted nightly from the decision rows and the gauge store (Phase G).
+    Copying it here is what makes the public instance's notifications
+    warn at the measured threshold for each horizon instead of the
+    shipped fallback.
 
 Both are small, static-per-cycle JSON documents on a network only these
 two containers share, so the transport is deliberately dull: one
@@ -50,28 +55,34 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Config
+from .push.paths import resolved_thresholds_path
 
 _log = structlog.get_logger(__name__)
 
 #: Spread the poll off the exact minute boundary, as every other task does.
 JITTER_SEC = 30
 
-#: The one file that does NOT land under ``data_dir`` by its relative
-#: path: the engine reads its curves from ``calibration.national_curves_path``,
-#: wherever the operator put it.
+#: The two files that do NOT land under ``data_dir`` by their relative
+#: path: the engine reads its curves from
+#: ``calibration.national_curves_path`` and the push service reads its
+#: thresholds from ``push.thresholds_path``, wherever the operator put
+#: them.
 CURVES_FILE = "calibration/national_curves.json"
+THRESHOLDS_FILE = "calibration/push_thresholds.json"
 
 
 def target_path(config: Config, name: str) -> Path:
     """Where a synced file lands on this instance.
 
-    Everything is ``<storage.data_dir>/<name>`` except the national
-    curves, which go to the path the engine actually reads. Getting this
-    wrong is silent — the file appears, nothing loads it — so it lives in
-    one function with one test.
+    Everything is ``<storage.data_dir>/<name>`` except the two fitted
+    files, which go to the paths the engine and the push service actually
+    read. Getting this wrong is silent — the file appears, nothing loads
+    it — so it lives in one function with one test.
     """
     if name == CURVES_FILE:
         return Path(config.calibration.national_curves_path)
+    if name == THRESHOLDS_FILE:
+        return resolved_thresholds_path(config)
     return Path(config.storage.data_dir).joinpath(*PurePosixPath(name).parts)
 
 
@@ -280,12 +291,16 @@ class ArtifactSync:
             self._client = None
 
 
-def build_artifact_sync(config: Config, engine=None) -> ArtifactSync | None:
+def build_artifact_sync(
+    config: Config, engine=None, *, push_thresholds=None,
+) -> ArtifactSync | None:
     """The sync task for this config, or ``None`` when it must not run.
 
     When ``engine`` is given, a freshly-synced curve file nudges it to
-    re-read the curves at the start of its next cycle; without one the
-    file still lands, it just takes a restart to take effect.
+    re-read the curves at the start of its next cycle; ``push_thresholds``
+    is the same arrangement for the fitted threshold table, nudged at the
+    start of the next fan-out. Without either, the file still lands — it
+    just takes a restart to take effect.
     """
     if not config.sync.enabled:
         return None
@@ -294,14 +309,20 @@ def build_artifact_sync(config: Config, engine=None) -> ArtifactSync | None:
         return None
 
     def _updated(name: str, path: Path) -> None:
-        if name != CURVES_FILE or engine is None:
+        target = None
+        if name == CURVES_FILE:
+            target = (engine, "note_curves_changed")
+        elif name == THRESHOLDS_FILE:
+            target = (push_thresholds, "note_changed")
+        if target is None or target[0] is None:
             return
-        note = getattr(engine, "note_curves_changed", None)
+        owner, hook = target
+        note = getattr(owner, hook, None)
         if callable(note):
             note()
-        else:  # pragma: no cover — an engine stub without the hook
+        else:  # pragma: no cover — a stub without the hook
             _log.info(
-                "curves_updated_on_disk", path=str(path),
+                "synced_file_needs_restart", file=name, path=str(path),
                 note="restart to apply",
             )
 
@@ -310,6 +331,7 @@ def build_artifact_sync(config: Config, engine=None) -> ArtifactSync | None:
 
 __all__ = [
     "CURVES_FILE",
+    "THRESHOLDS_FILE",
     "ArtifactSync",
     "SyncFileResult",
     "SyncResult",

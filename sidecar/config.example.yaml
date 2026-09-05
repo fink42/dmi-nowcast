@@ -108,8 +108,20 @@ lightning:
 #   # Both default to <storage.data_dir>/push/. Set only to move them.
 #   vapid_private_key_file: null   # -> /var/lib/dmi-nowcast/push/vapid_private.pem
 #   db_path: null                  # -> /var/lib/dmi-nowcast/push/subscriptions.sqlite
-#   # Offered lead times are forecast.national.leads_min at or above this.
+#   # The subscriber's ONE knob (Phase G): which horizons the form offers.
+#   # Must be a subset of forecast.national.leads_min. Unset derives them
+#   # as this shipped before the fitted table existed: every national lead
+#   # at or above min_lead_min.
+#   lead_options: [20, 30, 45, 60]
 #   min_lead_min: 20
+#   # The fitted horizon -> threshold table the notifications warn by,
+#   # written by quality_report.fit_thresholds below (or by
+#   # scripts/sweep_thresholds.py) and re-read without a restart. null ->
+#   # <storage.data_dir>/push_thresholds.json. Missing or unreadable is
+#   # not an error: every horizon falls back to 40 %.
+#   thresholds_path: null
+#   # NOT a menu any more: the bounds and default of the hidden
+#   # threshold_pct OVERRIDE that POST /api/push/subscribe still accepts.
 #   threshold_options_pct: [40, 60, 80]
 #   default_threshold_pct: 60
 #   default_lead_min: 30
@@ -230,6 +242,43 @@ quality_report:
   live_days_secondary: 30
   # Markdown twin of each report, stamped YYYY-MM-DD.md. null skips it.
   markdown_dir: /var/lib/dmi-nowcast-corpus/quality_reports
+  # The nightly push-threshold fit (Phase G, G4). Replays the push rule
+  # over the same decision rows at every threshold on the grid, keeps the
+  # F1 plateau midpoint per horizon, damps the result against the table
+  # already in service, and writes it where the running service reads it
+  # (push.thresholds_path). Runs BEFORE the report is built, so
+  # quality.json's thresholds section describes tonight's table.
+  #
+  # OFF until the first manual run has been eyeballed:
+  #   QUALITY_FIT_THRESHOLDS=1 sidecar/deploy/quality_report.sh
+  fit_thresholds:
+    enabled: false
+    # The live scoreboard rows and the historical replay, deduplicated on
+    # (radar_ts, station_id) with the live row winning.
+    decisions_dirs:
+      - /var/lib/dmi-nowcast-corpus/stations/replay/decisions
+      - /var/lib/dmi-nowcast-corpus/stations/eval
+    # The radar self-consistency set: the same replay over the radar
+    # calibration points, scored against the radar's own observed rain.
+    # Reported beside the gauge pick, never allowed to override it.
+    radar_decisions_dir: null
+    # null -> push.thresholds_path, which is the point: fitting into a
+    # file nothing loads would be a very well-documented no-op.
+    thresholds_out: null
+    # null -> push.lead_options. Fitting a horizon nobody can choose
+    # spends minutes of CPU on a column nobody reads.
+    leads: [20, 30, 45, 60]
+    thresholds: "20:80:5"
+    plateau_frac: 0.95
+    # Evidence floors: a lead with fewer scored warnings than this gets no
+    # pick at all, and a refit moves a served threshold only when it is at
+    # least min_delta_pct away AND that well evidenced.
+    min_warnings: 30
+    min_delta_pct: 5
+    # Rain arriving sooner than this after a warning is LATE: not a hit,
+    # not a false alarm, still counted against recall.
+    min_useful_lead_min: 5.0
+    workers: 4
 
 # --- Artifact sync (Phase F, F4) --------------------------------------
 # OFF here, and correctly so: this instance PRODUCES the quality report

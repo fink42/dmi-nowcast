@@ -35,6 +35,14 @@ at that lead. Its ``threshold_pct`` is null and
 :func:`effective_threshold` falls back, because a threshold fitted on four
 warnings is a story about four warnings.
 
+:func:`apply_stability_guard` is the third rule, and it is about time
+rather than shape: the fit runs nightly on a window that slides by one
+day, so most refits differ from the last by noise. A lead's served
+threshold moves only when the new pick is far enough away to matter and
+stands on enough evidence to believe; otherwise the value already in
+service stays, and every lead records which of those happened in
+``guard``.
+
 :func:`validate_thresholds` is the schema check; it returns a list of
 human-readable problems, empty when the document is sound, in the same
 style as ``quality_report.validate_report``. :func:`effective_threshold`
@@ -55,8 +63,12 @@ __all__ = [
     "OBJECTIVE_SPEC",
     "WINDOW_SPEC",
     "LEAD_SPEC",
+    "DEFAULT_MIN_DELTA_PCT",
+    "DEFAULT_GUARD_MIN_WARNINGS",
+    "apply_stability_guard",
     "validate_thresholds",
     "validate_leads_table",
+    "lead_pick",
     "effective_threshold",
     "load_thresholds",
 ]
@@ -268,6 +280,39 @@ def validate_leads_table(leads: Mapping[str, Any], where: str = "leads") -> list
     return problems
 
 
+def lead_pick(doc: Any, lead_min: Any) -> int | None:
+    """The usable threshold a document carries for one lead, or ``None``.
+
+    "Usable" is one definition, used by every reader: a lead row that is a
+    dict, is not marked ``insufficient``, and carries a whole percent in
+    (0, 100). :func:`effective_threshold` turns ``None`` into the
+    fallback; the service turns it into ``source="fallback"``; the
+    stability guard reads it on both the old and the new document. They
+    must never disagree about which leads the table can speak for, so
+    there is exactly one test.
+    """
+    if not isinstance(doc, dict):
+        return None
+    leads = doc.get("leads")
+    if not isinstance(leads, dict):
+        return None
+    try:
+        key = str(int(lead_min))
+    except (TypeError, ValueError):
+        return None
+    entry = leads.get(key)
+    if not isinstance(entry, dict) or entry.get("insufficient") is True:
+        return None
+    threshold = entry.get("threshold_pct")
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, int)
+        or not 0 < threshold < 100
+    ):
+        return None
+    return threshold
+
+
 def effective_threshold(doc: Any, lead_min: Any) -> int:
     """The percent this lead warns at: its fitted pick, or the fallback.
 
@@ -290,24 +335,8 @@ def effective_threshold(doc: Any, lead_min: Any) -> int:
     else:
         return fallback
 
-    leads = doc.get("leads")
-    if not isinstance(leads, dict):
-        return fallback
-    try:
-        key = str(int(lead_min))
-    except (TypeError, ValueError):
-        return fallback
-    entry = leads.get(key)
-    if not isinstance(entry, dict) or entry.get("insufficient") is True:
-        return fallback
-    threshold = entry.get("threshold_pct")
-    if (
-        isinstance(threshold, bool)
-        or not isinstance(threshold, int)
-        or not 0 < threshold < 100
-    ):
-        return fallback
-    return threshold
+    pick = lead_pick(doc, lead_min)
+    return fallback if pick is None else pick
 
 
 def load_thresholds(path: Path | str | None) -> dict | None:
@@ -330,3 +359,92 @@ def load_thresholds(path: Path | str | None) -> dict | None:
     if validate_thresholds(doc):
         return None
     return doc
+
+
+# ---------------------------------------------------------------------------
+# The stability guard
+# ---------------------------------------------------------------------------
+
+#: A refit must move a lead's threshold by at least this many points before
+#: the change is worth making. Below it the two rules are the same rule
+#: with different noise, and swapping them only changes who gets warned.
+DEFAULT_MIN_DELTA_PCT = 5
+
+#: And it must stand on at least this many scored warnings at that lead.
+DEFAULT_GUARD_MIN_WARNINGS = 30
+
+
+def apply_stability_guard(
+    new_doc: dict,
+    previous_doc: Any = None,
+    *,
+    min_delta_pct: int = DEFAULT_MIN_DELTA_PCT,
+    min_warnings: int = DEFAULT_GUARD_MIN_WARNINGS,
+) -> dict:
+    """Damp a refit against the table already in service.
+
+    The sweep runs nightly on a window that slides by one day, so most
+    refits differ from the last one by a percent or two of noise. Serving
+    that would mean a subscriber's rule changes under them every night for
+    no measured reason. So a lead's threshold moves only when the new pick
+    is **both** far enough away to matter (``min_delta_pct``) and standing
+    on enough evidence to believe (``min_warnings`` scored warnings at the
+    picked cell); otherwise the value already in service stays.
+
+    Every lead records what happened in ``guard``:
+
+    ``"first_fit"``
+        Nothing was in service for this lead — the new pick ships as-is.
+    ``"changed"``
+        Both tests passed; the new pick replaces the old one.
+    ``"kept_previous"``
+        One of the tests failed. The **previous lead row** is carried over
+        whole — its threshold is what ships, so its counts are the ones
+        that describe what ships — with the rejected pick recorded in
+        ``candidate_threshold_pct``.
+    ``"insufficient"``
+        The new fit produced no pick at all. The row keeps its null
+        threshold and :func:`effective_threshold` falls back, which is the
+        honest answer: a lead nothing could be fitted for is not a lead
+        with a secretly-still-good old number.
+
+    ``new_doc`` is not mutated; the returned document is a shallow copy
+    with a fresh ``leads`` table. Everything outside ``leads`` — the
+    objective, the window, the fit timestamp — is the new fit's, because
+    that is what produced the document.
+    """
+    leads = new_doc.get("leads") if isinstance(new_doc, dict) else None
+    if not isinstance(leads, dict):
+        return new_doc
+
+    out: dict[str, Any] = {}
+    for key, entry in leads.items():
+        row = dict(entry) if isinstance(entry, dict) else entry
+        new_pick = lead_pick(new_doc, key)
+        old_pick = lead_pick(previous_doc, key)
+        if new_pick is None:
+            if isinstance(row, dict):
+                row["guard"] = "insufficient"
+            out[key] = row
+            continue
+        if old_pick is None:
+            row["guard"] = "first_fit"
+            out[key] = row
+            continue
+        warnings = entry.get("warnings") if isinstance(entry, dict) else None
+        if isinstance(warnings, bool) or not isinstance(warnings, int):
+            warnings = 0
+        moved_enough = abs(new_pick - old_pick) >= int(min_delta_pct)
+        well_evidenced = warnings >= int(min_warnings)
+        if moved_enough and well_evidenced:
+            row["guard"] = "changed"
+            out[key] = row
+            continue
+        previous_row = dict(previous_doc["leads"][key])
+        previous_row["guard"] = "kept_previous"
+        previous_row["candidate_threshold_pct"] = new_pick
+        out[key] = previous_row
+
+    result = dict(new_doc)
+    result["leads"] = out
+    return result

@@ -7,8 +7,12 @@ warned about, which is the whole point of the feature.
 
 Two halves per row:
 
-- **preferences** (``lat``/``lon``, ``threshold_pct``, ``lead_min``, quiet
-  hours, ``tz``, ``lang``) — what the subscriber chose;
+- **preferences** (``lat``/``lon``, ``lead_min``, ``threshold_pct``, quiet
+  hours, ``tz``, ``lang``) — what the subscriber chose. Since Phase G the
+  choice is the horizon: ``threshold_pct`` is NULLABLE and null is the
+  normal value, meaning "whatever the fitted table says for this lead".
+  A non-null value is a deliberate override and pins that row to a
+  percent no refit will move;
 - **state machine** (``armed``, ``streak``, ``below_since_utc``,
   ``last_eval_radar_ts``, ``last_notified_utc``) — what
   ``push.engine.evaluate`` carries between radar observations.
@@ -32,6 +36,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final
 
+import structlog
+
+_log = structlog.get_logger(__name__)
+
 _SCHEMA: Final = """
 CREATE TABLE IF NOT EXISTS subscriptions (
     endpoint            TEXT PRIMARY KEY,
@@ -39,7 +47,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     auth                TEXT NOT NULL,
     lat                 REAL NOT NULL,
     lon                 REAL NOT NULL,
-    threshold_pct       INTEGER NOT NULL,
+    threshold_pct       INTEGER,
     lead_min            INTEGER NOT NULL,
     quiet_enabled       INTEGER NOT NULL,
     quiet_start         TEXT NOT NULL,
@@ -85,7 +93,9 @@ class NewSubscription:
     auth: str
     lat: float
     lon: float
-    threshold_pct: int
+    #: ``None`` — the normal case — means "use the fitted table for
+    #: ``lead_min``"; an int is a deliberate override.
+    threshold_pct: int | None
     lead_min: int
     quiet_enabled: bool
     quiet_start: str
@@ -103,7 +113,9 @@ class Subscription:
     auth: str
     lat: float
     lon: float
-    threshold_pct: int
+    #: ``None`` = follow the fitted table for ``lead_min`` (see
+    #: ``push.thresholds``); an int overrides it.
+    threshold_pct: int | None
     lead_min: int
     quiet_enabled: bool
     quiet_start: str
@@ -153,7 +165,9 @@ def _row_to_subscription(row: sqlite3.Row) -> Subscription:
         auth=row["auth"],
         lat=float(row["lat"]),
         lon=float(row["lon"]),
-        threshold_pct=int(row["threshold_pct"]),
+        threshold_pct=(
+            None if row["threshold_pct"] is None else int(row["threshold_pct"])
+        ),
         lead_min=int(row["lead_min"]),
         quiet_enabled=bool(row["quiet_enabled"]),
         quiet_start=row["quiet_start"],
@@ -186,6 +200,7 @@ class PushStore:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute(_SCHEMA)
             self._conn.commit()
+            self._migrate_threshold_nullable()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -193,10 +208,74 @@ class PushStore:
         with self._lock:
             self._conn.close()
 
+    # -- migrations --------------------------------------------------------
+
+    def _migrate_threshold_nullable(self) -> None:
+        """Phase G: ``threshold_pct`` becomes nullable, and every row goes null.
+
+        SQLite cannot drop a NOT NULL constraint in place, so this is the
+        documented twelve-step rebuild, reduced to what one table needs:
+        create the new shape, copy the rows, swap the names. It runs
+        inside one transaction — a crash halfway leaves the old table
+        exactly as it was.
+
+        **Existing rows migrate to NULL, not to their stored percent.**
+        Those rows carry a number the subscriber picked from a menu the UI
+        no longer shows; keeping it would pin every existing subscriber to
+        a pre-fit threshold for ever, which is the opposite of shipping a
+        fitted table. Null means "follow the table", and re-subscribing
+        with an explicit ``threshold_pct`` is how anyone opts back out.
+
+        Called with ``self._lock`` held.
+        """
+        columns = self._conn.execute(
+            "PRAGMA table_info(subscriptions)",
+        ).fetchall()
+        threshold = next(
+            (c for c in columns if c["name"] == "threshold_pct"), None,
+        )
+        if threshold is None or not int(threshold["notnull"]):
+            return
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                _SCHEMA.replace("subscriptions", "subscriptions_new", 1)
+                .replace("IF NOT EXISTS ", ""),
+            )
+            self._conn.execute(
+                f"INSERT INTO subscriptions_new ({_COLUMNS}) "
+                f"SELECT {_COLUMNS.replace('threshold_pct', 'NULL')} "
+                "FROM subscriptions",
+            )
+            migrated = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM subscriptions_new",
+            ).fetchone()["n"]
+            self._conn.execute("DROP TABLE subscriptions")
+            self._conn.execute(
+                "ALTER TABLE subscriptions_new RENAME TO subscriptions",
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys=ON")
+        _log.info(
+            "push_store_migrated",
+            migration="threshold_pct_nullable",
+            rows=int(migrated),
+            note="existing thresholds cleared; the fitted table decides",
+        )
+
     # -- writes ------------------------------------------------------------
 
     def upsert(self, sub: NewSubscription, *, now_utc: datetime | None = None) -> bool:
         """Create or update one subscription. True when it was created.
+
+        ``sub.threshold_pct`` is written as given, ``None`` included:
+        clearing an override is a thing a subscriber can do by
+        re-subscribing without one.
 
         An update rewrites the preferences and **restarts the state
         machine** (``armed=1, streak=0``, both timestamps cleared):

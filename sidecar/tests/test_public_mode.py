@@ -245,6 +245,14 @@ def test_shipped_public_example_config_is_actually_public() -> None:
     # Key and DB default into the data volume, not a bind mount.
     assert cfg.push.vapid_private_key_file is None
     assert cfg.push.db_path is None
+    # Phase G: the subscriber picks a horizon, and the percent it warns at
+    # is fitted on the private instance and PULLED here — never fitted
+    # locally (there is no corpus) and never chosen by the subscriber.
+    assert cfg.push.lead_options == [20, 30, 45, 60]
+    assert set(cfg.push.lead_options) <= set(cfg.forecast.national.leads_min)
+    assert cfg.push.thresholds_path is None
+    assert "calibration/push_thresholds.json" in cfg.sync.files
+    assert cfg.quality_report.fit_thresholds.enabled is False
 
 
 # ---------------------------------------------------------------------------

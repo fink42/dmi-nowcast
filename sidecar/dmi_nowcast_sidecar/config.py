@@ -305,9 +305,30 @@ class PushConfig(BaseModel):
     # SQLite subscription store. None → ``<storage.data_dir>/push/
     # subscriptions.sqlite`` (``push.paths.resolved_db_path``).
     db_path: Path | None = None
+    # The fitted horizon -> threshold table (Phase G), as written by the
+    # nightly sweep and read by ``push.thresholds.ThresholdTable``.
+    # None -> ``<storage.data_dir>/push_thresholds.json``; resolved by
+    # ``push.paths.resolved_thresholds_path``. A missing or unreadable
+    # table is not an error: every lead falls back to
+    # ``push_thresholds.DEFAULT_FALLBACK_THRESHOLD_PCT``.
+    thresholds_path: Path | None = None
     # Offered lead times are the national probability leads at or beyond
     # this. Below ~20 min a browser notification arrives too late to act on.
     min_lead_min: Annotated[int, Field(ge=0, le=180)] = 20
+    # The horizons the subscribe form offers — the ONE knob a subscriber
+    # has (Phase G). None derives them the way this shipped before the
+    # fitted table existed: every national probability lead at or above
+    # ``min_lead_min``. An explicit list must be a subset of
+    # ``forecast.national.leads_min`` (checked on the whole Config): a
+    # horizon the grids do not carry could be chosen and then never
+    # evaluated.
+    lead_options: list[int] | None = None
+    # The allowed range and default of the hidden ``threshold_pct``
+    # OVERRIDE. The subscribe API still accepts an explicit percent — for
+    # an operator, a test row, a subscriber the fitted table does not suit
+    # — and these bound it. They are no longer offered as a choice in the
+    # UI: with the table in service a subscription that sends no
+    # ``threshold_pct`` is the normal case, and the horizon decides.
     threshold_options_pct: list[int] = Field(default_factory=lambda: [40, 60, 80])
     default_threshold_pct: Annotated[int, Field(ge=1, le=99)] = 60
     default_lead_min: Annotated[int, Field(ge=1, le=180)] = 30
@@ -352,6 +373,17 @@ class PushConfig(BaseModel):
             raise ValueError("push threshold_options_pct entries must be in (0, 100)")
         return v
 
+    @field_validator("lead_options")
+    @classmethod
+    def _lead_options_valid(cls, v: list[int] | None) -> list[int] | None:
+        if v is None:
+            return None
+        if not v or v != sorted(v) or len(set(v)) != len(v):
+            raise ValueError("push lead_options must be ascending and unique")
+        if any(lead <= 0 or lead > 180 for lead in v):
+            raise ValueError("push lead_options entries must be in (0, 180]")
+        return v
+
     @field_validator("default_quiet_start", "default_quiet_end")
     @classmethod
     def _quiet_hhmm(cls, v: str) -> str:
@@ -388,6 +420,15 @@ class PushConfig(BaseModel):
             )
         if self.default_lead_min < self.min_lead_min:
             raise ValueError("push default_lead_min must be >= push min_lead_min")
+        if self.lead_options is not None:
+            if any(lead < self.min_lead_min for lead in self.lead_options):
+                raise ValueError(
+                    "push lead_options entries must be >= push min_lead_min",
+                )
+            if self.default_lead_min not in self.lead_options:
+                raise ValueError(
+                    "push default_lead_min must be one of push lead_options",
+                )
         return self
 
 
@@ -440,6 +481,48 @@ class StationEvalConfig(BaseModel):
 _UTC_HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
+class FitThresholdsConfig(BaseModel):
+    """The nightly push-threshold fit (Phase G, G4).
+
+    A step of the quality-report task, not a task of its own: it reads the
+    same decision rows and the same gauge store the report already reads,
+    and the report embeds the table it produces. Off by default, and
+    private-instance only for the same reason the report is — the decision
+    rows and the gauge store live on the corpus volume.
+
+    The sweep is the expensive part (minutes, not seconds, over a season of
+    rows at ~13 thresholds x 4 leads), which is why it runs once a night in
+    the executor beside the report build and never on a request path.
+    """
+
+    enabled: bool = False
+    #: Decision-row trees, later directories winning a ``(radar_ts,
+    #: station_id)`` tie — the live ``station_eval`` rows over the replay's
+    #: reconstruction. Empty disables the step as surely as ``enabled:
+    #: false``: there is nothing to fit on.
+    decisions_dirs: list[Path] = Field(default_factory=list)
+    #: The optional radar self-consistency set (``--radar-decisions-dir``).
+    radar_decisions_dir: Path | None = None
+    #: Where the fitted table is written. None -> the file the service
+    #: reads, ``push.thresholds_path`` (resolved), which is the whole
+    #: point: the fit lands where the running process picks it up.
+    thresholds_out: Path | None = None
+    #: The horizons to fit. None -> the offered ``push.lead_options``.
+    leads: list[int] | None = None
+    #: The threshold grid, ``lo:hi[:step]`` or a comma-separated list.
+    thresholds: str = "20:80:5"
+    plateau_frac: Annotated[float, Field(gt=0.0, le=1.0)] = 0.95
+    min_warnings: Annotated[int, Field(ge=0)] = 30
+    min_useful_lead_min: Annotated[float, Field(ge=0.0)] = 5.0
+    #: Stability guard (``push_thresholds.apply_stability_guard``): a
+    #: lead's served threshold moves only when the new pick is at least
+    #: this many points away AND stands on ``min_warnings`` scored
+    #: warnings. Otherwise the value already in service stays.
+    min_delta_pct: Annotated[int, Field(ge=0, le=99)] = 5
+    #: Processes over ``(lead, threshold)`` cells.
+    workers: Annotated[int, Field(ge=1, le=64)] = 1
+
+
 class QualityReportConfig(BaseModel):
     """The nightly ``quality.json`` build (Phase F, F4).
 
@@ -477,6 +560,12 @@ class QualityReportConfig(BaseModel):
     live_days_secondary: Annotated[int, Field(ge=1, le=3650)] = 30
     #: Also write a markdown twin here, stamped ``YYYY-MM-DD.md``.
     markdown_dir: Path | None = None
+    #: Refit the push thresholds before building the report (Phase G, G4),
+    #: so ``quality.json``'s ``thresholds`` section describes the table the
+    #: service is serving as of tonight rather than last night's.
+    fit_thresholds: FitThresholdsConfig = Field(
+        default_factory=FitThresholdsConfig,
+    )
 
     @field_validator("at_utc")
     @classmethod
@@ -598,6 +687,29 @@ class Config(BaseSettings):
             raise ValueError(
                 "station_obs.enabled requires storage.corpus_dir — the gauge "
                 "archive is written under <corpus_dir>/stations/",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _push_lead_options_are_served(self) -> "Config":
+        """Every offered horizon must be a lead the national grids carry.
+
+        ``push.lead_options`` is what the subscribe form shows and what
+        ``POST /api/push/subscribe`` accepts. A lead outside
+        ``forecast.national.leads_min`` would sample ``None`` for ever:
+        the subscription would be stored, evaluated on every cycle, and
+        could never warn. ``None`` derives the list instead and cannot be
+        wrong by construction.
+        """
+        offered = self.push.lead_options
+        if offered is None:
+            return self
+        served = list(self.forecast.national.leads_min)
+        missing = [lead for lead in offered if lead not in served]
+        if missing:
+            raise ValueError(
+                "push lead_options "
+                f"{missing} are not in forecast.national.leads_min {served}",
             )
         return self
 

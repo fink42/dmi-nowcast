@@ -11,6 +11,8 @@ Modules:
 - ``routes``           — the ``/api/push/*`` router.
 - ``service``          — per-cycle evaluation + fan-out.
 - ``engine``           — the per-subscription decision state machine.
+- ``thresholds``       — the fitted horizon -> threshold table (Phase G),
+                         hot-reloaded from ``push.thresholds_path``.
 - ``messages``         — notification payload construction (da/en).
 - ``fanout``           — one encrypted Web Push delivery.
 

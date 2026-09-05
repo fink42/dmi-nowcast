@@ -114,8 +114,13 @@ from .eta_smoother import EtaSmoother
 from .lightning_schema import LightningEtaResponse, StrikesAccepted, StrikesIn
 from .national_artifacts import LATEST_MANIFEST_NAME
 from .national_sample import finite_or_none, sample_point
-from .push.paths import resolved_db_path, resolved_key_path
+from .push.paths import (
+    resolved_db_path,
+    resolved_key_path,
+    resolved_thresholds_path,
+)
 from .push.routes import build_router as build_push_router
+from .push.thresholds import ThresholdTable
 from .quality_report import (
     QualityReportTask,
     build_quality_report_task,
@@ -237,12 +242,14 @@ def create_app(
         # corpus read or an unreachable peer must never delay a cycle.
         quality_task: QualityReportTask | None = (
             quality_report_task if quality_report_task is not None
-            else build_quality_report_task(config)
+            else build_quality_report_task(config, thresholds=push_thresholds)
         )
         app.state.quality_report_task = quality_task
         sync_task: ArtifactSync | None = (
             artifact_sync if artifact_sync is not None
-            else build_artifact_sync(config, engine)
+            else build_artifact_sync(
+                config, engine, push_thresholds=push_thresholds,
+            )
         )
         app.state.artifact_sync = sync_task
         if auto_start_scheduler:
@@ -293,6 +300,12 @@ def create_app(
     push_service = None
     push_store = None
     push_public_key = None
+    # The fitted horizon → threshold table (Phase G). One instance for the
+    # process: the routes answer from it, the fan-out evaluates against it,
+    # and the sync task (public) and the nightly fit (private) nudge it
+    # when they replace the file. Constructing it costs nothing — it reads
+    # the file on first use, not here.
+    push_thresholds = ThresholdTable(resolved_thresholds_path(config))
     if config.push.enabled:
         try:
             from .push.service import PushService
@@ -304,11 +317,18 @@ def create_app(
             push_store = PushStore(resolved_db_path(config))
             push_service = PushService(
                 config, engine, push_store, pem, push_public_key,
+                thresholds=push_thresholds,
             )
+            # Read the table once at boot so the log says which rule this
+            # process starts on, rather than leaving it to the first
+            # request or the first cycle.
+            push_thresholds.maybe_reload()
             _log.info(
                 "push_enabled",
                 db=str(resolved_db_path(config)),
                 key=str(resolved_key_path(config)),
+                thresholds=str(resolved_thresholds_path(config)),
+                thresholds_fitted_at=push_thresholds.fitted_at_utc,
             )
         except Exception as exc:  # noqa: BLE001
             _log.error("push_init_failed", error=str(exc))
@@ -317,6 +337,7 @@ def create_app(
             push_public_key = None
     app.state.push_service = push_service
     app.state.push_store = push_store
+    app.state.push_thresholds = push_thresholds
 
     # Gauge scoreboard (Phase F): a virtual subscriber at every rain gauge,
     # evaluated once per cycle after the real fan-out and appended to the
@@ -483,6 +504,33 @@ def create_app(
             raise HTTPException(
                 status_code=503,
                 detail="no national calibration curves on this instance yet",
+            )
+        return Response(
+            content=path.read_bytes(),
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    @app.get("/calibration/push_thresholds.json", tags=["calibration"])
+    async def push_thresholds_file(
+        request: Request, _: None = Depends(require_api_key),
+    ) -> Response:
+        """The fitted push thresholds, as this instance reads them.
+
+        The twin of ``/calibration/national_curves.json`` and private for
+        the same reason: ``_PUBLIC_PATHS`` does not list it, so public mode
+        404s it. It exists so the public instance's ``sync`` task can pull
+        the nightly fit across the shared docker network — the table the
+        private instance fitted is then the table the public instance
+        warns by, without anyone copying a file and forgetting the
+        restart. Subscribers see the resolved answer at
+        ``/api/push/options`` instead.
+        """
+        path = resolved_thresholds_path(request.app.state.config)
+        if not path.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail="no fitted push thresholds on this instance yet",
             )
         return Response(
             content=path.read_bytes(),
@@ -822,6 +870,7 @@ def create_app(
             store=push_store,
             public_key=push_public_key,
             service=push_service,
+            thresholds=push_thresholds,
         ),
     )
 
@@ -931,6 +980,7 @@ _PUBLIC_PATHS = frozenset({
     # ``/api/push/`` prefix — ``/api/push/test`` and ``/api/push/stats``
     # are operator routes and must stay behind the bearer.
     "/api/push/config",
+    "/api/push/options",
     "/api/push/subscribe",
     "/api/push/unsubscribe",
 })

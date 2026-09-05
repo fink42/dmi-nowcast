@@ -521,7 +521,10 @@ def test_config_route_is_anonymous_and_lists_options(client: TestClient) -> None
     assert r.headers["cache-control"] == "no-store"
     body = r.json()
     assert body["enabled"] is True
+    # Since Phase G these are the bounds of the hidden threshold OVERRIDE,
+    # not a menu: the resolved per-horizon rule is at /api/push/options.
     assert body["threshold_options_pct"] == [40, 60, 80]
+    # push.lead_options is unset here, so they derive as they always did:
     # national leads [10, 20, 30, 45, 60] filtered by min_lead_min = 20.
     assert body["lead_options_min"] == [20, 30, 45, 60]
     assert body["defaults"] == {
@@ -543,7 +546,16 @@ def test_subscribe_happy_path_writes_the_row(
 ) -> None:
     r = client.post("/api/push/subscribe", json=_sub_body())
     assert r.status_code == 200, r.text
-    assert r.json() == {"ok": True, "created": True}
+    # ``_sub_body`` sends an explicit threshold_pct, which Phase G keeps as
+    # an override — hence "override" rather than "table"/"fallback". The
+    # one-knob path (no threshold_pct at all) is covered in
+    # ``test_push_threshold_table.py``.
+    assert r.json() == {
+        "ok": True, "created": True,
+        "effective_threshold_pct": 60,
+        "threshold_source": "override",
+        "fitted_at_utc": None,
+    }
     assert r.headers["cache-control"] == "no-store"
 
     store = PushStore(resolved_db_path(push_config))
@@ -572,7 +584,8 @@ def test_resubscribe_updates_prefs_and_resets_state(
         "/api/push/subscribe",
         json=_sub_body(threshold_pct=80, lead_min=45, lang="en"),
     )
-    assert r.json() == {"ok": True, "created": False}
+    assert r.json()["created"] is False
+    assert r.json()["effective_threshold_pct"] == 80
 
     store = PushStore(resolved_db_path(push_config))
     row = store.get(ENDPOINT_A)

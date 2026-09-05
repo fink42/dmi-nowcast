@@ -3,6 +3,10 @@
 Two things are under test and they are the two ways this file can hurt
 somebody:
 
+0. **The stability guard damps a refit.** The sweep runs nightly on a
+   window that slides by a day; most refits differ by noise. A rule that
+   changed under a subscriber every night for no measured reason would be
+   worse than one that is merely a percent off.
 1. **The validator rejects what the service must not read.** A wrong
    version, a lead key that is not a lead, a percentage outside (0, 100),
    a lead claiming both "insufficient evidence" and a threshold — each one
@@ -23,6 +27,7 @@ import pytest
 from dmi_nowcast_core.push_thresholds import (
     DEFAULT_FALLBACK_THRESHOLD_PCT,
     SCHEMA_VERSION,
+    apply_stability_guard,
     effective_threshold,
     load_thresholds,
     validate_thresholds,
@@ -241,3 +246,107 @@ class TestLoad:
         invalid = tmp_path / "invalid.json"
         invalid.write_text(json.dumps(_doc(schema_version=99)))
         assert load_thresholds(invalid) is None
+
+
+# ---------------------------------------------------------------------------
+# The stability guard
+# ---------------------------------------------------------------------------
+
+
+class TestStabilityGuard:
+    """What a nightly refit is allowed to change, and what it is not.
+
+    The fixture's ``_doc()`` has three leads and they cover the three
+    interesting shapes: 20 carries 50 %, 30 carries 45 %, 60 has no pick
+    at all.
+    """
+
+    def test_without_a_previous_table_every_pick_is_a_first_fit(self) -> None:
+        out = apply_stability_guard(_doc(), None)
+        assert out["leads"]["20"]["threshold_pct"] == 50
+        assert out["leads"]["20"]["guard"] == "first_fit"
+        assert out["leads"]["30"]["guard"] == "first_fit"
+        # The unfittable lead is marked as such, not promoted.
+        assert out["leads"]["60"]["guard"] == "insufficient"
+        assert out["leads"]["60"]["threshold_pct"] is None
+
+    def test_a_big_well_evidenced_move_is_taken(self) -> None:
+        previous = _doc(leads={"30": _lead(threshold_pct=30)})
+        new = _doc(leads={"30": _lead(threshold_pct=45, warnings=210)})
+        out = apply_stability_guard(new, previous)
+        assert out["leads"]["30"]["threshold_pct"] == 45
+        assert out["leads"]["30"]["guard"] == "changed"
+
+    def test_a_small_move_keeps_the_served_value(self) -> None:
+        """44 → 45 is one point of noise, not a new rule."""
+        previous = _doc(leads={"30": _lead(threshold_pct=44, f1=0.40)})
+        new = _doc(leads={"30": _lead(threshold_pct=45, warnings=500)})
+        out = apply_stability_guard(new, previous)
+        row = out["leads"]["30"]
+        assert row["threshold_pct"] == 44
+        assert row["guard"] == "kept_previous"
+        # The rejected candidate is recorded, and the counts described are
+        # the served threshold's, not the candidate's.
+        assert row["candidate_threshold_pct"] == 45
+        assert row["f1"] == 0.40
+
+    def test_a_thinly_evidenced_move_keeps_the_served_value(self) -> None:
+        """Far enough away, but fitted on 12 warnings."""
+        previous = _doc(leads={"30": _lead(threshold_pct=30)})
+        new = _doc(leads={"30": _lead(threshold_pct=60, warnings=12)})
+        out = apply_stability_guard(new, previous)
+        assert out["leads"]["30"]["threshold_pct"] == 30
+        assert out["leads"]["30"]["guard"] == "kept_previous"
+        assert out["leads"]["30"]["candidate_threshold_pct"] == 60
+
+    def test_the_thresholds_are_configurable(self) -> None:
+        previous = _doc(leads={"30": _lead(threshold_pct=44)})
+        new = _doc(leads={"30": _lead(threshold_pct=45, warnings=12)})
+        loose = apply_stability_guard(
+            new, previous, min_delta_pct=1, min_warnings=10,
+        )
+        assert loose["leads"]["30"]["threshold_pct"] == 45
+        assert loose["leads"]["30"]["guard"] == "changed"
+
+    def test_a_lead_that_stops_being_fittable_falls_back(self) -> None:
+        """No pick tonight means the fallback, not a stale number.
+
+        Keeping the old threshold would mean serving a rule while the
+        document says ``insufficient``, and ``validate_thresholds``
+        forbids exactly that contradiction.
+        """
+        previous = _doc(leads={"60": _lead(threshold_pct=55)})
+        out = apply_stability_guard(_doc(), previous)
+        row = out["leads"]["60"]
+        assert row["insufficient"] is True
+        assert row["threshold_pct"] is None
+        assert row["guard"] == "insufficient"
+        assert effective_threshold(out, 60) == DEFAULT_FALLBACK_THRESHOLD_PCT
+
+    def test_a_guarded_document_is_still_a_valid_document(self) -> None:
+        previous = _doc(leads={"20": _lead(threshold_pct=48), "30": _lead()})
+        out = apply_stability_guard(_doc(), previous)
+        assert validate_thresholds(out) == []
+        # Every lead of the new fit survives, and only those.
+        assert set(out["leads"]) == {"20", "30", "60"}
+
+    def test_the_new_document_is_not_mutated(self) -> None:
+        new = _doc()
+        previous = _doc(leads={"30": _lead(threshold_pct=44)})
+        out = apply_stability_guard(new, previous)
+        assert out["leads"]["30"]["threshold_pct"] == 44
+        assert new["leads"]["30"]["threshold_pct"] == 45
+        assert "guard" not in new["leads"]["30"]
+        # Everything outside ``leads`` is the new fit's.
+        assert out["fitted_at_utc"] == new["fitted_at_utc"]
+        assert out["window"] == new["window"]
+
+    def test_a_previous_document_that_is_junk_is_a_first_fit(self) -> None:
+        for junk in (None, "40 %", {}, {"leads": "later"}):
+            out = apply_stability_guard(_doc(), junk)
+            assert out["leads"]["30"]["threshold_pct"] == 45
+            assert out["leads"]["30"]["guard"] == "first_fit"
+
+    def test_a_document_with_no_leads_is_returned_unchanged(self) -> None:
+        broken = {"schema_version": SCHEMA_VERSION}
+        assert apply_stability_guard(broken, _doc()) is broken

@@ -7,6 +7,10 @@ anonymous browser):
 
 - ``GET  /api/push/config``      — is push on, the VAPID public key, and
   the option lists the UI renders. ``{"enabled": false}`` when off.
+- ``GET  /api/push/options``     — the one knob (Phase G): the horizons on
+  offer and, for each, the percent it warns at and whether that came from
+  the fitted table or the fallback. Cacheable for five minutes; it changes
+  once a night at most.
 - ``POST /api/push/subscribe``   — store or update one browser
   subscription plus its alert preferences.
 - ``POST /api/push/unsubscribe`` — forget one endpoint. Idempotent.
@@ -37,8 +41,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import Config
 from ..national_sample import sample_point
+from .paths import resolved_thresholds_path
 from .endpoint_policy import validate_endpoint
 from .store import NewSubscription, PushStore, sub_id
+from .thresholds import ThresholdTable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .service import PushService
@@ -46,6 +52,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 _log = structlog.get_logger(__name__)
 
 _NO_STORE = {"Cache-Control": "no-store"}
+# The fitted table is rewritten once a night at most and every field in the
+# options answer is derived from it, so five minutes of shared caching costs
+# nothing and takes the whole surface off the request path for a busy page.
+_CACHE_5_MIN = {"Cache-Control": "public, max-age=300"}
 _HHMM = r"^(?:[01]\d|2[0-3]):[0-5]\d$"
 # Endpoint and key bounds. A browser endpoint is a URL well under 1 KB and
 # the two keys are fixed-size base64; the caps exist so a hostile body
@@ -100,7 +110,10 @@ class SubscribeRequest(BaseModel):
     subscription: BrowserSubscription
     lat: Annotated[float, Field(ge=-90.0, le=90.0)]
     lon: Annotated[float, Field(ge=-180.0, le=180.0)]
-    threshold_pct: Annotated[int, Field(ge=1, le=99)]
+    # The hidden override. Absent or null — the normal case — means "use
+    # the fitted threshold for ``lead_min``", which is the whole point of
+    # Phase G: the subscriber chooses a horizon and nothing else.
+    threshold_pct: Annotated[int | None, Field(ge=1, le=99)] = None
     lead_min: Annotated[int, Field(ge=1, le=180)]
     quiet_hours: QuietHoursIn | None = None
     # IANA zone name; the length cap keeps a junk value out of the DB
@@ -145,13 +158,40 @@ class PushConfigResponse(BaseModel):
 
 
 class SubscribeResponse(BaseModel):
+    """What was stored, and the rule it will actually be evaluated under.
+
+    ``effective_threshold_pct`` is what the next fan-out will compare this
+    subscription's probability against, and ``threshold_source`` says who
+    decided it: ``"override"`` (the request carried a percent),
+    ``"table"`` (the fitted file) or ``"fallback"`` (a lead the fit cannot
+    speak for). ``fitted_at_utc`` is the table's stamp, null when there is
+    no usable table.
+    """
+
     ok: bool
     created: bool
+    effective_threshold_pct: int
+    threshold_source: str
+    fitted_at_utc: str | None = None
 
 
 class UnsubscribeResponse(BaseModel):
     ok: bool
     deleted: bool
+
+
+class ThresholdOut(BaseModel):
+    threshold_pct: int
+    source: str
+
+
+class PushOptionsResponse(BaseModel):
+    """The one knob, resolved: horizons on offer and the rule behind each."""
+
+    lead_options: list[int]
+    fallback_threshold_pct: int
+    fitted_at_utc: str | None = None
+    thresholds: dict[str, ThresholdOut]
 
 
 class SendResponse(BaseModel):
@@ -165,11 +205,18 @@ class SendResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def lead_options(config: Config) -> list[int]:
-    """Offered lead times: national probability leads at/after ``min_lead_min``.
+    """The horizons the subscribe form offers and ``/subscribe`` accepts.
 
-    Derived, never configured separately — a lead the grids do not carry
-    could be selected and then never evaluated.
+    ``push.lead_options`` when set — validated on the whole ``Config`` to
+    be a subset of ``forecast.national.leads_min``, so a configured
+    horizon is always one the grids carry. Unset, they are derived exactly
+    as they were before the setting existed: every national probability
+    lead at or after ``push.min_lead_min``. Either way a lead that could be
+    selected and then never evaluated cannot get through.
     """
+    configured = config.push.lead_options
+    if configured:
+        return sorted(int(lead) for lead in configured)
     return sorted(
         int(lead)
         for lead in config.forecast.national.leads_min
@@ -183,6 +230,7 @@ def build_router(
     store: PushStore | None = None,
     public_key: str | None = None,
     service: "PushService | None" = None,
+    thresholds: ThresholdTable | None = None,
 ) -> APIRouter:
     """Build the ``/api/push`` router.
 
@@ -192,6 +240,12 @@ def build_router(
     """
     router = APIRouter(prefix="/api/push", tags=["push"])
     enabled = bool(config.push.enabled and store is not None and public_key)
+    # The same table the service evaluates against, so what /subscribe
+    # promises and what the fan-out does can never drift apart. A router
+    # built without one still answers — with the fallback for every lead.
+    table = thresholds if thresholds is not None else ThresholdTable(
+        resolved_thresholds_path(config),
+    )
 
     def _require_enabled() -> PushStore:
         if not enabled or store is None:
@@ -206,7 +260,15 @@ def build_router(
         response_model_exclude_none=True,
     )
     async def push_config(response: Response) -> PushConfigResponse:
-        """What the browser needs to render the subscribe form."""
+        """What the browser needs to render the subscribe form.
+
+        ``threshold_options_pct`` and ``defaults.threshold_pct`` are the
+        bounds and default of the hidden OVERRIDE since Phase G, not a
+        menu: the percent a horizon warns at is at ``/options``, resolved
+        from the fitted table. They stay in the response because removing
+        a field breaks deployed clients, and because an operator building
+        a subscription by hand still needs the allowed range.
+        """
         response.headers.update(_NO_STORE)
         if not enabled or store is None:
             return PushConfigResponse(enabled=False)
@@ -229,6 +291,35 @@ def build_router(
             capacity_reached=count >= pc.max_subscriptions,
         )
 
+    @router.get("/options", response_model=PushOptionsResponse)
+    async def push_options(response: Response) -> PushOptionsResponse:
+        """The horizons on offer and the percent each one warns at.
+
+        The subscriber's only choice is the horizon; this says what
+        choosing it means. ``source`` per lead is ``"table"`` when the
+        nightly fit produced a pick for it and ``"fallback"`` when it did
+        not — a horizon nobody could fit yet behaves exactly as the site
+        behaved before the fit existed, and says so rather than pretending
+        the number was measured.
+
+        Publicly cacheable for five minutes: the table changes once a
+        night at most, and the answer carries its own ``fitted_at_utc`` so
+        a stale copy is legible rather than misleading.
+        """
+        _require_enabled()
+        response.headers.update(_CACHE_5_MIN)
+        leads = lead_options(config)
+        await asyncio.to_thread(table.maybe_reload)
+        return PushOptionsResponse(
+            lead_options=leads,
+            fallback_threshold_pct=table.fallback_threshold_pct,
+            fitted_at_utc=table.fitted_at_utc,
+            thresholds={
+                key: ThresholdOut(**value)
+                for key, value in table.snapshot(leads).items()
+            },
+        )
+
     @router.post("/subscribe", response_model=SubscribeResponse)
     async def subscribe(
         body: SubscribeRequest, request: Request, response: Response,
@@ -238,7 +329,15 @@ def build_router(
         active = _require_enabled()
         pc = config.push
 
-        if body.threshold_pct not in pc.threshold_options_pct:
+        # ``threshold_pct`` is an OVERRIDE now, not a choice: absent (the
+        # normal case) the fitted table decides from ``lead_min``. When one
+        # IS sent it still has to be one of the configured options — the
+        # bounds exist so a hostile or careless body cannot install a 1 %
+        # rule that pushes on every frame.
+        if (
+            body.threshold_pct is not None
+            and body.threshold_pct not in pc.threshold_options_pct
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -307,15 +406,27 @@ def build_router(
                 lang=body.lang,
             ),
         )
+        if body.threshold_pct is not None:
+            effective, source = int(body.threshold_pct), "override"
+        else:
+            await asyncio.to_thread(table.maybe_reload)
+            effective, source = table.effective(body.lead_min)
         _log.info(
             "push_subscribed",
             sub=sub_id(endpoint),
             created=created,
-            threshold_pct=body.threshold_pct,
             lead_min=body.lead_min,
+            threshold_pct=effective,
+            threshold_source=source,
             lang=body.lang,
         )
-        return SubscribeResponse(ok=True, created=created)
+        return SubscribeResponse(
+            ok=True,
+            created=created,
+            effective_threshold_pct=effective,
+            threshold_source=source,
+            fitted_at_utc=table.fitted_at_utc,
+        )
 
     @router.post("/unsubscribe", response_model=UnsubscribeResponse)
     async def unsubscribe(
@@ -374,6 +485,7 @@ def build_router(
 __all__ = [
     "BrowserSubscription",
     "PushConfigResponse",
+    "PushOptionsResponse",
     "SubscribeRequest",
     "build_router",
     "lead_options",

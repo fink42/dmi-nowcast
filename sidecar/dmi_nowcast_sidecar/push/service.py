@@ -18,12 +18,19 @@ the state has been written. From there:
    about which pixel a point reads, nor about whether it is already
    raining there.
 
-3. **Persist first, send second.** The new state is written before any
+3. **One rule per horizon, re-read between cycles.** The threshold a
+   subscription is judged at comes from the fitted table
+   (``push.thresholds``) unless the row carries an explicit override. The
+   table is re-read at the start of the fan-out and never during one, so
+   every ``push_eval`` line of a cycle was decided under the same rule and
+   says which rule that was.
+
+4. **Persist first, send second.** The new state is written before any
    network call, so a crash mid-fan-out can only cost a notification, not
    cause a repeat. The failure the user forgives is a missed alert; the
    one they uninstall over is the same alert five times.
 
-4. **Fan out sequentially inside a wall-clock budget.** The push services
+5. **Fan out sequentially inside a wall-clock budget.** The push services
    are the slow part and the cycle must not be held hostage to them:
    whatever is still queued when the budget expires is dropped and
    counted. ``404``/``410`` from a push service means the browser is gone —
@@ -49,7 +56,9 @@ from . import engine as decision_engine
 from . import fanout
 from .engine import Observation, QuietHours, Rules, SubState
 from .messages import rain_incoming_payload, test_payload
+from .paths import resolved_thresholds_path
 from .store import PushStore, Subscription, sub_id
+from .thresholds import ThresholdTable
 
 _log = structlog.get_logger(__name__)
 
@@ -64,12 +73,21 @@ class PushService:
         store: PushStore,
         vapid_private_pem: bytes,
         public_key: str,
+        thresholds: ThresholdTable | None = None,
     ) -> None:
         self.config = config
         self.engine = engine
         self.store = store
         self.vapid_private_pem = vapid_private_pem
         self.public_key = public_key
+        #: The fitted horizon → threshold table (Phase G). Shared with the
+        #: routes so the subscribe response and the fan-out can never
+        #: disagree about which rule a subscription is on; built here when
+        #: nobody handed one over, so a service constructed in a test or a
+        #: script still reads the same file the deployment does.
+        self.thresholds = thresholds if thresholds is not None else ThresholdTable(
+            resolved_thresholds_path(config),
+        )
         self._last_evaluated_radar_ts: datetime | None = None
         self._last_fanout: dict | None = None
 
@@ -162,6 +180,12 @@ class PushService:
         forecast_mm_h: Any = None,
     ) -> dict:
         """Decide for every subscription, persist, then fan out. Blocking."""
+        # One stat per cycle, a JSON parse only when the fitted table
+        # moved. The start of a fan-out is the safe moment to swap it: the
+        # whole cycle then evaluates every subscription against one
+        # version of the rule, and the ``push_eval`` lines of a cycle are
+        # comparable with each other.
+        self.thresholds.maybe_reload()
         subs = self.store.list()
         rules = self._rules()
         pending: list[tuple[Subscription, dict]] = []
@@ -194,11 +218,22 @@ class PushService:
                 if sub.quiet_enabled
                 else None
             )
+            # The one knob: the subscription chose a horizon, the fitted
+            # table chose the percent that horizon warns at. A non-null
+            # ``threshold_pct`` on the row is a deliberate override and
+            # wins over both. ``evaluate`` stays pure — it is handed a
+            # number, and never learns where it came from.
+            if sub.threshold_pct is not None:
+                threshold_pct, threshold_source = int(sub.threshold_pct), "override"
+            else:
+                threshold_pct, threshold_source = self.thresholds.effective(
+                    sub.lead_min,
+                )
             try:
                 decision = decision_engine.evaluate(
                     state,
                     obs,
-                    threshold_pct=sub.threshold_pct,
+                    threshold_pct=threshold_pct,
                     quiet=quiet,
                     tz=sub.tz,
                     now_utc=now_utc,
@@ -222,6 +257,9 @@ class PushService:
                 sub=sub_id(sub.endpoint),
                 radar_ts=radar_ts.isoformat(),
                 action=decision.action,
+                lead_min=sub.lead_min,
+                threshold_pct=threshold_pct,
+                threshold_source=threshold_source,
                 p_rain=obs.p_rain,
                 eta_min=obs.eta_min,
                 intensity_mm_h=obs.intensity_mm_h,
@@ -258,6 +296,7 @@ class PushService:
         counts = self._fanout(pending)
         summary = {
             "radar_ts": radar_ts.isoformat(),
+            "thresholds_fitted_at": self.thresholds.fitted_at_utc,
             "subscriptions": len(subs),
             "notified": len(pending),
             "eval_errors": errors,

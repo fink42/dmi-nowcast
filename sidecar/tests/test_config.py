@@ -147,6 +147,10 @@ def test_push_defaults_are_off(config_yaml: Path) -> None:
     assert cfg.push.vapid_private_key_file is None
     assert cfg.push.db_path is None
     assert cfg.push.min_lead_min == 20
+    # Phase G: unset means "derive as before" and the fitted table lands
+    # beside the other synced artifacts in the data volume.
+    assert cfg.push.lead_options is None
+    assert cfg.push.thresholds_path is None
     assert cfg.push.threshold_options_pct == [40, 60, 80]
     assert cfg.push.default_threshold_pct == 60
     assert cfg.push.default_lead_min == 30
@@ -191,6 +195,55 @@ def test_push_defaults_must_be_offered_options(tmp_path: Path) -> None:
     )
     with pytest.raises(Exception, match="min_lead_min"):
         load_config(p2)
+
+
+def test_push_lead_options_must_be_leads_the_grids_carry(tmp_path: Path) -> None:
+    """A horizon outside forecast.national.leads_min could be chosen and
+    then never evaluated: the subscription would sample None for ever."""
+    good = tmp_path / "push_leads_ok.yaml"
+    good.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "push:\n  lead_options: [20, 30, 45, 60]\n"
+    )
+    assert load_config(good).push.lead_options == [20, 30, 45, 60]
+
+    bad = tmp_path / "push_leads_bad.yaml"
+    bad.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "push:\n  lead_options: [20, 44]\n"
+    )
+    with pytest.raises(Exception, match="lead_options"):
+        load_config(bad)
+
+    unsorted = tmp_path / "push_leads_unsorted.yaml"
+    unsorted.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "push:\n  lead_options: [30, 20]\n"
+    )
+    with pytest.raises(Exception, match="ascending"):
+        load_config(unsorted)
+
+
+def test_push_default_lead_must_be_offered(tmp_path: Path) -> None:
+    p = tmp_path / "push_default_lead.yaml"
+    p.write_text(
+        "home:\n  lat: 55\n  lon: 10\n"
+        "push:\n  lead_options: [20, 45]\n  default_lead_min: 30\n"
+    )
+    with pytest.raises(Exception, match="lead_options"):
+        load_config(p)
+
+
+def test_quality_report_threshold_fit_is_off_by_default(
+    config_yaml: Path,
+) -> None:
+    fit = load_config(config_yaml).quality_report.fit_thresholds
+    assert fit.enabled is False
+    assert fit.decisions_dirs == []
+    assert fit.thresholds == "20:80:5"
+    assert (fit.min_warnings, fit.min_delta_pct) == (30, 5)
+    assert fit.min_useful_lead_min == 5.0
+    assert fit.thresholds_out is None
 
 
 def test_push_quiet_hours_must_be_hhmm(tmp_path: Path) -> None:

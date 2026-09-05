@@ -1,7 +1,13 @@
-"""The (lead, threshold) sweep (``scripts/sweep_thresholds.py``).
+"""The (lead, threshold) sweep.
+
+The implementation is ``dmi_nowcast_sidecar.threshold_sweep`` (Phase G,
+G4: the nightly quality-report task runs the same fit, so it cannot live
+in a script); ``scripts/sweep_thresholds.py`` is the CLI over it, and
+every test below drives it through that CLI — which is also how the module
+and the script are held to the same behaviour.
 
 Tested from the sidecar suite for the same reason
-``test_replay_warnings.py`` is: the script imports ``push.engine`` for the
+``test_replay_warnings.py`` is: the fit replays ``push.engine`` for the
 decision and the core library for the scoring, and this environment is the
 only one that has both.
 
@@ -854,3 +860,103 @@ def test_a_radar_pick_that_disagrees_is_reported_as_a_disagreement(
     assert doc["leads"]["30"]["agrees_with_radar"] is False
     # The gauge pick still ships: the radar set never overrides it.
     assert doc["leads"]["30"]["threshold_pct"] == 45
+
+
+
+# ---------------------------------------------------------------------------
+# The importable module (Phase G, G4)
+# ---------------------------------------------------------------------------
+
+
+def test_the_module_and_the_cli_fit_the_same_table(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    """``run_fit`` is what the CLI runs — the nightly task gets the same fit.
+
+    The two paths differ only in how the options arrive (argparse versus a
+    dataclass) and in what is done with the result, so the fitted table
+    must be identical apart from its timestamp.
+    """
+    from dmi_nowcast_sidecar.threshold_sweep import SweepOptions, run_fit
+
+    out = tmp_path / "push_thresholds.json"
+    cli = _run(
+        tmp_path, corpus, "--min-warnings", "1", "--out-thresholds", str(out),
+    )
+    direct = run_fit(SweepOptions(
+        decisions_dirs=[corpus / "decisions"],
+        corpus_dir=corpus / "corpus",
+        leads=(10, 30),
+        thresholds=(40, 50, 70),
+        min_warnings=1,
+    ))
+
+    # The CLI runs the stability guard over the fit; with no --previous
+    # that stamps every lead "first_fit" and changes nothing else.
+    assert cli["thresholds"]["leads"] == {
+        lead: {**row, "guard": "first_fit" if row["threshold_pct"] else
+               "insufficient"}
+        for lead, row in direct["thresholds"]["leads"].items()
+    }
+    assert direct["window"] == cli["window"]
+    assert direct["cells"] == cli["cells"]
+    assert validate_thresholds(direct["thresholds"]) == []
+    assert direct["thresholds_schema_problems"] == []
+
+
+def test_nothing_to_fit_on_raises_rather_than_exits(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    """The CLI's exit code 2 is this exception, caught."""
+    from dmi_nowcast_sidecar.threshold_sweep import SweepError, SweepOptions, run_fit
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(SweepError, match="no decision rows"):
+        run_fit(SweepOptions(
+            decisions_dirs=[empty], corpus_dir=corpus / "corpus",
+        ))
+
+
+# ---------------------------------------------------------------------------
+# The stability guard, through the CLI
+# ---------------------------------------------------------------------------
+
+
+def test_previous_keeps_a_served_threshold_the_refit_barely_moves(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    """The fixture fits 45 %; a served 44 % is one point away and stays."""
+    out = tmp_path / "push_thresholds.json"
+    _run(tmp_path, corpus, "--min-warnings", "1", "--out-thresholds", str(out))
+    assert json.loads(out.read_text())["leads"]["30"]["threshold_pct"] == 45
+
+    served = tmp_path / "served.json"
+    doc = json.loads(out.read_text())
+    doc["leads"]["30"]["threshold_pct"] = 44
+    doc["leads"]["30"]["plateau"] = [40, 50]
+    served.write_text(json.dumps(doc))
+
+    _run(
+        tmp_path, corpus, "--min-warnings", "1",
+        "--out-thresholds", str(out), "--previous", str(served),
+    )
+    refitted = json.loads(out.read_text())["leads"]["30"]
+    assert refitted["threshold_pct"] == 44
+    assert refitted["guard"] == "kept_previous"
+    assert refitted["candidate_threshold_pct"] == 45
+    assert validate_thresholds(json.loads(out.read_text())) == []
+
+
+def test_an_absent_previous_file_is_a_first_fit(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    out = tmp_path / "push_thresholds.json"
+    _run(
+        tmp_path, corpus, "--min-warnings", "1",
+        "--out-thresholds", str(out),
+        "--previous", str(tmp_path / "never_written.json"),
+    )
+    row = json.loads(out.read_text())["leads"]["30"]
+    assert row["threshold_pct"] == 45
+    assert row["guard"] == "first_fit"

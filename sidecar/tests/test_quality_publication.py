@@ -37,6 +37,7 @@ from fastapi.testclient import TestClient
 from dmi_nowcast_sidecar.app import _PUBLIC_PATHS, _is_public_path, create_app
 from dmi_nowcast_sidecar.compute import CycleEngine
 from dmi_nowcast_sidecar.config import Config
+from dmi_nowcast_sidecar.push.paths import resolved_thresholds_path
 from dmi_nowcast_sidecar.quality_report import (
     QualityReportTask,
     build_quality_report_task,
@@ -388,6 +389,209 @@ def _ok(payload: dict, etag: str | None = None) -> httpx.Response:
     return httpx.Response(200, json=payload, headers=headers)
 
 
+# ---------------------------------------------------------------------------
+# The nightly push-threshold fit (Phase G, G4)
+# ---------------------------------------------------------------------------
+
+
+def _lead_row(threshold: int | None, warnings: int = 210) -> dict:
+    return {
+        "threshold_pct": threshold,
+        "insufficient": threshold is None,
+        "f1": 0.42, "precision": 0.48, "recall": 0.37,
+        "far": 0.55, "csi": 0.27,
+        "warnings": warnings, "hits": 94, "false_alarms": 101,
+        "misses": 150, "late": 15,
+        "plateau": None if threshold is None else [threshold - 5, threshold + 5],
+        "radar_plateau": None,
+        "agrees_with_radar": None,
+    }
+
+
+def _thresholds_doc(leads: dict[str, int | None], warnings: int = 210) -> dict:
+    return {
+        "schema_version": 1,
+        "fitted_at_utc": "2026-09-05T03:31:00+00:00",
+        "objective": {
+            "metric": "f1", "min_useful_lead_min": 5.0, "plateau_frac": 0.95,
+            "min_warnings": 30, "rearm_after_min": 60, "persistence_obs": 1,
+            "tolerance_min": 10, "dry_min": 30,
+        },
+        "window": {
+            "from": "2026-07-01T00:00:00+00:00",
+            "to": "2026-09-01T00:00:00+00:00",
+            "days": 62, "stations": 97, "rows": 1841203,
+        },
+        "fallback_threshold_pct": 40,
+        "leads": {
+            key: _lead_row(value, warnings) for key, value in leads.items()
+        },
+    }
+
+
+class _FakeTable:
+    """Stands in for the running service's ``ThresholdTable``."""
+
+    def __init__(self) -> None:
+        self.nudged = 0
+
+    def note_changed(self) -> None:
+        self.nudged += 1
+
+
+def _fit_config(tmp_path: Path, **fit) -> Config:
+    settings = {
+        "enabled": True,
+        "decisions_dirs": [tmp_path / "corpus" / "stations" / "eval"],
+        "thresholds": "40:60:10",
+    }
+    settings.update(fit)
+    return _config(tmp_path, quality_report={
+        "enabled": True, "fit_thresholds": settings,
+    })
+
+
+class TestNightlyThresholdFit:
+    """The sweep that runs in front of the report build.
+
+    The sweep itself is tested in ``test_sweep_thresholds.py``; what
+    matters here is the wiring around it — the guard, where the file
+    lands, the nudge, and the promise that a failed fit costs a table
+    nobody notices rather than the whole nightly build.
+    """
+
+    def test_it_is_off_by_default(self, tmp_path: Path) -> None:
+        config = _config(tmp_path, quality_report={"enabled": True})
+        assert config.quality_report.fit_thresholds.enabled is False
+        task = QualityReportTask(config, builder=lambda _inputs: dict(DOC))
+        result = anyio_run(task.build_once())
+        assert result.ok is True
+        assert result.thresholds_path is None
+        assert not resolved_thresholds_path(config).exists()
+
+    def test_a_first_fit_lands_where_the_service_reads_it(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _fit_config(tmp_path)
+        table = _FakeTable()
+        seen: list = []
+
+        def build(inputs):
+            seen.append(inputs)
+            return dict(DOC)
+
+        task = QualityReportTask(
+            config, builder=build, thresholds=table,
+            fitter=lambda options: {"thresholds": _thresholds_doc({"30": 45})},
+        )
+        result = anyio_run(task.build_once())
+
+        out = resolved_thresholds_path(config)
+        assert result.thresholds_path == out
+        assert result.thresholds_guard == {"30": "first_fit"}
+        written = json.loads(out.read_text())
+        assert written["leads"]["30"]["threshold_pct"] == 45
+        # The running service is told to re-read…
+        assert table.nudged == 1
+        # …and the report was built with the table that was just written,
+        # so quality.json describes tonight's rule, not last night's.
+        assert seen[0].thresholds_path == out
+
+    def test_the_guard_holds_a_small_move_back(self, tmp_path: Path) -> None:
+        config = _fit_config(tmp_path)
+        out = resolved_thresholds_path(config)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(_thresholds_doc({"30": 44})))
+
+        task = QualityReportTask(
+            config, builder=lambda _inputs: dict(DOC),
+            fitter=lambda options: {"thresholds": _thresholds_doc({"30": 45})},
+        )
+        result = anyio_run(task.build_once())
+        assert result.thresholds_guard == {"30": "kept_previous"}
+        assert json.loads(out.read_text())["leads"]["30"]["threshold_pct"] == 44
+
+    def test_a_big_well_evidenced_move_is_published(self, tmp_path: Path) -> None:
+        config = _fit_config(tmp_path)
+        out = resolved_thresholds_path(config)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(_thresholds_doc({"30": 40})))
+
+        task = QualityReportTask(
+            config, builder=lambda _inputs: dict(DOC),
+            fitter=lambda options: {"thresholds": _thresholds_doc({"30": 60})},
+        )
+        result = anyio_run(task.build_once())
+        assert result.thresholds_guard == {"30": "changed"}
+        assert json.loads(out.read_text())["leads"]["30"]["threshold_pct"] == 60
+
+    def test_a_failing_fit_keeps_the_table_and_still_builds(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _fit_config(tmp_path)
+        out = resolved_thresholds_path(config)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(_thresholds_doc({"30": 44})))
+
+        def explode(options):
+            raise RuntimeError("parquet on fire")
+
+        table = _FakeTable()
+        task = QualityReportTask(
+            config, builder=lambda _inputs: dict(DOC),
+            fitter=explode, thresholds=table,
+        )
+        result = anyio_run(task.build_once())
+        # The report is the point of the task; the fit is a step of it.
+        assert result.ok is True
+        assert quality_path(config).is_file()
+        assert "parquet on fire" in str(result.thresholds_error)
+        assert result.thresholds_path is None
+        # Untouched, and nobody was told to re-read anything.
+        assert json.loads(out.read_text())["leads"]["30"]["threshold_pct"] == 44
+        assert table.nudged == 0
+
+    def test_nothing_to_fit_on_is_not_a_failure(self, tmp_path: Path) -> None:
+        from dmi_nowcast_sidecar.threshold_sweep import SweepError
+
+        def nothing(options):
+            raise SweepError("no decision rows found")
+
+        config = _fit_config(tmp_path)
+        task = QualityReportTask(
+            config, builder=lambda _inputs: dict(DOC), fitter=nothing,
+        )
+        result = anyio_run(task.build_once())
+        assert result.ok is True
+        assert result.thresholds_error == "no decision rows found"
+        assert not resolved_thresholds_path(config).exists()
+
+    def test_the_options_are_the_live_rule(self, tmp_path: Path) -> None:
+        """The replay must run under the constants the service ships."""
+        config = _fit_config(tmp_path, radar_decisions_dir=tmp_path / "radar")
+        config.push.lead_options = [20, 30]
+        config.push.persistence_obs = 1
+        config.push.rearm_after_min = 45
+        options = QualityReportTask(config)._fit_options()
+        assert options.leads == (20, 30)
+        assert options.thresholds == (40, 50, 60)
+        assert options.persistence_obs == 1
+        assert options.rearm_after_min == 45
+        assert options.corpus_dir == config.storage.corpus_dir
+        assert options.radar_decisions_dirs == [tmp_path / "radar"]
+
+    def test_an_explicit_out_path_wins(self, tmp_path: Path) -> None:
+        config = _fit_config(tmp_path, thresholds_out=tmp_path / "elsewhere.json")
+        assert QualityReportTask(config).thresholds_out() == (
+            tmp_path / "elsewhere.json"
+        )
+
+
+# ---------------------------------------------------------------------------
+# The pull, continued
+# ---------------------------------------------------------------------------
+
+
 class TestArtifactSync:
     def test_a_200_lands_both_files_in_their_own_places(
         self, tmp_path: Path,
@@ -652,15 +856,18 @@ class TestPublicGate:
         """Exactly one new path is reachable anonymously.
 
         ``/nowcast/quality.json`` rides the ``/nowcast/`` prefix that
-        already existed; the curves route does not, and must not — the
-        public instance READS that file from the private one.
+        already existed; neither fitted file's route does, and neither
+        must — the public instance READS both from the private one.
+        ``/api/push/options`` (Phase G) is subscriber-facing and IS on the
+        allow-list, beside the other three push routes.
         """
         assert _is_public_path("/nowcast/quality.json")
         assert not _is_public_path("/calibration/national_curves.json")
-        # The exact-path allow-list is untouched by F4.
+        assert not _is_public_path("/calibration/push_thresholds.json")
         assert _PUBLIC_PATHS == frozenset({
             "/healthz", "/forecast",
-            "/api/push/config", "/api/push/subscribe", "/api/push/unsubscribe",
+            "/api/push/config", "/api/push/options",
+            "/api/push/subscribe", "/api/push/unsubscribe",
         })
 
     def test_the_gate_serves_quality_and_hides_the_curves(
