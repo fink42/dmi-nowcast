@@ -256,7 +256,7 @@ export const da = {
 				falseAlarms: string,
 				minutes: string
 			) =>
-				`Af ${total} varsler de seneste ${days} dage blev ${hits} fulgt af regn ved måleren inden for vinduet, ${falseAlarms} var falske alarmer, og det midterste varsel kom ${minutes} minutter for sent.`,
+				`Af ${total} varsler over ${days} målte dage blev ${hits} fulgt af regn ved måleren inden for vinduet, ${falseAlarms} var falske alarmer, og det midterste varsel kom ${minutes} minutter for sent.`,
 			warningsEarly: (
 				total: string,
 				days: number,
@@ -264,9 +264,9 @@ export const da = {
 				falseAlarms: string,
 				minutes: string
 			) =>
-				`Af ${total} varsler de seneste ${days} dage blev ${hits} fulgt af regn ved måleren inden for vinduet, ${falseAlarms} var falske alarmer, og det midterste varsel kom ${minutes} minutter for tidligt.`,
+				`Af ${total} varsler over ${days} målte dage blev ${hits} fulgt af regn ved måleren inden for vinduet, ${falseAlarms} var falske alarmer, og det midterste varsel kom ${minutes} minutter for tidligt.`,
 			warningsOnTime: (total: string, days: number, hits: string, falseAlarms: string) =>
-				`Af ${total} varsler de seneste ${days} dage blev ${hits} fulgt af regn ved måleren inden for vinduet, ${falseAlarms} var falske alarmer, og det midterste varsel ramte tiden.`,
+				`Af ${total} varsler over ${days} målte dage blev ${hits} fulgt af regn ved måleren inden for vinduet, ${falseAlarms} var falske alarmer, og det midterste varsel ramte tiden.`,
 			warningsRates: (pod: string, far: string, stations: string) =>
 				`Vi fangede ${pod} af regnen ved ${stations} stationer; ${far} af varslerne var falske.`,
 			marginTitle: 'Er vi bedre end ingenting?',

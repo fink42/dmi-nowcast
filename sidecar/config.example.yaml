@@ -183,3 +183,58 @@ station_obs:
 #     lead_min: 30
 #     rearm_after_min: 60
 #     persistence_obs: 1
+
+# --- The quality report (Phase F, F4) ---------------------------------
+# The document behind the website's /quality page ("How good are we?"):
+# reliability against radar and gauge truth, the warning scoreboard, the
+# margin over persistence, per-station scores. Built here every night and
+# written to <storage.data_dir>/nowcast/quality.json, which is exactly
+# what GET /nowcast/quality.json serves — publishing is a file write.
+#
+# Private instance ONLY: config load refuses the combination with
+# server.public_mode, and requires storage.corpus_dir. The public
+# instance PULLS the finished document instead (see the `sync` block in
+# deploy/public/config.public.example.yaml).
+#
+# Every input path is optional and a missing one nulls its section of the
+# report rather than faking it, so this can go on before the whole corpus
+# exists. Build the first one by hand with deploy/quality_report.sh —
+# the page 503s until a document is on disk.
+#
+quality_report:
+  enabled: true
+  # UTC. After the overnight replay, well away from a cycle's busy minute.
+  at_utc: "03:30"
+  # The national calibration corpus (stamped per calibrate.sh run — point
+  # this at the newest one, or at a stable symlink you maintain).
+  radar_corpus: /var/lib/dmi-nowcast-corpus/calibration/latest.parquet
+  # The same corpus over station points, widened with gauge truth by
+  # scripts/join_gauge_truth.py. This is what makes the gauge column of
+  # the page a measurement against the ground rather than against radar.
+  station_corpus: /var/lib/dmi-nowcast-corpus/stations/station_corpus_gauge.parquet
+  # scripts/replay_warnings.py output. Its decision rows and the live
+  # station_eval rows are scored as one table, deduplicated on
+  # (radar_ts, station_id) with the live row winning.
+  replay_dir: /var/lib/dmi-nowcast-corpus/stations/replay
+  # scripts/persistence_vs_advection.py results.json — the "are we better
+  # than nothing" headline. null drops that card, nothing else.
+  persistence_json: /var/lib/dmi-nowcast-corpus/pva/results.json
+  # The served curves. null falls back to
+  # calibration.national_curves_path, which is what the running service
+  # reads — reliability must be of the probability the site PUBLISHED,
+  # not of the raw ensemble fraction behind it.
+  national_curves: null
+  # How far back live stations/eval rows are read, and the shorter window
+  # the "recent warnings" list is drawn from.
+  live_days: 90
+  live_days_secondary: 30
+  # Markdown twin of each report, stamped YYYY-MM-DD.md. null skips it.
+  markdown_dir: /var/lib/dmi-nowcast-corpus/quality_reports
+
+# --- Artifact sync (Phase F, F4) --------------------------------------
+# OFF here, and correctly so: this instance PRODUCES the quality report
+# and the calibration curves. The public instance is the one that copies
+# them. Left documented so the two configs read as a pair.
+#
+# sync:
+#   enabled: false

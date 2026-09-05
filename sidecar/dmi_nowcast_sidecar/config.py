@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
 import yaml
@@ -436,6 +436,125 @@ class StationEvalConfig(BaseModel):
         return self
 
 
+#: 24-hour ``HH:MM`` UTC wall-clock, for the nightly report build.
+_UTC_HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+class QualityReportConfig(BaseModel):
+    """The nightly ``quality.json`` build (Phase F, F4).
+
+    Turns the corpora, the warning replay and the live scoreboard into the
+    document the website's /quality page renders, and writes it to
+    ``<storage.data_dir>/nowcast/quality.json`` — the directory the
+    ``/nowcast/*`` routes serve from.
+
+    Off by default and **private-instance only**, for the same reason as
+    ``station_eval``: the inputs live on the corpus volume, which the
+    public stack does not have. The public instance gets the finished
+    document by pulling it over the shared docker network (see
+    :class:`SyncConfig`), never by building it.
+
+    Every input path is optional. A missing one nulls its section of the
+    report rather than faking it, so this can be turned on before the
+    whole corpus exists.
+    """
+
+    enabled: bool = False
+    #: UTC wall-clock time of the daily build. Well after the monthly
+    #: calibration and any overnight replay, and nowhere near the busy
+    #: minute of a radar cycle.
+    at_utc: str = "03:30"
+    radar_corpus: Path | None = None
+    station_corpus: Path | None = None
+    replay_dir: Path | None = None
+    persistence_json: Path | None = None
+    #: The served national curves. ``None`` falls back to
+    #: ``calibration.national_curves_path``, which is what the running
+    #: service reads — reliability must be of the probability the site
+    #: actually published, not of the raw ensemble fraction.
+    national_curves: Path | None = None
+    live_days: Annotated[int, Field(ge=1, le=3650)] = 90
+    live_days_secondary: Annotated[int, Field(ge=1, le=3650)] = 30
+    #: Also write a markdown twin here, stamped ``YYYY-MM-DD.md``.
+    markdown_dir: Path | None = None
+
+    @field_validator("at_utc")
+    @classmethod
+    def _at_utc_valid(cls, v: str) -> str:
+        if not _UTC_HHMM_RE.match(v):
+            raise ValueError(
+                "quality_report at_utc must be a 24-hour 'HH:MM' UTC string",
+            )
+        return v
+
+
+class SyncConfig(BaseModel):
+    """Pull published artifacts from the private instance (Phase F, F4).
+
+    The public instance computes its own nowcast but can compute neither
+    the quality report nor the calibration curves — both need the corpus,
+    which only the private instance has. This task copies the finished
+    files across the shared docker network: one conditional HTTP GET per
+    file per ``interval_min``, written atomically into place.
+
+    **Last good wins.** A failed fetch — connection refused, 500, a body
+    that is not the JSON it claims to be — leaves whatever is already on
+    disk untouched. A public instance whose private peer is down keeps
+    serving yesterday's report, which is the honest degradation: the
+    document carries its own ``generated_at_utc`` and the page shows it.
+
+    ``files`` are paths relative to ``source_url``. They land under
+    ``storage.data_dir`` by the same relative path, with one deliberate
+    exception: ``calibration/national_curves.json`` goes to
+    ``calibration.national_curves_path``, because that is where the
+    running engine reads its curves from.
+    """
+
+    enabled: bool = False
+    #: Base URL of the private sidecar, e.g.
+    #: ``http://dmi-nowcast-sidecar:8081``. Required when enabled.
+    source_url: str | None = None
+    interval_min: Annotated[int, Field(ge=1, le=1440)] = 60
+    files: list[str] = Field(
+        default_factory=lambda: [
+            "nowcast/quality.json",
+            "calibration/national_curves.json",
+        ],
+    )
+    timeout_s: Annotated[float, Field(gt=0, le=300)] = 30.0
+    #: Refuse a body larger than this. The quality report is well under a
+    #: megabyte with a hundred stations; 16 MB is orders of headroom and
+    #: still bounds what a misconfigured source can push into the volume.
+    max_bytes: Annotated[int, Field(ge=1024, le=256 * 1024 * 1024)] = 16 * 1024 * 1024
+    #: Optional bearer for the source. The private instance normally has
+    #: no key on the shared docker network, hence ``None``.
+    api_key: str | None = None
+
+    @field_validator("files")
+    @classmethod
+    def _files_are_safe_relative_paths(cls, v: list[str]) -> list[str]:
+        out = [f.strip().lstrip("/") for f in v]
+        if not out or any(not f for f in out):
+            raise ValueError("sync files must be non-empty relative paths")
+        if len(set(out)) != len(out):
+            raise ValueError("sync files must be unique")
+        for name in out:
+            parts = PurePosixPath(name).parts
+            if not parts or any(p in ("..", ".") for p in parts):
+                raise ValueError(
+                    f"sync file {name!r} must be a relative path without '..'",
+                )
+        return out
+
+    @model_validator(mode="after")
+    def _needs_a_source(self) -> "SyncConfig":
+        if self.enabled and not self.source_url:
+            raise ValueError("sync.enabled requires sync.source_url")
+        if self.source_url and not self.source_url.startswith(("http://", "https://")):
+            raise ValueError("sync.source_url must be an http:// or https:// URL")
+        return self
+
+
 class Config(BaseSettings):
     """Sidecar config root. Env-var overrides via ``DMI_NOWCAST_*``."""
 
@@ -457,6 +576,8 @@ class Config(BaseSettings):
     push: PushConfig = Field(default_factory=PushConfig)
     station_obs: StationObsConfig = Field(default_factory=StationObsConfig)
     station_eval: StationEvalConfig = Field(default_factory=StationEvalConfig)
+    quality_report: QualityReportConfig = Field(default_factory=QualityReportConfig)
+    sync: SyncConfig = Field(default_factory=SyncConfig)
 
     @model_validator(mode="after")
     def _station_obs_not_public(self) -> "Config":
@@ -509,6 +630,33 @@ class Config(BaseSettings):
             raise ValueError(
                 "station_eval.rules.lead_min must be one of "
                 f"forecast.national.leads_min {self.forecast.national.leads_min}",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _quality_report_is_private(self) -> "Config":
+        """The report is BUILT on the private instance and only there.
+
+        Same reasoning as ``station_eval`` above: the corpora, the gauge
+        store and the replay output all live on the corpus volume, which
+        the public stack does not mount. The public instance receives the
+        finished document over ``sync`` instead — refusing here is what
+        keeps someone from "fixing" a blank /quality page by turning the
+        builder on in the wrong config.
+        """
+        if not self.quality_report.enabled:
+            return self
+        if self.server.public_mode:
+            raise ValueError(
+                "quality_report.enabled is not allowed with server.public_mode: "
+                "the report is built on the LAN instance that owns the corpus "
+                "and pulled by the public one via sync.enabled",
+            )
+        if self.storage.corpus_dir is None:
+            raise ValueError(
+                "quality_report.enabled requires storage.corpus_dir — the gauge "
+                "store, the live scoreboard rows and the station points all "
+                "live under <corpus_dir>/stations/",
             )
         return self
 

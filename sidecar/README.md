@@ -181,6 +181,48 @@ curl -fsS http://localhost:8081/api/push/stats \
 Subscriptions the push service reports as gone (404/410) are deleted
 during the fan-out — that is the only garbage collection the store has.
 
+## The quality report (`/nowcast/quality.json`)
+
+The document behind the website's /quality page: reliability against
+radar and gauge truth, the warning scoreboard, the margin over
+persistence, per-station scores. Its contract is
+`frontend/src/lib/quality/schema.ts`, and every top-level section is
+nullable — a section whose evidence is not on disk comes out `null`, and
+the page says "not measured yet" rather than showing a zero.
+
+Two instances, two different jobs:
+
+| | private (this config) | public (`deploy/public/`) |
+|---|---|---|
+| `quality_report.enabled` | `true` — builds it nightly at `at_utc` | refused by config load |
+| `sync.enabled` | `false` — nothing to pull | `true` — pulls it, and the curves |
+| `GET /nowcast/quality.json` | serves the file it built | serves the file it pulled |
+| `GET /calibration/national_curves.json` | serves the live curves | hidden by the public gate |
+
+The builder is `dmi_nowcast_core.quality_report`; every input path is
+optional and a missing one nulls only its own section, so the feature can
+be turned on before the whole corpus exists.
+
+Build the FIRST report by hand — the route 503s until a document is on
+disk, and waiting until 03:30 to find out a path was wrong is a poor way
+to learn it:
+
+```bash
+sidecar/deploy/quality_report.sh
+curl -fs http://localhost:8081/nowcast/quality.json | head -c 400
+```
+
+Nothing needs restarting: the route reads the file on every request, and
+the public instance picks up both files on its next `sync` interval. A
+freshly synced `national_curves.json` is re-read at the start of the next
+radar cycle, so the monthly fit now reaches the public instance without a
+restart too.
+
+When the private peer is unreachable the public instance keeps the last
+good copy of each file and logs one line per failure. A stale report is
+honest — it carries its own `generated_at_utc` — where a blanked one
+would not be.
+
 ## Deployment
 
 `deploy/` ships a Dockerfile, a Compose file and an SSH deploy script.

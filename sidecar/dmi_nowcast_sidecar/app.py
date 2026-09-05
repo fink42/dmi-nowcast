@@ -11,6 +11,14 @@ Website Phase A (§A3) adds the national surface:
 - ``GET /nowcast/{filename}`` — cycle-stamped artifact PNGs / manifests.
 - ``GET /forecast?lat=&lon=`` — point lookup into the national grids.
 
+Phase F (F4) adds the verification surface:
+
+- ``GET /nowcast/quality.json`` — the "How good are we?" report, built
+  nightly on the private instance and pulled by the public one.
+- ``GET /calibration/national_curves.json`` — the live isotonic curves.
+  PRIVATE: not on the public allow-list; it is the source the public
+  instance's ``sync`` task reads.
+
 Website Phase D adds the Web Push surface (see ``push/routes.py``):
 
 - ``GET  /api/push/config`` — feature flag + VAPID public key + options.
@@ -108,8 +116,14 @@ from .national_artifacts import LATEST_MANIFEST_NAME
 from .national_sample import finite_or_none, sample_point
 from .push.paths import resolved_db_path, resolved_key_path
 from .push.routes import build_router as build_push_router
+from .quality_report import (
+    QualityReportTask,
+    build_quality_report_task,
+    quality_path,
+)
 from .scheduler import CycleScheduler
 from .station_obs import StationObsPoller, build_station_obs_poller
+from .sync import ArtifactSync, build_artifact_sync
 from .state_schema import (
     ForecastPointLead,
     ForecastPointRain,
@@ -162,16 +176,19 @@ def create_app(
     engine: CycleEngine | None = None,
     scheduler: CycleScheduler | None = None,
     station_obs_poller: StationObsPoller | None = None,
+    quality_report_task: QualityReportTask | None = None,
+    artifact_sync: ArtifactSync | None = None,
     auto_start_scheduler: bool = True,
 ) -> FastAPI:
     """Build the FastAPI app.
 
-    ``engine``, ``scheduler`` and ``station_obs_poller`` are injected by
-    tests that want to control the cycle (or the gauge poll) directly;
-    the poller is otherwise built from config, and is ``None`` unless
-    ``station_obs.enabled``. The default in-process scheduler can be
-    disabled with ``auto_start_scheduler=False`` — useful for unit
-    tests that only exercise the HTTP surface.
+    ``engine``, ``scheduler``, ``station_obs_poller``,
+    ``quality_report_task`` and ``artifact_sync`` are injected by tests
+    that want to control the cycle (or one of the side tasks) directly;
+    each is otherwise built from config, and is ``None`` unless its
+    feature is enabled. The default in-process scheduler can be disabled
+    with ``auto_start_scheduler=False`` — useful for unit tests that only
+    exercise the HTTP surface.
     """
     if engine is None:
         engine = CycleEngine(config)
@@ -213,10 +230,29 @@ def create_app(
             else build_station_obs_poller(config)
         )
         app.state.station_obs_poller = station_poller
+        # The nightly quality report (private) and the artifact pull
+        # (public) are mutually exclusive by config: one instance owns the
+        # corpus and builds, the other has none and copies. Both get their
+        # own scheduler for the same reason the gauge poller does — a slow
+        # corpus read or an unreachable peer must never delay a cycle.
+        quality_task: QualityReportTask | None = (
+            quality_report_task if quality_report_task is not None
+            else build_quality_report_task(config)
+        )
+        app.state.quality_report_task = quality_task
+        sync_task: ArtifactSync | None = (
+            artifact_sync if artifact_sync is not None
+            else build_artifact_sync(config, engine)
+        )
+        app.state.artifact_sync = sync_task
         if auto_start_scheduler:
             await local_scheduler.start(run_immediately=True)
             if station_poller is not None:
                 await station_poller.start(run_immediately=True)
+            if quality_task is not None:
+                await quality_task.start()
+            if sync_task is not None:
+                await sync_task.start(run_immediately=True)
         try:
             yield
         finally:
@@ -224,6 +260,10 @@ def create_app(
                 await local_scheduler.shutdown()
                 if station_poller is not None:
                     await station_poller.shutdown()
+                if quality_task is not None:
+                    await quality_task.shutdown()
+                if sync_task is not None:
+                    await sync_task.shutdown()
             if push_store is not None:
                 # Close the SQLite handle explicitly; the WAL files are
                 # checkpointed on close, so a restart never inherits a
@@ -392,6 +432,62 @@ def create_app(
             content=path.read_bytes(),
             media_type="application/json",
             headers={"Cache-Control": "public, max-age=30"},
+        )
+
+    # NOTE: registered before /nowcast/{filename} for the same reason
+    # manifest.json is — the literal path must win over the stamped-name
+    # matcher, which would reject "quality.json" as unsafe anyway.
+    @app.get("/nowcast/quality.json", tags=["public"])
+    async def nowcast_quality(
+        request: Request, _: None = Depends(require_api_key),
+    ) -> Response:
+        """The "How good are we?" report (Phase F, F4).
+
+        Built nightly on the private instance and pulled by the public one
+        (``sync``), so on both this route is the same thing: read the file
+        the task last wrote atomically. 503 until the first build — the
+        page renders "not measured yet" rather than a page of zeros, which
+        is the whole point of the document.
+
+        Five minutes of caching: it changes once a day, and a stale copy
+        is harmless because the document carries its own
+        ``generated_at_utc``.
+        """
+        engine: CycleEngine = request.app.state.engine
+        path = quality_path(engine.config)
+        if not path.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail="no quality report yet — the nightly build has not run",
+            )
+        return Response(
+            content=path.read_bytes(),
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    @app.get("/calibration/national_curves.json", tags=["calibration"])
+    async def national_curves(
+        request: Request, _: None = Depends(require_api_key),
+    ) -> Response:
+        """The live national isotonic curves, as this instance reads them.
+
+        Private surface — ``_PUBLIC_PATHS`` does not list it, so public
+        mode 404s it like any other hidden route. It exists so the public
+        instance's ``sync`` task can pull the monthly fit across the shared
+        docker network instead of someone copying a file by hand and
+        forgetting the restart.
+        """
+        path = Path(request.app.state.config.calibration.national_curves_path)
+        if not path.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail="no national calibration curves on this instance yet",
+            )
+        return Response(
+            content=path.read_bytes(),
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"},
         )
 
     @app.get("/nowcast/{filename}", tags=["public"])
@@ -838,6 +934,12 @@ _PUBLIC_PATHS = frozenset({
     "/api/push/subscribe",
     "/api/push/unsubscribe",
 })
+# ``/nowcast/`` covers the manifest, every stamped artifact AND
+# ``/nowcast/quality.json`` (Phase F, F4) — the quality report is part of
+# the published surface by construction, not by a new entry here.
+# ``/calibration/national_curves.json`` is deliberately NOT listed: the
+# public instance PULLS that file from the private one, it does not
+# republish it.
 _PUBLIC_PREFIXES = ("/nowcast/",)
 
 # Byte-identical to Starlette's own "no such route" body, so a gated route

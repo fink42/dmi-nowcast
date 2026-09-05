@@ -162,3 +162,43 @@ station_eval:
   # stack does not have, and it measures the service rather than serving
   # anyone. It runs on the private instance beside the replay.
   enabled: false
+
+quality_report:
+  # OFF, and not optional: config load REFUSES quality_report.enabled
+  # together with server.public_mode. The report is built from the
+  # corpora, the gauge store and the warning replay — all on the corpus
+  # volume, which this stack does not have (storage.corpus_dir: null).
+  # This instance receives the finished document through `sync` below.
+  enabled: false
+
+sync:
+  # Pull the two files this instance serves but cannot produce, from the
+  # private instance over the shared docker network (website Phase F, F4).
+  #
+  #   nowcast/quality.json            → /var/lib/dmi-nowcast/nowcast/
+  #                                     (what GET /nowcast/quality.json serves)
+  #   calibration/national_curves.json → calibration.national_curves_path
+  #                                     (what makes the published
+  #                                      probabilities calibrated)
+  #
+  # LAST GOOD WINS. A refused connection, a 500, or a body that is not the
+  # JSON it claims to be leaves the file already on disk untouched: this
+  # instance keeps serving yesterday's report, which carries its own
+  # generated_at_utc so the page can say how old it is.
+  #
+  # New curves are re-read at the start of the next radar cycle — no
+  # restart, unlike the manual copy this replaces.
+  enabled: true
+  # Requires the two stacks to share a docker network: deploy with
+  # PUBLIC_SHARED_NETWORK=<network> (see docker-compose.shared-net.yml)
+  # and use the private container's service name here. Over the LAN
+  # instead, an http://<host>:<port> URL works the same way.
+  source_url: http://dmi-nowcast-sidecar:8081
+  interval_min: 60
+  files:
+    - nowcast/quality.json
+    - calibration/national_curves.json
+  timeout_s: 30.0
+  # Bearer for the source, when the private instance has server.api_key
+  # set. Null on a trusted network, which is the normal case here.
+  api_key: null

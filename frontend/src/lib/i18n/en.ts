@@ -242,7 +242,7 @@ export const en: Catalog = {
 				falseAlarms: string,
 				minutes: string
 			) =>
-				`Of ${total} notifications in the last ${days} days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification came ${minutes} minutes late.`,
+				`Of ${total} notifications over ${days} measured days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification came ${minutes} minutes late.`,
 			warningsEarly: (
 				total: string,
 				days: number,
@@ -250,9 +250,9 @@ export const en: Catalog = {
 				falseAlarms: string,
 				minutes: string
 			) =>
-				`Of ${total} notifications in the last ${days} days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification came ${minutes} minutes early.`,
+				`Of ${total} notifications over ${days} measured days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification came ${minutes} minutes early.`,
 			warningsOnTime: (total: string, days: number, hits: string, falseAlarms: string) =>
-				`Of ${total} notifications in the last ${days} days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification landed on time.`,
+				`Of ${total} notifications over ${days} measured days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification landed on time.`,
 			warningsRates: (pod: string, far: string, stations: string) =>
 				`We caught ${pod} of the rain at ${stations} stations; ${far} of the notifications were false.`,
 			marginTitle: 'Are we better than nothing?',

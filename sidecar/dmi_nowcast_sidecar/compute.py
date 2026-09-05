@@ -267,6 +267,12 @@ class CycleEngine:
         self._national_curves: dict[int, IsotonicCalibrator] = {}
         self._national_calibration_metadata: dict | None = None
         self._national_fitted_at: datetime | None = None
+        # (mtime_ns, size) of the national curve file as loaded. The
+        # sync task (F4) can replace that file under a running process;
+        # comparing the stamp at the start of each cycle is how a new
+        # fit takes effect without a restart.
+        self._national_curves_stamp: tuple[int, int] | None = None
+        self._national_curves_dirty = False
         self._reload_calibration()
         # Working cache for downloaded HDF5 files — short-lived, LRU-evicted
         # after each cycle to keep disk under ``working_cache_max_bytes``.
@@ -362,9 +368,12 @@ class CycleEngine:
     def national_curve_leads(self) -> frozenset[int]:
         """Leads covered by the loaded national calibration curves (§B4).
 
-        Static for the process lifetime (curves load once at init, before
-        any cycle), so the products held in ``national_latest`` were
-        calibrated with exactly these curves — /forecast derives its
+        Curves load at init and are re-read only at the START of a cycle,
+        when the file on disk has changed (Phase F, F4: the public
+        instance's ``sync`` task drops a freshly-fitted file in). That is
+        the one instant a swap is safe, so the products held in
+        ``national_latest`` were still calibrated with exactly the curves
+        this set names — /forecast derives its
         truthful ``calibrated`` flag from this set."""
         return frozenset(self._national_curves)
 
@@ -418,6 +427,8 @@ class CycleEngine:
         Missing/corrupt file → empty dict → everything behaves exactly as
         today (``calibrated: false``, raw fractions)."""
         path = self.config.calibration.national_curves_path
+        self._national_curves_stamp = _file_stamp(path)
+        self._national_curves_dirty = False
         if not path.exists():
             self._national_curves = {}
             self._national_calibration_metadata = None
@@ -442,10 +453,46 @@ class CycleEngine:
             self._national_calibration_metadata = None
             self._national_fitted_at = None
 
+    def note_curves_changed(self) -> None:
+        """Ask for a curve re-read at the start of the next cycle.
+
+        Called by the ``sync`` task after it writes a freshly-fitted
+        national curve file (Phase F, F4). It only sets a flag: swapping
+        the curves mid-cycle would leave ``national_latest`` calibrated
+        with one set of curves and ``national_curve_leads`` describing
+        another, which is exactly the kind of quiet inconsistency
+        /forecast's ``calibrated`` flag exists to prevent.
+        """
+        self._national_curves_dirty = True
+
+    def _reload_national_curves_if_changed(self) -> None:
+        """Re-read the national curves when the file on disk moved.
+
+        Cheap: a ``stat`` on every cycle, a JSON parse only when the
+        (mtime, size) pair changed or ``note_curves_changed`` asked for
+        one. Without this the private instance's monthly fit reaches the
+        public instance only on the next restart.
+        """
+        path = self.config.calibration.national_curves_path
+        stamp = _file_stamp(path)
+        if not self._national_curves_dirty and stamp == self._national_curves_stamp:
+            return
+        _log.info(
+            "national_curves_changed_on_disk",
+            path=str(path),
+            was=self._national_curves_stamp,
+            now=stamp,
+        )
+        self._reload_national_curves()
+
     async def run_cycle(self) -> CycleResult:
         """Execute one cycle. Network in this coroutine; compute in a thread."""
         t0 = time.perf_counter()
         fetch_ms = compute_ms = 0.0
+        # The start of a cycle is the one safe moment to swap the national
+        # curves: everything this cycle publishes is calibrated with what
+        # is loaded now, so the pair (products, curve leads) stays honest.
+        self._reload_national_curves_if_changed()
         try:
             t_fetch = time.perf_counter()
             paths = await self._fetch_latest_frames()
@@ -1376,6 +1423,19 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_bytes(data)
     tmp.replace(target)
+
+
+def _file_stamp(path: Path) -> tuple[int, int] | None:
+    """``(mtime_ns, size)`` of a file, or None when it does not exist.
+
+    Both halves, not just mtime: a filesystem with coarse timestamps and
+    a same-second rewrite would otherwise look unchanged.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
 
 
 def _parse_iso(s: str | None) -> datetime | None:
