@@ -20,7 +20,9 @@
  * It also serves `/api/push/*` with an in-memory subscription table and a
  * syntactically valid (but meaningless) VAPID key, so the notification UI can
  * be driven end to end without a push service. No message is ever sent — the
- * browser subscription is real, the delivery half is not.
+ * browser subscription is real, the delivery half is not. `/api/push/options`
+ * carries the fitted per-horizon thresholds, one of them served as a fallback
+ * so both fact lines the panel can show are reachable.
  *
  * It also serves `/nowcast/quality.json` straight from the committed
  * fixture (src/lib/quality/fixture.json), so the quality page can be
@@ -184,6 +186,12 @@ const VAPID_PUBLIC_KEY = (() => {
 	return bytes.toString('base64url');
 })();
 
+/**
+ * `threshold_options_pct` is still served, and the app deliberately ignores
+ * it: since the thresholds are fitted per horizon, no threshold the config
+ * offers is a choice the UI may make. Kept here so the endpoint keeps its
+ * shape for older clients.
+ */
 const PUSH_CONFIG = {
 	enabled: true,
 	vapid_public_key: VAPID_PUBLIC_KEY,
@@ -196,6 +204,38 @@ const PUSH_CONFIG = {
 	},
 	capacity_reached: false
 };
+
+/**
+ * `/api/push/options`: the horizons on offer, and the threshold fitted for
+ * each of them. Lead 60 is deliberately served as a fallback rather than a
+ * fitted value, so the panel's "default until enough data" line is reachable
+ * without editing anything — it is the same horizon the quality fixture
+ * marks `insufficient`.
+ */
+const PUSH_OPTIONS = {
+	lead_options: [20, 30, 45, 60],
+	fallback_threshold_pct: 40,
+	fitted_at_utc: '2026-09-03T02:11:07Z',
+	thresholds: {
+		20: { threshold_pct: 35, source: 'table' },
+		30: { threshold_pct: 35, source: 'table' },
+		45: { threshold_pct: 30, source: 'table' },
+		60: { threshold_pct: 40, source: 'fallback' }
+	}
+};
+
+/**
+ * The same lookup the service does at send time: the override if the request
+ * carried one, else the fitted row, else the fallback.
+ */
+function effectiveThreshold(leadMin, overridePct) {
+	if (typeof overridePct === 'number' && Number.isFinite(overridePct)) {
+		return { pct: Math.round(overridePct), source: 'override' };
+	}
+	const row = PUSH_OPTIONS.thresholds[leadMin];
+	if (row && row.source === 'table') return { pct: row.threshold_pct, source: 'table' };
+	return { pct: row ? row.threshold_pct : PUSH_OPTIONS.fallback_threshold_pct, source: 'fallback' };
+}
 
 /** endpoint → the stored row, exactly as the real service would upsert it. */
 const subscriptions = new Map();
@@ -523,6 +563,9 @@ createServer(async (req, res) => {
 	if (url.pathname === '/api/push/config') {
 		return sendJson(200, PUSH_CONFIG);
 	}
+	if (url.pathname === '/api/push/options') {
+		return sendJson(200, PUSH_OPTIONS);
+	}
 	if (url.pathname === '/api/push/subscribe' && req.method === 'POST') {
 		const body = await readJson(req);
 		const endpoint = body?.subscription?.endpoint;
@@ -533,12 +576,25 @@ createServer(async (req, res) => {
 			return sendJson(400, { detail: 'coordinates outside the radar composite grid' });
 		}
 		const created = !subscriptions.has(endpoint);
-		subscriptions.set(endpoint, { ...body, updated_at: new Date().toISOString() });
+		// `threshold_pct` is optional: absent means "use the fitted table",
+		// which is what every request that is not a hidden override sends.
+		const effective = effectiveThreshold(body.lead_min, body.threshold_pct);
+		subscriptions.set(endpoint, {
+			...body,
+			effective_threshold_pct: effective.pct,
+			updated_at: new Date().toISOString()
+		});
 		console.log(
 			`[mock-sidecar] ${created ? 'subscribed' : 'updated'} ${body.lat.toFixed(3)},${body.lon.toFixed(3)} ` +
-				`· ${body.threshold_pct} % / ${body.lead_min} min · ${subscriptions.size} device(s)`
+				`· ${effective.pct} % (${effective.source}) / ${body.lead_min} min · ${subscriptions.size} device(s)`
 		);
-		return sendJson(200, { ok: true, created });
+		return sendJson(200, {
+			ok: true,
+			created,
+			effective_threshold_pct: effective.pct,
+			threshold_source: effective.source,
+			fitted_at_utc: PUSH_OPTIONS.fitted_at_utc
+		});
 	}
 	if (url.pathname === '/api/push/unsubscribe' && req.method === 'POST') {
 		const body = await readJson(req);

@@ -135,10 +135,16 @@ export const en: Catalog = {
 		working: 'Working …',
 		showSettings: 'Settings',
 		hideSettings: 'Hide settings',
-		thresholdLabel: 'Probability at least',
-		thresholdOption: (pct: number) => `${pct} %`,
-		leadLabel: 'Warning time',
+		leadLabel: 'Warn me this many minutes ahead',
 		leadOption: (min: number) => `${min} min`,
+		factTable: (pct: number, date: string) =>
+			`Currently warns at ${pct} % — fitted against DMI’s rain gauges on ${date}.`,
+		factTableUndated: (pct: number) =>
+			`Currently warns at ${pct} % — fitted against DMI’s rain gauges.`,
+		factFallback: (pct: number) => `Currently warns at ${pct} % (default until enough data).`,
+		factOverride: (pct: number) => `Override: ${pct} % — used instead of the fitted value.`,
+		leadAdjusted: (stored: number, shown: number) =>
+			`Your notifications were set for ${stored} min, which is no longer offered — ${shown} min is selected instead.`,
 		quietLabel: 'No notifications at night',
 		quietFrom: 'From',
 		quietTo: 'To',
@@ -333,6 +339,32 @@ export const en: Catalog = {
 			onTime: 'on time',
 			empty: '—',
 			none: 'No notifications have been verified yet.'
+		},
+		/**
+		 * "How we choose when to warn" — the fitted push thresholds. The rule
+		 * is a measurement, not a preference, and this block is where the page
+		 * says so in words a subscriber can check.
+		 */
+		thresholds: {
+			title: 'How we choose when to warn',
+			intro: (leadMin: number) =>
+				`For each warning time we replay the notification rule at every threshold over months of recorded forecasts, score each replay against DMI’s rain gauges, and keep the threshold that gets the most warnings right without cutting the warning time below ${leadMin} minutes. Nobody picks these numbers by hand.`,
+			introNoLead:
+				'For each warning time we replay the notification rule at every threshold over months of recorded forecasts, score each replay against DMI’s rain gauges, and keep the threshold that gets the most warnings right. Nobody picks these numbers by hand.',
+			fittedAt: (when: string) => `Fitted ${when}.`,
+			fallbackNote: (pct: number) =>
+				`A warning time with too little evidence warns at ${pct} % until it has some.`,
+			none: 'The thresholds have not been fitted yet.',
+			colHorizon: 'Warning time',
+			colThreshold: 'Warns at',
+			colPrecision: 'Right when it warned',
+			colRecall: 'Rain it caught',
+			colF1: 'F1',
+			colWarnings: 'Warnings scored',
+			horizon: (min: number) => `${min} min`,
+			insufficient: 'Too little data — the default is used.',
+			disagrees: 'Radar and gauges disagree here; the gauges win.',
+			empty: '—'
 		},
 		methods: {
 			title: 'How this is measured',

@@ -33,6 +33,7 @@
 		reliabilityCard,
 		warningsCard
 	} from '$lib/quality/sentences';
+	import { thresholdIntro, thresholdRows } from '$lib/quality/thresholds';
 	import type { QualityReport } from '$lib/quality/schema';
 
 	let status = $state<'loading' | 'ready' | 'error'>('loading');
@@ -78,6 +79,8 @@
 	const rows = $derived(report ? eventRows(t(), locale(), report.events) : []);
 	const methods = $derived(report?.methods ?? null);
 	const windows = $derived(report?.windows ?? null);
+	const thresholds = $derived(report?.thresholds ?? null);
+	const thresholdTable = $derived(report ? thresholdRows(t(), locale(), thresholds) : []);
 </script>
 
 <article class="prose">
@@ -157,6 +160,50 @@
 			</div>
 		{:else}
 			<p class="quiet">{t().quality.events.none}</p>
+		{/if}
+
+		<h2>{t().quality.thresholds.title}</h2>
+		{#if thresholdTable.length > 0}
+			<p>{thresholdIntro(t(), thresholds)}</p>
+			<div class="scroll">
+				<table class="thresholds">
+					<thead>
+						<tr>
+							<th scope="col">{t().quality.thresholds.colHorizon}</th>
+							<th scope="col">{t().quality.thresholds.colThreshold}</th>
+							<th scope="col">{t().quality.thresholds.colPrecision}</th>
+							<th scope="col">{t().quality.thresholds.colRecall}</th>
+							<th scope="col">{t().quality.thresholds.colF1}</th>
+							<th scope="col">{t().quality.thresholds.colWarnings}</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each thresholdTable as row (row.key)}
+							<tr class:unfitted={row.insufficient}>
+								<th scope="row">{row.horizon}</th>
+								<td>{row.threshold}</td>
+								<td>{row.precision}</td>
+								<td>{row.recall}</td>
+								<td>{row.f1}</td>
+								<td>{row.warnings}</td>
+							</tr>
+							{#if row.note}
+								<tr class="note">
+									<td colspan="6">{row.note}</td>
+								</tr>
+							{/if}
+						{/each}
+					</tbody>
+				</table>
+			</div>
+			<p class="detail">
+				{t().quality.thresholds.fallbackNote(thresholds!.fallback_threshold_pct)}
+				{#if thresholds?.fitted_at_utc}
+					{t().quality.thresholds.fittedAt(localDate(thresholds.fitted_at_utc, locale()))}
+				{/if}
+			</p>
+		{:else}
+			<p class="quiet">{t().quality.thresholds.none}</p>
 		{/if}
 
 		<h2>{t().quality.methods.title}</h2>
@@ -309,27 +356,45 @@
 		overflow-x: auto;
 	}
 
-	table.events {
+	table.events,
+	table.thresholds {
 		border-collapse: collapse;
 		font-size: 0.82rem;
 		width: 100%;
 	}
 
 	table.events th,
-	table.events td {
+	table.events td,
+	table.thresholds th,
+	table.thresholds td {
 		text-align: left;
 		padding: 0.3rem 0.55rem 0.3rem 0;
 		border-bottom: 1px solid var(--border);
 		white-space: nowrap;
 	}
 
-	table.events thead th {
+	table.events thead th,
+	table.thresholds thead th {
 		color: var(--muted);
 		font-weight: 500;
 	}
 
-	table.events tbody th {
+	table.events tbody th,
+	table.thresholds tbody th {
 		font-weight: 600;
+	}
+
+	/* A horizon the fit cannot speak for keeps its row and loses its weight. */
+	table.thresholds tr.unfitted td,
+	table.thresholds tr.unfitted th {
+		color: var(--muted);
+	}
+
+	table.thresholds tr.note td {
+		color: var(--muted);
+		font-size: 0.76rem;
+		white-space: normal;
+		padding-bottom: 0.45rem;
 	}
 
 	/* A false alarm is not a failure to hide; it is greyed, not deleted. */

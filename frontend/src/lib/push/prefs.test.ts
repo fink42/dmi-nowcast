@@ -26,10 +26,8 @@ import {
 const CONFIG: PushConfig = {
 	enabled: true,
 	vapidPublicKey: 'BAaaaa',
-	thresholdOptionsPct: [40, 60, 80],
-	leadOptionsMin: [20, 30, 45, 60],
 	defaults: {
-		thresholdPct: 60,
+		thresholdPct: null,
 		leadMin: 30,
 		quietHours: { enabled: false, start: '22:00', end: '07:00' }
 	},
@@ -79,9 +77,9 @@ describe('defaultPrefs', () => {
 
 	it('hands back a copy, so the caller cannot edit the config', () => {
 		const prefs = defaultPrefs(CONFIG);
-		prefs.thresholdPct = 80;
+		prefs.leadMin = 60;
 		prefs.quietHours.enabled = true;
-		expect(CONFIG.defaults.thresholdPct).toBe(60);
+		expect(CONFIG.defaults.leadMin).toBe(30);
 		expect(CONFIG.defaults.quietHours.enabled).toBe(false);
 	});
 });
@@ -103,15 +101,24 @@ describe('normalisePrefs', () => {
 		});
 	});
 
-	it('snaps an out-of-set value to the nearest option the server offers', () => {
+	it('keeps a horizon the offered list may not contain', () => {
+		// Which horizons are offered is `/api/push/options`' business, and the
+		// panel is what preselects the nearest one and says that it did.
 		expect(normalisePrefs({ thresholdPct: 55, leadMin: 33 }, CONFIG)).toMatchObject({
-			thresholdPct: 60,
-			leadMin: 30
+			thresholdPct: 55,
+			leadMin: 33
 		});
-		expect(normalisePrefs({ thresholdPct: 100, leadMin: 5 }, CONFIG)).toMatchObject({
-			thresholdPct: 80,
+	});
+
+	it('drops an override outside the range rather than clamping it', () => {
+		// `?threshold=999` is a typo, not a wish for 80 %.
+		expect(normalisePrefs({ thresholdPct: 100, leadMin: 20 }, CONFIG)).toMatchObject({
+			thresholdPct: null,
 			leadMin: 20
 		});
+		expect(normalisePrefs({ thresholdPct: 5 }, CONFIG).thresholdPct).toBeNull();
+		expect(normalisePrefs({ thresholdPct: 20 }, CONFIG).thresholdPct).toBe(20);
+		expect(normalisePrefs({ thresholdPct: 80 }, CONFIG).thresholdPct).toBe(80);
 	});
 
 	it('falls back to the defaults for missing keys and outright garbage', () => {
@@ -133,11 +140,12 @@ describe('normalisePrefs', () => {
 		expect(normalisePrefs({ quietHours: 'nope' }, CONFIG)).toEqual(CONFIG.defaults);
 	});
 
-	it('works with no config at all, against the fallback options', () => {
+	it('works with no config at all', () => {
 		expect(normalisePrefs({ thresholdPct: 41, leadMin: 61 }, null)).toMatchObject({
-			thresholdPct: 40,
-			leadMin: 60
+			thresholdPct: 41,
+			leadMin: 61
 		});
+		expect(normalisePrefs({}, null)).toEqual(FALLBACK_PREFS);
 	});
 });
 
@@ -148,30 +156,26 @@ describe('parsePushConfig', () => {
 		}
 	});
 
-	it('repairs a config whose options or defaults are unusable', () => {
+	it('repairs a config whose defaults are unusable', () => {
 		const config = parsePushConfig({
 			enabled: true,
 			vapid_public_key: 'BAaaaa',
-			threshold_options_pct: 'nope',
-			lead_options_min: [],
 			defaults: { threshold_pct: 'x', lead_min: null, quiet_hours: { start: '99:99' } }
 		});
-		expect(config.thresholdOptionsPct).toEqual([40, 60, 80]);
-		expect(config.leadOptionsMin).toEqual([20, 30, 45, 60]);
 		expect(config.defaults).toEqual(FALLBACK_PREFS);
 	});
 
-	it('validates the server defaults against the server options', () => {
+	it('ignores the threshold the config offers, and keeps the default horizon', () => {
+		// The threshold is fitted per horizon and served by
+		// `/api/push/options`; nothing the config says about it is a choice.
 		const config = parsePushConfig({
 			enabled: true,
 			vapid_public_key: 'BAaaaa',
 			threshold_options_pct: [50, 70],
-			lead_options_min: [15, 45],
-			defaults: { threshold_pct: 60, lead_min: 30 }
+			defaults: { threshold_pct: 60, lead_min: 45 }
 		});
-		// Both defaults sit exactly between two options; the earlier one wins.
-		expect(config.defaults.thresholdPct).toBe(50);
-		expect(config.defaults.leadMin).toBe(15);
+		expect(config.defaults.thresholdPct).toBeNull();
+		expect(config.defaults.leadMin).toBe(45);
 	});
 });
 
@@ -180,6 +184,7 @@ const SUB: StoredSubscription = {
 	lat: 55.6761,
 	lon: 12.5683,
 	prefs: { thresholdPct: 80, leadMin: 45, quietHours: { enabled: true, start: '23:00', end: '06:30' } },
+	effective: { thresholdPct: 80, source: 'override', fittedAtUtc: '2026-09-03T02:11:07Z' },
 	lang: 'da',
 	tz: 'Europe/Copenhagen',
 	subscribedAt: '2026-09-02T13:05:00.000Z'
@@ -242,11 +247,25 @@ describe('stored subscription', () => {
 			lang: 'da',
 			tz: 'Europe/Copenhagen',
 			prefs: {
-				thresholdPct: 80,
+				thresholdPct: null,
 				leadMin: 30,
 				quietHours: { enabled: true, start: '22:00', end: '06:30' }
 			}
 		});
+	});
+
+	it('reads a copy written before the effective threshold existed', () => {
+		const { effective: _dropped, ...older } = SUB;
+		vi.stubGlobal('localStorage', fakeStorage(false, { [STORAGE_KEY]: JSON.stringify(older) }));
+		expect(loadStored(CONFIG)?.effective).toBeNull();
+	});
+
+	it('rejects an effective threshold it cannot read', () => {
+		for (const effective of [{ thresholdPct: 35 }, { thresholdPct: 'x', source: 'table' }]) {
+			const text = JSON.stringify({ ...SUB, effective });
+			vi.stubGlobal('localStorage', fakeStorage(false, { [STORAGE_KEY]: text }));
+			expect(loadStored(CONFIG)?.effective, text).toBeNull();
+		}
 	});
 });
 
@@ -275,8 +294,9 @@ describe('resolveTimeZone', () => {
 });
 
 describe('subscribeBody', () => {
-	it('builds exactly the shape the endpoint documents', () => {
-		const json = { endpoint: 'https://push.example/abc', keys: { p256dh: 'k', auth: 'a' } };
+	const json = { endpoint: 'https://push.example/abc', keys: { p256dh: 'k', auth: 'a' } };
+
+	it('sends threshold_pct only for the hidden override', () => {
 		expect(subscribeBody(json, 55.6761, 12.5683, SUB.prefs, 'en', 'Europe/Copenhagen')).toEqual({
 			subscription: json,
 			lat: 55.6761,
@@ -286,6 +306,27 @@ describe('subscribeBody', () => {
 			quiet_hours: { enabled: true, start: '23:00', end: '06:30' },
 			tz: 'Europe/Copenhagen',
 			lang: 'en'
+		});
+	});
+
+	it('omits it entirely without one, which is what asks for the fitted value', () => {
+		const body = subscribeBody(
+			json,
+			55.6761,
+			12.5683,
+			{ ...SUB.prefs, thresholdPct: null },
+			'da',
+			'Europe/Copenhagen'
+		);
+		expect('threshold_pct' in body).toBe(false);
+		expect(body).toEqual({
+			subscription: json,
+			lat: 55.6761,
+			lon: 12.5683,
+			lead_min: 45,
+			quiet_hours: { enabled: true, start: '23:00', end: '06:30' },
+			tz: 'Europe/Copenhagen',
+			lang: 'da'
 		});
 	});
 });

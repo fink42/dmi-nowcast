@@ -218,6 +218,62 @@ export interface QualityMethods {
 	sources: { radar: string; gauges: string };
 }
 
+/**
+ * What the threshold fit maximised, and the constraints it did so under.
+ * Every number is nullable because a producer may report a subset — the page
+ * drops the clause it cannot fill rather than the whole section.
+ */
+export interface ThresholdObjective {
+	/** What was maximised, e.g. "f1". Verbatim from the producer. */
+	metric: string;
+	/** Warnings shorter than this are not useful, so they do not count. */
+	min_useful_lead_min: number | null;
+	/** How close to the best score a threshold may be and still be picked. */
+	plateau_frac: number | null;
+	/** Fewer scored warnings than this at a lead and the lead is `insufficient`. */
+	min_warnings: number | null;
+}
+
+/**
+ * One horizon's fitted threshold and the scores behind it.
+ *
+ * `threshold_pct` is null exactly when `insufficient` is true: a threshold
+ * fitted on four warnings is a story about four warnings, and the served
+ * rule falls back instead. Rates are null over an empty denominator, never
+ * 0.0. `plateau` / `radar_plateau` are the [lo, hi] threshold ranges that
+ * score within `plateau_frac` of the best, against the gauges and against
+ * the radar; `agrees_with_radar` says whether the gauge pick lands inside
+ * the radar's range — null when there was no radar range to compare with.
+ */
+export interface LeadThresholdRow {
+	lead_min: number;
+	threshold_pct: number | null;
+	insufficient: boolean;
+	f1: number | null;
+	precision: number | null;
+	recall: number | null;
+	far: number | null;
+	csi: number | null;
+	warnings: number;
+	hits: number;
+	false_alarms: number;
+	misses: number;
+	late: number;
+	plateau: [number, number] | null;
+	radar_plateau: [number, number] | null;
+	agrees_with_radar: boolean | null;
+}
+
+/** The fitted push thresholds: one row per horizon, plus what produced them. */
+export interface QualityThresholds {
+	fitted_at_utc: string | null;
+	objective: ThresholdObjective | null;
+	/** The threshold a horizon the fit cannot speak for warns at. */
+	fallback_threshold_pct: number;
+	/** Sorted by horizon, ascending. */
+	leads: LeadThresholdRow[];
+}
+
 export interface QualityReport {
 	schema_version: number;
 	generated_at_utc: string;
@@ -229,4 +285,6 @@ export interface QualityReport {
 	/** Newest first, at most 20. */
 	events: VerifiedEvent[] | null;
 	methods: QualityMethods | null;
+	/** Additive, and null on any producer that has not fitted them yet. */
+	thresholds: QualityThresholds | null;
 }

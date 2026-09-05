@@ -6,6 +6,12 @@
  */
 import { apiUrl } from '$lib/nowcast/manifest';
 import { DISABLED_CONFIG, parsePushConfig, type PushConfig, type SubscribeBody } from './prefs';
+import {
+	FALLBACK_OPTIONS,
+	parsePushOptions,
+	type PushOptions,
+	type ThresholdSource
+} from './thresholds';
 
 /** The chosen point is outside the radar composite: nothing could be sent. */
 export class OffCoverageError extends Error {}
@@ -16,6 +22,14 @@ export class PushUnavailableError extends Error {}
 export interface SubscribeResult {
 	ok: boolean;
 	created: boolean;
+	/**
+	 * The threshold the server says this device will be warned at, and where
+	 * it got it. Null on a server built before the fit existed — the panel
+	 * then reads the same number out of `/api/push/options` instead.
+	 */
+	effectiveThresholdPct: number | null;
+	thresholdSource: ThresholdSource | null;
+	fittedAtUtc: string | null;
 }
 
 export interface UnsubscribeResult {
@@ -52,6 +66,24 @@ export async function fetchPushConfig(signal?: AbortSignal): Promise<PushConfig>
 	}
 }
 
+/**
+ * The horizons on offer and the threshold fitted for each, or the fallback
+ * options for anything that is not a well-formed answer.
+ *
+ * Like `fetchPushConfig`, this never throws: a sidecar built before the fit
+ * existed answers with the SPA shell, and the honest reading of that is "no
+ * table here yet", which is exactly what the fallback says.
+ */
+export async function fetchPushOptions(signal?: AbortSignal): Promise<PushOptions> {
+	try {
+		const res = await fetch(apiUrl('/api/push/options'), { signal, cache: 'no-cache' });
+		if (!res.ok) return FALLBACK_OPTIONS;
+		return parsePushOptions(await res.json());
+	} catch {
+		return FALLBACK_OPTIONS;
+	}
+}
+
 async function postJson(path: string, body: unknown, signal?: AbortSignal): Promise<Response> {
 	return fetch(apiUrl(path), {
 		method: 'POST',
@@ -77,8 +109,19 @@ export async function postSubscribe(
 		throw new PushUnavailableError(await detail(res, 'push notifications unavailable'));
 	}
 	if (!res.ok) throw new Error(`push subscribe: HTTP ${res.status}`);
-	const result = (await res.json()) as Partial<SubscribeResult>;
-	return { ok: result?.ok === true, created: result?.created === true };
+	const result = (await res.json()) as Record<string, unknown>;
+	const pct = result?.effective_threshold_pct;
+	const source = result?.threshold_source;
+	const fittedAt = result?.fitted_at_utc;
+	return {
+		ok: result?.ok === true,
+		created: result?.created === true,
+		effectiveThresholdPct:
+			typeof pct === 'number' && Number.isFinite(pct) ? Math.round(pct) : null,
+		thresholdSource:
+			source === 'table' || source === 'override' || source === 'fallback' ? source : null,
+		fittedAtUtc: typeof fittedAt === 'string' && fittedAt ? fittedAt : null
+	};
 }
 
 export async function postUnsubscribe(

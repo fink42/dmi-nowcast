@@ -1311,5 +1311,107 @@
 			"radar": "DMI radar composite (pseudoCAPPI column max, 500 m, 10 min)",
 			"gauges": "DMI metObs 10-minute precipitation (Pluvio and Synop stations)"
 		}
+	},
+	"thresholds": {
+		"fitted_at_utc": "2026-09-03T02:11:07Z",
+		"objective": {
+			"metric": "f1",
+			"min_useful_lead_min": 5,
+			"plateau_frac": 0.95,
+			"min_warnings": 30,
+			"rearm_after_min": 60,
+			"persistence_obs": 1,
+			"tolerance_min": 10,
+			"dry_min": 30
+		},
+		"fallback_threshold_pct": 40,
+		"leads": {
+			"20": {
+				"threshold_pct": 35,
+				"insufficient": false,
+				"f1": 0.612,
+				"precision": 0.664,
+				"recall": 0.567,
+				"far": 0.336,
+				"csi": 0.441,
+				"warnings": 214,
+				"hits": 142,
+				"false_alarms": 72,
+				"misses": 108,
+				"late": 19,
+				"plateau": [
+					30,
+					40
+				],
+				"radar_plateau": [
+					30,
+					45
+				],
+				"agrees_with_radar": true
+			},
+			"30": {
+				"threshold_pct": 35,
+				"insufficient": false,
+				"f1": 0.574,
+				"precision": 0.598,
+				"recall": 0.552,
+				"far": 0.402,
+				"csi": 0.402,
+				"warnings": 268,
+				"hits": 160,
+				"false_alarms": 108,
+				"misses": 130,
+				"late": 27,
+				"plateau": [
+					30,
+					45
+				],
+				"radar_plateau": [
+					30,
+					45
+				],
+				"agrees_with_radar": true
+			},
+			"45": {
+				"threshold_pct": 30,
+				"insufficient": false,
+				"f1": 0.489,
+				"precision": 0.503,
+				"recall": 0.476,
+				"far": 0.497,
+				"csi": 0.324,
+				"warnings": 302,
+				"hits": 152,
+				"false_alarms": 150,
+				"misses": 167,
+				"late": 41,
+				"plateau": [
+					25,
+					35
+				],
+				"radar_plateau": [
+					40,
+					55
+				],
+				"agrees_with_radar": false
+			},
+			"60": {
+				"threshold_pct": null,
+				"insufficient": true,
+				"f1": null,
+				"precision": null,
+				"recall": null,
+				"far": null,
+				"csi": null,
+				"warnings": 18,
+				"hits": 7,
+				"false_alarms": 11,
+				"misses": 96,
+				"late": 3,
+				"plateau": null,
+				"radar_plateau": null,
+				"agrees_with_radar": null
+			}
+		}
 	}
 }

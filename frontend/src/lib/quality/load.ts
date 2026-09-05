@@ -19,12 +19,14 @@ import {
 	type GaugeWindow,
 	type HeadlineReliability,
 	type HeadlineWarnings,
+	type LeadThresholdRow,
 	type LiveWindow,
 	type PersistenceMargin,
 	type QualityHeadline,
 	type QualityMethods,
 	type QualityReliability,
 	type QualityReport,
+	type QualityThresholds,
 	type QualityWindows,
 	type RadarWindow,
 	type RainingNowCheck,
@@ -33,6 +35,7 @@ import {
 	type StationCollection,
 	type StationFeature,
 	type StationProperties,
+	type ThresholdObjective,
 	type VerifiedEvent
 } from './schema';
 
@@ -317,6 +320,81 @@ function parseMethods(raw: unknown): QualityMethods | null {
 	};
 }
 
+/** A [lo, hi] pair of finite numbers, or null. */
+function pair(raw: unknown): [number, number] | null {
+	if (!Array.isArray(raw)) return null;
+	const lo = num(raw[0]);
+	const hi = num(raw[1]);
+	return lo === null || hi === null ? null : [lo, hi];
+}
+
+function parseObjective(raw: unknown): ThresholdObjective | null {
+	if (!isObject(raw)) return null;
+	const metric = str(raw.metric);
+	if (metric === null) return null;
+	return {
+		metric,
+		min_useful_lead_min: num(raw.min_useful_lead_min),
+		plateau_frac: num(raw.plateau_frac),
+		min_warnings: num(raw.min_warnings)
+	};
+}
+
+/**
+ * One horizon's row. The counts have to be there — a row that cannot say how
+ * many warnings it scored cannot be checked, and an unscored row on a page
+ * about evidence is worse than a missing one — while every rate stays
+ * nullable, because a rate over an empty denominator is not zero.
+ */
+function parseLeadThreshold(lead: number, raw: unknown): LeadThresholdRow | null {
+	if (!isObject(raw)) return null;
+	const counts = numbers(raw, ['warnings', 'hits', 'false_alarms', 'misses', 'late'] as const);
+	if (counts === null) return null;
+	const threshold = num(raw.threshold_pct);
+	return {
+		lead_min: lead,
+		threshold_pct: threshold,
+		// A row with no threshold is insufficient whatever the flag says: the
+		// two disagreeing would put a blank cell next to "fitted".
+		insufficient: raw.insufficient === true || threshold === null,
+		f1: num(raw.f1),
+		precision: num(raw.precision),
+		recall: num(raw.recall),
+		far: num(raw.far),
+		csi: num(raw.csi),
+		...counts,
+		plateau: pair(raw.plateau),
+		radar_plateau: pair(raw.radar_plateau),
+		agrees_with_radar: typeof raw.agrees_with_radar === 'boolean' ? raw.agrees_with_radar : null
+	};
+}
+
+/**
+ * The fitted push thresholds. Additive: a producer that has never run the
+ * fit omits the section, and null here is what the page renders as "not
+ * fitted yet". A section with no readable horizon in it is the same thing.
+ */
+function parseThresholds(raw: unknown): QualityThresholds | null {
+	if (!isObject(raw) || !isObject(raw.leads)) return null;
+	const leads: LeadThresholdRow[] = [];
+	for (const [key, value] of Object.entries(raw.leads)) {
+		const lead = key.trim() === '' ? null : num(Number(key));
+		if (lead === null) continue;
+		const row = parseLeadThreshold(lead, value);
+		if (row !== null) leads.push(row);
+	}
+	if (leads.length === 0) return null;
+	const fallback = num(raw.fallback_threshold_pct);
+	return {
+		fitted_at_utc: iso(raw.fitted_at_utc),
+		objective: parseObjective(raw.objective),
+		// The producer's own default when it stated one; otherwise the rule
+		// that shipped before the fit existed.
+		fallback_threshold_pct: fallback === null ? 40 : Math.round(fallback),
+		leads: leads.sort((a, b) => a.lead_min - b.lead_min)
+	};
+}
+
 /**
  * Parse a quality document. Null only when there is nothing to render at all —
  * not an object, or without a readable `generated_at_utc`, which is the one
@@ -344,7 +422,8 @@ export function parseQuality(raw: unknown): QualityReport | null {
 		raining_now: parseRainingNow(raw.raining_now),
 		stations: parseStations(raw.stations),
 		events: parseEvents(raw.events),
-		methods: parseMethods(raw.methods)
+		methods: parseMethods(raw.methods),
+		thresholds: parseThresholds(raw.thresholds)
 	};
 }
 

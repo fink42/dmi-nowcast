@@ -142,10 +142,23 @@ export const da = {
 		working: 'Arbejder …',
 		showSettings: 'Indstillinger',
 		hideSettings: 'Skjul indstillinger',
-		thresholdLabel: 'Sandsynlighed mindst',
-		thresholdOption: (pct: number) => `${pct} %`,
-		leadLabel: 'Varsel',
+		/**
+		 * Ét valg, i almindelige ord: hvor lang tid i forvejen. Tærsklen er
+		 * ikke en indstilling — den er tilpasset pr. horisont og vises som
+		 * en oplysning under vælgeren.
+		 */
+		leadLabel: 'Varsl mig så mange minutter i forvejen',
 		leadOption: (min: number) => `${min} min`,
+		factTable: (pct: number, date: string) =>
+			`Varsler i dag ved ${pct} % — tilpasset efter DMI’s regnmålere ${date}.`,
+		factTableUndated: (pct: number) =>
+			`Varsler i dag ved ${pct} % — tilpasset efter DMI’s regnmålere.`,
+		factFallback: (pct: number) =>
+			`Varsler i dag ved ${pct} % (standard, indtil der er data nok).`,
+		factOverride: (pct: number) =>
+			`Tilsidesat: ${pct} % — bruges i stedet for den tilpassede værdi.`,
+		leadAdjusted: (stored: number, shown: number) =>
+			`Dine beskeder var sat til ${stored} min, som ikke længere tilbydes — ${shown} min er valgt i stedet.`,
 		quietLabel: 'Ingen beskeder om natten',
 		quietFrom: 'Fra',
 		quietTo: 'Til',
@@ -347,6 +360,32 @@ export const da = {
 			onTime: 'ramte tiden',
 			empty: '—',
 			none: 'Der er endnu ingen efterprøvede varsler.'
+		},
+		/**
+		 * “Sådan vælger vi, hvornår vi varsler” — de tilpassede tærskler.
+		 * Reglen er en måling, ikke en indstilling, og her siger siden det
+		 * med ord, en modtager kan efterprøve.
+		 */
+		thresholds: {
+			title: 'Sådan vælger vi, hvornår vi varsler',
+			intro: (leadMin: number) =>
+				`For hver varslingstid afspiller vi varslingsreglen ved hver eneste tærskel hen over måneders gemte prognoser, holder hver afspilning op mod DMI’s regnmålere og beholder den tærskel, der rammer flest varsler rigtigt uden at skære varslingstiden ned under ${leadMin} minutter. Ingen vælger tallene i hånden.`,
+			introNoLead:
+				'For hver varslingstid afspiller vi varslingsreglen ved hver eneste tærskel hen over måneders gemte prognoser, holder hver afspilning op mod DMI’s regnmålere og beholder den tærskel, der rammer flest varsler rigtigt. Ingen vælger tallene i hånden.',
+			fittedAt: (when: string) => `Tilpasset ${when}.`,
+			fallbackNote: (pct: number) =>
+				`En varslingstid med for lidt datagrundlag varsler ved ${pct} %, indtil den har nok.`,
+			none: 'Tærsklerne er ikke tilpasset endnu.',
+			colHorizon: 'Varslingstid',
+			colThreshold: 'Varsler ved',
+			colPrecision: 'Ret, når vi varslede',
+			colRecall: 'Regn vi fangede',
+			colF1: 'F1',
+			colWarnings: 'Varsler bedømt',
+			horizon: (min: number) => `${min} min`,
+			insufficient: 'For lidt data — standarden bruges.',
+			disagrees: 'Radar og regnmålere er uenige her; regnmålerne vinder.',
+			empty: '—'
 		},
 		methods: {
 			title: 'Sådan er det målt',

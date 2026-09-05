@@ -31,6 +31,7 @@ describe('parseQuality on the fixture', () => {
 		expect(report!.stations).not.toBeNull();
 		expect(report!.events).not.toBeNull();
 		expect(report!.methods).not.toBeNull();
+		expect(report!.thresholds).not.toBeNull();
 	});
 
 	it('keeps the numbers it was given', () => {

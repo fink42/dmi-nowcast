@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	fetchPushConfig,
+	fetchPushOptions,
 	OffCoverageError,
 	postSubscribe,
 	postUnsubscribe,
@@ -58,10 +59,10 @@ describe('fetchPushConfig', () => {
 		expect(config).toEqual({
 			enabled: true,
 			vapidPublicKey: 'BAaaaa',
-			thresholdOptionsPct: [40, 60, 80],
-			leadOptionsMin: [20, 30, 45, 60],
 			defaults: {
-				thresholdPct: 60,
+				// The config's own threshold is ignored: it is fitted per
+				// horizon and served by `/api/push/options`.
+				thresholdPct: null,
 				leadMin: 30,
 				quietHours: { enabled: false, start: '22:00', end: '07:00' }
 			},
@@ -115,13 +116,85 @@ const BODY = subscribeBody(
 	'Europe/Copenhagen'
 );
 
+const SERVER_OPTIONS = {
+	lead_options: [20, 30, 45, 60],
+	fallback_threshold_pct: 40,
+	fitted_at_utc: '2026-09-03T02:11:07Z',
+	thresholds: {
+		20: { threshold_pct: 35, source: 'table' },
+		60: { threshold_pct: 40, source: 'fallback' }
+	}
+};
+
+describe('fetchPushOptions', () => {
+	it('camel-cases the options and keys the table by horizon', async () => {
+		stubFetch(() => json(SERVER_OPTIONS));
+		const options = await fetchPushOptions();
+		expect(calls[0].url).toBe('/api/push/options');
+		expect(options.leadOptionsMin).toEqual([20, 30, 45, 60]);
+		expect(options.fallbackThresholdPct).toBe(40);
+		expect(options.fittedAtUtc).toBe('2026-09-03T02:11:07Z');
+		expect(options.thresholds[20]).toEqual({ thresholdPct: 35, source: 'table' });
+	});
+
+	it('reads the SPA shell, a 404 and a dead network as "no table yet"', async () => {
+		for (const responder of [
+			() => new Response('<!doctype html>', { status: 200 }),
+			() => json({ detail: 'not found' }, 404),
+			() => {
+				throw new TypeError('Failed to fetch');
+			}
+		]) {
+			vi.unstubAllGlobals();
+			stubFetch(responder);
+			const options = await fetchPushOptions();
+			expect(options.leadOptionsMin).toEqual([20, 30, 45, 60]);
+			expect(options.fittedAtUtc).toBeNull();
+			expect(options.thresholds).toEqual({});
+		}
+	});
+});
+
 describe('postSubscribe', () => {
 	it('posts JSON and returns the server result', async () => {
 		stubFetch(() => json({ ok: true, created: true }));
-		await expect(postSubscribe(BODY)).resolves.toEqual({ ok: true, created: true });
+		await expect(postSubscribe(BODY)).resolves.toEqual({
+			ok: true,
+			created: true,
+			effectiveThresholdPct: null,
+			thresholdSource: null,
+			fittedAtUtc: null
+		});
 		expect(calls[0].url).toBe('/api/push/subscribe');
 		expect(calls[0].init?.method).toBe('POST');
 		expect(JSON.parse(String(calls[0].init?.body))).toEqual(BODY);
+	});
+
+	it('carries the effective threshold the server answered with', async () => {
+		stubFetch(() =>
+			json({
+				ok: true,
+				created: false,
+				effective_threshold_pct: 35,
+				threshold_source: 'table',
+				fitted_at_utc: '2026-09-03T02:11:07Z'
+			})
+		);
+		await expect(postSubscribe(BODY)).resolves.toMatchObject({
+			effectiveThresholdPct: 35,
+			thresholdSource: 'table',
+			fittedAtUtc: '2026-09-03T02:11:07Z'
+		});
+	});
+
+	it('reads an unusable effective threshold as absent, not as a number', async () => {
+		stubFetch(() =>
+			json({ ok: true, created: true, effective_threshold_pct: 'x', threshold_source: 'guess' })
+		);
+		await expect(postSubscribe(BODY)).resolves.toMatchObject({
+			effectiveThresholdPct: null,
+			thresholdSource: null
+		});
 	});
 
 	it('maps 400 to OffCoverageError', async () => {

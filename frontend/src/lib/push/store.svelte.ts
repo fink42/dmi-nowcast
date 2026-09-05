@@ -21,10 +21,12 @@ import { browser } from '$app/environment';
 import { locale } from '$lib/i18n';
 import {
 	fetchPushConfig,
+	fetchPushOptions,
 	OffCoverageError,
 	postSubscribe,
 	postUnsubscribe,
-	PushUnavailableError
+	PushUnavailableError,
+	type SubscribeResult
 } from './api';
 import { urlBase64ToUint8Array } from './keys';
 import {
@@ -33,11 +35,18 @@ import {
 	saveStored,
 	subscribeBody,
 	resolveTimeZone,
+	type EffectiveThreshold,
 	type PushConfig,
 	type PushPrefs,
 	type StoredSubscription
 } from './prefs';
 import { currentEnv, detectPushSupport, type PushSupport } from './support';
+import {
+	effectiveThreshold,
+	FALLBACK_OPTIONS,
+	thresholdOverrideFromUrl,
+	type PushOptions
+} from './thresholds';
 
 export type PushStatus = 'idle' | 'loading' | 'subscribing' | 'subscribed' | 'error';
 
@@ -73,6 +82,14 @@ function readPermission(): NotificationPermission | 'unknown' {
 
 class PushStore {
 	config = $state<PushConfig | null>(null);
+	/** The horizons on offer and the threshold fitted for each. */
+	options = $state<PushOptions>(FALLBACK_OPTIONS);
+	/**
+	 * The hidden `?threshold=NN` override this tab was opened with, or null.
+	 * Read once at start-up: it is a power-user escape hatch, not a control,
+	 * and a value that appeared mid-session would have nothing to explain it.
+	 */
+	urlOverride = $state<number | null>(null);
 	support = $state<PushSupport | 'unknown'>('unknown');
 	permission = $state<NotificationPermission | 'unknown'>('unknown');
 	status = $state<PushStatus>('idle');
@@ -101,7 +118,14 @@ class PushStore {
 		this.status = 'loading';
 		this.support = detectPushSupport(currentEnv());
 		this.permission = readPermission();
-		this.config = await fetchPushConfig();
+		this.urlOverride = thresholdOverrideFromUrl(
+			typeof location === 'undefined' ? '' : location.search
+		);
+		// Two independent endpoints, neither of which throws: the config says
+		// whether push works at all, the options say what may be chosen.
+		const [config, options] = await Promise.all([fetchPushConfig(), fetchPushOptions()]);
+		this.config = config;
+		this.options = options;
 		this.stored = loadStored(this.config);
 		if (this.support !== 'supported' || !this.config.enabled) {
 			this.status = 'idle';
@@ -225,8 +249,9 @@ class PushStore {
 
 		const lang = locale();
 		const tz = resolveTimeZone();
+		let result: SubscribeResult;
 		try {
-			await postSubscribe(subscribeBody(subscription.toJSON(), lat, lon, prefs, lang, tz));
+			result = await postSubscribe(subscribeBody(subscription.toJSON(), lat, lon, prefs, lang, tz));
 		} catch (err) {
 			// Nothing must dangle: a subscription this call created, which the
 			// server never recorded, would leave the browser thinking it is
@@ -247,6 +272,7 @@ class PushStore {
 			lat,
 			lon,
 			prefs,
+			effective: this.#effectiveOf(result, prefs),
 			lang,
 			tz,
 			subscribedAt: new Date().toISOString()
@@ -272,8 +298,9 @@ class PushStore {
 		}
 		const lang = locale();
 		const tz = resolveTimeZone();
+		let result: SubscribeResult;
 		try {
-			await postSubscribe(
+			result = await postSubscribe(
 				subscribeBody(subscription.toJSON(), stored.lat, stored.lon, prefs, lang, tz)
 			);
 		} catch (err) {
@@ -284,6 +311,7 @@ class PushStore {
 			...stored,
 			endpoint: subscription.endpoint,
 			prefs,
+			effective: this.#effectiveOf(result, prefs),
 			lang,
 			tz
 		};
@@ -324,6 +352,30 @@ class PushStore {
 		this.stored = null;
 		this.status = 'idle';
 		this.error = null;
+	}
+
+	/**
+	 * What the server answered it will warn this device at.
+	 *
+	 * A server built before the fit existed answers without the field, and
+	 * the same number is then derived from the options table — the two agree
+	 * whenever both exist, and the response wins when they do not, because it
+	 * is the row that was actually written.
+	 */
+	#effectiveOf(result: SubscribeResult, prefs: PushPrefs): EffectiveThreshold {
+		if (result.effectiveThresholdPct !== null) {
+			return {
+				thresholdPct: result.effectiveThresholdPct,
+				source: result.thresholdSource ?? 'fallback',
+				fittedAtUtc: result.fittedAtUtc ?? this.options.fittedAtUtc
+			};
+		}
+		const pick = effectiveThreshold(this.options, prefs.leadMin, prefs.thresholdPct);
+		return {
+			thresholdPct: pick.pct,
+			source: pick.source,
+			fittedAtUtc: this.options.fittedAtUtc
+		};
 	}
 
 	#fail(key: PushErrorKey): void {
