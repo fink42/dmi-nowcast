@@ -44,6 +44,22 @@ rain came later than the ETA — the warning was early. The website's
 quality page is built on this convention; do not flip it here without
 flipping it there.
 
+**Coverage** is the other half of the same honesty. An onset is only a
+miss where a decision could have caught it. The gauge archive is
+backfilled — months of 10-minute slots at a hundred stations — while
+decision rows exist only for the frames the service actually evaluated,
+and scoring the first against the second counts every rain event since
+December as a miss. The first live report did exactly that: five
+warnings, two hits, and 2 088 "misses" from a gauge archive the service
+had never been running for.
+
+So pass ``coverage`` — the intervals the decision rows actually span, from
+:func:`coverage_runs` — and an unclaimed onset outside them is
+``uncovered``: not a hit, not a miss, not in POD. A claimed onset is
+always a hit, coverage or not; the claim is evidence in itself, and the
+run's tail is where a warning's own window legitimately reaches past the
+last frame.
+
 **Pending** is the third outcome, and the reason it exists is that a
 report is built while the weather is still happening. A warning sent two
 minutes ago promises rain within the next forty; the gauge has not
@@ -94,10 +110,21 @@ __all__ = [
     "DEFAULT_LEAD_MIN",
     "DEFAULT_TOLERANCE_MIN",
     "DECISION_COLUMNS",
+    "DEFAULT_PRODUCT_LEADS_MIN",
+    "align_decision_table",
+    "concat_decision_tables",
+    "decision_columns",
+    "decision_leads_in",
     "decision_schema",
+    "decision_table",
+    "p_rain_column",
+    "parse_p_rain_column",
+    "per_lead_columns",
+    "DEFAULT_COVERAGE_GAP_MIN",
     "slot_end_of",
     "gauge_slots",
     "onsets",
+    "coverage_runs",
     "WarningOutcome",
     "OnsetOutcome",
     "ScoreResult",
@@ -124,15 +151,28 @@ DEFAULT_DRY_MIN = 30
 DEFAULT_LEAD_MIN = 30
 DEFAULT_TOLERANCE_MIN = 10
 
+#: The longest gap between consecutive decision rows that still counts as
+#: continuous coverage: two radar cycles at DMI's 10-minute cadence. One
+#: missed cycle is a hiccup and the rain either side of it was still being
+#: watched; three hours is an outage, and nothing in it was.
+DEFAULT_COVERAGE_GAP_MIN = 20
+
 
 # ---------------------------------------------------------------------------
 # The decision row — one shape, two writers
 # ---------------------------------------------------------------------------
 
-#: Columns of one evaluated (frame, station) decision. The historical
-#: replay and the live ``station_eval`` step in the sidecar append rows of
-#: exactly this shape, so a replay parquet and a live parquet concatenate
-#: without a translation layer and this module can score either.
+#: The columns EVERY decision row carries, in order. The historical replay
+#: and the live ``station_eval`` step in the sidecar both append rows of
+#: this shape, so a replay parquet and a live parquet concatenate without
+#: a translation layer and this module can score either.
+#:
+#: ``p_rain`` is the probability at the *rule's* lead — the number the
+#: decision was actually taken on. It is joined on disk by one
+#: ``p_rain_<lead>`` column per served lead (:func:`decision_columns`), so
+#: a threshold/horizon sweep can be run offline against the gauges without
+#: re-running STEPS. This base tuple stays fixed: readers pin it, and files
+#: written before the per-lead columns existed have exactly these.
 DECISION_COLUMNS: tuple[str, ...] = (
     "radar_ts",
     "generated_at",
@@ -147,9 +187,40 @@ DECISION_COLUMNS: tuple[str, ...] = (
     "streak_after",
 )
 
+#: Default per-lead probability columns: the leads the national products
+#: publish (mirrors ``national.DEFAULT_LEADS_MIN`` — restated rather than
+#: imported so this module's import graph stays dependency-free).
+DEFAULT_PRODUCT_LEADS_MIN: tuple[int, ...] = (10, 20, 30, 45, 60)
 
-def decision_schema():
-    """Arrow schema for :data:`DECISION_COLUMNS`.
+_P_RAIN_PREFIX = "p_rain_"
+
+
+def p_rain_column(lead: int) -> str:
+    """Column name for the probability at ``lead`` minutes."""
+    return f"{_P_RAIN_PREFIX}{int(lead)}"
+
+
+def parse_p_rain_column(name: str) -> int | None:
+    """``"p_rain_30"`` → ``30``; anything else → ``None``."""
+    if not name.startswith(_P_RAIN_PREFIX):
+        return None
+    tail = name[len(_P_RAIN_PREFIX):]
+    return int(tail) if tail.isdigit() else None
+
+
+def _leads(leads_min: Iterable[int] | None) -> tuple[int, ...]:
+    if leads_min is None:
+        leads_min = DEFAULT_PRODUCT_LEADS_MIN
+    return tuple(sorted({int(lead) for lead in leads_min}))
+
+
+def decision_columns(leads_min: Iterable[int] | None = None) -> tuple[str, ...]:
+    """:data:`DECISION_COLUMNS` plus one ``p_rain_<lead>`` per served lead."""
+    return DECISION_COLUMNS + tuple(p_rain_column(lead) for lead in _leads(leads_min))
+
+
+def decision_schema(leads_min: Iterable[int] | None = None):
+    """Arrow schema for :func:`decision_columns`.
 
     pyarrow is imported lazily: this module's scoring functions are pure
     Python and must stay importable in an environment that has no Arrow
@@ -158,11 +229,16 @@ def decision_schema():
     Every forecast field is nullable float32 — ``None`` from
     ``sample_point`` means "off coverage / nodata", which is emphatically
     not zero, and the null survives to the parquet so a reader cannot
-    silently average it as a dry sample.
+    silently average it as a dry sample. That applies to the per-lead
+    columns too: a lead the cycle did not publish reads null, never 0 %.
+
+    ``leads_min`` defaults to :data:`DEFAULT_PRODUCT_LEADS_MIN`. Pass the
+    cycle's own ``products.leads_min`` when writing, so a config that
+    serves different leads writes the columns it actually has.
     """
     import pyarrow as pa
 
-    return pa.schema([
+    fields = [
         ("radar_ts", pa.timestamp("us", tz="UTC")),
         ("generated_at", pa.timestamp("us", tz="UTC")),
         ("station_id", pa.string()),
@@ -174,7 +250,93 @@ def decision_schema():
         ("action", pa.string()),
         ("armed_after", pa.bool_()),
         ("streak_after", pa.int32()),
-    ])
+    ]
+    fields += [(p_rain_column(lead), pa.float32()) for lead in _leads(leads_min)]
+    return pa.schema(fields)
+
+
+def per_lead_columns(p_rain: Mapping[int, float | None] | None) -> dict:
+    """``sample_point``'s ``p_rain`` dict → the ``p_rain_<lead>`` row fields.
+
+    One place, two writers: the replay and the live step must name and
+    populate these identically or their parquet files stop concatenating.
+    """
+    if not p_rain:
+        return {}
+    return {p_rain_column(lead): value for lead, value in p_rain.items()}
+
+
+def decision_table(rows: Sequence[Mapping[str, Any]], leads_min=None):
+    """Row dicts → an Arrow table in the decision schema.
+
+    A row missing a column contributes a null, which is what lets a writer
+    hand over rows built before a lead was served.
+    """
+    import pyarrow as pa
+
+    schema = decision_schema(leads_min)
+    return pa.table(
+        {
+            name: pa.array(
+                [row.get(name) for row in rows], type=schema.field(name).type,
+            )
+            for name in schema.names
+        },
+        schema=schema,
+    )
+
+
+def decision_leads_in(table) -> tuple[int, ...]:
+    """The lead times a decision table (or column-name list) carries."""
+    names = table.schema.names if hasattr(table, "schema") else list(table)
+    found = {parse_p_rain_column(name) for name in names}
+    return tuple(sorted(lead for lead in found if lead is not None))
+
+
+def align_decision_table(table, leads_min: Iterable[int] | None = None):
+    """Conform a decision table to the schema, filling absent columns with nulls.
+
+    This is what makes a parquet written before the per-lead columns
+    existed readable beside one written after: the target schema is the
+    UNION of the requested leads and the leads the file already has, so
+    nothing on disk is dropped and nothing missing reads as a value. Types
+    are cast rather than assumed, so a file written by an older float64
+    build still lines up.
+    """
+    import pyarrow as pa
+
+    leads = tuple(sorted(set(_leads(leads_min)) | set(decision_leads_in(table))))
+    schema = decision_schema(leads)
+    present = set(table.schema.names)
+    columns = [
+        table.column(field.name).cast(field.type)
+        if field.name in present
+        else pa.nulls(table.num_rows, type=field.type)
+        for field in schema
+    ]
+    return pa.table(columns, schema=schema)
+
+
+def concat_decision_tables(tables, leads_min: Iterable[int] | None = None):
+    """Concatenate decision tables written under different lead sets.
+
+    The report producer reads a directory of per-day parquet files that may
+    straddle the day the per-lead columns were added; this aligns every one
+    of them to the union schema first, so the concatenation cannot fail on
+    a schema mismatch.
+    """
+    import pyarrow as pa
+
+    tables = list(tables)
+    leads = set(_leads(leads_min))
+    for table in tables:
+        leads |= set(decision_leads_in(table))
+    leads = tuple(sorted(leads))
+    if not tables:
+        return decision_schema(leads).empty_table()
+    return pa.concat_tables(
+        [align_decision_table(table, leads) for table in tables]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +530,56 @@ def onsets(
 
 
 # ---------------------------------------------------------------------------
+# Coverage: the intervals a decision row could actually have caught rain in
+# ---------------------------------------------------------------------------
+
+
+def coverage_runs(
+    timestamps: Iterable[datetime],
+    *,
+    max_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
+    extend_min: float = 0.0,
+) -> list[tuple[datetime, datetime]]:
+    """Merge decision timestamps into the runs they actually cover.
+
+    ``timestamps`` are one station's decision instants — the ``radar_ts``
+    of every evaluated frame. Consecutive stamps no more than
+    ``max_gap_min`` apart belong to the same run; a longer gap ends it,
+    because nothing was being watched in between and rain that fell there
+    was never anybody's to catch.
+
+    Each run's end is pushed out by ``extend_min`` — the caller passes
+    ``lead_min + tolerance_min`` — since the last frame of a run makes a
+    promise about the following half hour, and an onset that lands inside
+    that promise is squarely in scope even though no later frame exists.
+
+    Returns disjoint, sorted ``[(start, end)]``. Empty input, empty list:
+    no decisions, no coverage, and nothing to score against.
+    """
+    if max_gap_min <= 0:
+        raise ValueError("max_gap_min must be positive")
+    stamps = sorted({_as_utc(ts, "decision timestamp") for ts in timestamps})
+    if not stamps:
+        return []
+    gap = timedelta(minutes=max_gap_min)
+    tail = timedelta(minutes=float(extend_min))
+    runs: list[tuple[datetime, datetime]] = []
+    start = previous = stamps[0]
+    for ts in stamps[1:]:
+        if ts - previous > gap:
+            runs.append((start, previous + tail))
+            start = ts
+        previous = ts
+    runs.append((start, previous + tail))
+    return runs
+
+
+def _covered(ts: datetime, runs: Sequence[tuple[datetime, datetime]]) -> bool:
+    """Whether ``ts`` falls inside any run (both ends inclusive)."""
+    return any(start <= ts <= end for start, end in runs)
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
@@ -394,8 +606,9 @@ class OnsetOutcome:
     """One gauge onset and the warning (if any) that claimed it."""
 
     onset_utc: datetime
-    #: ``"hit"``, ``"miss"``, or ``"pending"`` (an unclaimed onset too
-    #: close to ``known_until`` for the gauge's word to be final).
+    #: ``"hit"``, ``"miss"``, ``"pending"`` (an unclaimed onset too close
+    #: to ``known_until`` for the gauge's word to be final), or
+    #: ``"uncovered"`` (no decision row was watching that instant).
     outcome: str
     sent_utc: datetime | None = None
     lead_error_min: float | None = None
@@ -441,6 +654,7 @@ def score_warnings(
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
     known_until: datetime | None = None,
+    coverage: Sequence[tuple[datetime, datetime]] | None = None,
 ) -> ScoreResult:
     """Match warnings to onsets; return per-warning, per-onset and totals.
 
@@ -454,8 +668,16 @@ def score_warnings(
     ``(sent, sent + lead_min + tolerance_min]``. Warnings that claim
     nothing are false alarms; onsets nothing claimed are misses. Hence
     ``hits + false_alarms == warnings`` and ``hits + misses == n_onsets −
-    pending_onsets`` always hold, which is what makes POD and FAR readable
-    side by side.
+    pending_onsets − uncovered_onsets`` always hold, which is what makes
+    POD and FAR readable side by side.
+
+    ``coverage`` is that station's decision runs from :func:`coverage_runs`.
+    Give it and an unclaimed onset outside every run is ``uncovered``
+    rather than a miss: the gauge archive runs back to the backfill, the
+    decisions only cover the frames the service evaluated, and counting
+    the difference as misses measures the archive's depth rather than the
+    service's skill. A CLAIMED onset stays a hit regardless — the claim is
+    its own evidence.
 
     ``known_until`` is the last gauge slot end this station reported. Give
     it and the scoring gains a third outcome — see the module docstring:
@@ -478,6 +700,13 @@ def score_warnings(
     window = timedelta(minutes=lead_min + tolerance_min)
     grace = timedelta(minutes=tolerance_min)
     horizon = _as_utc(known_until, "known_until") if known_until is not None else None
+    runs = (
+        None if coverage is None
+        else [
+            (_as_utc(a, "coverage start"), _as_utc(b, "coverage end"))
+            for a, b in coverage
+        ]
+    )
     sent_list = sorted(
         ((_as_utc(sent, "sent_utc"), eta) for sent, eta in warnings),
         key=lambda pair: pair[0],
@@ -525,7 +754,7 @@ def score_warnings(
     onset_rows = tuple(
         OnsetOutcome(
             onset,
-            _onset_outcome(claimed_by[i], onset, horizon, grace),
+            _onset_outcome(claimed_by[i], onset, horizon, grace, runs),
             claimed_by[i],
             claimed_error[i],
         )
@@ -535,7 +764,8 @@ def score_warnings(
     scored = n_sent - pending
     false_alarms = scored - hits
     pending_onsets = sum(1 for row in onset_rows if row.outcome == "pending")
-    misses = len(onset_list) - hits - pending_onsets
+    uncovered = sum(1 for row in onset_rows if row.outcome == "uncovered")
+    misses = len(onset_list) - hits - pending_onsets - uncovered
     summary = {
         # ``warnings`` is the SCORED count, so hits + false_alarms adds up
         # to it in the sentence the page writes. ``n_sent`` keeps the raw
@@ -547,6 +777,7 @@ def score_warnings(
         "false_alarms": false_alarms,
         "misses": misses,
         "pending_onsets": pending_onsets,
+        "uncovered_onsets": uncovered,
         "n_onsets": len(onset_list),
         "pod": (hits / (hits + misses)) if (hits + misses) else None,
         "far": (false_alarms / scored) if scored else None,
@@ -555,6 +786,7 @@ def score_warnings(
         "tolerance_min": int(tolerance_min),
         "dry_min": int(dry_min),
         "known_until": horizon,
+        "coverage_runs": 0 if runs is None else len(runs),
     }
     return ScoreResult(tuple(warning_rows), onset_rows, summary)
 
@@ -564,16 +796,22 @@ def _onset_outcome(
     onset: datetime,
     horizon: datetime | None,
     grace: timedelta,
+    runs: Sequence[tuple[datetime, datetime]] | None,
 ) -> str:
-    """``hit`` / ``miss`` / ``pending`` for one onset.
+    """``hit`` / ``miss`` / ``pending`` / ``uncovered`` for one onset.
 
-    An onset nothing claimed is only a miss once the gauge's word about
-    its neighbourhood is final. DMI backfills late station reports, so a
-    slot within ``tolerance`` of the last known one can still move, and
-    with it the onset instant a warning would have had to match.
+    A claimed onset is a hit and nothing downgrades it. An unclaimed one
+    is a miss only where the service could have caught it: inside a
+    decision run (else ``uncovered`` — nobody was watching), and far
+    enough from the gauge's last word for that word to be final (else
+    ``pending`` — DMI backfills late station reports, so a slot within
+    ``tolerance`` of the edge can still move, and with it the onset
+    instant a warning would have had to match).
     """
     if claimed_by is not None:
         return "hit"
+    if runs is not None and not _covered(onset, runs):
+        return "uncovered"
     if horizon is not None and onset + grace > horizon:
         return "pending"
     return "miss"
@@ -587,10 +825,12 @@ def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
     two warnings and a station with two hundred must not carry the same
     weight in a national number.
 
-    Pending warnings and pending onsets pool as their own counts and stay
-    out of every rate, exactly as they do per station — a station whose
-    window is still open must not drag the national FAR up for the
-    fifteen minutes before its gauge reports.
+    Pending and uncovered onsets, and pending warnings, pool as their own
+    counts and stay out of every rate, exactly as they do per station — a
+    station whose window is still open must not drag the national FAR up
+    for the fifteen minutes before its gauge reports, and a station whose
+    gauge archive predates the service must not drag POD to zero with
+    rain nobody was watching for.
     """
     rows = list(results)
     warnings = [w for r in rows for w in r.warnings]
@@ -601,6 +841,7 @@ def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
     false_alarms = scored - hits
     misses = sum(1 for o in onset_rows if o.outcome == "miss")
     pending_onsets = sum(1 for o in onset_rows if o.outcome == "pending")
+    uncovered = sum(1 for o in onset_rows if o.outcome == "uncovered")
     errors = [w.lead_error_min for w in warnings if w.lead_error_min is not None]
     out = {
         "warnings": scored,
@@ -610,6 +851,7 @@ def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
         "false_alarms": false_alarms,
         "misses": misses,
         "pending_onsets": pending_onsets,
+        "uncovered_onsets": uncovered,
         "n_onsets": len(onset_rows),
         "pod": (hits / (hits + misses)) if (hits + misses) else None,
         "far": (false_alarms / scored) if scored else None,

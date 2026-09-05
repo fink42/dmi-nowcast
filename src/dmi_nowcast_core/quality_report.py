@@ -88,12 +88,14 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from .warning_score import (
+    DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
     DEFAULT_LEAD_MIN,
     DEFAULT_TOLERANCE_MIN,
     SLOT_MIN,
     WET_DUR_MIN,
     WET_PRECIP_MM,
+    coverage_runs,
     gauge_slots,
     onsets,
     pooled_summary,
@@ -183,6 +185,9 @@ class QualityInputs:
     tolerance_min: int = DEFAULT_TOLERANCE_MIN
     dry_min: int = DEFAULT_DRY_MIN
     raining_now_mm_h: float = 0.5
+    #: The longest gap between consecutive decision rows that still counts
+    #: as continuous coverage (two radar cycles).
+    coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN
     served_leads: tuple[int, ...] | None = None
     max_events: int = 20
     min_station_warnings: int = MIN_STATION_WARNINGS
@@ -949,12 +954,15 @@ def _score_decisions(
         return board
 
     warnings_by_station: dict[str, list[tuple[datetime, float | None]]] = defaultdict(list)
+    frames_by_station: dict[str, list[datetime]] = defaultdict(list)
     p_rain_at: dict[tuple[str, datetime], float | None] = {}
     for row in rows:
         stamp = _parse_ts(row.get("generated_at"))
         if stamp is None:
             continue
         station = str(row.get("station_id"))
+        frame = _parse_ts(row.get("radar_ts")) or stamp
+        frames_by_station[station].append(frame)
         if row.get("action") != "notify":
             continue
         eta = row.get("eta_min")
@@ -965,6 +973,19 @@ def _score_decisions(
             None if row.get("p_rain") is None else float(row["p_rain"])
         )
 
+    # An onset is only a miss where a decision could have caught it. The
+    # gauge archive is backfilled months deep; the decision rows cover the
+    # frames the service actually evaluated, which on a fresh install is
+    # one day. Without this the first live report counted every rain event
+    # since the backfill as a miss — 2 088 of them against five warnings.
+    coverage_by_station = {
+        station: coverage_runs(
+            stamps,
+            max_gap_min=inputs.coverage_gap_min,
+            extend_min=inputs.lead_min + inputs.tolerance_min,
+        )
+        for station, stamps in frames_by_station.items()
+    }
     results = {
         station: score_warnings(
             warnings_by_station.get(station, []),
@@ -973,6 +994,7 @@ def _score_decisions(
             tolerance_min=inputs.tolerance_min,
             dry_min=inputs.dry_min,
             known_until=truth.known_until.get(station),
+            coverage=coverage_by_station.get(station, []),
         )
         for station in station_ids
     }
@@ -998,6 +1020,9 @@ def _score_decisions(
             "warnings": int(pooled["warnings"]),
             "pending": int(pooled["pending"]),
             "n_sent": int(pooled["n_sent"]),
+            # Onsets outside every decision run: rain that fell while the
+            # service was not watching. Reported, never scored.
+            "uncovered_onsets": int(pooled["uncovered_onsets"]),
             "hits": int(pooled["hits"]),
             "false_alarms": int(pooled["false_alarms"]),
             "misses": int(pooled["misses"]),
@@ -1379,6 +1404,13 @@ def _methods_section(
             f"the highest bin at the headline lead with n ≥ "
             f"{inputs.headline_min_n}; failing that, the most populated "
             f"bin above {inputs.headline_min_prob:g}"
+        ),
+        "coverage_rule": (
+            f"an onset counts only inside a run of decision rows — "
+            f"consecutive frames no more than {inputs.coverage_gap_min} min "
+            f"apart, extended by {inputs.lead_min} + {inputs.tolerance_min} "
+            f"min at the end. Rain outside those runs fell while the "
+            f"service was not watching and is neither a hit nor a miss"
         ),
         "pending_rule": (
             "a warning whose window (sent + lead + tolerance) reaches past "
@@ -1870,6 +1902,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"{warnings['misses']:,} misses"
             + (f", {pending:,} still pending (window not closed)"
                if pending else "")
+            + (f", {warnings['uncovered_onsets']:,} gauge onsets outside "
+               f"any decision run (not scored)"
+               if warnings.get("uncovered_onsets") else "")
             + f". POD {_num(warnings['pod'])}, FAR {_num(warnings['far'])}. "
             f"Lead error p25/p50/p75 = {_num(spread['p25'], 1)} / "
             f"{_num(spread['p50'], 1)} / {_num(spread['p75'], 1)} min "
@@ -1983,6 +2018,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             add(f"- {methods['reliability_brier_improvement']}.")
         if methods.get("headline_bin_rule"):
             add(f"- Headline bin: {methods['headline_bin_rule']}.")
+        if methods.get("coverage_rule"):
+            add(f"- Coverage: {methods['coverage_rule']}.")
         if methods.get("pending_rule"):
             add(f"- Pending: {methods['pending_rule']}.")
         add(f"- Sources: {methods['sources']['radar']}; "

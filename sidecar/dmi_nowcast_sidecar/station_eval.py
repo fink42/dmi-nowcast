@@ -46,7 +46,14 @@ from typing import Any, Sequence
 
 import structlog
 
-from dmi_nowcast_core.warning_score import DECISION_COLUMNS, decision_schema
+from dmi_nowcast_core.warning_score import (
+    DECISION_COLUMNS,
+    align_decision_table,
+    decision_leads_in,
+    decision_schema,
+    decision_table,
+    per_lead_columns,
+)
 
 from .config import Config
 from .national_sample import sample_point
@@ -141,7 +148,7 @@ def _write_atomic(path: Path, write) -> None:
             os.unlink(tmp)
 
 
-def append_rows(path: Path, rows: Sequence[dict]) -> int:
+def append_rows(path: Path, rows: Sequence[dict], leads_min=None) -> int:
     """Merge ``rows`` into a month partition, keyed on (radar_ts, station_id).
 
     Read-modify-write of one month rather than an append: parquet has no
@@ -149,50 +156,36 @@ def append_rows(path: Path, rows: Sequence[dict]) -> int:
     ~100 stations is ~430k rows) and a full rewrite is the only way to
     make the key idempotent. Existing rows for a key the cycle is writing
     are dropped, so re-running a frame corrects it instead of doubling it.
+
+    The existing partition is aligned to the UNION of its own lead columns
+    and this cycle's before the merge, so a month that was started before
+    the ``p_rain_<lead>`` columns existed — or under a different
+    ``national.leads_min`` — keeps every column it had and gains nulls for
+    the rest, instead of failing the rewrite on a schema mismatch.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    schema = decision_schema()
-    new = pa.table(
-        {
-            name: pa.array(
-                [row.get(name) for row in rows], type=schema.field(name).type,
-            )
-            for name in schema.names
-        },
-        schema=schema,
-    )
+    new = decision_table(rows, leads_min)
     if path.is_file():
         try:
-            existing = pq.read_table(path, schema=schema)
+            existing = pq.read_table(path)
         except Exception as exc:  # noqa: BLE001 — a corrupt month is replaced
             _log.warning(
                 "station_eval_partition_unreadable", path=str(path), error=str(exc),
             )
             existing = None
         if existing is not None and existing.num_rows:
-            keys = {
-                (r["radar_ts"], r["station_id"]) for r in new.to_pylist()
-            }
+            existing = align_decision_table(existing, leads_min)
+            leads = decision_leads_in(existing)
+            new = align_decision_table(new, leads)
+            keys = {(r["radar_ts"], r["station_id"]) for r in new.to_pylist()}
             kept = [
                 r for r in existing.to_pylist()
                 if (r["radar_ts"], r["station_id"]) not in keys
             ]
             if kept:
-                new = pa.concat_tables([
-                    pa.table(
-                        {
-                            name: pa.array(
-                                [r.get(name) for r in kept],
-                                type=schema.field(name).type,
-                            )
-                            for name in schema.names
-                        },
-                        schema=schema,
-                    ),
-                    new,
-                ])
+                new = pa.concat_tables([decision_table(kept, leads), new])
     new = new.sort_by([("radar_ts", "ascending"), ("station_id", "ascending")])
     _write_atomic(path, lambda tmp: pq.write_table(new, tmp, compression="zstd"))
     return new.num_rows
@@ -383,7 +376,11 @@ class StationEvalService:
                 "radar_ts": radar_ts,
                 "generated_at": generated_at,
                 "station_id": station,
+                # The rule's lead is what the decision was taken on; every
+                # served lead rides along so the offline threshold sweep
+                # never has to re-run STEPS.
                 "p_rain": obs.p_rain,
+                **per_lead_columns(sample.p_rain if sample else None),
                 "eta_min": obs.eta_min,
                 "intensity_mm_h": obs.intensity_mm_h,
                 "observed_mm_h": obs.observed_mm_h,
@@ -399,7 +396,10 @@ class StationEvalService:
         # State first, rows second: a crash between the two costs one
         # cycle's rows, never a double-counted streak.
         self._write_state(self._states, generated_at)
-        n_rows = append_rows(partition_path(self.config, radar_ts), rows)
+        n_rows = append_rows(
+            partition_path(self.config, radar_ts), rows,
+            getattr(products, "leads_min", None),
+        )
         summary = {
             "radar_ts": radar_ts.isoformat(),
             "stations": len(rows),

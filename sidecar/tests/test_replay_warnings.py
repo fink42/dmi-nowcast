@@ -318,9 +318,11 @@ def test_run_day_writes_a_row_per_station_per_frame(replayed_day) -> None:
     assert result["rows"] == result["frames"] * len(POINTS["points"])
     assert len(result["frame_ms"]) == result["frames"]
 
-    rows = rw.read_decisions(out_dir / "decisions" / f"{DAY}.parquet")
+    rows = rw.read_decisions(
+        out_dir / "decisions" / f"{DAY}.parquet", TINY.leads_min,
+    )
     assert len(rows) == result["rows"]
-    assert set(rows[0]) == set(rw.decision_schema().names)
+    assert set(rows[0]) == set(rw.decision_schema(TINY.leads_min).names)
     assert {r["station_id"] for r in rows} == {"06180", "06120"}
     assert all(r["radar_ts"].tzinfo is not None for r in rows)
     assert all(
@@ -559,3 +561,59 @@ def test_score_matches_a_replayed_warning_to_a_gauge_onset() -> None:
     assert agreement["n_scored"] == 1
     assert agreement["observed"]["correct_negatives"] == 1
     assert slot_lists["06180"]
+
+
+# ---------------------------------------------------------------------------
+# Per-lead probability columns
+# ---------------------------------------------------------------------------
+
+
+def test_the_replay_writes_one_probability_column_per_served_lead(
+    replayed_day,
+) -> None:
+    """The offline threshold sweep must not need a second STEPS run."""
+    from dmi_nowcast_core.warning_score import decision_columns
+
+    _, out_dir = replayed_day
+    rows = rw.read_decisions(
+        out_dir / "decisions" / f"{DAY}.parquet", TINY.leads_min,
+    )
+    assert set(rows[0]) == set(decision_columns(TINY.leads_min))
+    for row in rows:
+        # The rule's lead is 30, so p_rain must equal the p_rain_30 column —
+        # the sweep and the decision read the same number.
+        assert row["p_rain"] == pytest.approx(row["p_rain_30"])
+        for lead in TINY.leads_min:
+            value = row[f"p_rain_{lead}"]
+            assert value is None or 0.0 <= value <= 1.0
+    # A soaked fixture: at least one lead carries a real probability.
+    assert any(r["p_rain_10"] is not None for r in rows)
+
+
+def test_read_decisions_tolerates_a_file_without_the_per_lead_columns(
+    tmp_path: Path,
+) -> None:
+    """Days replayed before the columns existed must still score."""
+    from dmi_nowcast_core.warning_score import DECISION_COLUMNS, decision_table
+
+    path = tmp_path / "old.parquet"
+    row = {
+        "radar_ts": T_ANCHOR,
+        "generated_at": T_ANCHOR + timedelta(minutes=14),
+        "station_id": "06180",
+        "p_rain": 0.8,
+        "eta_min": 25.0,
+        "intensity_mm_h": 1.0,
+        "observed_mm_h": 0.0,
+        "forecast_now_mm_h": 0.0,
+        "action": "notify",
+        "armed_after": False,
+        "streak_after": 1,
+    }
+    old = decision_table([row], leads_min=())
+    assert tuple(old.schema.names) == DECISION_COLUMNS
+    rw._write_table_atomic(old, path)
+
+    rows = rw.read_decisions(path)
+    assert rows[0]["p_rain"] == pytest.approx(0.8)   # the old column survives
+    assert rows[0]["p_rain_30"] is None              # the new one reads unknown

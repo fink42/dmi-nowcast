@@ -134,9 +134,13 @@ from dmi_nowcast_core.warning_score import (  # noqa: E402
     PRECIP_DUR_PARAM,
     PRECIP_PARAM,
     ScoreResult,
+    align_decision_table,
     decision_schema,
+    decision_table,
+    coverage_runs,
     gauge_slots,
     onsets,
+    per_lead_columns,
     pooled_summary,
     raining_now_agreement,
     score_warnings,
@@ -581,7 +585,11 @@ def run_day(args: tuple) -> dict:
                     "radar_ts": sample["radar_ts"],
                     "generated_at": sample["generated_at"],
                     "station_id": station,
+                    # The rule's lead — the number the decision was taken
+                    # on — plus every served lead beside it, so a
+                    # threshold/horizon sweep needs no second STEPS run.
                     "p_rain": obs.p_rain,
+                    **per_lead_columns(sample["p_rain"]),
                     "eta_min": obs.eta_min,
                     "intensity_mm_h": obs.intensity_mm_h,
                     "observed_mm_h": obs.observed_mm_h,
@@ -593,7 +601,7 @@ def run_day(args: tuple) -> dict:
             result["frames"] += 1
             result["frame_ms"].append(round((time.time() - t0) * 1000.0, 1))
         out_path = Path(out_dir_s) / "decisions" / f"{day_s}.parquet"
-        write_decisions(out_path, rows)
+        write_decisions(out_path, rows, settings.leads_min)
         result["rows"] = len(rows)
         result["state"] = {sid: state_to_json(s) for sid, s in states.items()}
     except Exception as exc:  # noqa: BLE001 — a dead day must not kill the run
@@ -624,28 +632,25 @@ def _write_table_atomic(table, path: Path) -> None:
             os.unlink(tmp)
 
 
-def write_decisions(path: Path, rows: Sequence[dict]) -> None:
+def write_decisions(path: Path, rows: Sequence[dict], leads_min=None) -> None:
     """Write one day's decision rows, atomically, in the shared schema."""
-    import pyarrow as pa
-
-    schema = decision_schema()
-    columns = {
-        name: [row.get(name) for row in rows] for name in schema.names
-    }
-    table = pa.table(
-        {
-            name: pa.array(columns[name], type=schema.field(name).type)
-            for name in schema.names
-        },
-        schema=schema,
-    )
-    _write_table_atomic(table, path)
+    _write_table_atomic(decision_table(rows, leads_min), path)
 
 
-def read_decisions(path: Path) -> list[dict]:
+def read_decisions(path: Path, leads_min=None) -> list[dict]:
+    """Read one day's rows, tolerating a file written under other leads.
+
+    Deliberately NOT ``read_table(..., schema=...)``: a parquet written
+    before the per-lead columns existed has only the base columns, and
+    pinning the schema on read would refuse it. The file is read as it is
+    and then aligned to the union schema, so an old day and a new day are
+    the same dict shape by the time anything scores them.
+    """
     import pyarrow.parquet as pq
 
-    return pq.read_table(path, schema=decision_schema()).to_pylist()
+    return align_decision_table(
+        pq.read_table(path), leads_min,
+    ).to_pylist()
 
 
 def write_events(path: Path, rows: Sequence[dict]) -> None:
@@ -771,12 +776,27 @@ def score(
     warnings_by_station: dict[str, list[tuple[datetime, float | None]]] = {
         p.id: [] for p in points
     }
+    frames_by_station: dict[str, list[datetime]] = {p.id: [] for p in points}
     for row in decisions:
+        if row.get("radar_ts") is not None:
+            frames_by_station.setdefault(row["station_id"], []).append(
+                row["radar_ts"],
+            )
         if row.get("action") != "notify":
             continue
         warnings_by_station.setdefault(row["station_id"], []).append(
             (row["generated_at"], row.get("eta_min"))
         )
+
+    # The intervals each station was actually being watched over. A replay
+    # runs contiguous days, so this is normally one run per day-block plus
+    # the lead window at its end — but a resumed run with a missing day
+    # must not count that day's rain as misses, and the gauge archive
+    # reaches back years further than any replay does.
+    coverage_by_station = {
+        sid: coverage_runs(stamps, extend_min=lead_min + tolerance_min)
+        for sid, stamps in frames_by_station.items()
+    }
 
     # The last slot each station actually reported. A warning whose window
     # reaches past it has not come due yet, and neither has an onset within
@@ -798,6 +818,7 @@ def score(
             tolerance_min=tolerance_min,
             dry_min=dry_min,
             known_until=known_until.get(sid),
+            coverage=coverage_by_station.get(sid),
         )
         for sid in (p.id for p in points)
     }
@@ -931,7 +952,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         path = out_dir / "decisions" / f"{d}.parquet"
         if not path.is_file():
             continue
-        rows = read_decisions(path)
+        rows = read_decisions(path, settings.leads_min)
         decisions += rows
         n_frames += len({r["radar_ts"] for r in rows})
 

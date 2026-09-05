@@ -275,6 +275,10 @@ async def test_the_step_appends_one_row_per_station(config: Config) -> None:
     assert row["radar_ts"] == RADAR_TS
     assert row["generated_at"] == GENERATED_AT
     assert row["p_rain"] == pytest.approx(0.9)     # the rule's lead, 30 min
+    # ... and every served lead beside it, from the same sample_point call.
+    assert row["p_rain_10"] == pytest.approx(0.1)
+    assert row["p_rain_20"] == pytest.approx(0.5)
+    assert row["p_rain_30"] == pytest.approx(0.9)
     assert row["eta_min"] == pytest.approx(25.0)
     assert row["intensity_mm_h"] == pytest.approx(1.8)
     assert row["observed_mm_h"] == pytest.approx(0.0)
@@ -507,3 +511,76 @@ def test_app_leaves_it_none_when_disabled(config: Config) -> None:
     config.station_eval.enabled = False
     app = create_app(config, auto_start_scheduler=False)
     assert app.state.station_eval_service is None
+
+
+# ---------------------------------------------------------------------------
+# Per-lead probability columns
+# ---------------------------------------------------------------------------
+
+
+async def test_the_live_step_writes_the_cycles_own_lead_columns(
+    config: Config,
+) -> None:
+    from dmi_nowcast_core.warning_score import decision_columns
+
+    service = StationEvalService(config, _engine(_products()))
+    await service.after_cycle(_cycle_result())
+    rows = _read_partition(config)
+    # The products serve 10/20/30, so those are the columns written — not
+    # the module default, which would invent leads this cycle never had.
+    assert set(rows[0]) == set(decision_columns((10, 20, 30)))
+
+
+def test_append_rows_merges_into_a_partition_without_the_new_columns(
+    tmp_path: Path,
+) -> None:
+    """A month started before the per-lead columns must keep accepting rows."""
+    import pyarrow.parquet as pq
+
+    from dmi_nowcast_core.warning_score import (
+        DECISION_COLUMNS,
+        decision_table,
+    )
+
+    path = tmp_path / "09.parquet"
+    old = decision_table([_row("06180", RADAR_TS)], leads_min=())
+    assert tuple(old.schema.names) == DECISION_COLUMNS
+    pq.write_table(old, path)
+
+    later = RADAR_TS + timedelta(minutes=10)
+    n = append_rows(
+        path, [{**_row("06120", later), "p_rain_30": 0.9}], leads_min=(30,),
+    )
+    assert n == 2
+    rows = pq.read_table(path).to_pylist()
+    assert tuple(pq.read_table(path).schema.names) == (
+        DECISION_COLUMNS + ("p_rain_30",)
+    )
+    by_station = {r["station_id"]: r for r in rows}
+    assert by_station["06180"]["p_rain_30"] is None      # backfilled unknown
+    assert by_station["06120"]["p_rain_30"] == pytest.approx(0.9)
+
+
+def test_append_rows_keeps_a_lead_the_partition_already_had(
+    tmp_path: Path,
+) -> None:
+    """A narrowed config must not silently drop a column already on disk."""
+    import pyarrow.parquet as pq
+
+    from dmi_nowcast_core.warning_score import decision_table
+
+    path = tmp_path / "09.parquet"
+    pq.write_table(
+        decision_table(
+            [{**_row("06180", RADAR_TS), "p_rain_45": 0.4, "p_rain_30": 0.7}],
+            leads_min=(30, 45),
+        ),
+        path,
+    )
+    later = RADAR_TS + timedelta(minutes=10)
+    append_rows(
+        path, [{**_row("06120", later), "p_rain_30": 0.2}], leads_min=(30,),
+    )
+    rows = {r["station_id"]: r for r in pq.read_table(path).to_pylist()}
+    assert rows["06180"]["p_rain_45"] == pytest.approx(0.4)
+    assert rows["06120"]["p_rain_45"] is None

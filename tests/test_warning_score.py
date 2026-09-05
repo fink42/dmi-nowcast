@@ -19,6 +19,11 @@ import pytest
 
 from dmi_nowcast_core.warning_score import (
     DECISION_COLUMNS,
+    DEFAULT_PRODUCT_LEADS_MIN,
+    decision_columns,
+    p_rain_column,
+    parse_p_rain_column,
+    per_lead_columns,
     PRECIP_DUR_PARAM,
     PRECIP_PARAM,
     gauge_slots,
@@ -420,12 +425,133 @@ def test_decision_schema_matches_the_declared_columns() -> None:
     from dmi_nowcast_core.warning_score import decision_schema
 
     schema = decision_schema()
-    assert tuple(schema.names) == DECISION_COLUMNS
+    assert tuple(schema.names) == decision_columns()
+    # The base columns stay first and in order — readers pin them.
+    assert tuple(schema.names)[:len(DECISION_COLUMNS)] == DECISION_COLUMNS
     # Every forecast field must be nullable: None from the sampler means
     # "off coverage", which must never round-trip as a dry 0.0.
     for name in ("p_rain", "eta_min", "intensity_mm_h", "observed_mm_h",
                  "forecast_now_mm_h"):
         assert schema.field(name).nullable
+
+
+# ---------------------------------------------------------------------------
+# Per-lead probability columns
+# ---------------------------------------------------------------------------
+
+
+def test_p_rain_column_names_round_trip() -> None:
+    assert p_rain_column(30) == "p_rain_30"
+    assert parse_p_rain_column("p_rain_45") == 45
+    # The rule's-lead column is NOT a per-lead column, and neither is junk.
+    assert parse_p_rain_column("p_rain") is None
+    assert parse_p_rain_column("p_rain_x") is None
+    assert parse_p_rain_column("observed_mm_h") is None
+
+
+def test_decision_columns_appends_one_column_per_served_lead() -> None:
+    assert decision_columns() == DECISION_COLUMNS + tuple(
+        f"p_rain_{lead}" for lead in DEFAULT_PRODUCT_LEADS_MIN
+    )
+    assert decision_columns([30, 5, 5]) == DECISION_COLUMNS + (
+        "p_rain_5", "p_rain_30",
+    )
+
+
+def test_per_lead_columns_maps_the_sampler_dict() -> None:
+    # A nodata lead stays None — a lead with no probability is unknown,
+    # never 0 %.
+    assert per_lead_columns({10: 0.25, 30: None}) == {
+        "p_rain_10": 0.25, "p_rain_30": None,
+    }
+    assert per_lead_columns(None) == {}
+    assert per_lead_columns({}) == {}
+
+
+def test_decision_schema_types_the_per_lead_columns_nullable_float32() -> None:
+    pa = pytest.importorskip("pyarrow")
+    from dmi_nowcast_core.warning_score import decision_schema
+
+    schema = decision_schema([10, 30])
+    for name in ("p_rain_10", "p_rain_30"):
+        assert schema.field(name).type == pa.float32()
+        assert schema.field(name).nullable
+
+
+def _base_row() -> dict:
+    return {
+        "radar_ts": T0,
+        "generated_at": T0 + timedelta(minutes=14),
+        "station_id": "06180",
+        "p_rain": 0.7,
+        "eta_min": 20.0,
+        "intensity_mm_h": 1.0,
+        "observed_mm_h": 0.0,
+        "forecast_now_mm_h": 0.0,
+        "action": "notify",
+        "armed_after": False,
+        "streak_after": 1,
+    }
+
+
+def test_align_fills_an_old_file_that_predates_the_per_lead_columns() -> None:
+    """A parquet with only the base columns must still read."""
+    pytest.importorskip("pyarrow")
+    from dmi_nowcast_core.warning_score import (
+        align_decision_table,
+        decision_table,
+    )
+
+    old = decision_table([_base_row()], leads_min=())
+    assert tuple(old.schema.names) == DECISION_COLUMNS
+    aligned = align_decision_table(old)
+    assert tuple(aligned.schema.names) == decision_columns()
+    row = aligned.to_pylist()[0]
+    assert row["p_rain"] == pytest.approx(0.7)      # untouched
+    assert row["p_rain_30"] is None                 # unknown, not 0.0
+
+
+def test_align_keeps_a_lead_the_file_has_but_the_caller_did_not_ask_for() -> None:
+    pytest.importorskip("pyarrow")
+    from dmi_nowcast_core.warning_score import (
+        align_decision_table,
+        decision_leads_in,
+        decision_table,
+    )
+
+    wide = decision_table(
+        [{**_base_row(), "p_rain_5": 0.1, "p_rain_30": 0.7}], leads_min=(5, 30),
+    )
+    aligned = align_decision_table(wide, leads_min=(30,))
+    assert decision_leads_in(aligned) == (5, 30)     # nothing dropped
+    assert aligned.to_pylist()[0]["p_rain_5"] == pytest.approx(0.1)
+
+
+def test_concat_unions_files_written_under_different_lead_sets() -> None:
+    """The report producer reads days that straddle the schema change."""
+    pytest.importorskip("pyarrow")
+    from dmi_nowcast_core.warning_score import (
+        concat_decision_tables,
+        decision_table,
+    )
+
+    old = decision_table([_base_row()], leads_min=())
+    new = decision_table(
+        [{**_base_row(), "p_rain_30": 0.7}], leads_min=(30,),
+    )
+    merged = concat_decision_tables([old, new], leads_min=())
+    assert merged.num_rows == 2
+    assert tuple(merged.schema.names) == DECISION_COLUMNS + ("p_rain_30",)
+    assert [r["p_rain_30"] for r in merged.to_pylist()] == [None, pytest.approx(0.7)]
+
+
+def test_concat_of_nothing_is_an_empty_typed_table() -> None:
+    pytest.importorskip("pyarrow")
+    from dmi_nowcast_core.warning_score import concat_decision_tables
+
+    empty = concat_decision_tables([], leads_min=(30,))
+    assert empty.num_rows == 0
+    assert tuple(empty.schema.names) == DECISION_COLUMNS + ("p_rain_30",)
 
 
 # ---------------------------------------------------------------------------
@@ -568,3 +694,176 @@ def test_a_pending_warning_contributes_no_lead_error() -> None:
     )
     assert result.summary["lead_error_min"]["n"] == 0
     assert result.summary["lead_error_min"]["p50"] is None
+
+
+# ---------------------------------------------------------------------------
+# Coverage: an onset is only a miss where a decision could have caught it
+# ---------------------------------------------------------------------------
+#
+# The defect this fixes, from the first served report: five warnings, two
+# hits, and 2 088 "misses" — gauge onsets from a backfilled archive running
+# back to December, scored against decision rows that existed only for that
+# day. POD came out 0.001, which measured the archive's depth and nothing
+# about the service.
+
+
+def _cover(*minutes: int, extend: float = 40.0) -> list:
+    from dmi_nowcast_core.warning_score import coverage_runs
+
+    return coverage_runs([_at(m) for m in minutes], extend_min=extend)
+
+
+def test_coverage_runs_merges_frames_within_two_cycles() -> None:
+    # 10-minute frames: one continuous run, ending a lead window later.
+    runs = _cover(0, 10, 20, 30, extend=40.0)
+    assert runs == [(_at(0), _at(70))]
+
+
+def test_coverage_runs_tolerates_one_missed_cycle() -> None:
+    """A 20-minute gap is a hiccup; the rain either side was watched."""
+    assert _cover(0, 20, 40, extend=0.0) == [(_at(0), _at(40))]
+
+
+def test_coverage_runs_breaks_on_a_longer_gap() -> None:
+    """A three-hour hole is an outage, and nothing in it was watched."""
+    runs = _cover(0, 10, 190, 200, extend=40.0)
+    assert runs == [(_at(0), _at(50)), (_at(190), _at(240))]
+
+
+def test_coverage_runs_of_nothing_covers_nothing() -> None:
+    from dmi_nowcast_core.warning_score import coverage_runs
+
+    assert coverage_runs([]) == []
+
+
+def test_coverage_runs_dedupes_and_sorts() -> None:
+    assert _cover(30, 0, 10, 0, 20, extend=0.0) == [(_at(0), _at(30))]
+
+
+def test_an_onset_a_week_before_the_first_decision_is_not_a_miss() -> None:
+    week_before = T0 - timedelta(days=7)
+    result = score_warnings(
+        [], [week_before], lead_min=30, tolerance_min=10,
+        coverage=_cover(0, 10, 20),
+    )
+    assert [o.outcome for o in result.onsets] == ["uncovered"]
+    summary = result.summary
+    assert summary["uncovered_onsets"] == 1
+    assert summary["misses"] == 0
+    # No scored onsets at all, so POD is "not measured", never 0.0.
+    assert summary["pod"] is None
+
+
+def test_an_onset_inside_a_covered_run_with_no_warning_is_a_miss() -> None:
+    result = score_warnings(
+        [], [_at(15)], lead_min=30, tolerance_min=10,
+        coverage=_cover(0, 10, 20), known_until=_at(500),
+    )
+    assert [o.outcome for o in result.onsets] == ["miss"]
+    assert result.summary["misses"] == 1
+    assert result.summary["uncovered_onsets"] == 0
+    assert result.summary["pod"] == 0.0
+
+
+def test_a_three_hour_gap_between_rows_does_not_bridge() -> None:
+    """Rain in the hole is nobody's to catch; rain in either run is."""
+    result = score_warnings(
+        [],
+        [_at(5), _at(100), _at(195)],   # run 1, the gap, run 2
+        lead_min=30, tolerance_min=10,
+        coverage=_cover(0, 10, 190, 200),
+        known_until=_at(500),
+    )
+    assert [o.outcome for o in result.onsets] == ["miss", "uncovered", "miss"]
+    assert result.summary["misses"] == 2
+    assert result.summary["uncovered_onsets"] == 1
+
+
+def test_the_run_tail_covers_the_promise_the_last_frame_made() -> None:
+    """The final frame promises the next lead window; that is in scope."""
+    result = score_warnings(
+        [], [_at(55)], lead_min=30, tolerance_min=10,
+        coverage=_cover(0, 10, 20), known_until=_at(500),
+    )
+    # Run ends at 20 + 40 = 60, so an onset at 55 is inside it.
+    assert [o.outcome for o in result.onsets] == ["miss"]
+
+
+def test_a_claimed_onset_is_a_hit_even_outside_coverage() -> None:
+    """The claim is its own evidence and no coverage rule unmakes it.
+
+    Demoting it would drop a hit from POD's numerator while its onset
+    stayed in the denominator — the same trap the pending rule avoids.
+    """
+    result = score_warnings(
+        [(_at(20), 20.0)], [_at(55)], lead_min=30, tolerance_min=10,
+        coverage=[(_at(0), _at(30))],   # deliberately short: 55 is outside
+        known_until=_at(500),
+    )
+    assert [w.outcome for w in result.warnings] == ["hit"]
+    assert [o.outcome for o in result.onsets] == ["hit"]
+    assert result.summary["pod"] == 1.0
+    assert result.summary["uncovered_onsets"] == 0
+
+
+def test_without_coverage_every_onset_is_scored_as_before() -> None:
+    result = score_warnings([], [T0 - timedelta(days=7)], lead_min=30)
+    assert [o.outcome for o in result.onsets] == ["miss"]
+    assert result.summary["uncovered_onsets"] == 0
+    assert result.summary["coverage_runs"] == 0
+
+
+def test_the_counts_add_up_with_coverage_pending_and_misses_together() -> None:
+    result = score_warnings(
+        [(_at(0), 20.0), (_at(60), 20.0)],
+        [T0 - timedelta(days=7), _at(20), _at(150), _at(495)],
+        lead_min=30, tolerance_min=10,
+        coverage=_cover(0, 10, 20, 60, 70, 150, 160, 490, 500),
+        known_until=_at(500),
+    )
+    s = result.summary
+    assert [o.outcome for o in result.onsets] == [
+        "uncovered", "hit", "miss", "pending",
+    ]
+    assert s["hits"] + s["misses"] == (
+        s["n_onsets"] - s["pending_onsets"] - s["uncovered_onsets"]
+    ) == 2
+    assert s["pod"] == 0.5
+
+
+def test_pooled_summary_pools_uncovered_onsets_out_of_the_rates() -> None:
+    watched = score_warnings(
+        [(_at(0), 20.0)], [_at(20)], lead_min=30, tolerance_min=10,
+        coverage=_cover(0, 10, 20), known_until=_at(500),
+    )
+    archive_only = score_warnings(
+        [], [T0 - timedelta(days=7), T0 - timedelta(days=6)],
+        lead_min=30, tolerance_min=10, coverage=_cover(0, 10, 20),
+    )
+    pooled = pooled_summary([watched, archive_only])
+    assert pooled["hits"] == 1
+    assert pooled["uncovered_onsets"] == 2
+    assert pooled["misses"] == 0
+    # The archive's depth must not drag the national POD toward zero.
+    assert pooled["pod"] == 1.0
+
+
+def test_raining_now_agreement_only_ever_looks_at_decision_rows() -> None:
+    """Confirmation, not a change: it iterates rows, never the slot grid.
+
+    A station with a year of gauge slots and two decision rows scores two
+    slots — the ones a decision was made in — and nothing else.
+    """
+    slots = [
+        (T0 + timedelta(minutes=10 * k), k % 2 == 0) for k in range(-500, 500)
+    ]
+    rows = [
+        {"station_id": "06180", "generated_at": _at(0),
+         "forecast_now_mm_h": 1.0, "observed_mm_h": 1.0},
+        {"station_id": "06180", "generated_at": _at(10),
+         "forecast_now_mm_h": 0.0, "observed_mm_h": 0.0},
+    ]
+    out = raining_now_agreement(rows, {"06180": slots})
+    assert out["n_rows"] == 2
+    assert out["n_scored"] == 2
+    assert out["forecast_now"]["n"] == 2

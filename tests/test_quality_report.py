@@ -209,7 +209,55 @@ ONSET_TIMES = (
 ONSET_TIMES_2 = (DAY + timedelta(hours=3, minutes=0),)
 
 
-def write_gauge_store(corpus_dir: Path) -> None:
+#: Onsets in the BACKFILLED archive, on days before any decision row
+#: exists. This is the shape of the defect: the gauge store is read a
+#: month at a time (it has to be — the onset rule needs the dry slots
+#: before an event), while the decisions cover a single day, and every
+#: event in the difference was being counted as a miss.
+ARCHIVE_ONSETS = (
+    DAY - timedelta(days=2) + timedelta(hours=6),    # 09-01 06:00
+    DAY - timedelta(days=2) + timedelta(hours=18),   # 09-01 18:00
+    DAY - timedelta(days=1) + timedelta(hours=6),    # 09-02 06:00
+    DAY - timedelta(days=1) + timedelta(hours=18),   # 09-02 18:00
+)
+#: An unclaimed onset ON the decision day, inside coverage: a real miss,
+#: and the control that proves the fix did not simply stop counting.
+COVERED_MISS = DAY + timedelta(hours=9)
+
+
+def _archive_rows() -> list[dict]:
+    """Gauge slots from the start of the month up to the fixture day.
+
+    All dry except around :data:`ARCHIVE_ONSETS`, so the onset rule finds
+    them — the point of the test is that they ARE detected and then
+    deliberately left unscored, not that they are never seen.
+    """
+    wet = {
+        onset + timedelta(minutes=10 * k)
+        for onset in ARCHIVE_ONSETS for k in range(3)
+    }
+    rows: list[dict] = []
+    slot = DAY.replace(day=1)
+    while slot < DAY:
+        is_wet = slot in wet
+        rows.append({
+            "station_id": "06180", "observed_utc": slot,
+            "parameter_id": "precip_past10min", "value": 0.4 if is_wet else 0.0,
+        })
+        slot += timedelta(minutes=10)
+    # …and one wet spell at a station that never warns, mid-decision-day.
+    rows += [
+        {
+            "station_id": "06182",
+            "observed_utc": COVERED_MISS + timedelta(minutes=10 * k),
+            "parameter_id": "precip_past10min", "value": 0.4,
+        }
+        for k in range(3)
+    ]
+    return rows
+
+
+def write_gauge_store(corpus_dir: Path, *, with_archive: bool = False) -> None:
     from dmi_nowcast_core.station_store import obs_schema
 
     wet_by_station = {
@@ -218,6 +266,8 @@ def write_gauge_store(corpus_dir: Path) -> None:
         "06182": set(),
     }
     rows = [r for s in STATIONS for r in _obs_rows(s, wet_by_station[s])]
+    if with_archive:
+        rows += _archive_rows()
     schema = obs_schema()
     table = pa.table(
         {
@@ -1135,6 +1185,85 @@ class TestDecisions:
         ))
         assert len(report["events"]) == 20
         assert validate_report(report) == []
+
+
+class TestOnsetsOutsideCoverage:
+    """Defect (4): a backfilled archive is not a list of missed warnings.
+
+    The served report had five warnings, two hits and 2 088 misses, POD
+    0.001 — the misses were gauge onsets going back to the December
+    backfill, scored against decision rows that existed only for that day.
+    """
+
+    @pytest.fixture
+    def corpus_dir(self, tmp_path: Path) -> Path:
+        out = tmp_path / "corpus"
+        out.mkdir()
+        write_gauge_store(out, with_archive=True)
+        write_points(out)
+        write_catalogue(out)
+        return out
+
+    def _report(self, tmp_path: Path, corpus_dir: Path) -> dict:
+        write_replay(tmp_path / "replay")
+        return build_quality_report(QualityInputs(
+            replay_dir=tmp_path / "replay", corpus_dir=corpus_dir, now=NOW,
+        ))
+
+    def test_the_archive_onsets_are_found_and_then_left_unscored(
+        self, tmp_path: Path, corpus_dir: Path,
+    ) -> None:
+        warnings = self._report(tmp_path, corpus_dir)["headline"]["warnings"]
+        # Found — the onset rule sees every one of them…
+        assert warnings["uncovered_onsets"] == len(ARCHIVE_ONSETS)
+        # …and not one reached the misses, where the served report put
+        # 2 088 of them.
+        assert warnings["misses"] == 1
+        assert warnings["hits"] == 4
+        assert warnings["pod"] == pytest.approx(0.8)
+
+    def test_an_onset_inside_coverage_with_no_warning_is_still_a_miss(
+        self, tmp_path: Path, corpus_dir: Path,
+    ) -> None:
+        """The control: the fix must not stop counting the real misses.
+
+        06182 never warns, and rain starts there mid-morning while the
+        service is demonstrably watching — decision rows either side, ten
+        minutes apart. That is a miss and must stay one.
+        """
+        warnings = self._report(tmp_path, corpus_dir)["headline"]["warnings"]
+        assert warnings["misses"] == 1
+        assert warnings["pod"] < 1.0
+
+    def test_a_three_hour_hole_in_the_decisions_does_not_bridge(
+        self, tmp_path: Path, corpus_dir: Path,
+    ) -> None:
+        """The same onset, scored or not, purely on whether anyone watched.
+
+        With decisions all day, the 09:00 rain at 06182 is a miss (the
+        test above). Drop three hours of decisions around it — an outage,
+        a restart, a resumed replay skipping a day — and the very same
+        onset is uncovered instead. Nothing about the weather changed;
+        what changed is whether the service was there to see it.
+        """
+        hole = (DAY + timedelta(hours=8), DAY + timedelta(hours=11))
+        rows = [
+            row for row in decision_rows(live=False)
+            if not (hole[0] <= row["generated_at"] < hole[1])
+        ]
+        write_replay(tmp_path / "replay", rows)
+        warnings = build_quality_report(QualityInputs(
+            replay_dir=tmp_path / "replay", corpus_dir=corpus_dir, now=NOW,
+        ))["headline"]["warnings"]
+        assert warnings["misses"] == 0
+        assert warnings["uncovered_onsets"] == len(ARCHIVE_ONSETS) + 1
+
+    def test_methods_states_the_coverage_rule(
+        self, tmp_path: Path, corpus_dir: Path,
+    ) -> None:
+        methods = self._report(tmp_path, corpus_dir)["methods"]
+        assert "20 min apart" in methods["coverage_rule"]
+        assert "not watching" in methods["coverage_rule"]
 
 
 class TestFreshWarningsArePending:
