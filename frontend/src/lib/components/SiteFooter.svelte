@@ -13,6 +13,7 @@
 	const links = $derived([
 		{ href: `${base}/`, label: t().nav.map },
 		{ href: `${base}/about/`, label: t().nav.about },
+		{ href: `${base}/quality/`, label: t().nav.quality },
 		{ href: `${base}/data/`, label: t().nav.data },
 		{ href: `${base}/privacy/`, label: t().nav.privacy },
 		{ href: `${base}/support/`, label: t().nav.support }

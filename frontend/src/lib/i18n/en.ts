@@ -17,6 +17,7 @@ export const en: Catalog = {
 	nav: {
 		map: 'Map',
 		about: 'About',
+		quality: 'Quality',
 		data: 'Data',
 		privacy: 'Privacy',
 		support: 'Support',
@@ -118,6 +119,7 @@ export const en: Catalog = {
 		uncalibratedBadge: 'Uncalibrated',
 		uncalibratedTooltip:
 			'This cycle serves raw probabilities — they have not been adjusted against backtest data.',
+		calibratedMore: 'See how good we are.',
 		offCoverage: 'Outside radar coverage',
 		offCoverageBody:
 			'This point lies outside the radar composite the forecast is built from. That is not a 0% chance — we simply do not know.',
@@ -201,9 +203,175 @@ export const en: Catalog = {
 			'Advected rain loses its edge fast: 0–30 minutes is useful, out towards 60 minutes it is weak, and beyond that a weather model wins decisively.',
 			'Summer showers are roughly three times harder than steady winter rain.'
 		],
+		qualityTitle: 'How good are we?',
+		qualityBody:
+			'The promise that “70%” is worth 70% is a testable one — and it has been tested, against both the radar and DMI’s rain gauges.',
+		qualityLink: 'See the numbers',
 		sourceTitle: 'Source code',
 		sourceBody: 'Everything — algorithm, service and this site — is openly available on GitHub.',
 		sourceLink: 'github.com/nsimonsen/dmi-nowcast'
+	},
+	quality: {
+		title: 'How good are we?',
+		description:
+			'How good the nowcast and the rain notifications are, measured against DMI’s radar and DMI’s rain gauges.',
+		lead: 'These numbers are measured against two truths that see different things: the radar, which covers the whole country, and DMI’s rain gauges, which measure what a person feels.',
+		loading: 'Loading the numbers …',
+		error: 'The numbers could not be loaded. Please try again shortly.',
+		notMeasured: 'Not measured yet.',
+		generatedAt: (when: string) => `Computed ${when}.`,
+		/** Percent sign, English spacing; used everywhere on the page. */
+		percent: (value: number) => `${value}%`,
+		headline: {
+			reliabilityTitle: 'Do the probabilities hold?',
+			reliabilityBoth: (said: string, radar: string, gauge: string) =>
+				`When we say ${said}, it rains ${radar} of the time measured on the radar, and ${gauge} measured at the gauges.`,
+			reliabilityRadar: (said: string, radar: string) =>
+				`When we say ${said}, it rains ${radar} of the time measured on the radar.`,
+			reliabilityGauge: (said: string, gauge: string) =>
+				`When we say ${said}, it rains ${gauge} of the time measured at the gauges.`,
+			reliabilityLead: (lead: number, n: string) =>
+				`Forecasts ${lead} minutes ahead · ${n} comparisons.`,
+			reliabilityLeadPair: (radarLead: number, gaugeLead: number) =>
+				`Radar ${radarLead} minutes ahead · gauges ${gaugeLead} minutes ahead.`,
+			warningsTitle: 'Do the notifications hold?',
+			warningsLate: (
+				total: string,
+				days: number,
+				hits: string,
+				falseAlarms: string,
+				minutes: string
+			) =>
+				`Of ${total} notifications in the last ${days} days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification came ${minutes} minutes late.`,
+			warningsEarly: (
+				total: string,
+				days: number,
+				hits: string,
+				falseAlarms: string,
+				minutes: string
+			) =>
+				`Of ${total} notifications in the last ${days} days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification came ${minutes} minutes early.`,
+			warningsOnTime: (total: string, days: number, hits: string, falseAlarms: string) =>
+				`Of ${total} notifications in the last ${days} days, ${hits} were followed by rain at the gauge within the window, ${falseAlarms} were false alarms, and the median notification landed on time.`,
+			warningsRates: (pod: string, far: string, stations: string) =>
+				`We caught ${pod} of the rain at ${stations} stations; ${far} of the notifications were false.`,
+			marginTitle: 'Are we better than nothing?',
+			marginBeats: (horizon: number, points: string) =>
+				`${horizon} minutes ahead we beat “assume nothing moves” by ${points} points of CSI.`,
+			marginBehind: (horizon: number, points: string) =>
+				`${horizon} minutes ahead we are ${points} points of CSI behind “assume nothing moves”.`,
+			marginTied: (horizon: number) =>
+				`${horizon} minutes ahead we are level with “assume nothing moves”.`,
+			marginDetail: (advection: string, persistence: string, frames: string) =>
+				`CSI ${advection} against ${persistence} · measured over ${frames} radar frames.`
+		},
+		reliability: {
+			title: 'When we say a probability',
+			intro: 'Each dot gathers the forecasts that promised about the same thing: across, what we said; up, how often it then rained. A dot on the diagonal means 70% was worth 70%. Below it, we promised too much.',
+			markerNote: 'The size of a dot shows how many forecasts are behind it.',
+			radar: 'Radar',
+			gauge: 'Gauges',
+			perfect: 'Perfect calibration',
+			axisX: 'Probability we said',
+			axisY: 'It rained',
+			panel: (lead: number) => `${lead} minutes ahead`,
+			brierRadar: (value: string) => `Brier radar ${value}`,
+			brierGauge: (value: string) => `Brier gauges ${value}`,
+			tableToggle: 'Show the numbers as a table',
+			tableCaption: (lead: number) => `Calibration ${lead} minutes ahead`,
+			colBin: 'We said',
+			colRadar: 'Radar: it rained',
+			colRadarN: 'Radar: n',
+			colGauge: 'Gauges: it rained',
+			colGaugeN: 'Gauges: n',
+			empty: '—',
+			none: 'Calibration has not been measured yet.'
+		},
+		stations: {
+			title: 'The gauges, one by one',
+			intro: 'Each dot is a DMI station. The colour shows how much of the rain at that station we managed to warn about. Where there are too few notifications for that number, the dot is coloured by its Brier score instead and drawn as a ring.',
+			mapLabel: 'Map of Denmark with DMI’s measuring stations',
+			legendTitle: 'Share of the rain we warned about',
+			legendPoor: 'under 50%',
+			legendFair: '50–65%',
+			legendGood: '65–80%',
+			legendBest: 'over 80%',
+			legendUnknown: 'no score',
+			legendBrier: 'Ring: the colour comes from the Brier score, not from the share.',
+			hint: 'Point at a dot to see that station’s numbers — they are in the list below as well.',
+			stationLabel: (name: string, kind: string) => `${name} (${kind})`,
+			stationPod: (pod: string) => `Rain warned about: ${pod}`,
+			stationFar: (far: string) => `false notifications: ${far}`,
+			stationBrier: (brier: string) => `Brier ${brier}`,
+			stationEvents: (events: string, warnings: string) =>
+				`${events} rain events, ${warnings} notifications`,
+			stationNoScore: 'Too few notifications for a score',
+			none: 'There are no stations to show yet.'
+		},
+		rainingNow: {
+			title: '“It is raining here now”',
+			sentence: (agreement: string, pod: string, far: string) =>
+				`When we report rain at a gauge, we are right ${agreement} of the time: we catch ${pod} of the wet ten-minute slots, and ${far} of our wet calls were dry on the ground.`,
+			comparison: (observation: string) =>
+				`The raw radar image alone would have agreed ${observation}.`,
+			detail: (slots: string) => `Measured over ${slots} ten-minute slots.`,
+			none: 'Not measured yet.'
+		},
+		events: {
+			title: 'Latest verified notifications',
+			intro: 'The newest notifications, held against the rain gauge at the station.',
+			colStation: 'Station',
+			colWarned: 'Notified',
+			colSaid: 'We said',
+			colHappened: 'What happened',
+			colError: 'Off by',
+			said: (min: number, probability: string) => `rain in about ${min} min (${probability})`,
+			onset: (time: string) => `rain at ${time}`,
+			noRain: 'no rain',
+			early: (min: number) => `${min} min early`,
+			late: (min: number) => `${min} min late`,
+			onTime: 'on time',
+			empty: '—',
+			none: 'No notifications have been verified yet.'
+		},
+		methods: {
+			title: 'How this is measured',
+			radarTitle: 'The radar as truth',
+			radarBody:
+				'The radar covers the whole country and sees every shower, including the ones that never reach a gauge. What it cannot see is itself: it measures the strongest echo in the column above the ground, so virga, the melting layer and clutter from buildings and wind turbines all count as rain — and the threshold for “rain” is our own.',
+			gaugeTitle: 'The gauges as truth',
+			gaugeBody:
+				'The gauges measure what a person feels: water in a funnel on the ground. But they are about a hundred points in the whole country, they count in ten-minute boxes, they cannot see less than 0.1 mm, and in wind they catch less than actually falls.',
+			rulesTitle: 'The rules behind the numbers',
+			wetRule: 'Wet gauge',
+			onsetRule: 'Onset of rain',
+			threshold: 'Rain threshold',
+			thresholdValue: (mmH: string) => `${mmH} mm/h`,
+			frameAge: 'Age of the radar image',
+			frameAgeValue: (min: string, max: string) => `${min}–${max} minutes`,
+			subscriberRule: 'When a notification is sent',
+			subscriberRuleValue: (
+				threshold: string,
+				lead: number,
+				persistence: number,
+				rearm: number
+			) =>
+				`Probability above ${threshold} within ${lead} minutes, confirmed on ${persistence} consecutive cycles, and no new notification until ${rearm} minutes later.`,
+			leadErrorNote:
+				'A positive error means the rain had already started when the notification said it would arrive — the notification came late.',
+			windowsTitle: 'Periods',
+			radarWindow: (from: string, to: string, events: string, points: string) =>
+				`Radar: ${from}–${to}, ${events} rain events, ${points} comparisons.`,
+			gaugeWindow: (from: string, to: string, events: string, stations: string) =>
+				`Gauges: ${from}–${to}, ${events} events at ${stations} stations.`,
+			liveWindow: (days: number, from: string, to: string) =>
+				`Notifications: the last ${days} days (${from}–${to}).`,
+			cadence: 'Every number on this page is recomputed nightly.',
+			sourcesTitle: 'Sources',
+			sourceRadar: 'Radar',
+			sourceGauges: 'Gauges',
+			attribution: 'Radar data and observations: DMI.'
+		}
 	},
 	data: {
 		title: 'Data and attribution',

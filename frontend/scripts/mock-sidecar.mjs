@@ -22,10 +22,15 @@
  * be driven end to end without a push service. No message is ever sent — the
  * browser subscription is real, the delivery half is not.
  *
+ * It also serves `/nowcast/quality.json` straight from the committed
+ * fixture (src/lib/quality/fixture.json), so the quality page can be
+ * developed without waiting for the nightly verification job.
+ *
  * Usage:
  *   node scripts/mock-sidecar.mjs --port 8099
  *   VITE_SIDECAR_URL=http://localhost:8099 npm run dev
  */
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { deflateSync } from 'node:zlib';
 
@@ -540,6 +545,18 @@ createServer(async (req, res) => {
 		const deleted = typeof body?.endpoint === 'string' && subscriptions.delete(body.endpoint);
 		console.log(`[mock-sidecar] unsubscribed · ${subscriptions.size} device(s)`);
 		return sendJson(200, { ok: true, deleted });
+	}
+	if (url.pathname === '/nowcast/quality.json') {
+		// Read per request, so editing the fixture shows up on a reload; the
+		// stamp is moved to now, or the page's "computed …" line would sit
+		// permanently on the day the fixture was written.
+		const quality = JSON.parse(
+			readFileSync(new URL('../src/lib/quality/fixture.json', import.meta.url), 'utf8')
+		);
+		quality.generated_at_utc = new Date().toISOString();
+		return send(200, JSON.stringify(quality), 'application/json', {
+			'cache-control': 'no-cache'
+		});
 	}
 	if (url.pathname === '/nowcast/manifest.json') {
 		return send(200, JSON.stringify(manifest(), null, 2), 'application/json', {

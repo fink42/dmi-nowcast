@@ -13,11 +13,26 @@
 	if (browser) initLocale();
 
 	const isMap = $derived(page.url.pathname === `${base}/` || page.url.pathname === base);
+	/**
+	 * The one content page that states its own title: it is the page people
+	 * link to, and “Regnradar — kortsigtet regnvarsel” tells a reader nothing
+	 * about what they are about to open. Set here rather than in the page's
+	 * own <svelte:head>, because the browser takes the *first* <title> in the
+	 * document, which is always the layout's.
+	 */
+	const isQuality = $derived(page.url.pathname === `${base}/quality/`);
 </script>
 
 <svelte:head>
-	<title>{t().site.title} — {t().site.tagline}</title>
-	<meta name="description" content={t().site.description} />
+	<title
+		>{isQuality
+			? `${t().quality.title} — ${t().site.title}`
+			: `${t().site.title} — ${t().site.tagline}`}</title
+	>
+	<meta
+		name="description"
+		content={isQuality ? t().quality.description : t().site.description}
+	/>
 </svelte:head>
 
 <div class="shell" class:map-page={isMap}>
@@ -31,6 +46,11 @@
 			<span>{t().site.title}</span>
 		</a>
 		<span class="tagline">{t().site.tagline}</span>
+		<nav class="topnav" aria-label={t().nav.menu}>
+			<a href={`${base}/quality/`} aria-current={isQuality ? 'page' : undefined}
+				>{t().nav.quality}</a
+			>
+		</nav>
 		<LangToggle />
 	</header>
 
@@ -76,6 +96,18 @@
 		width: 1.1rem;
 		height: 1.1rem;
 		fill: var(--accent);
+	}
+
+	.topnav a {
+		font-size: 0.8rem;
+		color: var(--ink);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.topnav a[aria-current='page'] {
+		color: var(--accent);
+		font-weight: 600;
 	}
 
 	.tagline {

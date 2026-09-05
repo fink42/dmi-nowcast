@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { base } from '$app/paths';
 	import { t } from '$lib/i18n';
 	import { GITHUB_URL } from '$lib/links';
 	import SiteFooter from '$lib/components/SiteFooter.svelte';
@@ -17,6 +18,12 @@
 			<li>{sentence}</li>
 		{/each}
 	</ol>
+
+	<h2>{t().about.qualityTitle}</h2>
+	<p>
+		{t().about.qualityBody}
+		<a href={`${base}/quality/`}>{t().about.qualityLink}</a>
+	</p>
 
 	<h2>{t().about.limitsTitle}</h2>
 	<ul>

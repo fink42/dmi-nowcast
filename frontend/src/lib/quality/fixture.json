@@ -1,0 +1,1315 @@
+{
+	"schema_version": 1,
+	"generated_at_utc": "2026-09-05T02:14:37Z",
+	"windows": {
+		"radar": {
+			"from": "2026-03-01T00:00:00Z",
+			"to": "2026-09-01T00:00:00Z",
+			"events": 412,
+			"points": 1286400
+		},
+		"gauge": {
+			"from": "2026-03-01T00:00:00Z",
+			"to": "2026-09-01T00:00:00Z",
+			"events": 1875,
+			"stations": 96
+		},
+		"live": {
+			"days": 30,
+			"from": "2026-08-06T00:00:00Z",
+			"to": "2026-09-05T00:00:00Z"
+		}
+	},
+	"headline": {
+		"reliability": {
+			"radar": {
+				"lead_min": 30,
+				"said_pct": 70,
+				"happened_pct": 67.8,
+				"n": 41250
+			},
+			"gauge": {
+				"lead_min": 30,
+				"said_pct": 70,
+				"happened_pct": 63.5,
+				"n": 1180
+			}
+		},
+		"warnings": {
+			"window_days": 30,
+			"n_stations": 96,
+			"warnings": 148,
+			"hits": 103,
+			"false_alarms": 45,
+			"misses": 37,
+			"pod": 0.736,
+			"far": 0.304,
+			"lead_error_min": {
+				"p25": -9,
+				"p50": 4,
+				"p75": 16
+			}
+		},
+		"persistence_margin": {
+			"horizon_min": 10,
+			"csi_advection": 0.612,
+			"csi_persistence": 0.548,
+			"frames": 4032,
+			"from": "2026-06-01T00:00:00Z",
+			"to": "2026-09-01T00:00:00Z"
+		}
+	},
+	"reliability": {
+		"radar": [
+			{
+				"lead_min": 10,
+				"brier": 0.041,
+				"n": 247998,
+				"eff_n": 20667,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.032,
+						"observed_freq": 0.033,
+						"n": 70801,
+						"eff_n": 5900
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.144,
+						"observed_freq": 0.144,
+						"n": 51412,
+						"eff_n": 4284
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.244,
+						"observed_freq": 0.246,
+						"n": 37333,
+						"eff_n": 3111
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.346,
+						"observed_freq": 0.335,
+						"n": 27109,
+						"eff_n": 2259
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.442,
+						"observed_freq": 0.428,
+						"n": 19685,
+						"eff_n": 1640
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.547,
+						"observed_freq": 0.534,
+						"n": 14294,
+						"eff_n": 1191
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.651,
+						"observed_freq": 0.624,
+						"n": 10380,
+						"eff_n": 865
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.751,
+						"observed_freq": 0.73,
+						"n": 7537,
+						"eff_n": 628
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.85,
+						"observed_freq": 0.818,
+						"n": 5473,
+						"eff_n": 456
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": 0.94,
+						"observed_freq": 0.905,
+						"n": 3974,
+						"eff_n": 331
+					}
+				]
+			},
+			{
+				"lead_min": 20,
+				"brier": 0.062,
+				"n": 247998,
+				"eff_n": 20667,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.036,
+						"observed_freq": 0.045,
+						"n": 70801,
+						"eff_n": 5900
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.146,
+						"observed_freq": 0.136,
+						"n": 51412,
+						"eff_n": 4284
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.246,
+						"observed_freq": 0.244,
+						"n": 37333,
+						"eff_n": 3111
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.352,
+						"observed_freq": 0.35,
+						"n": 27109,
+						"eff_n": 2259
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.45,
+						"observed_freq": 0.44,
+						"n": 19685,
+						"eff_n": 1640
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.552,
+						"observed_freq": 0.529,
+						"n": 14294,
+						"eff_n": 1191
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.658,
+						"observed_freq": 0.623,
+						"n": 10380,
+						"eff_n": 865
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.744,
+						"observed_freq": 0.688,
+						"n": 7537,
+						"eff_n": 628
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.844,
+						"observed_freq": 0.778,
+						"n": 5473,
+						"eff_n": 456
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": 0.948,
+						"observed_freq": 0.862,
+						"n": 3974,
+						"eff_n": 331
+					}
+				]
+			},
+			{
+				"lead_min": 30,
+				"brier": 0.081,
+				"n": 247998,
+				"eff_n": 20667,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.029,
+						"observed_freq": 0.022,
+						"n": 70801,
+						"eff_n": 5900
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.149,
+						"observed_freq": 0.137,
+						"n": 51412,
+						"eff_n": 4284
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.251,
+						"observed_freq": 0.237,
+						"n": 37333,
+						"eff_n": 3111
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.349,
+						"observed_freq": 0.348,
+						"n": 27109,
+						"eff_n": 2259
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.443,
+						"observed_freq": 0.417,
+						"n": 19685,
+						"eff_n": 1640
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.543,
+						"observed_freq": 0.517,
+						"n": 14294,
+						"eff_n": 1191
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.647,
+						"observed_freq": 0.593,
+						"n": 10380,
+						"eff_n": 865
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.757,
+						"observed_freq": 0.679,
+						"n": 7537,
+						"eff_n": 628
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.854,
+						"observed_freq": 0.743,
+						"n": 5473,
+						"eff_n": 456
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": 0.94,
+						"observed_freq": 0.817,
+						"n": 3974,
+						"eff_n": 331
+					}
+				]
+			},
+			{
+				"lead_min": 45,
+				"brier": 0.099,
+				"n": 247998,
+				"eff_n": 20667,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.036,
+						"observed_freq": 0.042,
+						"n": 70801,
+						"eff_n": 5900
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.153,
+						"observed_freq": 0.144,
+						"n": 51412,
+						"eff_n": 4284
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.251,
+						"observed_freq": 0.248,
+						"n": 37333,
+						"eff_n": 3111
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.347,
+						"observed_freq": 0.329,
+						"n": 27109,
+						"eff_n": 2259
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.448,
+						"observed_freq": 0.43,
+						"n": 19685,
+						"eff_n": 1640
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.547,
+						"observed_freq": 0.5,
+						"n": 14294,
+						"eff_n": 1191
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.649,
+						"observed_freq": 0.569,
+						"n": 10380,
+						"eff_n": 865
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.749,
+						"observed_freq": 0.651,
+						"n": 7537,
+						"eff_n": 628
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.851,
+						"observed_freq": 0.714,
+						"n": 5473,
+						"eff_n": 456
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": 0.936,
+						"observed_freq": 0.758,
+						"n": 3974,
+						"eff_n": 331
+					}
+				]
+			},
+			{
+				"lead_min": 60,
+				"brier": 0.112,
+				"n": 247998,
+				"eff_n": 20667,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.037,
+						"observed_freq": 0.048,
+						"n": 70801,
+						"eff_n": 5900
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.148,
+						"observed_freq": 0.149,
+						"n": 51412,
+						"eff_n": 4284
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.25,
+						"observed_freq": 0.235,
+						"n": 37333,
+						"eff_n": 3111
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.35,
+						"observed_freq": 0.321,
+						"n": 27109,
+						"eff_n": 2259
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.448,
+						"observed_freq": 0.415,
+						"n": 19685,
+						"eff_n": 1640
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.549,
+						"observed_freq": 0.49,
+						"n": 14294,
+						"eff_n": 1191
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.65,
+						"observed_freq": 0.541,
+						"n": 10380,
+						"eff_n": 865
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.755,
+						"observed_freq": 0.606,
+						"n": 7537,
+						"eff_n": 628
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.844,
+						"observed_freq": 0.667,
+						"n": 5473,
+						"eff_n": 456
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": 0.943,
+						"observed_freq": 0.701,
+						"n": 3974,
+						"eff_n": 331
+					}
+				]
+			}
+		],
+		"gauge": [
+			{
+				"lead_min": 10,
+				"brier": 0.055,
+				"n": 1901,
+				"eff_n": 634,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.033,
+						"observed_freq": 0.055,
+						"n": 542,
+						"eff_n": 181
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.149,
+						"observed_freq": 0.129,
+						"n": 394,
+						"eff_n": 131
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.255,
+						"observed_freq": 0.216,
+						"n": 286,
+						"eff_n": 95
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.35,
+						"observed_freq": 0.359,
+						"n": 208,
+						"eff_n": 69
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.454,
+						"observed_freq": 0.482,
+						"n": 151,
+						"eff_n": 50
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.554,
+						"observed_freq": 0.573,
+						"n": 110,
+						"eff_n": 37
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.644,
+						"observed_freq": 0.585,
+						"n": 80,
+						"eff_n": 27
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.75,
+						"observed_freq": 0.765,
+						"n": 58,
+						"eff_n": 19
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.846,
+						"observed_freq": 0.833,
+						"n": 42,
+						"eff_n": 14
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": 0.939,
+						"observed_freq": 0.909,
+						"n": 30,
+						"eff_n": 10
+					}
+				]
+			},
+			{
+				"lead_min": 20,
+				"brier": 0.078,
+				"n": 1901,
+				"eff_n": 634,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.041,
+						"observed_freq": 0.057,
+						"n": 542,
+						"eff_n": 181
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.155,
+						"observed_freq": 0.198,
+						"n": 394,
+						"eff_n": 131
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.249,
+						"observed_freq": 0.246,
+						"n": 286,
+						"eff_n": 95
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.344,
+						"observed_freq": 0.319,
+						"n": 208,
+						"eff_n": 69
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.451,
+						"observed_freq": 0.402,
+						"n": 151,
+						"eff_n": 50
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.544,
+						"observed_freq": 0.488,
+						"n": 110,
+						"eff_n": 37
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.655,
+						"observed_freq": 0.583,
+						"n": 80,
+						"eff_n": 27
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.746,
+						"observed_freq": 0.701,
+						"n": 58,
+						"eff_n": 19
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.843,
+						"observed_freq": 0.766,
+						"n": 42,
+						"eff_n": 14
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": 0.939,
+						"observed_freq": 0.88,
+						"n": 30,
+						"eff_n": 10
+					}
+				]
+			},
+			{
+				"lead_min": 30,
+				"brier": 0.098,
+				"n": 1901,
+				"eff_n": 634,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.028,
+						"observed_freq": 0.016,
+						"n": 542,
+						"eff_n": 181
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.146,
+						"observed_freq": 0.117,
+						"n": 394,
+						"eff_n": 131
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.254,
+						"observed_freq": 0.263,
+						"n": 286,
+						"eff_n": 95
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.345,
+						"observed_freq": 0.318,
+						"n": 208,
+						"eff_n": 69
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.445,
+						"observed_freq": 0.438,
+						"n": 151,
+						"eff_n": 50
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.551,
+						"observed_freq": 0.498,
+						"n": 110,
+						"eff_n": 37
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.649,
+						"observed_freq": 0.631,
+						"n": 80,
+						"eff_n": 27
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.747,
+						"observed_freq": 0.671,
+						"n": 58,
+						"eff_n": 19
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.853,
+						"observed_freq": 0.732,
+						"n": 42,
+						"eff_n": 14
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": 0.938,
+						"observed_freq": 0.82,
+						"n": 30,
+						"eff_n": 10
+					}
+				]
+			},
+			{
+				"lead_min": 45,
+				"brier": 0.118,
+				"n": 1871,
+				"eff_n": 624,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.031,
+						"observed_freq": 0.025,
+						"n": 542,
+						"eff_n": 181
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.155,
+						"observed_freq": 0.181,
+						"n": 394,
+						"eff_n": 131
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.249,
+						"observed_freq": 0.23,
+						"n": 286,
+						"eff_n": 95
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.353,
+						"observed_freq": 0.319,
+						"n": 208,
+						"eff_n": 69
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.455,
+						"observed_freq": 0.417,
+						"n": 151,
+						"eff_n": 50
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.548,
+						"observed_freq": 0.466,
+						"n": 110,
+						"eff_n": 37
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.656,
+						"observed_freq": 0.59,
+						"n": 80,
+						"eff_n": 27
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.75,
+						"observed_freq": 0.664,
+						"n": 58,
+						"eff_n": 19
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": 0.849,
+						"observed_freq": 0.663,
+						"n": 42,
+						"eff_n": 14
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": null,
+						"observed_freq": null,
+						"n": 0,
+						"eff_n": 0
+					}
+				]
+			},
+			{
+				"lead_min": 60,
+				"brier": 0.131,
+				"n": 1829,
+				"eff_n": 610,
+				"bins": [
+					{
+						"lo": 0,
+						"hi": 0.1,
+						"forecast_mean": 0.033,
+						"observed_freq": 0.019,
+						"n": 542,
+						"eff_n": 181
+					},
+					{
+						"lo": 0.1,
+						"hi": 0.2,
+						"forecast_mean": 0.143,
+						"observed_freq": 0.164,
+						"n": 394,
+						"eff_n": 131
+					},
+					{
+						"lo": 0.2,
+						"hi": 0.3,
+						"forecast_mean": 0.251,
+						"observed_freq": 0.291,
+						"n": 286,
+						"eff_n": 95
+					},
+					{
+						"lo": 0.3,
+						"hi": 0.4,
+						"forecast_mean": 0.35,
+						"observed_freq": 0.372,
+						"n": 208,
+						"eff_n": 69
+					},
+					{
+						"lo": 0.4,
+						"hi": 0.5,
+						"forecast_mean": 0.445,
+						"observed_freq": 0.393,
+						"n": 151,
+						"eff_n": 50
+					},
+					{
+						"lo": 0.5,
+						"hi": 0.6,
+						"forecast_mean": 0.543,
+						"observed_freq": 0.498,
+						"n": 110,
+						"eff_n": 37
+					},
+					{
+						"lo": 0.6,
+						"hi": 0.7,
+						"forecast_mean": 0.658,
+						"observed_freq": 0.59,
+						"n": 80,
+						"eff_n": 27
+					},
+					{
+						"lo": 0.7,
+						"hi": 0.8,
+						"forecast_mean": 0.747,
+						"observed_freq": 0.59,
+						"n": 58,
+						"eff_n": 19
+					},
+					{
+						"lo": 0.8,
+						"hi": 0.9,
+						"forecast_mean": null,
+						"observed_freq": null,
+						"n": 0,
+						"eff_n": 0
+					},
+					{
+						"lo": 0.9,
+						"hi": 1,
+						"forecast_mean": null,
+						"observed_freq": null,
+						"n": 0,
+						"eff_n": 0
+					}
+				]
+			}
+		]
+	},
+	"raining_now": {
+		"n_slots": 8640,
+		"agreement": 0.871,
+		"pod": 0.824,
+		"far": 0.187,
+		"observation_agreement": 0.793,
+		"from": "2026-08-06T00:00:00Z",
+		"to": "2026-09-05T00:00:00Z"
+	},
+	"stations": {
+		"type": "FeatureCollection",
+		"features": [
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						9.983,
+						57.196
+					]
+				},
+				"properties": {
+					"station_id": "06031",
+					"name": "Tylstrup",
+					"kind": "Synop",
+					"n_events": 196,
+					"brier_gauge": 0.104,
+					"warn_pod": 0.78,
+					"warn_far": 0.24,
+					"warnings": 18,
+					"raining_now_agreement": 0.9
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						10.628,
+						57.736
+					]
+				},
+				"properties": {
+					"station_id": "06041",
+					"name": "Skagen Fyr",
+					"kind": "Synop",
+					"n_events": 164,
+					"brier_gauge": 0.121,
+					"warn_pod": 0.71,
+					"warn_far": 0.31,
+					"warnings": 14,
+					"raining_now_agreement": 0.87
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						8.132,
+						55.997
+					]
+				},
+				"properties": {
+					"station_id": "06058",
+					"name": "Hvide Sande",
+					"kind": "Synop",
+					"n_events": 212,
+					"brier_gauge": 0.098,
+					"warn_pod": 0.83,
+					"warn_far": 0.21,
+					"warnings": 22,
+					"raining_now_agreement": 0.91
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						11.513,
+						56.716
+					]
+				},
+				"properties": {
+					"station_id": "06065",
+					"name": "Anholt Havn",
+					"kind": "Synop",
+					"n_events": 118,
+					"brier_gauge": 0.147,
+					"warn_pod": 0.62,
+					"warn_far": 0.38,
+					"warnings": 9,
+					"raining_now_agreement": 0.82
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						10.239,
+						56.066
+					]
+				},
+				"properties": {
+					"station_id": "06074",
+					"name": "Aarhus Syd",
+					"kind": "Pluvio",
+					"n_events": 188,
+					"brier_gauge": 0.109,
+					"warn_pod": 0.76,
+					"warn_far": 0.26,
+					"warnings": 17,
+					"raining_now_agreement": 0.89
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						8.083,
+						55.558
+					]
+				},
+				"properties": {
+					"station_id": "06081",
+					"name": "Blåvandshuk Fyr",
+					"kind": "Synop",
+					"n_events": 205,
+					"brier_gauge": 0.101,
+					"warn_pod": 0.81,
+					"warn_far": 0.22,
+					"warnings": 20,
+					"raining_now_agreement": 0.9
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						8.554,
+						55.216
+					]
+				},
+				"properties": {
+					"station_id": "06096",
+					"name": "Rømø/Juvre",
+					"kind": "Pluvio",
+					"n_events": 151,
+					"brier_gauge": 0.129,
+					"warn_pod": 0.68,
+					"warn_far": 0.33,
+					"warnings": 12,
+					"raining_now_agreement": 0.85
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						9.264,
+						55.221
+					]
+				},
+				"properties": {
+					"station_id": "06109",
+					"name": "Skrydstrup",
+					"kind": "Synop",
+					"n_events": 173,
+					"brier_gauge": 0.115,
+					"warn_pod": 0.74,
+					"warn_far": 0.28,
+					"warnings": 15,
+					"raining_now_agreement": 0.88
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						10.331,
+						55.476
+					]
+				},
+				"properties": {
+					"station_id": "06126",
+					"name": "Odense/Beldringe",
+					"kind": "Synop",
+					"n_events": 181,
+					"brier_gauge": 0.112,
+					"warn_pod": 0.75,
+					"warn_far": 0.27,
+					"warnings": 16,
+					"raining_now_agreement": 0.88
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						11.966,
+						54.567
+					]
+				},
+				"properties": {
+					"station_id": "06149",
+					"name": "Gedser",
+					"kind": "Synop",
+					"n_events": 139,
+					"brier_gauge": 0.134,
+					"warn_pod": 0.66,
+					"warn_far": 0.35,
+					"warnings": 11,
+					"raining_now_agreement": 0.84
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						12.641,
+						55.613
+					]
+				},
+				"properties": {
+					"station_id": "06181",
+					"name": "Københavns Lufthavn",
+					"kind": "Synop",
+					"n_events": 199,
+					"brier_gauge": 0.106,
+					"warn_pod": 0.79,
+					"warn_far": 0.23,
+					"warnings": 19,
+					"raining_now_agreement": 0.9
+				}
+			},
+			{
+				"type": "Feature",
+				"geometry": {
+					"type": "Point",
+					"coordinates": [
+						14.777,
+						55.298
+					]
+				},
+				"properties": {
+					"station_id": "06193",
+					"name": "Hammer Odde Fyr",
+					"kind": "Synop",
+					"n_events": 97,
+					"brier_gauge": 0.158,
+					"warn_pod": null,
+					"warn_far": null,
+					"warnings": 3,
+					"raining_now_agreement": 0.79
+				}
+			}
+		]
+	},
+	"events": [
+		{
+			"station_id": "06181",
+			"name": "Københavns Lufthavn",
+			"warned_at_utc": "2026-09-04T18:35:00.000Z",
+			"eta_min": 17,
+			"p_rain": 0.81,
+			"gauge_onset_utc": "2026-09-04T18:50:00.000Z",
+			"outcome": "hit",
+			"lead_error_min": 2
+		},
+		{
+			"station_id": "06074",
+			"name": "Aarhus Syd",
+			"warned_at_utc": "2026-09-04T14:05:00.000Z",
+			"eta_min": 22,
+			"p_rain": 0.74,
+			"gauge_onset_utc": "2026-09-04T14:40:00.000Z",
+			"outcome": "hit",
+			"lead_error_min": -13
+		},
+		{
+			"station_id": "06058",
+			"name": "Hvide Sande",
+			"warned_at_utc": "2026-09-04T09:20:00.000Z",
+			"eta_min": 12,
+			"p_rain": 0.88,
+			"gauge_onset_utc": "2026-09-04T09:30:00.000Z",
+			"outcome": "hit",
+			"lead_error_min": 2
+		},
+		{
+			"station_id": "06126",
+			"name": "Odense/Beldringe",
+			"warned_at_utc": "2026-09-03T21:10:00.000Z",
+			"eta_min": 25,
+			"p_rain": 0.69,
+			"gauge_onset_utc": null,
+			"outcome": "false_alarm",
+			"lead_error_min": null
+		},
+		{
+			"station_id": "06031",
+			"name": "Tylstrup",
+			"warned_at_utc": "2026-09-03T16:45:00.000Z",
+			"eta_min": 18,
+			"p_rain": 0.77,
+			"gauge_onset_utc": "2026-09-03T17:20:00.000Z",
+			"outcome": "hit",
+			"lead_error_min": -17
+		},
+		{
+			"station_id": "06109",
+			"name": "Skrydstrup",
+			"warned_at_utc": "2026-09-03T11:55:00.000Z",
+			"eta_min": 15,
+			"p_rain": 0.72,
+			"gauge_onset_utc": "2026-09-03T12:00:00.000Z",
+			"outcome": "hit",
+			"lead_error_min": 10
+		},
+		{
+			"station_id": "06149",
+			"name": "Gedser",
+			"warned_at_utc": "2026-09-02T19:30:00.000Z",
+			"eta_min": 28,
+			"p_rain": 0.66,
+			"gauge_onset_utc": null,
+			"outcome": "false_alarm",
+			"lead_error_min": null
+		},
+		{
+			"station_id": "06081",
+			"name": "Blåvandshuk Fyr",
+			"warned_at_utc": "2026-09-02T07:15:00.000Z",
+			"eta_min": 20,
+			"p_rain": 0.85,
+			"gauge_onset_utc": "2026-09-02T07:30:00.000Z",
+			"outcome": "hit",
+			"lead_error_min": 5
+		}
+	],
+	"methods": {
+		"gauge_wet_rule": ">= 0.1 mm accumulated in a 10-minute slot",
+		"onset_rule": "first wet slot at or after the warning, within lead + 20 min",
+		"threshold_mm_h": 0.5,
+		"frame_age_range_min": [
+			14,
+			24
+		],
+		"subscriber_rule": {
+			"threshold_pct": 60,
+			"lead_min": 30,
+			"rearm_after_min": 90,
+			"persistence_obs": 2
+		},
+		"sources": {
+			"radar": "DMI radar composite (pseudoCAPPI column max, 500 m, 10 min)",
+			"gauges": "DMI metObs 10-minute precipitation (Pluvio and Synop stations)"
+		}
+	}
+}

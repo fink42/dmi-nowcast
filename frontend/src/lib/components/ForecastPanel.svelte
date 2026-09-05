@@ -10,6 +10,7 @@
 	 * one line that answers the question — so the map underneath is visible
 	 * without giving up the point, which is what the × does.
 	 */
+	import { base } from '$app/paths';
 	import { t, locale } from '$lib/i18n';
 	import {
 		clockTime,
@@ -268,15 +269,21 @@
 					</dl>
 
 					<p class="badges">
-						<span
+						<!-- The badge links to the page that checks the promise it makes:
+						     "70 % is meant to be worth 70 %" is a claim, and /quality is
+						     where the claim is measured. -->
+						<a
 							class="badge"
 							class:calibrated={forecast.calibrated}
-							title={forecast.calibrated
-								? t().panel.calibratedTooltip
-								: t().panel.uncalibratedTooltip}
+							href={`${base}/quality/`}
+							title={`${
+								forecast.calibrated
+									? t().panel.calibratedTooltip
+									: t().panel.uncalibratedTooltip
+							} ${t().panel.calibratedMore}`}
 						>
 							{forecast.calibrated ? t().panel.calibratedBadge : t().panel.uncalibratedBadge}
-						</span>
+						</a>
 						<span class="source"
 							>{forecast.source === 'client' ? t().panel.sourceLocal : t().panel.sourceServer}</span
 						>
@@ -502,7 +509,7 @@
 		border-radius: 999px;
 		border: 1px solid var(--border);
 		color: var(--muted);
-		cursor: help;
+		text-decoration: none;
 	}
 
 	.badge.calibrated {
