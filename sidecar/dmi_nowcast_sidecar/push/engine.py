@@ -104,6 +104,15 @@ class Observation:
     #: never "dry", so an absent observation can only leave the ETA test
     #: to decide, exactly as before this field existed.
     observed_mm_h: float | None = None
+    #: The DETERMINISTIC forecast rain rate at the point valid NOW, mm/h —
+    #: the lead-0 entry of the cycle's forecast series, i.e. the newest
+    #: composite advected forward by its own age. Carried for logging and
+    #: for whatever a future rule wants to do with it; it deliberately
+    #: takes NO part in the decision below. The already-raining test stays
+    #: on measurement (``observed_mm_h``) and the ETA grid, because
+    #: silencing a notification on an extrapolation would mean the user
+    #: hears nothing when the extrapolation is wrong.
+    forecast_now_mm_h: float | None = None
 
 
 @dataclass(frozen=True)

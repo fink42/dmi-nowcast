@@ -71,7 +71,7 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -109,7 +109,11 @@ from .national_sample import finite_or_none, sample_point
 from .push.paths import resolved_db_path, resolved_key_path
 from .push.routes import build_router as build_push_router
 from .scheduler import CycleScheduler
-from .state_schema import ForecastPointLead, ForecastPointResponse
+from .state_schema import (
+    ForecastPointLead,
+    ForecastPointRain,
+    ForecastPointResponse,
+)
 from .storage import StateStore
 
 _log = structlog.get_logger(__name__)
@@ -381,6 +385,7 @@ def create_app(
         sample = sample_point(
             products, geo, lat, lon,
             observed_mm_h=getattr(latest, "observed_mm_h", None),
+            forecast_mm_h=getattr(latest, "forecast_mm_h", None),
         )
         if sample is None:
             raise HTTPException(
@@ -391,6 +396,22 @@ def create_app(
             ForecastPointLead(lead_min=lead, p_rain=p)
             for lead, p in sample.p_rain.items()
         ]
+        # The deterministic rain series, timestamped from the cycle's own
+        # generation instant so a client can match an entry to the loop
+        # frame the manifest says is valid then. Both are additive and
+        # travel together: without a generation time the leads have no
+        # clock, so the series is served only when the snapshot has one.
+        generated_at = getattr(latest, "generated_at_utc", None)
+        forecast_series = None
+        if sample.forecast_mm_h is not None and generated_at is not None:
+            forecast_series = [
+                ForecastPointRain(
+                    lead_min=lead,
+                    valid_ts_utc=generated_at + timedelta(minutes=lead),
+                    mm_h=mm_h,
+                )
+                for lead, mm_h in sorted(sample.forecast_mm_h.items())
+            ]
         # Confidence stays the global scalar in Phase A — sourced from the
         # same store /state.json serves; null before the first state exists.
         state = engine.store.load()
@@ -420,6 +441,8 @@ def create_app(
             eta_min=sample.eta_min,
             intensity_mm_h=sample.intensity_mm_h,
             observed_mm_h=sample.observed_mm_h,
+            generated_at_utc=generated_at,
+            forecast_mm_h=forecast_series,
             confidence=float(state.confidence) if state is not None else None,
         )
 

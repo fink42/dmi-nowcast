@@ -7,7 +7,8 @@ static, immutable-cacheable artifacts served by the ``/nowcast/`` endpoints
 - each product grid → an 8-bit **grayscale** PNG with linear scale/offset
   quantisation (value 255 reserved for NaN/nodata) — including
   ``observed_mm_h``, the only grid that is an observation rather than a
-  forecast (see below),
+  forecast (see below), and ``forecast_mm_h``, the deterministic advected
+  rain rate reduced onto the same pixels, one grid per overlay lead,
 - the supplied native-500 m advected rain fields → **colormapped RGBA**
   overlay PNGs (render.py's colormap + NaN-transparency conventions),
 - one JSON manifest per cycle describing every artifact, written **last**
@@ -28,6 +29,9 @@ product            range         rationale
                                  contract), values above are clamped upstream
 ``observed_mm_h``  0 – 100       mm/h — same quantity, same cap, so it shares
                                  ``intensity``'s spec object exactly
+``forecast_mm_h``  0 – 100       mm/h — the deterministic advected field on the
+                                 product grid, one per overlay lead; same
+                                 quantity again, same spec object
 ``motion_*_kmh``   −120 – +120   km/h — the flow is clipped to 30 px/frame
                                  upstream, i.e. ±90 km/h at 500 m / 10 min;
                                  ±120 leaves headroom for a shorter cadence
@@ -103,7 +107,11 @@ _log = structlog.get_logger(__name__)
 # new entry in the existing ``artifacts`` list, in the established
 # grayscale8 shape, with ``lead_min: 0`` because it depicts
 # ``radar_ts_utc`` itself. A client that doesn't know the product simply
-# ignores the entry, so no bump there either.
+# ignores the entry, so no bump there either. ``forecast_mm_h`` and the
+# lead-0 forecast overlay join on the same terms: new entries in
+# ``artifacts``, in the established grayscale8 / rgba8 shapes, each
+# carrying ``kind`` and ``valid_ts_utc`` so a reader can tell the
+# forecast valid *now* from the observation valid at radar time.
 MANIFEST_SCHEMA_VERSION = 2
 
 # Trailing observed frames referenced by each manifest — 3 prior cycles is
@@ -145,10 +153,11 @@ class QuantSpec:
 # Motion grids are symmetric about zero; ±120 km/h (see module docstring).
 MOTION_MAX_ABS_KMH = 120.0
 
-# Rain rate in mm/h, capped at the Z-R cap. Forecast intensity and the
-# observed grid are the same quantity on the same grid, so they share ONE
-# spec object: a client that decodes one decodes the other with the same
-# scale/offset, and the two can never drift apart.
+# Rain rate in mm/h, capped at the Z-R cap. Forecast intensity, the
+# observed grid and the deterministic forecast grids are the same quantity
+# on the same grid, so they share ONE spec object: a client that decodes
+# one decodes the others with the same scale/offset, and they can never
+# drift apart.
 _RAIN_RATE_SPEC = QuantSpec(0.0, 100.0)
 
 # The documented, fixed quantisation ranges (see module docstring).
@@ -157,6 +166,7 @@ QUANT_SPECS: dict[str, QuantSpec] = {
     "eta": QuantSpec(0.0, 120.0),
     "intensity": _RAIN_RATE_SPEC,
     "observed_mm_h": _RAIN_RATE_SPEC,
+    "forecast_mm_h": _RAIN_RATE_SPEC,
     "motion_east_kmh": QuantSpec(-MOTION_MAX_ABS_KMH, MOTION_MAX_ABS_KMH),
     "motion_north_kmh": QuantSpec(-MOTION_MAX_ABS_KMH, MOTION_MAX_ABS_KMH),
 }
@@ -215,6 +225,8 @@ def write_national_artifacts(
     motion_east_kmh: np.ndarray | None = None,
     motion_north_kmh: np.ndarray | None = None,
     observed_mm_h: np.ndarray | None = None,
+    forecast_mm_h: dict[int, np.ndarray] | None = None,
+    overlay_now_forecast_mm_h: np.ndarray | None = None,
     history_frames: int = DEFAULT_HISTORY_FRAMES,
     ensemble_horizon_min: float | None = None,
 ) -> NationalArtifactsResult:
@@ -245,6 +257,27 @@ def write_national_artifacts(
     and it exists because no forecast product can answer "is it raining
     here right now" (the ensemble's first timestep is already ten minutes
     out).
+
+    ``forecast_mm_h`` maps lead minutes → the DETERMINISTIC advected rain
+    rate on the **product** grid (same shape as ``products.eta_min``), in
+    mm/h — ``observed_rain_grid`` applied to the very fields the overlays
+    are drawn from, so a point reads out of the forecast grid and the
+    observation grid at the same pixel. Lead ``0`` is the field advected by
+    ``frame_age_min`` alone: what the radar would show *at generation
+    time*, which is the number a "raining here now" headline must be read
+    from — the newest composite is 14-24 min old at any moment a viewer
+    looks at it. Every entry carries ``kind: "forecast"`` and
+    ``valid_ts_utc = generated_at_utc + lead``. ``None`` or ``{}`` skips
+    them; a cycle whose reduction failed simply publishes no series.
+
+    ``overlay_now_forecast_mm_h`` is the same lead-0 forecast on the
+    **native** grid, rendered as one extra RGBA overlay
+    (``overlay_0min_<stamp>.png``, ``kind: "forecast"``, valid at
+    ``generated_at_utc``) beside the lead-0 *observation*
+    (``overlay_now_<stamp>.png``, ``kind: "observation"``, valid at
+    ``radar_ts_utc``). The two share a lead of 0 and are listed
+    observation-first, so a stable sort by ``lead_min`` preserves that
+    order. ``None`` skips it.
 
     ``history_frames`` caps how many prior cycles' ``overlay_now`` PNGs the
     manifest references as observation history (0 disables). Only files
@@ -345,6 +378,33 @@ def write_national_artifacts(
                         obs_spec, obs_grid.shape, units="mm/h"),
         )
 
+    # --- deterministic forecast rain on the product grid → grayscale PNGs --
+    # Same reduction as ``observed_mm_h`` (block p90 over the native field),
+    # so lead L reads at the very pixel ``eta_min`` and ``observed_mm_h``
+    # read at. Lead 0 is the advected-to-NOW field: the newest composite is
+    # 14-24 min old whenever a viewer looks, so "is it raining here now"
+    # cannot be answered from the observation alone.
+    if forecast_mm_h:
+        fc_spec = QUANT_SPECS["forecast_mm_h"]
+        for lead in sorted(forecast_mm_h):
+            grid = np.asarray(forecast_mm_h[lead])
+            if grid.shape != products.eta_min.shape:
+                raise ValueError(
+                    f"forecast_mm_h lead {lead} must be on the product grid "
+                    f"{products.eta_min.shape}, got {grid.shape}"
+                )
+            name = f"forecast_mm_h_{int(lead)}min_{stamp}.png"
+            entry = _grid_entry(name, "forecast_mm_h", int(lead), fc_spec,
+                                grid.shape, units="mm/h")
+            # Validity is measured from GENERATION time, not radar time:
+            # lead 0 already carries the frame age, so the series reads
+            # "now, now + 10, now + 20 …" for a viewer of this cycle.
+            entry["kind"] = "forecast"
+            entry["valid_ts_utc"] = (
+                generated_utc + timedelta(minutes=float(lead))
+            ).isoformat()
+            _emit(name, _encode_gray_png(quantise(grid, fc_spec)), entry)
+
     # --- R2 cell-motion grids → grayscale PNGs -----------------------------
     # Same product grid, same quantisation machinery as everything above, so
     # the browser samples an arrow exactly the way it samples a probability.
@@ -407,6 +467,38 @@ def write_national_artifacts(
                 "valid_ts_utc": valid_utc.isoformat(),
                 "encoding": "rgba8",
                 "shape": [int(field.shape[0]), int(field.shape[1])],
+            },
+        )
+
+    # The lead-0 FORECAST overlay: the same instant the loop's "now" frame
+    # is watched at, advected by the frame age from the radar frame. Emitted
+    # after the lead-0 observation so a stable sort by ``lead_min`` keeps
+    # observation-before-forecast at the shared lead of 0.
+    if overlay_now_forecast_mm_h is not None:
+        fc_field = np.asarray(overlay_now_forecast_mm_h)
+        if fc_field.ndim != 2:
+            raise ValueError(
+                "overlay_now_forecast_mm_h must be 2-D, got shape "
+                f"{fc_field.shape}"
+            )
+        if overlay_shape is not None and fc_field.shape != overlay_shape:
+            raise ValueError(
+                f"overlay fields must share one shape; the lead-0 forecast "
+                f"has {fc_field.shape}, the observed overlays had {overlay_shape}"
+            )
+        overlay_shape = fc_field.shape
+        fc_name = f"overlay_0min_{stamp}.png"
+        _emit(
+            fc_name,
+            _encode_rgba_png(_apply_colormap(fc_field)),
+            {
+                "filename": fc_name,
+                "product": "overlay",
+                "lead_min": 0,
+                "kind": "forecast",
+                "valid_ts_utc": generated_utc.isoformat(),
+                "encoding": "rgba8",
+                "shape": [int(fc_field.shape[0]), int(fc_field.shape[1])],
             },
         )
 
@@ -483,7 +575,11 @@ def write_national_artifacts(
         cycle=stamp,
         files=len(files_written),
         bytes=bytes_written,
-        overlays=len(overlay_fields_mm_h or {}),
+        overlays=(
+            len(overlay_fields_mm_h or {})
+            + (1 if overlay_now_forecast_mm_h is not None else 0)
+        ),
+        forecast_grids=len(forecast_mm_h or {}),
         history=len(history),
         pruned_files=pruned_files,
         pruned_bytes=pruned_bytes,

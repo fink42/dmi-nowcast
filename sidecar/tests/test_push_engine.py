@@ -438,9 +438,72 @@ def test_live_20260904_0620z_case_does_not_push_into_falling_rain() -> None:
     assert without.action == "notify"
 
 
+def test_forecast_now_mm_h_carries_but_never_decides() -> None:
+    """The deterministic "raining now" field rides on the observation for
+    logging; it must NOT silence a notification.
+
+    The panel reads its headline from the advected field because the radar
+    frame is 14-24 min old. A push is a different bargain: silencing one on
+    an extrapolation means the user hears nothing when the extrapolation is
+    wrong. So a wet ``forecast_now_mm_h`` over a dry measurement and an ETA
+    20 min out still notifies — the rules are exactly what they were.
+    """
+    live = Rules(raining_now_mm_h=0.5)
+    state = SubState(
+        armed=True, streak=1, below_since_utc=None,
+        last_eval_radar_ts=T0 - CADENCE,
+    )
+    wet_forecast = Observation(
+        radar_ts_utc=T0,
+        p_rain=0.9,
+        eta_min=20.0,
+        intensity_mm_h=1.2,
+        observed_mm_h=0.0,        # the radar frame says dry at the point
+        forecast_now_mm_h=4.0,    # the advected field says wet, right now
+    )
+    decision = evaluate(
+        state, wet_forecast, threshold_pct=40, quiet=None, tz=CPH,
+        now_utc=T0 + timedelta(minutes=2), rules=live,
+    )
+    assert decision.action == "notify"
+
+    # Byte-for-byte the same verdict as the observation without the field:
+    # nothing downstream of it moved.
+    without = evaluate(
+        state,
+        Observation(
+            radar_ts_utc=T0, p_rain=0.9, eta_min=20.0,
+            intensity_mm_h=1.2, observed_mm_h=0.0,
+        ),
+        threshold_pct=40, quiet=None, tz=CPH,
+        now_utc=T0 + timedelta(minutes=2), rules=live,
+    )
+    assert without == decision
+
+    # And it cannot rescue one either: a dry forecast over a wet
+    # measurement is still "already raining".
+    raining = evaluate(
+        state,
+        Observation(
+            radar_ts_utc=T0, p_rain=0.9, eta_min=20.0, intensity_mm_h=1.2,
+            observed_mm_h=2.0, forecast_now_mm_h=0.0,
+        ),
+        threshold_pct=40, quiet=None, tz=CPH,
+        now_utc=T0 + timedelta(minutes=2), rules=live,
+    )
+    assert raining.action == "already_raining"
+
+
+def test_forecast_now_mm_h_defaults_to_none() -> None:
+    """Additive: every existing construction site keeps working."""
+    obs = Observation(radar_ts_utc=T0, p_rain=0.5, eta_min=None,
+                      intensity_mm_h=None)
+    assert obs.forecast_now_mm_h is None
+
+
 # --------------------------------------------------------------------------
 # Quiet hours defer, they do not disarm
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------"""
 
 QUIET = QuietHours(start="22:00", end="07:00")
 #: 2026-06-01 23:00Z is 2026-06-02 01:00 in Copenhagen — inside the window.

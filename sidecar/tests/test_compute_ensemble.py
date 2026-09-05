@@ -758,16 +758,22 @@ def test_cycle_computes_national_products_and_writes_artifacts(
             assert entry.p_ensemble == pytest.approx(grid_val)
 
     # Artifacts on disk: 5 p_rain + eta + intensity + observed + 2 motion
-    # grayscale, overlays for every deterministic lead + the now frame,
-    # stamped + stable manifests.
+    # grayscale, one forecast_mm_h grid per deterministic lead plus lead 0,
+    # overlays for every deterministic lead + the now frame + the lead-0
+    # forecast frame, stamped + stable manifests.
     out = _nowcast_dir(engine)
     names = sorted(p.name for p in out.iterdir())
-    n_overlays = len(engine.config.forecast.leads_min) + 1
+    n_det_leads = len(engine.config.forecast.leads_min)
+    n_overlays = n_det_leads + 2       # now (observation) + now (forecast)
+    n_forecast_grids = n_det_leads + 1  # {0} ∪ leads_min
     assert len([n for n in names if n.startswith("p_rain_")]) == 5
     assert len([n for n in names if n.startswith("eta_")]) == 1
     assert len([n for n in names if n.startswith("intensity_")]) == 1
     assert len([n for n in names if n.startswith("observed_mm_h_")]) == 1
     assert len([n for n in names if n.startswith("motion_")]) == 2
+    assert len(
+        [n for n in names if n.startswith("forecast_mm_h_")]
+    ) == n_forecast_grids
     assert len([n for n in names if n.startswith("overlay_")]) == n_overlays
     assert "manifest.json" in names
     assert len([n for n in names if n.startswith("manifest_")]) == 1
@@ -775,7 +781,7 @@ def test_cycle_computes_national_products_and_writes_artifacts(
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["n_members"] == 8
     assert manifest["leads_min"] == [10, 20, 30, 45, 60]
-    assert len(manifest["artifacts"]) == 10 + n_overlays
+    assert len(manifest["artifacts"]) == 10 + n_overlays + n_forecast_grids
 
     # R2: the motion grids ride the product grid the ensemble produced.
     assert manifest["motion"]["grid"] == "product"
@@ -792,16 +798,37 @@ def test_cycle_computes_national_products_and_writes_artifacts(
     overlays = [e for e in manifest["artifacts"] if e["product"] == "overlay"]
     assert len(overlays) == n_overlays          # cold start → no history yet
     radar_ts = datetime.fromisoformat(manifest["radar_ts_utc"])
+    generated_at = datetime.fromisoformat(manifest["generated_at_utc"])
+    lead0 = [e for e in overlays if e["lead_min"] == 0]
+    # Two frames share lead 0 — the radar observation and the field
+    # advected to now — and the observation is listed FIRST, which is what
+    # a stable sort by lead_min preserves for the animation loop.
+    assert [e["kind"] for e in lead0] == ["observation", "forecast"]
+    assert datetime.fromisoformat(lead0[0]["valid_ts_utc"]) == radar_ts
+    assert datetime.fromisoformat(lead0[1]["valid_ts_utc"]) == generated_at
+    assert lead0[1]["filename"].startswith("overlay_0min_")
     for entry in overlays:
-        valid = datetime.fromisoformat(entry["valid_ts_utc"])
         if entry["lead_min"] == 0:
-            assert entry["kind"] == "observation"
-            assert valid == radar_ts
-        else:
-            assert entry["kind"] == "forecast"
-            assert valid == radar_ts + timedelta(
+            continue
+        assert entry["kind"] == "forecast"
+        assert datetime.fromisoformat(entry["valid_ts_utc"]) == (
+            radar_ts + timedelta(
                 minutes=manifest["frame_age_min"] + entry["lead_min"],
             )
+        )
+
+    # The deterministic point series: one grid per lead, ascending from 0,
+    # each valid at generated_at + lead, all on the product grid.
+    fc_entries = [e for e in manifest["artifacts"]
+                  if e["product"] == "forecast_mm_h"]
+    assert [e["lead_min"] for e in fc_entries] == [
+        0, *engine.config.forecast.leads_min
+    ]
+    assert all(e["kind"] == "forecast" for e in fc_entries)
+    assert all(e["shape"] == manifest["grid"]["shape"] for e in fc_entries)
+    assert [datetime.fromisoformat(e["valid_ts_utc"]) for e in fc_entries] == [
+        generated_at + timedelta(minutes=e["lead_min"]) for e in fc_entries
+    ]
 
     assert state.diagnostics.national_ms > 0.0
     assert state.diagnostics.artifact_bytes > 0
@@ -832,6 +859,81 @@ def test_cycle_publishes_the_observed_rain_grid(
     assert float(np.nanmax(observed)) == pytest.approx(3.0, abs=0.2)
 
 
+def test_cycle_publishes_the_deterministic_forecast_series(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forecast grids ride the snapshot on the same product grid, one
+    per ``{0} ∪ leads_min``, with the generation instant they are measured
+    from — and lead 0 is the field advected to that instant, which is what
+    a "raining here now" readout needs."""
+    calls: list[dict] = []
+    monkeypatch.setattr(compute_mod, "run_ensemble", _make_fake_run_ensemble(calls))
+
+    before = datetime.now(timezone.utc)
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+    after = datetime.now(timezone.utc)
+
+    latest = engine.national_latest
+    assert latest is not None
+    series = latest.forecast_mm_h
+    assert series is not None
+    assert list(series) == [0, *engine.config.forecast.leads_min]
+    for grid in series.values():
+        assert grid.shape == latest.products.eta_min.shape
+        assert grid.dtype == np.float32
+
+    generated = latest.generated_at_utc
+    assert generated is not None
+    assert before <= generated <= after
+    # The synthetic frames are a uniform ~3 mm/h field, so advecting it
+    # anywhere still reads ~3 mm/h where the source is on the grid.
+    lead0 = series[0]
+    assert float(np.nanmax(lead0)) == pytest.approx(3.0, abs=0.2)
+    # Same reduction as the observation, so the two are directly comparable
+    # at every pixel — one clock apart, not one geometry apart.
+    assert latest.observed_mm_h is not None
+    assert lead0.shape == latest.observed_mm_h.shape
+
+
+def test_forecast_series_failure_does_not_cost_the_cycle(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same policy as the observed grid and the motion grids: warn, publish
+    the cycle without the series."""
+    calls: list[dict] = []
+    monkeypatch.setattr(compute_mod, "run_ensemble", _make_fake_run_ensemble(calls))
+
+    real = compute_mod.observed_rain_grid
+    seen = {"n": 0}
+
+    def _boom_after_the_observation(*args, **kwargs):
+        seen["n"] += 1
+        if seen["n"] == 1:          # the observed grid still succeeds
+            return real(*args, **kwargs)
+        raise RuntimeError("forecast reduction exploded")
+
+    monkeypatch.setattr(
+        compute_mod, "observed_rain_grid", _boom_after_the_observation,
+    )
+    state = engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+
+    assert state.probabilistic is not None
+    latest = engine.national_latest
+    assert latest is not None
+    assert latest.observed_mm_h is not None     # kept
+    assert latest.forecast_mm_h is None         # lost, and only it
+    names = [p.name for p in _nowcast_dir(engine).iterdir()]
+    assert not [n for n in names if n.startswith("forecast_mm_h_")]
+    assert [n for n in names if n.startswith("observed_mm_h_")]
+    # The lead-0 forecast OVERLAY is drawn from the native field, not from
+    # the reduction, so it survives a reduction failure.
+    assert [n for n in names if n.startswith("overlay_0min_")]
+
+
 def test_national_latest_still_unpacks_as_the_products_pair(
     engine: CycleEngine,
     synthetic_paths: list[Path],
@@ -849,6 +951,9 @@ def test_national_latest_still_unpacks_as_the_products_pair(
     assert latest[0] is products and latest[1] == radar_ts
     assert latest.products is products
     assert latest.radar_ts_utc == radar_ts
+    # Every field past the pair is additive, reached by name only.
+    assert latest.forecast_mm_h is not None
+    assert latest.generated_at_utc is not None
 
 
 def test_observed_grid_failure_does_not_cost_the_cycle(

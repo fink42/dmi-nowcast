@@ -155,6 +155,23 @@ class ForecastPointLead(BaseModel):
     p_rain: float | None
 
 
+class ForecastPointRain(BaseModel):
+    """One lead of the point's DETERMINISTIC rain series in ``GET /forecast``.
+
+    The advected rain rate at the queried pixel, reduced onto the product
+    grid with the same block-p90 as ``observed_mm_h`` — so this series, the
+    observation and the ETA grid all speak about one pixel. ``valid_ts_utc``
+    is ``generated_at_utc + lead_min``, and lead 0 is valid *now*: the field
+    advected forward by the frame age, which is the only product that can
+    say whether it is raining at the point at this moment (the newest
+    composite is 14-24 min old whenever a viewer looks at it). ``mm_h`` is
+    null for a nodata pixel — unknown, never dry.
+    """
+    lead_min: int
+    valid_ts_utc: datetime
+    mm_h: float | None
+
+
 class ForecastPointResponse(BaseModel):
     """Root payload for ``GET /forecast?lat=&lon=`` (website Phase A plan §A3).
 
@@ -191,6 +208,17 @@ class ForecastPointResponse(BaseModel):
     # published no observed grid. Additive (default null), so pinned
     # clients are unaffected.
     observed_mm_h: float | None = None
+    # When this cycle's grids were produced, UTC. The clock the
+    # ``forecast_mm_h`` series is measured from; null on a snapshot that
+    # predates the series.
+    generated_at_utc: datetime | None = None
+    # The point's deterministic rain series, ascending lead, each entry
+    # valid at ``generated_at_utc + lead_min``. Lead 0 is the field advected
+    # to now — read the headline from this, not from ``observed_mm_h``,
+    # which speaks for a radar frame 14-24 min in the past. Null (not an
+    # empty list) when the cycle published no series. Additive, so pinned
+    # clients are unaffected.
+    forecast_mm_h: list[ForecastPointRain] | None = None
     # Global confidence scalar from the latest ``state.json`` (Phase A keeps
     # confidence global, plan §A1); null when no state is available yet.
     confidence: float | None

@@ -20,13 +20,14 @@ The optional observed-rain grid rides the same pixel. It is not part
 of :class:`~dmi_nowcast_core.national.NationalProducts` (it is an
 observation, not an ensemble reduction) but it is on the same grid by
 construction, so it is sampled here rather than through a second path
-that could drift.
+that could drift. The optional deterministic forecast series rides it
+too, for the same reason.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -46,8 +47,15 @@ class PointSample:
 
     ``observed_mm_h`` is the rain rate measured at the pixel by the newest
     composite — ``None`` when no observed grid was supplied or the pixel is
-    nodata. It is the only field here that is not a forecast, and the only
-    one that can say "it is raining at this point *now*".
+    nodata. It is the only field here that is not a forecast, and it speaks
+    for the radar frame, which is 14-24 min old whenever anyone looks.
+
+    ``forecast_mm_h`` is the point's DETERMINISTIC rain series, keyed by
+    lead minutes and valid at ``generated_at + lead`` — so lead 0 is the
+    rain rate advected to *now*, the number a "raining here now" readout
+    should be based on rather than the ageing observation. ``None`` overall
+    when the cycle published no series; ``None`` per lead for a nodata
+    pixel or a lead whose grid was not on the product grid.
     """
 
     row: int
@@ -56,6 +64,7 @@ class PointSample:
     eta_min: float | None
     intensity_mm_h: float | None
     observed_mm_h: float | None = None
+    forecast_mm_h: dict[int, float | None] | None = None
 
 
 def product_pixel(
@@ -79,6 +88,7 @@ def sample_point(
     lon: float,
     *,
     observed_mm_h: np.ndarray | None = None,
+    forecast_mm_h: Mapping[int, np.ndarray] | None = None,
 ) -> PointSample | None:
     """Read every product at the nearest pixel; ``None`` when off coverage.
 
@@ -86,6 +96,15 @@ def sample_point(
     product grid. Absent — or a differently-shaped grid, which would mean
     a caller paired two different reductions — the sample's
     ``observed_mm_h`` is ``None``: an unknown observation, never a dry one.
+
+    ``forecast_mm_h`` maps lead minutes → the cycle's deterministic
+    forecast grids, also on the product grid; the sample's
+    ``forecast_mm_h`` is the point's rain series, valid at
+    ``generated_at + lead``. Not supplied → ``None`` for the whole series
+    rather than an empty dict, so "no series this cycle" and "a series with
+    nothing in it" stay distinguishable. A lead whose grid is shaped
+    differently is skipped entirely — unknown, never dry — in the same
+    spirit as the observed shape check.
     """
     pixel = product_pixel(products, geo, lat, lon)
     if pixel is None:
@@ -97,6 +116,13 @@ def sample_point(
         and observed_mm_h.shape == products.eta_min.shape
     ):
         observed = finite_or_none(observed_mm_h[row, col])
+    forecast: dict[int, float | None] | None = None
+    if forecast_mm_h is not None:
+        forecast = {
+            int(lead): finite_or_none(grid[row, col])
+            for lead, grid in sorted(forecast_mm_h.items())
+            if getattr(grid, "shape", None) == products.eta_min.shape
+        }
     return PointSample(
         row=row,
         col=col,
@@ -107,6 +133,7 @@ def sample_point(
         eta_min=finite_or_none(products.eta_min[row, col]),
         intensity_mm_h=finite_or_none(products.intensity_mm_h[row, col]),
         observed_mm_h=observed,
+        forecast_mm_h=forecast,
     )
 
 

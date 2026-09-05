@@ -549,6 +549,207 @@ def test_observed_grid_is_pruned_with_its_cycle(
 
 
 # ---------------------------------------------------------------------------
+# forecast_mm_h — the deterministic point series on the product grid, and
+# the lead-0 forecast overlay it is drawn from
+# ---------------------------------------------------------------------------
+
+FORECAST_LEADS = (0, 10, 20)
+
+
+def _forecast_grids(
+    leads: tuple[int, ...] = FORECAST_LEADS, h: int = PRODUCT_PX, w: int = PRODUCT_PX,
+) -> dict[int, np.ndarray]:
+    """A distinguishable grid per lead (lead L peaks at L + 1 mm/h), each
+    with the same nodata pixel the other product grids carry."""
+    grids = {}
+    for lead in leads:
+        g = np.linspace(0.0, float(lead) + 1.0, h * w, dtype=np.float32).reshape(h, w)
+        g[0, 0] = np.nan
+        grids[lead] = g
+    return grids
+
+
+def _fc_entries(manifest: dict) -> list[dict]:
+    return [e for e in manifest["artifacts"] if e["product"] == "forecast_mm_h"]
+
+
+def test_forecast_grids_are_written_one_per_lead(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """One grid per lead in ``{0} ∪ leads``, ascending, lead 0 first, each
+    valid at ``generated_at + lead`` — the viewer's clock, not the radar's,
+    because the composite is 14-24 min old whenever anyone looks."""
+    result = _write(geo, tmp_path, forecast_mm_h=_forecast_grids())
+    for lead in FORECAST_LEADS:
+        assert (tmp_path / f"forecast_mm_h_{lead}min_{STAMP}.png").is_file()
+
+    manifest = json.loads(result.manifest_path.read_text())
+    entries = _fc_entries(manifest)
+    assert len(entries) == len(FORECAST_LEADS)
+    assert [e["lead_min"] for e in entries] == list(FORECAST_LEADS)
+    assert all(e["kind"] == "forecast" for e in entries)
+    valid = [datetime.fromisoformat(e["valid_ts_utc"]) for e in entries]
+    assert valid == sorted(valid) and len(set(valid)) == len(valid)
+    assert valid[0] == GENERATED_AT
+    assert valid == [GENERATED_AT + timedelta(minutes=lead)
+                     for lead in FORECAST_LEADS]
+    # It rides the product grid, so a client samples it like p_rain.
+    assert all(e["shape"] == manifest["grid"]["shape"] for e in entries)
+    # Additive within schema v2 — no bump, no renamed keys.
+    assert manifest["schema_version"] == MANIFEST_SCHEMA_VERSION == 2
+
+    # The exact entry shape a browser consumes.
+    assert entries[0] == {
+        "filename": f"forecast_mm_h_0min_{STAMP}.png",
+        "product": "forecast_mm_h",
+        "lead_min": 0,
+        "encoding": "grayscale8",
+        "scale": QUANT_SPECS["intensity"].scale,
+        "offset": QUANT_SPECS["intensity"].offset,
+        "nodata": NODATA_LEVEL,
+        "units": "mm/h",
+        "shape": [PRODUCT_PX, PRODUCT_PX],
+        "kind": "forecast",
+        "valid_ts_utc": GENERATED_AT.isoformat(),
+    }
+
+
+def test_forecast_grids_share_the_observed_quantisation(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """Forecast rain and observed rain are one quantity: one spec object, so
+    a panel comparing "now (forecast)" against "now (radar)" cannot be
+    comparing two different decodings."""
+    assert QUANT_SPECS["forecast_mm_h"] is QUANT_SPECS["observed_mm_h"]
+
+    result = _write(geo, tmp_path, forecast_mm_h=_forecast_grids(),
+                    observed_mm_h=_observed_grid())
+    manifest = json.loads(result.manifest_path.read_text())
+    obs = next(e for e in manifest["artifacts"] if e["product"] == "observed_mm_h")
+    for entry in _fc_entries(manifest):
+        assert entry["scale"] == obs["scale"]
+        assert entry["offset"] == obs["offset"]
+
+
+def test_forecast_grids_round_trip_through_the_png(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    grids = _forecast_grids()
+    result = _write(geo, tmp_path, forecast_mm_h=grids)
+    manifest = json.loads(result.manifest_path.read_text())
+    for entry in _fc_entries(manifest):
+        want = grids[entry["lead_min"]]
+        with Image.open(tmp_path / entry["filename"]) as img:
+            assert img.mode == "L"
+            levels = np.asarray(img)
+        decoded = dequantise(levels, scale=entry["scale"], offset=entry["offset"])
+        assert decoded.shape == want.shape
+        assert np.array_equal(np.isnan(decoded), np.isnan(want))
+        assert levels[0, 0] == NODATA_LEVEL
+        finite = ~np.isnan(want)
+        err = np.abs(decoded[finite] - want[finite])
+        assert float(err.max()) <= entry["scale"] / 2 + 1e-4
+
+
+def test_forecast_grids_are_optional(geo: CompositeGeo, tmp_path: Path) -> None:
+    """A cycle whose forecast reduction failed writes everything else."""
+    for value in (None, {}):
+        out = tmp_path / f"case_{value is None}"
+        result = _write(geo, out, forecast_mm_h=value)
+        assert not list(out.glob("forecast_mm_h_*.png"))
+        manifest = json.loads(result.manifest_path.read_text())
+        assert not _fc_entries(manifest)
+        assert any(e["product"] == "intensity" for e in manifest["artifacts"])
+
+
+def test_forecast_grids_must_be_on_the_product_grid(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="product grid"):
+        _write(geo, tmp_path,
+               forecast_mm_h={0: np.zeros((GRID_PX, GRID_PX), np.float32)})
+
+
+def test_forecast_artifacts_are_pruned_with_their_cycle(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """New filenames, same cycle stamp — retention needs no special case,
+    but a naming slip would leak four PNGs per cycle forever."""
+    for minute in range(4):
+        ts = RADAR_TS + timedelta(minutes=10 * minute)
+        _write(geo, tmp_path, radar_ts_utc=ts, keep_cycles=2,
+               forecast_mm_h=_forecast_grids(),
+               overlay_now_forecast_mm_h=_overlay_field(),
+               history_frames=0)
+    grids = sorted(p.name for p in tmp_path.glob("forecast_mm_h_*.png"))
+    assert len(grids) == 2 * len(FORECAST_LEADS), grids
+    frames = sorted(p.name for p in tmp_path.glob("overlay_0min_*.png"))
+    assert len(frames) == 2, frames
+
+
+def test_lead_zero_forecast_overlay_follows_the_observation(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """Two frames share lead 0 — the radar observation (valid at radar time)
+    and the field advected to now (valid at generation time). The
+    observation is listed FIRST, which is what a stable sort by lead_min
+    preserves for the loop."""
+    result = _write(geo, tmp_path, overlay_now_forecast_mm_h=_overlay_field())
+    assert (tmp_path / f"overlay_0min_{STAMP}.png").is_file()
+
+    manifest = json.loads(result.manifest_path.read_text())
+    lead0 = [e for e in _overlays(manifest) if e["lead_min"] == 0]
+    assert [e["kind"] for e in lead0] == ["observation", "forecast"]
+    assert lead0[0]["filename"] == f"overlay_now_{STAMP}.png"
+    assert lead0[1]["filename"] == f"overlay_0min_{STAMP}.png"
+    assert datetime.fromisoformat(lead0[0]["valid_ts_utc"]) == RADAR_TS
+    assert datetime.fromisoformat(lead0[1]["valid_ts_utc"]) == GENERATED_AT
+    assert lead0[1] == {
+        "filename": f"overlay_0min_{STAMP}.png",
+        "product": "overlay",
+        "lead_min": 0,
+        "kind": "forecast",
+        "valid_ts_utc": GENERATED_AT.isoformat(),
+        "encoding": "rgba8",
+        "shape": [GRID_PX, GRID_PX],
+    }
+    # A stable sort by lead keeps that pairing, history and all.
+    ordered = sorted(_overlays(manifest), key=lambda e: e["lead_min"])
+    zeros = [i for i, e in enumerate(ordered) if e["lead_min"] == 0]
+    assert [ordered[i]["kind"] for i in zeros] == ["observation", "forecast"]
+
+
+def test_lead_zero_forecast_overlay_must_match_the_other_overlays(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="share one shape"):
+        _write(geo, tmp_path,
+               overlay_now_forecast_mm_h=np.zeros((8, 8), np.float32))
+
+
+def test_lead_zero_forecast_overlay_leaves_the_history_alone(
+    geo: CompositeGeo, tmp_path: Path,
+) -> None:
+    """The history references prior cycles' ``overlay_now`` PNGs only; the
+    new ``overlay_0min`` files must never be picked up as observations."""
+    base = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    for i in range(5):
+        result = _write_cycle(
+            geo, tmp_path, base + timedelta(minutes=10 * i),
+            overlay_now_forecast_mm_h=_overlay_field(),
+        )
+    manifest = json.loads(result.manifest_path.read_text())
+    history = [e for e in _overlays(manifest) if e["lead_min"] < 0]
+    assert [e["lead_min"] for e in history] == [-30, -20, -10]
+    assert all(e["kind"] == "observation" for e in history)
+    assert all(e["filename"].startswith("overlay_now_") for e in history)
+    # Exactly one observation valid at this cycle's radar time, plus the
+    # three past ones — the forecast frame is not counted among them.
+    kinds = [e["kind"] for e in _overlays(manifest)]
+    assert kinds.count("observation") == 4
+
+
+# ---------------------------------------------------------------------------
 # R1 — 30-min observation history in the manifest
 # ---------------------------------------------------------------------------
 

@@ -155,17 +155,23 @@ class EnsembleOutcome:
 
 class NationalSnapshot(tuple):
     """What ``CycleEngine.national_latest`` publishes: the cycle's national
-    products, their radar timestamp, and the observed-rain grid.
+    products, their radar timestamp, the observed-rain grid, and the
+    deterministic forecast series with the instant it was generated.
 
-    Deliberately a **2-tuple subclass** rather than a three-field
+    Deliberately a **2-tuple subclass** rather than a many-field
     dataclass. ``national_latest`` has pinned readers — ``/forecast``, the
     push service, the push subscribe route and three test modules all do
-    ``products, radar_ts = engine.national_latest`` — and the observed grid
-    is additive here in the same sense a manifest key is additive: the
-    unpacking and indexing that existed keep working untouched, while
-    readers that want the new grid reach it by name (or, defensively,
+    ``products, radar_ts = engine.national_latest`` — and every field past
+    the pair is additive here in the same sense a manifest key is additive:
+    the unpacking and indexing that existed keep working untouched, while
+    readers that want a new field reach it by name (or, defensively,
     ``getattr(latest, "observed_mm_h", None)``, which also tolerates a
     plain tuple).
+
+    ``forecast_mm_h`` maps lead minutes → the deterministic advected rain
+    rate on the product grid, lead 0 being the field advected to
+    ``generated_at_utc`` — the point series a "raining here now" readout
+    must come from, since the observation is 14-24 min old.
 
     Swapped as one object so a reader on another thread can never see a
     products grid from one cycle paired with an observation from the next.
@@ -176,10 +182,14 @@ class NationalSnapshot(tuple):
         products: NationalProducts,
         radar_ts_utc: datetime,
         observed_mm_h: np.ndarray | None = None,
+        forecast_mm_h: dict[int, np.ndarray] | None = None,
+        generated_at_utc: datetime | None = None,
     ) -> "NationalSnapshot":
         self = super().__new__(cls, (products, radar_ts_utc))
-        # tuple subclasses can't carry __slots__, so this lands in __dict__.
+        # tuple subclasses can't carry __slots__, so these land in __dict__.
         self.observed_mm_h = observed_mm_h
+        self.forecast_mm_h = forecast_mm_h
+        self.generated_at_utc = generated_at_utc
         return self
 
     @property
@@ -677,11 +687,25 @@ class CycleEngine:
         # scheme costs far more than the old one-shot Euler back-step
         # (~7 s for 8 leads on the native 1728×1984 grid), and chaining
         # takes ~20 % off that.
-        advected = advect_field_series(
+        #
+        # The series LEADS with the frame age alone: the field advected to
+        # NOW, which is the clock a viewer is on. The newest composite is
+        # 14-24 min old at any moment (10-min cadence + ~12 min DMI delay +
+        # a cycle serving up to 10 min), so the observation cannot answer
+        # "is it raining here now" and the first forecast lead is already
+        # ten minutes past it. Horizons stay non-decreasing, chaining makes
+        # the extra one near-free, and the per-lead pairing below is
+        # unchanged: the lead-0 field is consumed off an explicit iterator
+        # first, so lead i still pairs with the field for lead i.
+        advected = iter(advect_field_series(
             rain_now, vy, vx,
-            horizons_minutes=[lead + frame_age_min for lead in self.config.forecast.leads_min],
+            horizons_minutes=(
+                [frame_age_min]
+                + [lead + frame_age_min for lead in self.config.forecast.leads_min]
+            ),
             dt_minutes=dt_min,
-        )
+        ))
+        forecast_now_field = next(advected)
         for lead, field in zip(self.config.forecast.leads_min, advected):
             if collect_overlays:
                 overlay_fields[int(lead)] = field
@@ -804,8 +828,38 @@ class CycleEngine:
                 )
             except Exception as exc:  # noqa: BLE001
                 _log.warning("observed_grid_failed", error=str(exc))
+            # DETERMINISTIC forecast series on the same product grid, from
+            # the same fields the overlays are drawn from and through the
+            # same reduction — so the panel's headline, the loop frame it
+            # sits next to and the ETA grid all read one pixel. Lead 0 is
+            # the field advected to ``generated_at``: the answer to "is it
+            # raining here now" that the 14-24 min old composite cannot
+            # give. ~16 ms per lead; a failure costs the series, not the
+            # cycle.
+            #
+            # ONE generation instant for the series, the snapshot and the
+            # artifacts: a client must be able to add a lead to it and land
+            # on the frame the manifest says is valid then.
+            generated_at_utc = datetime.now(timezone.utc)
+            forecast_grids: dict[int, np.ndarray] | None = None
+            try:
+                factor = ensemble.national.downsample_factor
+                fields: dict[int, np.ndarray] = {0: forecast_now_field}
+                for lead in self.config.forecast.leads_min:
+                    if int(lead) != 0 and int(lead) in overlay_fields:
+                        fields[int(lead)] = overlay_fields[int(lead)]
+                forecast_grids = {
+                    lead: observed_rain_grid(fld, downsample_factor=factor)
+                    for lead, fld in sorted(fields.items())
+                }
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("forecast_grids_failed", error=str(exc))
             self._national_latest = NationalSnapshot(
-                ensemble.national, composite_now.timestamp_utc, observed_grid,
+                ensemble.national,
+                composite_now.timestamp_utc,
+                observed_grid,
+                forecast_grids,
+                generated_at_utc,
             )
             # R2 cell-motion grids: the display product, on the product
             # grid, in km/h. Fed the *raw* sanitised flow, not the
@@ -831,13 +885,20 @@ class CycleEngine:
                     ensemble.national,
                     geo=geo,
                     radar_ts_utc=composite_now.timestamp_utc,
-                    generated_at_utc=datetime.now(timezone.utc),
+                    generated_at_utc=generated_at_utc,
                     overlay_fields_mm_h=overlay_fields,
                     out_dir=self._national_dir,
                     keep_cycles=self.config.forecast.national.keep_cycles,
                     motion_east_kmh=motion_east,
                     motion_north_kmh=motion_north,
                     observed_mm_h=observed_grid,
+                    forecast_mm_h=forecast_grids,
+                    # The lead-0 forecast as an overlay frame too: the loop
+                    # frame nearest wall-clock now, beside the lead-0
+                    # observation it must not be confused with.
+                    overlay_now_forecast_mm_h=(
+                        forecast_now_field if collect_overlays else None
+                    ),
                     # §B4: null when the served grids are raw; otherwise
                     # fitted_at + curve-file echo + calibrated_leads.
                     calibration=self._national_calibration_manifest(ensemble.national),

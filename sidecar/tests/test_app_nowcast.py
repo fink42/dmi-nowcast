@@ -15,7 +15,7 @@ Fully synthetic, mirroring the suite's conventions:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import h5py
@@ -30,6 +30,7 @@ from dmi_nowcast_core.parse import parse_composite
 from dmi_nowcast_sidecar.app import _safe_nowcast_name, create_app
 from dmi_nowcast_sidecar.compute import CycleEngine, NationalSnapshot
 from dmi_nowcast_sidecar.config import Config
+from dmi_nowcast_sidecar.national_sample import sample_point
 
 # Same home as ``minimal_config`` (conftest.py); the synthetic grid is built
 # so this point lands exactly at its centre (adapted from
@@ -46,8 +47,13 @@ GRID_DS = GRID_PX // DOWNSAMPLE           # 16×16 product grids
 CENTRE_DS = (GRID_PX // 2) // DOWNSAMPLE  # home pixel on the product grid
 NAN_PIXEL = (2, 3)                        # downsampled pixel forced to NaN
 OBSERVED_MM_H = 1.25                      # observed rain on the product grid
+#: Deterministic forecast rain per lead. Lead 0 is valid at GENERATED_AT —
+#: a wet "now" against a drier radar frame, which is the whole point of the
+#: series: the composite is 14-24 min old whenever a viewer looks.
+FORECAST_MM_H = {0: 3.5, 10: 2.0, 20: 0.0}
 
 RADAR_TS = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+GENERATED_AT = datetime(2026, 8, 28, 12, 14, 30, tzinfo=timezone.utc)
 STAMP = "202608281200"
 
 # Tiny valid 1x1 transparent PNG (same bytes test_frames.py uses).
@@ -147,17 +153,26 @@ def observed() -> np.ndarray:
 
 
 @pytest.fixture
+def forecast_grids() -> dict[int, np.ndarray]:
+    """Deterministic forecast grids, same product grid and nodata pixel."""
+    return {lead: _grid(value) for lead, value in FORECAST_MM_H.items()}
+
+
+@pytest.fixture
 def engine(
     minimal_config: Config,
     geo: CompositeGeo,
     products: NationalProducts,
     observed: np.ndarray,
+    forecast_grids: dict[int, np.ndarray],
 ) -> CycleEngine:
     """Engine with synthetic geo + national products already 'computed'."""
     eng = CycleEngine(minimal_config)
     eng._basemap_attempted = True  # never fetch OSM
     eng._geo = geo
-    eng._national_latest = NationalSnapshot(products, RADAR_TS, observed)
+    eng._national_latest = NationalSnapshot(
+        products, RADAR_TS, observed, forecast_grids, GENERATED_AT,
+    )
     return eng
 
 
@@ -401,6 +416,9 @@ def test_forecast_nan_pixel_returns_nulls(
     assert body["intensity_mm_h"] is None
     # A nodata pixel is an UNKNOWN observation, never a dry one.
     assert body["observed_mm_h"] is None
+    # Same for every lead of the deterministic series: the leads are still
+    # listed (the cycle did publish a series), each with a null value.
+    assert [e["mm_h"] for e in body["forecast_mm_h"]] == [None, None, None]
     # Grid-independent fields still present.
     assert body["n_members"] == 8
 
@@ -418,7 +436,39 @@ def test_forecast_without_an_observed_grid_serves_null(
     assert r.status_code == 200
     body = r.json()
     assert body["observed_mm_h"] is None
+    # The deterministic series and its clock are additive in exactly the
+    # same way — an older snapshot object simply has neither.
+    assert body["forecast_mm_h"] is None
+    assert body["generated_at_utc"] is None
     assert body["eta_min"] == pytest.approx(6.0)
+
+
+def test_forecast_serves_the_deterministic_rain_series(
+    client: TestClient,
+) -> None:
+    """The point's rain series on the viewer's clock: ascending leads from
+    0, each valid at generated_at + lead, lead 0 valid NOW. This is what a
+    "raining here now" headline reads — ``observed_mm_h`` speaks for a
+    radar frame 14-24 min in the past."""
+    r = client.get("/forecast", params={"lat": HOME_LAT, "lon": HOME_LON})
+    assert r.status_code == 200
+    body = r.json()
+    assert datetime.fromisoformat(body["generated_at_utc"]) == GENERATED_AT
+
+    series = body["forecast_mm_h"]
+    assert [e["lead_min"] for e in series] == [0, 10, 20]
+    assert [e["mm_h"] for e in series] == [
+        pytest.approx(FORECAST_MM_H[lead]) for lead in (0, 10, 20)
+    ]
+    valid = [datetime.fromisoformat(e["valid_ts_utc"]) for e in series]
+    assert valid[0] == GENERATED_AT
+    assert valid == [GENERATED_AT + timedelta(minutes=lead)
+                     for lead in (0, 10, 20)]
+    # The whole incident in one assertion: the radar frame says it is
+    # raining at the point, the field advected to now says it still is,
+    # and the two are different numbers on different clocks.
+    assert body["observed_mm_h"] == pytest.approx(OBSERVED_MM_H)
+    assert series[0]["mm_h"] != pytest.approx(body["observed_mm_h"])
 
 
 def test_forecast_out_of_grid_400(client: TestClient) -> None:
@@ -440,6 +490,67 @@ def test_forecast_invalid_params_422(client: TestClient) -> None:
     assert client.get(
         "/forecast", params={"lat": HOME_LAT, "lon": 181.0},
     ).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# sample_point — the one arithmetic /forecast and the push engine share
+# ---------------------------------------------------------------------------
+
+def _home_sample(products, geo, **kwargs):
+    sample = sample_point(products, geo, HOME_LAT, HOME_LON, **kwargs)
+    assert sample is not None
+    return sample
+
+
+def test_sample_point_series_is_none_when_none_is_supplied(
+    products: NationalProducts, geo: CompositeGeo,
+) -> None:
+    """No series this cycle and a series with nothing in it must stay
+    distinguishable, so the default is None rather than {}."""
+    sample = _home_sample(products, geo)
+    assert sample.forecast_mm_h is None
+    assert _home_sample(products, geo, forecast_mm_h={}).forecast_mm_h == {}
+
+
+def test_sample_point_series_reads_the_same_pixel_as_every_product(
+    products: NationalProducts, geo: CompositeGeo,
+    forecast_grids: dict[int, np.ndarray],
+) -> None:
+    sample = _home_sample(products, geo, forecast_mm_h=forecast_grids)
+    assert (sample.row, sample.col) == (CENTRE_DS, CENTRE_DS)
+    assert sample.forecast_mm_h == {
+        lead: pytest.approx(value) for lead, value in FORECAST_MM_H.items()
+    }
+    assert list(sample.forecast_mm_h) == sorted(FORECAST_MM_H)
+
+
+def test_sample_point_series_is_none_per_lead_on_a_nodata_pixel(
+    products: NationalProducts, geo: CompositeGeo,
+    forecast_grids: dict[int, np.ndarray],
+) -> None:
+    """A NaN pixel is an unknown forecast, never a dry one."""
+    lon, lat = geo.grid_to_lonlat(
+        NAN_PIXEL[0] * DOWNSAMPLE, NAN_PIXEL[1] * DOWNSAMPLE,
+    )
+    sample = sample_point(
+        products, geo, lat, lon, forecast_mm_h=forecast_grids,
+    )
+    assert sample is not None
+    assert sample.forecast_mm_h == {lead: None for lead in FORECAST_MM_H}
+
+
+def test_sample_point_skips_a_lead_on_the_wrong_grid(
+    products: NationalProducts, geo: CompositeGeo,
+    forecast_grids: dict[int, np.ndarray],
+) -> None:
+    """A grid from a different reduction would read a different place on
+    the map. Drop the lead as unknown rather than report a wrong number —
+    the same rule the observed grid follows."""
+    mixed = dict(forecast_grids)
+    mixed[10] = np.zeros((GRID_PX, GRID_PX), dtype=np.float32)
+    sample = _home_sample(products, geo, forecast_mm_h=mixed)
+    assert set(sample.forecast_mm_h) == {0, 20}
+    assert 10 not in sample.forecast_mm_h
 
 
 # ---------------------------------------------------------------------------

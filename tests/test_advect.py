@@ -4,7 +4,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from dmi_nowcast_core.advect import advect_field, advect_point
+from dmi_nowcast_core.advect import (
+    advect_field,
+    advect_field_series,
+    advect_point,
+)
 
 
 def test_advect_point_shifts_by_negative_flow():
@@ -76,3 +80,70 @@ def test_advect_field_shape_mismatch_raises():
     vx = np.zeros((10, 10), dtype=np.float32)
     with pytest.raises(ValueError):
         advect_field(field, vy, vx, horizon_minutes=10.0)
+
+
+# ---------------------------------------------------------------------------
+# The frame-age lead: the sidecar prepends ``frame_age_min`` so the first
+# field of the series is "what the radar would show right now". The leads
+# after it must be the same forecast they were without it.
+# ---------------------------------------------------------------------------
+
+
+def _blob_and_shear(shape=(96, 96)):
+    """A smooth blob under a sheared flow — sheared so the trajectory really
+    is integrated rather than translated, which is what makes an extra
+    breakpoint able to matter at all."""
+    ys, xs = np.indices(shape, dtype=np.float32)
+    field = 10.0 * np.exp(-(((ys - 30.0) ** 2 + (xs - 40.0) ** 2) / (2 * 9.0 ** 2)))
+    vy = (2.0 + 0.02 * xs).astype(np.float32)
+    vx = (1.0 + 0.03 * ys).astype(np.float32)
+    return field.astype(np.float32), vy, vx
+
+
+def test_series_leading_frame_age_field_equals_a_direct_call():
+    """The prepended horizon yields exactly what a single call to that
+    horizon yields — the lead-0 forecast is not a special construction."""
+    field, vy, vx = _blob_and_shear()
+    frame_age = 14.3
+    leads = [10.0, 20.0, 30.0]
+
+    first = next(iter(advect_field_series(
+        field, vy, vx,
+        horizons_minutes=[frame_age] + [lead + frame_age for lead in leads],
+        dt_minutes=10.0,
+    )))
+    direct = advect_field(
+        field, vy, vx, horizon_minutes=frame_age, dt_minutes=10.0,
+    )
+    # Same code path, same inputs — identical, NaN mask included.
+    np.testing.assert_array_equal(first, direct)
+
+
+def test_series_leading_frame_age_horizon_leaves_the_leads_alone():
+    """Chaining takes a breakpoint at the frame age that a bare series does
+    not, so the later fields are not bit-identical — but they must be the
+    same forecast, well inside a 0.1 mm/h radar quantum."""
+    field, vy, vx = _blob_and_shear()
+    frame_age = 14.3
+    leads = [10.0, 20.0, 30.0]
+    horizons = [lead + frame_age for lead in leads]
+
+    with_age = list(advect_field_series(
+        field, vy, vx, horizons_minutes=[frame_age] + horizons, dt_minutes=10.0,
+    ))
+    without = list(advect_field_series(
+        field, vy, vx, horizons_minutes=horizons, dt_minutes=10.0,
+    ))
+
+    assert len(with_age) == len(leads) + 1
+    assert len(without) == len(leads)
+    for lead, got, want in zip(leads, with_age[1:], without):
+        both = np.isfinite(got) & np.isfinite(want)
+        assert both.any(), f"lead {lead}: nothing finite to compare"
+        assert float(np.abs(got[both] - want[both]).max()) < 0.02 * float(
+            field.max()
+        ), f"lead {lead}: the extra horizon changed the forecast"
+        disagree = np.isnan(got) ^ np.isnan(want)
+        assert disagree.mean() < 1e-3, (
+            f"lead {lead}: NaN masks differ on {int(disagree.sum())} px"
+        )

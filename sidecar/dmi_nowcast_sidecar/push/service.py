@@ -132,6 +132,9 @@ class PushService:
             # Additive on the snapshot: a cycle whose observed reduction
             # failed still evaluates, on the ETA test alone.
             getattr(latest, "observed_mm_h", None),
+            # Deterministic forecast series — carried for the evaluation
+            # log only; it changes no decision.
+            getattr(latest, "forecast_mm_h", None),
         )
         self._last_evaluated_radar_ts = radar_ts
         self._last_fanout = summary
@@ -156,6 +159,7 @@ class PushService:
         radar_ts: datetime,
         now_utc: datetime,
         observed_mm_h: Any = None,
+        forecast_mm_h: Any = None,
     ) -> dict:
         """Decide for every subscription, persist, then fan out. Blocking."""
         subs = self.store.list()
@@ -166,14 +170,18 @@ class PushService:
 
         for sub in subs:
             sample = sample_point(
-                products, geo, sub.lat, sub.lon, observed_mm_h=observed_mm_h,
+                products, geo, sub.lat, sub.lon,
+                observed_mm_h=observed_mm_h,
+                forecast_mm_h=forecast_mm_h,
             )
+            series = sample.forecast_mm_h if sample else None
             obs = Observation(
                 radar_ts_utc=radar_ts,
                 p_rain=sample.p_rain.get(sub.lead_min) if sample else None,
                 eta_min=sample.eta_min if sample else None,
                 intensity_mm_h=sample.intensity_mm_h if sample else None,
                 observed_mm_h=sample.observed_mm_h if sample else None,
+                forecast_now_mm_h=series.get(0) if series else None,
             )
             state = SubState(
                 armed=sub.armed,
@@ -205,6 +213,21 @@ class PushService:
                 continue
 
             actions[decision.action] = actions.get(decision.action, 0) + 1
+            # One line per subscription per cycle: everything needed to
+            # replay why this row did or did not get a push. Identified by
+            # the row's hashed handle only — never the endpoint (a bearer
+            # capability) and never the coordinates.
+            _log.info(
+                "push_eval",
+                sub=sub_id(sub.endpoint),
+                radar_ts=radar_ts.isoformat(),
+                action=decision.action,
+                p_rain=obs.p_rain,
+                eta_min=obs.eta_min,
+                intensity_mm_h=obs.intensity_mm_h,
+                observed_mm_h=obs.observed_mm_h,
+                forecast_now_mm_h=obs.forecast_now_mm_h,
+            )
             notify = decision.action == "notify" and obs.p_rain is not None
             new_state = decision.state
             # Persist BEFORE sending: a crash may cost a notification, it

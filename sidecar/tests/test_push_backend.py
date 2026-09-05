@@ -23,6 +23,7 @@ delivery would otherwise happen.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
+import structlog
 from fastapi.testclient import TestClient
 from pyproj import CRS, Transformer
 
@@ -1132,3 +1134,108 @@ async def test_fanout_budget_stops_the_cycle_being_held_hostage(
     await service.after_cycle(CycleResult(state=_state_with(RADAR_TS2)))
     assert service.last_fanout["skipped"] == 1  # type: ignore[index]
     assert service.last_fanout["sent"] == 0     # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# The deterministic forecast series on the push path — carried and logged,
+# never a decision
+# ---------------------------------------------------------------------------
+
+def _spy_on_evaluate(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record every ``Observation`` the decision machine is handed."""
+    from dmi_nowcast_sidecar.push import service as service_mod
+
+    seen: list = []
+    real = service_mod.decision_engine.evaluate
+
+    def _spy(state, obs, **kwargs):
+        seen.append(obs)
+        return real(state, obs, **kwargs)
+
+    monkeypatch.setattr(service_mod.decision_engine, "evaluate", _spy)
+    return seen
+
+
+async def test_service_passes_the_lead_zero_forecast_to_the_engine(
+    service: PushService,
+    seeded_engine: CycleEngine,
+    products: NationalProducts,
+    monkeypatch: pytest.MonkeyPatch,
+    sends: list[dict],
+) -> None:
+    """``forecast_now_mm_h`` is the series' lead-0 value at the point — the
+    field advected to now, which is a different number from the ageing
+    radar frame's ``observed_mm_h``."""
+    seen = _spy_on_evaluate(monkeypatch)
+
+    seeded_engine._national_latest = NationalSnapshot(
+        products, RADAR_TS, _grid(0.0), {0: _grid(4.25), 30: _grid(1.0)},
+        RADAR_TS + timedelta(minutes=14),
+    )
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+
+    wet = [o for o in seen if o.observed_mm_h is not None]
+    assert wet, "the home subscription's observation should be on the grid"
+    assert wet[0].forecast_now_mm_h == pytest.approx(4.25)
+    assert wet[0].observed_mm_h == pytest.approx(0.0)
+    # The NaN-pixel subscription reads unknown, not dry.
+    nodata = [o for o in seen if o.observed_mm_h is None]
+    assert nodata and nodata[0].forecast_now_mm_h is None
+
+
+async def test_service_forecast_series_absent_is_none_not_zero(
+    service: PushService,
+    seeded_engine: CycleEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    sends: list[dict],
+) -> None:
+    """A snapshot without the series (an older object, or a cycle whose
+    reduction failed) must not read as a dry forecast."""
+    seen = _spy_on_evaluate(monkeypatch)
+    seeded_engine._national_latest = (
+        seeded_engine.national_latest[0], RADAR_TS,  # the plain-tuple shape
+    )
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+
+    assert seen
+    assert all(o.forecast_now_mm_h is None for o in seen)
+
+
+async def test_service_logs_one_push_eval_per_subscription(
+    service: PushService,
+    seeded_engine: CycleEngine,
+    products: NationalProducts,
+    sends: list[dict],
+) -> None:
+    """One replayable line per row per cycle — and never the endpoint or
+    the coordinates, which is this repo's privacy rule for push logs."""
+    seeded_engine._national_latest = NationalSnapshot(
+        products, RADAR_TS, _grid(0.0), {0: _grid(4.25), 30: _grid(1.0)},
+        RADAR_TS + timedelta(minutes=14),
+    )
+    with structlog.testing.capture_logs() as logs:
+        await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+
+    evals = [e for e in logs if e.get("event") == "push_eval"]
+    assert len(evals) == 2                      # one per subscription
+    assert {e["sub"] for e in evals} == {sub_id(ENDPOINT_A), sub_id(ENDPOINT_B)}
+    assert all(e["log_level"] == "info" for e in evals)
+    for entry in evals:
+        assert set(entry) >= {
+            "sub", "radar_ts", "action", "p_rain", "eta_min",
+            "intensity_mm_h", "observed_mm_h", "forecast_now_mm_h",
+        }
+        assert entry["radar_ts"] == RADAR_TS.isoformat()
+        assert entry["action"] in {"none", "notify", "deferred_quiet",
+                                   "already_raining"}
+
+    on_grid = next(e for e in evals if e["sub"] == sub_id(ENDPOINT_A))
+    assert on_grid["forecast_now_mm_h"] == pytest.approx(4.25)
+    assert on_grid["observed_mm_h"] == pytest.approx(0.0)
+    assert on_grid["p_rain"] == pytest.approx(0.9)
+
+    # Nothing identifying leaks: not the endpoint, not the point.
+    rendered = json.dumps(evals, default=str)
+    for secret in (ENDPOINT_A, ENDPOINT_B, P256DH, AUTH,
+                   str(HOME_LAT), str(HOME_LON)):
+        assert secret not in rendered
