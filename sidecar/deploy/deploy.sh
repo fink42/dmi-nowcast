@@ -190,6 +190,15 @@ for i in $(seq 1 60); do
     fi
 done
 
+# Every ``--build`` leaves the previous image dangling (~3 GB each: opencv,
+# pysteps, the vendored STEPS). Four deploys in a day filled the VM's disk
+# on 2026-09-05 and killed a running corpus build, so a healthy deploy
+# now prunes dangling images (only those — nothing tagged, no volumes).
+if [[ "$do_build" == 1 ]]; then
+    echo "==> Pruning dangling images left by the rebuild"
+    "${SSH[@]}" "docker image prune -f | tail -1"
+fi
+
 if [[ "$do_tail" == 1 ]]; then
     "${SSH[@]}" "cd '$REMOTE_DIR/$COMPOSE_DIR' && docker compose logs -f $SERVICE"
 fi
