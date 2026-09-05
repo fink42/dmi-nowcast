@@ -16,7 +16,7 @@
 		confidenceWord,
 		countdownEtaMin,
 		headline,
-		headlineKind,
+		headlineDecision,
 		intensityWord,
 		percent,
 		probabilityWithin
@@ -56,14 +56,18 @@
 		countdownEtaMin(forecast?.etaMin ?? null, nowcast.manifest?.generated_at_utc, nowcast.now)
 	);
 	/**
-	 * What the radar measures over the point right now, and the headline that
-	 * follows from it plus the ETA. Kept as one derived value because the
-	 * headline and the arrival row have to agree: if the observation is what
-	 * makes this "raining now", arrival is "now" too, whatever the ETA product
-	 * says about the next cell behind this one.
+	 * The headline and the arrival it implies, decided together and once.
+	 *
+	 * It is read from the deterministic advected field at wall-clock now — the
+	 * same field, at the same instant, that the loop's clock marker sits on —
+	 * so the sentence and the picture cannot contradict each other. The raw
+	 * observation deliberately does not enter into it: the newest composite is
+	 * 14–24 min old whenever anyone looks, and letting it lead is what put "it
+	 * is raining here now" over a loop showing the point dry. See
+	 * `headlineDecision`.
 	 */
-	const observedMmH = $derived(forecast?.observedMmH ?? null);
-	const kind = $derived(headlineKind(etaNow, observedMmH));
+	const decision = $derived(headlineDecision(etaNow, forecast?.rainSeries ?? [], nowcast.now));
+	const kind = $derived(decision.kind);
 	const confidence = $derived(forecast?.confidence ?? nowcast.confidence);
 	const ageMin = $derived(nowcast.radarAgeMin);
 	const highlight = $derived(forecast ? probabilityWithin(forecast, 20) : null);
@@ -144,7 +148,7 @@
 			<p class="muted peek">{t().panel.error}</p>
 		{:else if forecast}
 			<p class="headline peek" class:rain={kind !== 'no-rain'}>
-				{headline(t(), etaNow, observedMmH)}
+				{headline(t(), decision)}
 			</p>
 		{/if}
 
@@ -162,6 +166,12 @@
 						</p>
 					{/if}
 
+					<!-- The bars are the cycle's own cumulative probabilities: P(rain
+					     by lead L, counted from when the cycle was computed). After a
+					     first arrival they therefore describe the cycle rather than
+					     the viewer's clock, and can read high while the headline —
+					     which is read from the field at wall-clock now — says the
+					     shower has passed. The mismatch lasts at most one cycle. -->
 					{#if bars.length > 0}
 						<div class="curve" role="img" aria-label={t().panel.probabilityLabel}>
 							{#each bars as bar (bar.leadMin)}
@@ -183,12 +193,16 @@
 					<dl class="facts">
 						<div>
 							<dt>{t().panel.etaLabel}</dt>
+							<!-- Straight off the same decision as the headline: if the
+							     lead sentence says it is raining, arrival is "now", and
+							     otherwise this is the very minute count that sentence
+							     names. They cannot drift apart. -->
 							<dd>
 								{kind === 'raining-now'
 									? t().panel.etaNow
-									: etaNow === null
+									: decision.etaMin === null
 										? t().panel.etaNone
-										: t().panel.etaValue(Math.round(etaNow))}
+										: t().panel.etaValue(Math.round(decision.etaMin))}
 							</dd>
 						</div>
 						<div>

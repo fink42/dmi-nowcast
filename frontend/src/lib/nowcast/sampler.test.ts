@@ -17,6 +17,7 @@ import { describe, expect, it } from 'vitest';
 import { decodeGray8Png } from './png';
 import type { ArtifactEntry, Manifest } from './manifest';
 import {
+	forecastSeriesArtifacts,
 	lonLatToGrid,
 	nearestPixel,
 	observedArtifact,
@@ -63,6 +64,8 @@ const ETA = { lo: 0, hi: 120 };
 const INTENSITY = { lo: 0, hi: 100 };
 /** The observation grid: mm/h, quantised exactly like intensity. */
 const OBSERVED = { lo: 0, hi: 100 };
+/** The advected rain field: same units, same quantisation as the observation. */
+const FORECAST = { lo: 0, hi: 100 };
 /** Cell motion: symmetric about zero, ±MOTION_MAX_ABS_KMH. */
 const MOTION = { lo: -120, hi: 120 };
 const MAX_LEVEL = 254;
@@ -528,6 +531,120 @@ describe('samplePoint', () => {
 			// Everything else in a cycle is left alone by the lookup.
 			const others = [gridEntry('eta_x.png', 'eta', null, ETA, [3, 3])];
 			expect(observedArtifact({ ...manifest, artifacts: others })).toBeNull();
+		});
+	});
+
+	/**
+	 * The advected rain field: what the loop draws, sampled at the point. The
+	 * headline is read from this series, so two things have to hold — it is
+	 * sampled at the *same pixel* as everything else (a one-pixel drift would
+	 * put the sentence and the picture on different places), and a cycle
+	 * without it yields an empty series rather than a dry one.
+	 */
+	describe('advected rain series', () => {
+		/** p_rain and eta all nodata; this block is about the series. */
+		async function baseGrids() {
+			const empty = Array(9).fill(null);
+			return {
+				pRain: new Map([
+					[
+						10,
+						{
+							entry: gridEntry('p_rain_10min_x.png', 'p_rain', 10, P_RAIN, [3, 3]),
+							image: await decoded(empty, P_RAIN)
+						}
+					]
+				]),
+				eta: {
+					entry: gridEntry('eta_x.png', 'eta', null, ETA, [3, 3]),
+					image: await decoded(empty, ETA)
+				}
+			};
+		}
+
+		const GENERATED = Date.parse('2026-08-28T12:01:30+00:00');
+		const validAt = (leadMin: number) => new Date(GENERATED + leadMin * 60_000).toISOString();
+
+		/** A forecast-field entry for one lead, stamped the way the sidecar does. */
+		const seriesEntry = (leadMin: number): ArtifactEntry => ({
+			...gridEntry(`forecast_mm_h_${leadMin}min_x.png`, 'forecast_mm_h', leadMin, FORECAST, [
+				3, 3
+			]),
+			kind: 'forecast',
+			valid_ts_utc: validAt(leadMin)
+		});
+
+		/**
+		 * A series whose centre pixel walks `centreMmH` lead by lead, with the
+		 * ring around it left nodata — so a sample from the wrong pixel is a
+		 * null, not a plausible number.
+		 */
+		async function forecastSeries(centreMmH: (number | null)[]) {
+			return Promise.all(
+				centreMmH.map(async (mmH, i) => ({
+					entry: seriesEntry(i * 10),
+					image: await decoded([...Array(4).fill(null), mmH, ...Array(4).fill(null)], FORECAST)
+				}))
+			);
+		}
+
+		it('samples the series at the same pixel as everything else', async () => {
+			const grids = {
+				...(await baseGrids()),
+				observed: {
+					entry: gridEntry('observed_mm_h_x.png', 'observed_mm_h', 0, OBSERVED, [3, 3]),
+					image: await decoded([...Array(4).fill(null), 1.8, ...Array(4).fill(null)], OBSERVED)
+				},
+				forecastSeries: await forecastSeries([1.6, 0.9, 0, null])
+			};
+			const forecast = samplePoint(manifest, grids, 56.0, 10.5666);
+			expect(forecast!.rainSeries.map((s) => s.leadMin)).toEqual([0, 10, 20, 30]);
+			expect(forecast!.rainSeries.map((s) => s.validTsUtc)).toEqual([
+				validAt(0),
+				validAt(10),
+				validAt(20),
+				validAt(30)
+			]);
+			const halfStep = scaleOf(FORECAST) / 2;
+			expect(Math.abs((forecast!.rainSeries[0].mmH as number) - 1.6)).toBeLessThanOrEqual(halfStep);
+			expect(Math.abs((forecast!.rainSeries[1].mmH as number) - 0.9)).toBeLessThanOrEqual(halfStep);
+			expect(forecast!.rainSeries[2].mmH).toBe(0);
+			// Nodata at a lead stays null: unknown, never dry.
+			expect(forecast!.rainSeries[3].mmH).toBeNull();
+			// The same pixel the observation came from — this is the whole point.
+			expect(forecast!.observedMmH).not.toBeNull();
+
+			// One pixel north, everything is nodata in both products alike.
+			const neighbour = samplePoint(manifest, grids, 56.017, 10.5666);
+			expect(neighbour!.rainSeries.every((s) => s.mmH === null)).toBe(true);
+			expect(neighbour!.observedMmH).toBeNull();
+		});
+
+		it('is empty when the cycle served no such grids', async () => {
+			const forecast = samplePoint(manifest, await baseGrids(), 56.0, 10.5666);
+			expect(forecast!.rainSeries).toEqual([]);
+			// An older sidecar costs the series and nothing else.
+			expect(forecast!.perLead).toHaveLength(2);
+			expect(forecast!.source).toBe('client');
+
+			// An explicitly empty array reads the same way.
+			const empty = { ...(await baseGrids()), forecastSeries: [] };
+			expect(samplePoint(manifest, empty, 56.0, 10.5666)!.rainSeries).toEqual([]);
+		});
+
+		it('collects the artifacts in ascending lead, dropping unstamped ones', () => {
+			const stamped = [seriesEntry(20), seriesEntry(0), seriesEntry(10)];
+			const unstamped = { ...seriesEntry(30), valid_ts_utc: undefined };
+			const blank = { ...seriesEntry(40), valid_ts_utc: '  ' };
+			const found = forecastSeriesArtifacts({
+				...manifest,
+				artifacts: [...stamped, unstamped, blank, gridEntry('eta_x.png', 'eta', null, ETA, [3, 3])]
+			});
+			expect(found.map((a) => a.lead_min)).toEqual([0, 10, 20]);
+		});
+
+		it('finds nothing on a manifest written before the product existed', () => {
+			expect(forecastSeriesArtifacts(manifest)).toEqual([]);
 		});
 	});
 });

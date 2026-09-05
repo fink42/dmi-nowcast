@@ -3,12 +3,20 @@
 	 * The timeline: one track carrying the whole loop, docked to the bottom
 	 * edge of the map.
 	 *
-	 * The past half is hatched and the future half is plain, split by a "now"
-	 * marker, because the single thing a viewer must never get wrong is which
-	 * side of it they are looking at — a forecast frame read as a measurement
-	 * is a lie the styling told. The active frame's own clock time and state
-	 * word are spelled out above the track, and they are the *only* place the
-	 * site states a frame time.
+	 * The past half is hatched and the future half is plain, split at the
+	 * latest observation, because the single thing a viewer must never get
+	 * wrong is which side of that hinge they are looking at — a forecast frame
+	 * read as a measurement is a lie the styling told. The active frame's own
+	 * clock time and state word are spelled out above the track, and they are
+	 * the *only* place the site states a frame time.
+	 *
+	 * Two marks sit on the track and they are different instants. The hinge is
+	 * the newest radar image, which is 14–24 min old whenever anyone looks:
+	 * DMI's delay, a 10 min composite cadence, and a cycle that serves for up
+	 * to 10 min. Wall-clock "now" is therefore some way to the right of it,
+	 * among the forecast frames, and it gets its own moving marker — labelling
+	 * the newest observation "Now" while the panel counted from the wall clock
+	 * put two different "now"s on one screen.
 	 *
 	 * Underneath it stays a native `input[type=range]`: it owns the keyboard,
 	 * the touch behaviour and the a11y semantics, and everything drawn here is
@@ -21,7 +29,7 @@
 	import { t, locale } from '$lib/i18n';
 	import { clockTime } from '$lib/format';
 	import { nowcast } from '$lib/nowcast/store.svelte';
-	import { timelineGeometry, type TimelineFrame } from '$lib/nowcast/timeline';
+	import { clockPosition, timelineGeometry, type TimelineFrame } from '$lib/nowcast/timeline';
 
 	const frames = $derived(nowcast.timeline);
 	const count = $derived(frames.length);
@@ -37,7 +45,7 @@
 	const pct = (position: number) => `${(position * 100).toFixed(2)}%`;
 
 	const stateWord = (frame: TimelineFrame) =>
-		frame.isNow
+		frame.isLatest
 			? t().loop.stateNow
 			: frame.kind === 'observation'
 				? t().loop.stateObserved
@@ -46,13 +54,18 @@
 	/** Frame time, always from `valid_ts_utc`, in the viewer's own zone. */
 	const frameTime = (frame: TimelineFrame) => clockTime(frame.validTsUtc, locale());
 
+	/**
+	 * The end labels say where a frame sits relative to the radar image, so
+	 * lead 0 is "Latest", never "Now": the radar image is not now, and "Now"
+	 * belongs to the clock marker alone.
+	 */
 	const edgeLabel = (frame: TimelineFrame | undefined) =>
 		!frame
 			? ''
 			: frame.leadMin < 0
 				? t().loop.lag(-frame.leadMin)
 				: frame.leadMin === 0
-					? t().loop.now
+					? t().loop.latest
 					: t().loop.lead(frame.leadMin);
 
 	// The screen-reader value of the slider: the same three facts the sighted
@@ -63,12 +76,30 @@
 			: t().loop.noFrames
 	);
 
-	// Both ends carry a label; either is dropped when the "now" marker is
+	/** The hinge: the newest radar image, where hatched past meets forecast. */
+	const latestAt = $derived(geometry.latestPosition);
+	/**
+	 * Wall-clock now, interpolated between the frames bracketing it. The store
+	 * re-stamps `now` every 15 s and whenever the tab becomes visible, so the
+	 * marker walks the track on its own — no timer of this component's.
+	 */
+	const clockAt = $derived(clockPosition(frames, nowcast.now));
+
+	// Both ends carry a label; either is dropped when a marker's label is
 	// sitting close enough to collide with it (a cold-start manifest has no
-	// history at all, which puts "now" exactly on the left edge).
-	const nowAt = $derived(geometry.nowPosition);
-	const showStart = $derived(count > 1 && (nowAt === null || nowAt > 0.14));
-	const showEnd = $derived(count > 1 && (nowAt === null || nowAt < 0.86));
+	// history at all, which puts the hinge exactly on the left edge).
+	const clearOfEdge = (position: number | null, edge: number) =>
+		position === null || Math.abs(position - edge) > 0.14;
+	const showStart = $derived(count > 1 && clearOfEdge(latestAt, 0) && clearOfEdge(clockAt, 0));
+	const showEnd = $derived(count > 1 && clearOfEdge(latestAt, 1) && clearOfEdge(clockAt, 1));
+	/**
+	 * "Now" is the label that must always be readable, so when the two land on
+	 * top of each other it is "Latest" that gives way — its tick stays, since
+	 * the hatching already says which side of it is measured.
+	 */
+	const showLatestLabel = $derived(
+		latestAt !== null && (clockAt === null || Math.abs(clockAt - latestAt) >= 0.08)
+	);
 </script>
 
 <div class="timeline" class:empty={count === 0}>
@@ -113,9 +144,12 @@
 
 		<div class="rail">
 			<!-- Decoration only; the range input below owns the interaction. -->
+			<!-- The hatched region ends at the latest observation: everything to
+			     its right is extrapolation, including the frames the clock marker
+			     has already walked past. -->
 			<div class="bar" aria-hidden="true">
-				{#if nowAt !== null && nowAt > 0}
-					<div class="past" style:width={pct(nowAt)}></div>
+				{#if latestAt !== null && latestAt > 0}
+					<div class="past" style:width={pct(latestAt)}></div>
 				{/if}
 			</div>
 
@@ -127,8 +161,11 @@
 						style:left={pct(geometry.positions[i])}
 					></span>
 				{/each}
-				{#if nowAt !== null}
-					<span class="now" style:left={pct(nowAt)}></span>
+				{#if latestAt !== null}
+					<span class="latest" style:left={pct(latestAt)}></span>
+				{/if}
+				{#if clockAt !== null}
+					<span class="clock" style:left={pct(clockAt)}></span>
 				{/if}
 			</div>
 
@@ -148,14 +185,22 @@
 			{#if showStart}
 				<span class="edge start">{edgeLabel(frames[0])}</span>
 			{/if}
-			{#if nowAt !== null}
+			{#if latestAt !== null && showLatestLabel}
 				<!-- Centred on the marker, except at the ends of the track — a
-				     cold-start manifest puts "now" on the left edge. -->
+				     cold-start manifest puts the hinge on the left edge. -->
 				<span
-					class="edge at-now"
-					class:flush-start={nowAt <= 0.02}
-					class:flush-end={nowAt >= 0.98}
-					style:left={pct(nowAt)}>{t().loop.now}</span
+					class="edge at-latest"
+					class:flush-start={latestAt <= 0.02}
+					class:flush-end={latestAt >= 0.98}
+					style:left={pct(latestAt)}>{t().loop.latest}</span
+				>
+			{/if}
+			{#if clockAt !== null}
+				<span
+					class="edge at-clock"
+					class:flush-start={clockAt <= 0.02}
+					class:flush-end={clockAt >= 0.98}
+					style:left={pct(clockAt)}>{t().loop.now}</span
 				>
 			{/if}
 			{#if showEnd}
@@ -322,7 +367,8 @@
 		opacity: 0.7;
 	}
 
-	.now {
+	/* The hinge: a plain dark bar in the text colour, the end of the hatching. */
+	.latest {
 		position: absolute;
 		top: 0;
 		width: 2px;
@@ -330,6 +376,30 @@
 		border-radius: 1px;
 		background: var(--ink);
 		transform: translate(-50%, -50%);
+	}
+
+	/* Wall-clock now: a thinner, brighter line carrying a small triangle, so
+	   the two marks are told apart by shape as well as by colour. */
+	.clock {
+		position: absolute;
+		top: 0;
+		width: 1.5px;
+		height: 1.35rem;
+		background: var(--accent);
+		transform: translate(-50%, -50%);
+	}
+
+	.clock::before {
+		content: '';
+		position: absolute;
+		left: 50%;
+		top: -0.16rem;
+		width: 0;
+		height: 0;
+		border-left: 0.28rem solid transparent;
+		border-right: 0.28rem solid transparent;
+		border-top: 0.34rem solid var(--accent);
+		transform: translateX(-50%);
 	}
 
 	/* Transparent and the full height of the rail: the decoration underneath
@@ -405,17 +475,26 @@
 		right: 0;
 	}
 
-	.edge.at-now {
+	.edge.at-latest,
+	.edge.at-clock {
 		transform: translateX(-50%);
-		color: var(--ink);
 		font-weight: 600;
 	}
 
-	.edge.at-now.flush-start {
+	.edge.at-latest {
+		color: var(--ink);
+	}
+
+	/* Same colour as its marker: the label and the line are one object. */
+	.edge.at-clock {
+		color: var(--accent);
+	}
+
+	.edge.flush-start {
 		transform: none;
 	}
 
-	.edge.at-now.flush-end {
+	.edge.flush-end {
 		transform: translateX(-100%);
 	}
 

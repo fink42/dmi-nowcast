@@ -7,11 +7,18 @@
  * carries one thing the grids do not: the global confidence scalar.
  */
 import { apiUrl, NoDataError } from './manifest';
-import type { PointForecast } from './sampler';
+import type { PointForecast, RainSample } from './sampler';
 
 interface ForecastPointLead {
 	lead_min: number;
 	p_rain: number | null;
+}
+
+/** One step of the advected rain field, as the endpoint serves it. */
+interface ForecastPointRain {
+	lead_min: number;
+	valid_ts_utc: string;
+	mm_h: number | null;
 }
 
 interface ForecastPointResponse {
@@ -30,7 +37,34 @@ interface ForecastPointResponse {
 	 * is why the mapping below normalises one into the other.
 	 */
 	observed_mm_h?: number | null;
+	/**
+	 * When the cycle behind this answer was computed. Additive, and read here
+	 * only to document the contract: the countdown the panel applies uses the
+	 * manifest's stamp, which is available on this path too (the fallback
+	 * exists because the *grids* could not be read, not the manifest).
+	 */
+	generated_at_utc?: string | null;
+	/**
+	 * The advected rain field at this point, one entry per overlay lead —
+	 * additive, so absent from an older sidecar and null from a cycle that
+	 * produced none. Both map to an empty series, which the headline reads as
+	 * "no field evidence", never as "dry".
+	 */
+	forecast_mm_h?: ForecastPointRain[] | null;
 	confidence: number | null;
+}
+
+/**
+ * The served series as `RainSample`s: ascending in lead, and entries without
+ * a usable timestamp dropped, exactly as `forecastSeriesArtifacts` does on the
+ * client-side path. The two paths must answer the same question the same way.
+ */
+function rainSeriesOf(served: ForecastPointRain[] | null | undefined): RainSample[] {
+	if (!Array.isArray(served)) return [];
+	return served
+		.filter((s) => typeof s.valid_ts_utc === 'string' && s.valid_ts_utc.trim() !== '')
+		.map((s) => ({ leadMin: s.lead_min, validTsUtc: s.valid_ts_utc, mmH: s.mm_h ?? null }))
+		.sort((a, b) => a.leadMin - b.leadMin);
 }
 
 /**
@@ -57,6 +91,7 @@ export async function fetchPointForecast(
 		etaMin: body.eta_min,
 		intensityMmH: body.intensity_mm_h,
 		observedMmH: body.observed_mm_h ?? null,
+		rainSeries: rainSeriesOf(body.forecast_mm_h),
 		// The endpoint serves no motion vector, and this path exists precisely
 		// because the grids could not be read. Null is the honest answer.
 		motion: null,

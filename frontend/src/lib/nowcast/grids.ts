@@ -6,7 +6,14 @@
  */
 import { artifactUrl, type ArtifactEntry, type Manifest } from './manifest';
 import { decodeGray8Png, type Gray8Image } from './png';
-import { motionArtifacts, observedArtifact, productArtifacts, type DecodedGrids } from './sampler';
+import {
+	forecastSeriesArtifacts,
+	motionArtifacts,
+	observedArtifact,
+	productArtifacts,
+	type DecodedGrid,
+	type DecodedGrids
+} from './sampler';
 
 async function loadArtifact(entry: ArtifactEntry): Promise<Gray8Image> {
 	const res = await fetch(artifactUrl(entry.filename));
@@ -34,10 +41,15 @@ export async function loadGrids(manifest: Manifest): Promise<DecodedGrids> {
 			grids.intensity = { entry, image };
 		}
 	});
-	// Both extras are optional and independent, so neither waits on the other.
-	const [motion, observed] = await Promise.all([loadMotion(manifest), loadObserved(manifest)]);
+	// The extras are optional and independent, so none waits on another.
+	const [motion, observed, forecastSeries] = await Promise.all([
+		loadMotion(manifest),
+		loadObserved(manifest),
+		loadForecastSeries(manifest)
+	]);
 	grids.motion = motion;
 	grids.observed = observed;
+	grids.forecastSeries = forecastSeries;
 	return grids;
 }
 
@@ -73,5 +85,25 @@ async function loadObserved(manifest: Manifest): Promise<DecodedGrids['observed'
 	} catch (err) {
 		console.warn('observed rain grid unavailable', err);
 		return undefined;
+	}
+}
+
+/**
+ * This cycle's advected rain field, one grid per overlay lead. As forgiving
+ * as the two above and for a sharper reason: this series is what the headline
+ * reads, and a partial series would be read as a shorter forecast rather than
+ * as a failed download. So it is all of it or none of it — an empty array,
+ * which the headline treats as "no field evidence" and answers from the
+ * ensemble ETA instead. It never throws.
+ */
+export async function loadForecastSeries(manifest: Manifest): Promise<DecodedGrid[]> {
+	const entries = forecastSeriesArtifacts(manifest);
+	if (entries.length === 0) return [];
+	try {
+		const images = await Promise.all(entries.map(loadArtifact));
+		return entries.map((entry, i) => ({ entry, image: images[i] }));
+	} catch (err) {
+		console.warn('advected rain grids unavailable', err);
+		return [];
 	}
 }

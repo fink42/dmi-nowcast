@@ -6,17 +6,25 @@
  * boundary: radar timestamps into the viewer's local clock.
  */
 import type { Catalog, Locale } from '$lib/i18n';
-import type { PointForecast } from '$lib/nowcast/sampler';
+import type { PointForecast, RainSample } from '$lib/nowcast/sampler';
 
-/** Below this many minutes an ETA means "it is already raining here". */
+/**
+ * An ensemble ETA at or below this many minutes has already run out: the
+ * cycle's first-arrival product is saying the rain reached this point at or
+ * before the moment we are asking about. It is *not* a claim that it is
+ * raining now — the ETA product is cumulative first arrival, so it sticks at
+ * zero for the rest of the cycle once a cell has passed over — which is why
+ * the decision below hands that case to the rain field rather than to a
+ * headline.
+ */
 export const RAINING_NOW_MIN = 1.5;
 
 /**
- * Observed rain rate (mm/h) at or above which the radar is saying it rains
- * here now. Mirrors the sidecar's `forecast.rain_threshold_mm_h` (default
- * 0.5 ≈ 18 dBZ, genuine light rain), applied to the same statistic: the
- * observation grid is the native field reduced by block-wise p90, so this is
- * the `detection_stat: p90` test the sidecar's own `raining_now` performs.
+ * Rain rate (mm/h) at or above which we say it is raining at a point.
+ * Mirrors the sidecar's `forecast.rain_threshold_mm_h` (default 0.5 ≈ 18 dBZ,
+ * genuine light rain) and is applied to the same statistic: the rain grids
+ * are the native field reduced by block-wise p90, so this is the
+ * `detection_stat: p90` test the sidecar's own `raining_now` performs.
  * Change it only together with that setting.
  */
 export const RAINING_NOW_MM_H = 0.5;
@@ -62,34 +70,151 @@ export function countdownEtaMin(
 
 export type Headline = 'raining-now' | 'eta' | 'no-rain';
 
-/**
- * Which sentence the panel leads with.
- *
- * The observation wins. The ETA product answers "when does the next shower
- * reach this pixel", and on the trailing edge of rain that is happily some
- * *later* cell 16 minutes out — while the radar is showing rain over the
- * point right now. Telling someone standing in the rain that it starts in a
- * quarter of an hour is the one way this panel can be obviously, visibly
- * wrong, so a measurement at or above the detection threshold outranks any
- * forecast. `observedMmH` null is not dry: a cycle with no observation grid,
- * a nodata pixel and the server path all land there, and all of them fall
- * back to the ETA rule rather than asserting anything.
- *
- * Otherwise it is the ETA *as of now* — pass the `countdownEtaMin` value, not
- * the forecast's own field, or the headline flips a cycle late.
- */
-export function headlineKind(etaMin: number | null, observedMmH: number | null): Headline {
-	if (observedMmH !== null && observedMmH >= RAINING_NOW_MM_H) return 'raining-now';
-	if (etaMin === null) return 'no-rain';
-	return etaMin <= RAINING_NOW_MIN ? 'raining-now' : 'eta';
+/** The instants of a rain series, or null when any of them is unusable. */
+function seriesTimes(series: readonly RainSample[]): number[] | null {
+	const times = series.map((s) => Date.parse(s.validTsUtc));
+	// One frame we cannot place in time makes the ordering of all of them a
+	// guess, and this series is only useful as a function of time. Better to
+	// say nothing than to interpolate across a hole of unknown width.
+	return times.every((t) => Number.isFinite(t)) ? times : null;
 }
 
-export function headline(t: Catalog, etaMin: number | null, observedMmH: number | null): string {
-	switch (headlineKind(etaMin, observedMmH)) {
+/**
+ * The rain rate over the point at wall-clock `nowMs`, in mm/h, read off the
+ * deterministic advected field — the same field the loop draws.
+ *
+ * The series is sampled at discrete leads (0, 10 … 60 min from the cycle's
+ * generation), and "now" almost never lands on one of them, so the value is
+ * interpolated linearly in time between the two entries bracketing it. Before
+ * the first entry and after the last the nearest one is used unchanged rather
+ * than extrapolated.
+ *
+ * Null means "we do not know" and must never be shown as dry: an empty series
+ * (a cycle that served no field), a nodata pixel at either end of the bracket,
+ * or timestamps that will not parse all land there. Pure, and it never throws.
+ */
+export function rainNowMmH(series: readonly RainSample[], nowMs: number): number | null {
+	if (series.length === 0 || !Number.isFinite(nowMs)) return null;
+	const times = seriesTimes(series);
+	if (!times) return null;
+	// Ascending in time, whatever order the caller had it in.
+	const order = Array.from({ length: series.length }, (_, i) => i).sort(
+		(a, b) => times[a] - times[b]
+	);
+	const at = (k: number) => ({ t: times[order[k]], mmH: series[order[k]].mmH });
+
+	const first = at(0);
+	if (nowMs <= first.t) return first.mmH;
+	const last = at(order.length - 1);
+	if (nowMs >= last.t) return last.mmH;
+
+	for (let k = 0; k < order.length - 1; k++) {
+		const a = at(k);
+		const b = at(k + 1);
+		if (nowMs < a.t || nowMs > b.t) continue;
+		// A nodata end of the bracket poisons the interpolation: there is no
+		// honest number between "2 mm/h" and "no idea".
+		if (a.mmH === null || b.mmH === null) return null;
+		if (b.t === a.t) return a.mmH;
+		return a.mmH + ((nowMs - a.t) / (b.t - a.t)) * (b.mmH - a.mmH);
+	}
+	return null;
+}
+
+/**
+ * Minutes from `nowMs` until the field is next wet at this point, or null when
+ * it never is within the series.
+ *
+ * Only entries *after* now count: a wet entry in the past is what already
+ * happened, and one exactly at now is the business of `rainNowMmH`. Entries
+ * with no readable value or timestamp are skipped rather than treated as dry.
+ */
+export function nextWetMinutes(
+	series: readonly RainSample[],
+	nowMs: number,
+	threshold: number = RAINING_NOW_MM_H
+): number | null {
+	if (!Number.isFinite(nowMs)) return null;
+	let best: number | null = null;
+	for (const sample of series) {
+		if (sample.mmH === null || sample.mmH < threshold) continue;
+		const t = Date.parse(sample.validTsUtc);
+		if (!Number.isFinite(t) || t <= nowMs) continue;
+		const minutes = (t - nowMs) / 60000;
+		if (best === null || minutes < best) best = minutes;
+	}
+	return best;
+}
+
+/** The headline, and the arrival time the same decision implies. */
+export interface HeadlineDecision {
+	kind: Headline;
+	/** Minutes until rain arrives — only ever set on the `eta` kind. */
+	etaMin: number | null;
+}
+
+/**
+ * Which sentence the panel leads with, and the arrival it implies.
+ *
+ * The rule is that the headline is read from the same field the loop draws,
+ * sampled at the same wall-clock instant the loop's clock marker sits on. Text
+ * and picture then agree by construction, which is the only way they can be
+ * made to agree at all.
+ *
+ * Two tempting inputs are deliberately *not* used:
+ *
+ *  - **The raw observation.** The newest composite is 14–24 min old at any
+ *    moment a viewer looks — DMI's own delay plus a 10 min composite cadence
+ *    plus a cycle that serves for up to 10 min — so it is a measurement of the
+ *    recent past, not of now. Letting it win outright is how the panel came to
+ *    say "it is raining here now" while the loop's frame for that same minute
+ *    showed the point dry. It is still sampled and still served; it is simply
+ *    not evidence about *now*.
+ *  - **A zero ETA on its own.** The ensemble ETA is a cumulative first-arrival
+ *    product: once a cell was over the point at the first ensemble step it
+ *    stays at 0 for the whole cycle, long after that cell has gone. A zero
+ *    therefore means "the ensemble says rain reached you by now", which the
+ *    field can and does contradict — and when it does, the field wins and the
+ *    next wet step of the same field becomes the arrival time.
+ *
+ * `etaNow` must be the counted-down value from `countdownEtaMin`, not the
+ * cycle's own field, or the decision flips a cycle late.
+ *
+ * A cycle that served no field at all (an older sidecar, or a download that
+ * failed) leaves the series empty, and the decision falls back to the ETA rule
+ * as it stood before any of this existed: absence of evidence is not evidence
+ * of a dry sky.
+ */
+export function headlineDecision(
+	etaNow: number | null,
+	series: readonly RainSample[],
+	nowMs: number
+): HeadlineDecision {
+	if (series.length === 0) {
+		// Legacy path: no field to read, so the ensemble is all there is.
+		if (etaNow === null) return { kind: 'no-rain', etaMin: null };
+		if (etaNow <= RAINING_NOW_MIN) return { kind: 'raining-now', etaMin: null };
+		return { kind: 'eta', etaMin: etaNow };
+	}
+
+	const rainNow = rainNowMmH(series, nowMs);
+	if (rainNow !== null && rainNow >= RAINING_NOW_MM_H) return { kind: 'raining-now', etaMin: null };
+	if (etaNow === null) return { kind: 'no-rain', etaMin: null };
+	if (etaNow > RAINING_NOW_MIN) return { kind: 'eta', etaMin: etaNow };
+
+	// The sticky first-arrival case: the ensemble says the rain arrived by
+	// now, the field for now says it is not here. Answer with the field's own
+	// next wet step, and if it has none, with no rain.
+	const next = nextWetMinutes(series, nowMs);
+	return next === null ? { kind: 'no-rain', etaMin: null } : { kind: 'eta', etaMin: next };
+}
+
+export function headline(t: Catalog, decision: HeadlineDecision): string {
+	switch (decision.kind) {
 		case 'raining-now':
 			return t.panel.headlineRainingNow;
 		case 'eta':
-			return t.panel.headlineEta(Math.round(etaMin ?? 0));
+			return t.panel.headlineEta(Math.round(decision.etaMin ?? 0));
 		default:
 			return t.panel.headlineNoRain;
 	}

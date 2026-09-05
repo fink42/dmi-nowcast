@@ -2,10 +2,11 @@
  * The server fallback's mapping, against a stubbed `fetch`.
  *
  * It has to produce the same shape as the client-side sampler, including the
- * fields it cannot answer — and the field that matters most here is the newest
- * one: `observed_mm_h` is additive, so a sidecar that predates it simply omits
- * the key, and an omitted key must arrive as null ("no measurement") rather
- * than as `undefined` leaking into the headline rule.
+ * fields it cannot answer — and the fields that matter most here are the
+ * additive ones. `observed_mm_h` and `forecast_mm_h` are both absent from a
+ * sidecar that predates them, and both absences have to arrive as something
+ * the headline reads as "we do not know": null for the observation, an empty
+ * series for the field, never `undefined` leaking through.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fetchPointForecast } from './forecast';
@@ -37,11 +38,17 @@ const BODY = {
 	eta_min: 16,
 	intensity_mm_h: 2.4,
 	observed_mm_h: 1.2,
+	generated_at_utc: '2026-08-28T12:01:30+00:00',
+	forecast_mm_h: [
+		{ lead_min: 0, valid_ts_utc: '2026-08-28T12:01:30+00:00', mm_h: 0.1 },
+		{ lead_min: 10, valid_ts_utc: '2026-08-28T12:11:30+00:00', mm_h: 2.2 },
+		{ lead_min: 20, valid_ts_utc: '2026-08-28T12:21:30+00:00', mm_h: null }
+	],
 	confidence: 0.72
 };
 
 describe('fetchPointForecast', () => {
-	it('camel-cases the body, observation included', async () => {
+	it('camel-cases the body, observation and rain field included', async () => {
 		stubFetch(() => json(BODY));
 		const forecast = await fetchPointForecast(55.6761, 12.5683);
 		expect(forecast).toEqual({
@@ -55,6 +62,11 @@ describe('fetchPointForecast', () => {
 			etaMin: 16,
 			intensityMmH: 2.4,
 			observedMmH: 1.2,
+			rainSeries: [
+				{ leadMin: 0, validTsUtc: '2026-08-28T12:01:30+00:00', mmH: 0.1 },
+				{ leadMin: 10, validTsUtc: '2026-08-28T12:11:30+00:00', mmH: 2.2 },
+				{ leadMin: 20, validTsUtc: '2026-08-28T12:21:30+00:00', mmH: null }
+			],
 			motion: null,
 			confidence: 0.72,
 			calibrated: true,
@@ -78,6 +90,36 @@ describe('fetchPointForecast', () => {
 	it('keeps a measured zero, which is dry rather than unknown', async () => {
 		stubFetch(() => json({ ...BODY, observed_mm_h: 0 }));
 		expect((await fetchPointForecast(55.6761, 12.5683))!.observedMmH).toBe(0);
+	});
+
+	it('reads a missing or null rain field as an empty series, not as dry', async () => {
+		// A sidecar older than the product omits the key entirely.
+		const { forecast_mm_h: _omitted, ...older } = BODY;
+		stubFetch(() => json(older));
+		expect((await fetchPointForecast(55.6761, 12.5683))!.rainSeries).toEqual([]);
+		// A cycle that produced none sends an explicit null.
+		stubFetch(() => json({ ...BODY, forecast_mm_h: null }));
+		expect((await fetchPointForecast(55.6761, 12.5683))!.rainSeries).toEqual([]);
+		// Empty is empty; the headline falls back to the ensemble ETA there.
+		stubFetch(() => json({ ...BODY, forecast_mm_h: [] }));
+		expect((await fetchPointForecast(55.6761, 12.5683))!.rainSeries).toEqual([]);
+	});
+
+	it('sorts the rain field by lead and drops entries with no instant', async () => {
+		// The client-side path drops unstamped entries too: a step we cannot
+		// place on the clock is worse than one fewer sample.
+		stubFetch(() =>
+			json({
+				...BODY,
+				forecast_mm_h: [
+					{ lead_min: 20, valid_ts_utc: '2026-08-28T12:21:30+00:00', mm_h: 1 },
+					{ lead_min: 10, valid_ts_utc: '', mm_h: 5 },
+					{ lead_min: 0, valid_ts_utc: '2026-08-28T12:01:30+00:00', mm_h: 3 }
+				]
+			})
+		);
+		const forecast = await fetchPointForecast(55.6761, 12.5683);
+		expect(forecast!.rainSeries.map((s) => s.leadMin)).toEqual([0, 20]);
 	});
 
 	it('asks the endpoint for the point it was given', async () => {

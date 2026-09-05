@@ -46,7 +46,13 @@ export const en: Catalog = {
 	loop: {
 		play: 'Play',
 		pause: 'Pause',
+		/**
+		 * Two marks on one track, and they are not the same instant: `latest` is
+		 * the newest radar image (14–24 min old whenever anyone looks) and `now`
+		 * is the viewer's own clock, out among the forecast frames.
+		 */
 		now: 'Now',
+		latest: 'Latest',
 		lead: (min: number) => `+${min} min`,
 		lag: (min: number) => `−${min} min`,
 		frameOf: (i: number, n: number) => `Frame ${i} of ${n}`,

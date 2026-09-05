@@ -42,6 +42,13 @@ const PROJ4 = '+proj=stere +lat_0=56 +lon_0=10.5666 +lat_ts=56 +ellps=WGS84 +uni
  * grids — the leads the isotonic curves were actually fitted for.
  */
 const OVERLAY_LEADS = [10, 20, 30, 40, 50, 60];
+/**
+ * The leads the deterministic advected field is served on: the overlay leads
+ * plus lead 0, which is the radar field advected forward by its own age — the
+ * forecast for the instant the cycle was generated. The panel's headline is
+ * read from this series, so it has to cover the same instants the loop draws.
+ */
+const FORECAST_LEADS = [0, ...OVERLAY_LEADS];
 const PROB_LEADS = [10, 20, 30, 45, 60];
 /**
  * Lead times scanned when asking "when does rain first reach this pixel?"
@@ -86,6 +93,9 @@ const SPECS = {
 	// same range — because it is the same physical quantity, measured rather
 	// than forecast.
 	observed_mm_h: [0, 100],
+	// The advected field is the same physical quantity as the observation,
+	// forecast rather than measured, and is quantised identically.
+	forecast_mm_h: [0, 100],
 	motion_east_kmh: [-120, 120],
 	motion_north_kmh: [-120, 120]
 };
@@ -123,17 +133,23 @@ function rainAt(col, row, leadMin) {
 }
 
 /**
- * The rain the radar "measures" at one product pixel: the 90th percentile of
- * the FACTOR x FACTOR native block behind it, at lead 0. Percentile rather
- * than max because that is what the sidecar reduces with — the composite is
- * column-max reflectivity, so a single hot virga pixel would otherwise decide
- * whether it is raining — and linear interpolation between order statistics
- * because that is numpy's default and the sidecar is numpy.
+ * The rain at one product pixel `leadMin` minutes after the radar frame: the
+ * 90th percentile of the FACTOR x FACTOR native block behind it. Percentile
+ * rather than max because that is what the sidecar reduces with — the
+ * composite is column-max reflectivity, so a single hot virga pixel would
+ * otherwise decide whether it is raining — and linear interpolation between
+ * order statistics because that is numpy's default and the sidecar is numpy.
+ *
+ * At lead 0 this is the observation; at `FRAME_AGE_MIN + lead` it is the
+ * advected forecast for the overlay frame of that lead. One function, because
+ * the two must agree wherever they describe the same instant.
  */
-function observedAt(col, row) {
+function blockP90(col, row, leadMin) {
 	const block = [];
 	for (let dr = 0; dr < FACTOR; dr++) {
-		for (let dc = 0; dc < FACTOR; dc++) block.push(rainAt(col * FACTOR + dc, row * FACTOR + dr, 0));
+		for (let dc = 0; dc < FACTOR; dc++) {
+			block.push(rainAt(col * FACTOR + dc, row * FACTOR + dr, leadMin));
+		}
 	}
 	block.sort((a, b) => a - b);
 	const pos = 0.9 * (block.length - 1);
@@ -304,7 +320,12 @@ function productPng(product, leadMin) {
 				} else if (product === 'observed_mm_h') {
 					// A measurement, so dry is 0.0 and not nodata: "no rain here"
 					// is something the radar can say, unlike "no arrival".
-					value = observedAt(col, row);
+					value = blockP90(col, row, 0);
+				} else if (product === 'forecast_mm_h') {
+					// The field the overlay frame of this lead draws, on the
+					// product grid — frame-age corrected, so lead 0 is already
+					// FRAME_AGE_MIN ahead of the radar image.
+					value = blockP90(col, row, FRAME_AGE_MIN + leadMin);
 				} else if (product === 'p_rain') {
 					const mm = rainAt(nCol, nRow, leadMin);
 					value = Math.min(1, mm / 4);
@@ -352,17 +373,25 @@ function manifest() {
 	});
 	const productShape = [PRODUCT.rows, PRODUCT.cols];
 	const overlayShape = [NATIVE.rows, NATIVE.cols];
-	/** Overlay entry, v2: every frame says what it is and when it is valid. */
-	const overlayEntry = (filename, lead) => ({
+	/** When a frame is valid: measurements at their own time, forecasts frame-age corrected. */
+	const validAt = (lead, kind) =>
+		new Date(
+			Date.parse(s.iso) + (kind === 'forecast' ? FRAME_AGE_MIN + lead : lead) * 60_000
+		).toISOString();
+	/**
+	 * Overlay entry, v2: every frame says what it is and when it is valid.
+	 * The kind is explicit rather than inferred from the sign of the lead,
+	 * because lead 0 carries two frames — the radar image, and the same field
+	 * advected forward by the frame age.
+	 */
+	const overlayEntry = (filename, lead, kind = lead > 0 ? 'forecast' : 'observation') => ({
 		filename,
 		product: 'overlay',
 		lead_min: lead,
-		kind: lead > 0 ? 'forecast' : 'observation',
+		kind,
 		// Forecast validity is frame-age corrected the way the sidecar does it:
 		// radar_ts + frame_age + lead. An observation is valid when it was taken.
-		valid_ts_utc: new Date(
-			Date.parse(s.iso) + (lead > 0 ? FRAME_AGE_MIN + lead : lead) * 60_000
-		).toISOString(),
+		valid_ts_utc: validAt(lead, kind),
 		encoding: 'rgba8',
 		shape: overlayShape
 	});
@@ -454,7 +483,25 @@ function manifest() {
 			...HISTORY_MIN.map((lead) =>
 				overlayEntry(`overlay_now_${stamp(lead).text}.png`, lead)
 			),
+			// The advected field, one grid per overlay lead — what the headline
+			// is read from, sampled at the instant the loop's clock marker sits
+			// on. Lead 0 is the radar field advected forward by its own age.
+			...FORECAST_LEADS.map((lead) => ({
+				...gridEntry(
+					`forecast_mm_h_${lead}min_${s.text}.png`,
+					'forecast_mm_h',
+					lead,
+					SPECS.forecast_mm_h,
+					productShape,
+					'mm/h'
+				),
+				kind: 'forecast',
+				valid_ts_utc: validAt(lead, 'forecast')
+			})),
 			overlayEntry(`overlay_now_${s.text}.png`, 0),
+			// The second lead-0 overlay: the same instant the lead-0 field
+			// describes, and listed after the observation it ties with.
+			overlayEntry(`overlay_0min_${s.text}.png`, 0, 'forecast'),
 			...OVERLAY_LEADS.map((lead) => overlayEntry(`overlay_${lead}min_${s.text}.png`, lead))
 		]
 	};
@@ -507,14 +554,20 @@ createServer(async (req, res) => {
 		const lead = leadText
 			? Number(leadText)
 			: Math.round((stampMs(cycleText) - stampMs(stamp().text)) / 60_000);
+		// A `…_Nmin_` overlay is a forecast frame and is drawn frame-age
+		// corrected, so it depicts the instant its `valid_ts_utc` claims; a
+		// `…_now_` one is the measurement itself.
 		const png =
-			product === 'overlay' ? overlayPng(lead) : productPng(product, product === 'p_rain' ? lead : 0);
+			product === 'overlay'
+				? overlayPng(leadText ? FRAME_AGE_MIN + lead : lead)
+				: productPng(product, product === 'p_rain' || product === 'forecast_mm_h' ? lead : 0);
 		return send(200, png, 'image/png', { 'cache-control': 'public, max-age=300, immutable' });
 	}
 	if (url.pathname === '/forecast') {
 		const lat = Number(url.searchParams.get('lat'));
 		const lon = Number(url.searchParams.get('lon'));
 		const s = stamp();
+		const generated = new Date(Date.parse(s.iso) + FRAME_AGE_MIN * 60_000);
 		return send(
 			200,
 			JSON.stringify({
@@ -527,13 +580,19 @@ createServer(async (req, res) => {
 				per_lead: PROB_LEADS.map((lead) => ({ lead_min: lead, p_rain: 0.5 })),
 				eta_min: 18,
 				intensity_mm_h: 2.4,
-				// Fixed, like every other number on this endpoint, and chosen
-				// above the 0.5 mm/h detection threshold on purpose: the server
-				// fallback is otherwise never seen in development, and this is
-				// the case it exists to get right — rain measured here now, with
-				// the next cell's arrival still 18 min out. The client-side path
-				// samples the real synthetic field instead.
+				// Fixed, like every other number on this endpoint. Deliberately
+				// the incident's own shape: a measurement above the 0.5 mm/h
+				// threshold (the composite behind it is minutes old) over a
+				// field that is dry now and wet again at +30. The headline must
+				// read the field, not the measurement, and so must say "rain in
+				// about 18 min" here rather than "it is raining here now".
 				observed_mm_h: 1.2,
+				generated_at_utc: generated.toISOString(),
+				forecast_mm_h: FORECAST_LEADS.map((lead) => ({
+					lead_min: lead,
+					valid_ts_utc: new Date(generated.getTime() + lead * 60_000).toISOString(),
+					mm_h: lead >= 30 ? 2.4 : 0
+				})),
 				confidence: 0.72
 			}),
 			'application/json'

@@ -35,6 +35,20 @@ export type ProductName =
 	 * existed, so every reader of it must tolerate `undefined`.
 	 */
 	| 'observed_mm_h'
+	/**
+	 * The deterministic advected rain field, one grid per overlay lead
+	 * (0, 10 … 60 min), on the product grid and with the same mm/h
+	 * quantisation as `observed_mm_h`. Lead 0 is the radar field advected
+	 * forward by the frame age — the forecast for the instant the cycle was
+	 * generated, not the measurement it was made from.
+	 *
+	 * This is the field the loop draws, which is why the headline is read
+	 * from it: sampling it at wall-clock now is the only way the sentence and
+	 * the picture can agree by construction. Additive in schema v2 — absent
+	 * from every manifest written before it existed, and absence means "we do
+	 * not know", never "it is dry".
+	 */
+	| 'forecast_mm_h'
 	| 'motion_east_kmh'
 	| 'motion_north_kmh';
 
@@ -167,15 +181,24 @@ export async function fetchManifest(signal?: AbortSignal): Promise<Manifest> {
 }
 
 /**
- * Overlay frames in animation order, ordered by lead (0 = "now").
+ * Overlay frames in animation order, ordered by lead (0 = the radar frame).
  *
  * Schema v2's observation history carries negative leads, so ascending order
  * puts the past first for free: −20, −10, 0, +10 …
+ *
+ * Two frames share lead 0: the radar image itself, and the deterministic
+ * field advected forward by the frame age — the forecast for the instant the
+ * cycle was generated. The measurement always comes first, and that tie-break
+ * is decided here rather than left to the manifest's own ordering: the frame
+ * the timeline calls "the latest observation" is the hinge between what was
+ * measured and what is extrapolated, and it may not move because the sidecar
+ * emitted its artifacts in a different order.
  */
 export function overlayFrames(manifest: Manifest): ArtifactEntry[] {
+	const rank = (entry: ArtifactEntry) => (frameKind(entry) === 'observation' ? 0 : 1);
 	return manifest.artifacts
 		.filter((a) => a.product === 'overlay')
-		.sort((a, b) => (a.lead_min ?? 0) - (b.lead_min ?? 0));
+		.sort((a, b) => (a.lead_min ?? 0) - (b.lead_min ?? 0) || rank(a) - rank(b));
 }
 
 /**

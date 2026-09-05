@@ -116,6 +116,21 @@ export interface LeadProbability {
 	pRain: number | null;
 }
 
+/**
+ * One step of the deterministic advected rain field at a point: what the loop
+ * draws over this pixel at `validTsUtc`, in mm/h.
+ *
+ * `mmH` null is a nodata pixel — outside coverage, or a lead the field could
+ * not fill — and reads as "we do not know", never as "dry". `validTsUtc` is
+ * the manifest's own stamp, already frame-age corrected, because placing this
+ * series on the wall clock is the whole reason it exists.
+ */
+export interface RainSample {
+	leadMin: number;
+	validTsUtc: string;
+	mmH: number | null;
+}
+
 export interface PointForecast {
 	lat: number;
 	lon: number;
@@ -132,8 +147,22 @@ export interface PointForecast {
 	 * grid (any manifest older than the product) or the pixel is nodata, and
 	 * those two must stay indistinguishable from "we don't know": a null here
 	 * may never be read as "it is dry here".
+	 *
+	 * Kept, sampled and served — but not read by the headline any more. The
+	 * newest composite is 14–24 min old at any moment a viewer looks, so this
+	 * is a measurement of the recent past, and letting it lead was how the
+	 * panel came to say "it is raining here now" over a loop showing the point
+	 * dry. See `headlineDecision` in `$lib/format`.
 	 */
 	observedMmH: number | null;
+	/**
+	 * The deterministic advected rain field over this point, one entry per
+	 * overlay lead — the same field the loop draws, sampled at the same pixel.
+	 * Empty when the cycle served none (a sidecar older than the product, or a
+	 * download that failed), which the headline treats as "no field evidence"
+	 * and falls back to the ensemble ETA for.
+	 */
+	rainSeries: RainSample[];
 	/**
 	 * Which way the echo over this point is moving. Null whenever there is no
 	 * estimate — a cycle without motion grids, a nodata pixel, or the server
@@ -165,6 +194,12 @@ export interface DecodedGrids {
 	 * "it is raining here now" headline and nothing else.
 	 */
 	observed?: DecodedGrid;
+	/**
+	 * The advected rain field, ascending in lead. Absent or empty on a cycle
+	 * that served none — the headline then has no field to read and says so by
+	 * falling back to the ensemble ETA.
+	 */
+	forecastSeries?: DecodedGrid[];
 	/**
 	 * Cell motion, both components or neither — the sidecar writes them as a
 	 * pair and a single component says nothing. Absent on a cycle that served
@@ -206,11 +241,28 @@ export function samplePoint(
 		observedMmH: grids.observed
 			? sampleArtifact(grids.observed.image, grids.observed.entry, pixel)
 			: null,
+		rainSeries: sampleRainSeries(grids, pixel),
 		motion: sampleMotion(grids, pixel),
 		confidence: null,
 		calibrated: isCalibrated(manifest),
 		source: 'client'
 	};
+}
+
+/**
+ * The advected rain field at one pixel, one entry per lead. Empty when the
+ * cycle served no such grids — the caller distinguishes that from "dry" and
+ * must, so the emptiness is carried rather than filled with zeros.
+ */
+export function sampleRainSeries(grids: DecodedGrids, pixel: PixelIndex): RainSample[] {
+	const series = grids.forecastSeries;
+	if (!series || series.length === 0) return [];
+	return series.map(({ entry, image }) => ({
+		leadMin: entry.lead_min ?? 0,
+		// `forecastSeriesArtifacts` already dropped entries without a stamp.
+		validTsUtc: entry.valid_ts_utc ?? '',
+		mmH: sampleArtifact(image, entry, pixel)
+	}));
 }
 
 /**
@@ -249,6 +301,27 @@ export function observedArtifact(manifest: Manifest): ArtifactEntry | null {
 	return (
 		manifest.artifacts.find((a) => a.product === 'observed_mm_h' && (a.lead_min ?? 0) === 0) ?? null
 	);
+}
+
+/**
+ * This cycle's advected rain field, ascending in lead — the series the
+ * headline is read from. Empty on a manifest written before the product
+ * existed, which is a state every reader has to tolerate.
+ *
+ * An entry with no `valid_ts_utc` is dropped rather than dated by arithmetic:
+ * the whole point of the series is to be placed on the wall clock, and a
+ * frame whose instant we would have to guess (radar time? generated time?
+ * plus which frame age?) is worse than one fewer sample.
+ */
+export function forecastSeriesArtifacts(manifest: Manifest): ArtifactEntry[] {
+	return manifest.artifacts
+		.filter(
+			(a) =>
+				a.product === 'forecast_mm_h' &&
+				typeof a.valid_ts_utc === 'string' &&
+				a.valid_ts_utc.trim() !== ''
+		)
+		.sort((a, b) => (a.lead_min ?? 0) - (b.lead_min ?? 0));
 }
 
 /**

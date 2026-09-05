@@ -48,7 +48,13 @@ export const da = {
 	loop: {
 		play: 'Afspil',
 		pause: 'Pause',
+		/**
+		 * To mærker på samme spor, og de er ikke samme tidspunkt: `latest` er det
+		 * nyeste radarbillede (14–24 min gammelt, når nogen kigger), og `now` er
+		 * beskuerens eget ur ude blandt prognosebillederne.
+		 */
 		now: 'Nu',
+		latest: 'Seneste',
 		lead: (min: number) => `+${min} min`,
 		lag: (min: number) => `−${min} min`,
 		frameOf: (i: number, n: number) => `Billede ${i} af ${n}`,
