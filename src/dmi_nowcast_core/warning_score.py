@@ -44,6 +44,27 @@ rain came later than the ETA — the warning was early. The website's
 quality page is built on this convention; do not flip it here without
 flipping it there.
 
+**Pending** is the third outcome, and the reason it exists is that a
+report is built while the weather is still happening. A warning sent two
+minutes ago promises rain within the next forty; the gauge has not
+reported those forty minutes yet, so calling it a false alarm is not a
+measurement, it is an accusation the evidence cannot support. Pass
+``known_until`` — the last gauge slot end that station actually reported
+— and any warning whose window ``sent + lead + tolerance`` reaches past
+it, and which has claimed no onset, is PENDING: excluded from hits, false
+alarms, POD, FAR and the lead-error quantiles alike, and counted on its
+own. The same boundary applies to onsets: an unclaimed onset within
+``tolerance`` of ``known_until`` is pending rather than a miss, because
+DMI backfills late station reports and a slot near the edge can still
+change. Without ``known_until`` nothing is pending and the scoring is
+exactly what it was.
+
+A warning that HAS claimed an onset is never pending, even with its
+window still open: the onset is in the record, the claim is settled, and
+no later slot can unmake it. Demoting it would take a confirmed hit out
+of the numerator while leaving its onset in POD's denominator — turning
+a hit into a miss, which is worse than the bug this rule fixes.
+
 **A hit** is a warning with an onset in ``(sent, sent + lead + tolerance]``.
 The tolerance exists because the warning promises "rain within LEAD
 minutes" off a radar frame that is already 14–24 min old; a warning whose
@@ -357,7 +378,9 @@ class WarningOutcome:
 
     sent_utc: datetime
     eta_min: float | None
-    outcome: str  # "hit" | "false_alarm"
+    #: ``"hit"``, ``"false_alarm"``, or ``"pending"`` — the last only when
+    #: ``known_until`` says the window has not closed yet.
+    outcome: str
     onset_utc: datetime | None = None
     #: ``eta - (onset - sent)``, minutes. POSITIVE = the rain arrived
     #: SOONER than the ETA said, i.e. the warning was late and the user got
@@ -371,7 +394,9 @@ class OnsetOutcome:
     """One gauge onset and the warning (if any) that claimed it."""
 
     onset_utc: datetime
-    outcome: str  # "hit" | "miss"
+    #: ``"hit"``, ``"miss"``, or ``"pending"`` (an unclaimed onset too
+    #: close to ``known_until`` for the gauge's word to be final).
+    outcome: str
     sent_utc: datetime | None = None
     lead_error_min: float | None = None
 
@@ -415,6 +440,7 @@ def score_warnings(
     lead_min: int = DEFAULT_LEAD_MIN,
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
+    known_until: datetime | None = None,
 ) -> ScoreResult:
     """Match warnings to onsets; return per-warning, per-onset and totals.
 
@@ -427,9 +453,18 @@ def score_warnings(
     claims the earliest still-unclaimed onset inside its window
     ``(sent, sent + lead_min + tolerance_min]``. Warnings that claim
     nothing are false alarms; onsets nothing claimed are misses. Hence
-    ``hits + false_alarms == len(warnings)`` and
-    ``hits + misses == len(onsets)`` always hold, which is what makes POD
-    and FAR readable side by side.
+    ``hits + false_alarms == warnings`` and ``hits + misses == n_onsets −
+    pending_onsets`` always hold, which is what makes POD and FAR readable
+    side by side.
+
+    ``known_until`` is the last gauge slot end this station reported. Give
+    it and the scoring gains a third outcome — see the module docstring:
+    a warning whose window has not closed yet, and which has claimed no
+    onset, is ``pending`` rather than a false alarm, and an unclaimed
+    onset within ``tolerance_min`` of ``known_until`` is ``pending``
+    rather than a miss. Both are excluded from every rate. Omit it (the
+    default) and nothing is pending, which is the right behaviour for a
+    closed historical window.
 
     A second warning cannot inherit an onset an earlier warning already
     took: two warnings for one rain event means one of them was noise, and
@@ -441,6 +476,8 @@ def score_warnings(
     the onset definition it was produced under.
     """
     window = timedelta(minutes=lead_min + tolerance_min)
+    grace = timedelta(minutes=tolerance_min)
+    horizon = _as_utc(known_until, "known_until") if known_until is not None else None
     sent_list = sorted(
         ((_as_utc(sent, "sent_utc"), eta) for sent, eta in warnings),
         key=lambda pair: pair[0],
@@ -452,6 +489,7 @@ def score_warnings(
     warning_rows: list[WarningOutcome] = []
     lead_errors: list[float] = []
     hits = 0
+    pending = 0
     for sent, eta in sent_list:
         pick: int | None = None
         for i, onset in enumerate(onset_list):
@@ -464,6 +502,12 @@ def score_warnings(
             pick = i
             break
         if pick is None:
+            if horizon is not None and sent + window > horizon:
+                # The promise has not come due yet. Grading it now would
+                # only measure how recently the report was built.
+                pending += 1
+                warning_rows.append(WarningOutcome(sent, eta, "pending"))
+                continue
             warning_rows.append(WarningOutcome(sent, eta, "false_alarm"))
             continue
         onset = onset_list[pick]
@@ -481,29 +525,58 @@ def score_warnings(
     onset_rows = tuple(
         OnsetOutcome(
             onset,
-            "hit" if claimed_by[i] is not None else "miss",
+            _onset_outcome(claimed_by[i], onset, horizon, grace),
             claimed_by[i],
             claimed_error[i],
         )
         for i, onset in enumerate(onset_list)
     )
-    n_warnings = len(warning_rows)
-    false_alarms = n_warnings - hits
-    misses = len(onset_list) - hits
+    n_sent = len(warning_rows)
+    scored = n_sent - pending
+    false_alarms = scored - hits
+    pending_onsets = sum(1 for row in onset_rows if row.outcome == "pending")
+    misses = len(onset_list) - hits - pending_onsets
     summary = {
-        "warnings": n_warnings,
+        # ``warnings`` is the SCORED count, so hits + false_alarms adds up
+        # to it in the sentence the page writes. ``n_sent`` keeps the raw
+        # total honest alongside.
+        "warnings": scored,
+        "n_sent": n_sent,
+        "pending": pending,
         "hits": hits,
         "false_alarms": false_alarms,
         "misses": misses,
+        "pending_onsets": pending_onsets,
         "n_onsets": len(onset_list),
-        "pod": (hits / len(onset_list)) if onset_list else None,
-        "far": (false_alarms / n_warnings) if n_warnings else None,
+        "pod": (hits / (hits + misses)) if (hits + misses) else None,
+        "far": (false_alarms / scored) if scored else None,
         "lead_error_min": _quantiles(lead_errors),
         "lead_min": int(lead_min),
         "tolerance_min": int(tolerance_min),
         "dry_min": int(dry_min),
+        "known_until": horizon,
     }
     return ScoreResult(tuple(warning_rows), onset_rows, summary)
+
+
+def _onset_outcome(
+    claimed_by: datetime | None,
+    onset: datetime,
+    horizon: datetime | None,
+    grace: timedelta,
+) -> str:
+    """``hit`` / ``miss`` / ``pending`` for one onset.
+
+    An onset nothing claimed is only a miss once the gauge's word about
+    its neighbourhood is final. DMI backfills late station reports, so a
+    slot within ``tolerance`` of the last known one can still move, and
+    with it the onset instant a warning would have had to match.
+    """
+    if claimed_by is not None:
+        return "hit"
+    if horizon is not None and onset + grace > horizon:
+        return "pending"
+    return "miss"
 
 
 def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
@@ -513,22 +586,33 @@ def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
     the pooled populations rather than averaged, because a station with
     two warnings and a station with two hundred must not carry the same
     weight in a national number.
+
+    Pending warnings and pending onsets pool as their own counts and stay
+    out of every rate, exactly as they do per station — a station whose
+    window is still open must not drag the national FAR up for the
+    fifteen minutes before its gauge reports.
     """
     rows = list(results)
     warnings = [w for r in rows for w in r.warnings]
     onset_rows = [o for r in rows for o in r.onsets]
     hits = sum(1 for w in warnings if w.outcome == "hit")
-    false_alarms = len(warnings) - hits
+    pending = sum(1 for w in warnings if w.outcome == "pending")
+    scored = len(warnings) - pending
+    false_alarms = scored - hits
     misses = sum(1 for o in onset_rows if o.outcome == "miss")
+    pending_onsets = sum(1 for o in onset_rows if o.outcome == "pending")
     errors = [w.lead_error_min for w in warnings if w.lead_error_min is not None]
     out = {
-        "warnings": len(warnings),
+        "warnings": scored,
+        "n_sent": len(warnings),
+        "pending": pending,
         "hits": hits,
         "false_alarms": false_alarms,
         "misses": misses,
+        "pending_onsets": pending_onsets,
         "n_onsets": len(onset_rows),
-        "pod": (hits / len(onset_rows)) if onset_rows else None,
-        "far": (false_alarms / len(warnings)) if warnings else None,
+        "pod": (hits / (hits + misses)) if (hits + misses) else None,
+        "far": (false_alarms / scored) if scored else None,
         "lead_error_min": _quantiles(errors),
     }
     out.update(params)

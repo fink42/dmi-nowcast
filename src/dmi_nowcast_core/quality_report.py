@@ -168,9 +168,13 @@ class QualityInputs:
     live_days_secondary: int = 30
     #: Overrides ``datetime.now(timezone.utc)``; tests pin it.
     now: datetime | None = None
-    #: The lead the headline sentence quotes, and the bin it reads.
+    #: The lead the headline sentence quotes.
     headline_lead_min: int = 30
-    headline_bin_prob: float = 0.7
+    #: The headline reads the highest bin at that lead carrying at least
+    #: this many forecasts; failing that, the most populated bin whose
+    #: lower edge is at or above ``headline_min_prob``.
+    headline_min_n: int = 200
+    headline_min_prob: float = 0.3
     #: The horizon ``headline.persistence_margin`` is taken at.
     persistence_horizon_min: int = 10
     #: Scoring rules. ``lead_min`` is the subscriber's promise; the rest
@@ -392,25 +396,127 @@ def _served_leads(
     return wanted or present
 
 
+def _fold_labels(values: Sequence[Any]) -> tuple[list[str], list[str]]:
+    """``(month, day)`` labels for a column of event timestamps.
+
+    String slicing rather than datetime parsing: the corpus stores
+    ``event_time`` as an ISO string, and over a few million rows the
+    difference is seconds against minutes. Anything that is not an ISO
+    string falls back to parsing, and anything unreadable gets the empty
+    label — which groups with nothing and is dropped from the folds.
+    """
+    months: list[str] = []
+    days: list[str] = []
+    for value in values:
+        if isinstance(value, str) and len(value) >= 10 and value[4] == "-":
+            months.append(value[:7])
+            days.append(value[:10])
+            continue
+        stamp = _parse_ts(value)
+        if stamp is None:
+            months.append("")
+            days.append("")
+            continue
+        months.append(f"{stamp.year:04d}-{stamp.month:02d}")
+        days.append(stamp.date().isoformat())
+    return months, days
+
+
+def _out_of_fold_calibrated(
+    prob: "np.ndarray",
+    outcome: "np.ndarray",
+    weight: "np.ndarray",
+    folds: "np.ndarray",
+) -> tuple["np.ndarray", "np.ndarray", int] | None:
+    """Leave-one-fold-out isotonic calibration: ``(values, mask, n_folds)``.
+
+    For each fold, the calibrator is fitted on **every other fold's** rows
+    with the same weighted fitter the served curves come from
+    (:func:`dmi_nowcast_core.calibrate.fit_isotonic_weighted`) and applied
+    to the held-out fold. Pooling the held-out predictions gives a
+    reliability diagram of a calibration that never saw the row it is
+    grading.
+
+    This is not a refinement, it is the difference between a measurement
+    and a tautology. The served curves were fitted ON this corpus, so
+    binning their output against it draws a perfect diagonal by
+    construction — the first real report had ``forecast_mean ==
+    observed_freq`` to three decimals in every bin, which says only that
+    isotonic regression can describe its own training data.
+
+    ``mask`` marks the rows that got a prediction; a fold whose training
+    set is degenerate (one distinct probability, no positive weight) is
+    dropped rather than silently left raw, because a diagram mixing
+    calibrated and uncalibrated values is neither. ``None`` when there is
+    only one fold and cross-validation is impossible.
+    """
+    from .calibrate import fit_isotonic_weighted
+
+    labels = [f for f in dict.fromkeys(folds.tolist()) if f]
+    if len(labels) < 2:
+        return None
+    out = np.array(prob, dtype=np.float64, copy=True)
+    ok = np.zeros(prob.shape, dtype=bool)
+    used = 0
+    for label in labels:
+        test = folds == label
+        train = (~test) & (folds != "")
+        if not test.any() or not train.any():
+            continue
+        try:
+            calibrator = fit_isotonic_weighted(
+                prob[train], outcome[train], weight[train],
+            )
+        except ValueError:
+            continue
+        out[test] = np.asarray(calibrator.predict(prob[test]), dtype=np.float64)
+        ok |= test
+        used += 1
+    if used < 2 or not ok.any():
+        return None
+    return out, ok, used
+
+
 def reliability_from_corpus(
     path: Path,
     *,
     outcome_column: str = "outcome",
     curves: Mapping[int, Any] | None = None,
     inputs: QualityInputs | None = None,
+    calibration: str = "served",
+    per_point: bool = False,
 ) -> dict:
     """Reliability curves plus the window and totals of one corpus.
 
+    ``calibration`` picks which probability the diagram is OF, and the
+    choice is different for the two truths:
+
+    ``"cv"``
+        Leave-one-month-out cross-validation (:func:`_out_of_fold_calibrated`).
+        This is what the RADAR corpus needs: the served curves were fitted
+        on it, so grading them against it measures nothing.
+    ``"served"``
+        The live curves, applied as the service applies them. Honest for
+        the GAUGE corpus, whose truth column the fit never saw — the
+        gauge is an independent instrument, so "the probability we
+        published against what the ground recorded" is a real claim.
+    ``"raw"``
+        The raw ensemble exceedance fraction, uncalibrated.
+
     Returns ``{"curves": [...], "window": {...}, "frame_age": (lo, hi),
-    "threshold_mm_h": float|None, "per_point_brier": {...},
-    "calibrated_leads": [...]}``. ``curves`` is empty when nothing in the
-    corpus is usable, which the caller reads as "null this section".
+    "threshold_mm_h": float|None, "per_point_brier": {...}, "mode": str,
+    "cv_folds": int, "fold": str|None}``. ``curves`` is empty when nothing
+    in the corpus is usable, which the caller reads as "null this
+    section". Each curve carries ``brier_raw`` alongside ``brier`` — the
+    same rows scored without any calibration, so the improvement is a
+    paired comparison rather than two numbers over different samples.
     """
     inputs = inputs or QualityInputs()
     curves = dict(curves or {})
     empty = {
         "curves": [], "window": None, "frame_age": None,
-        "threshold_mm_h": None, "per_point_brier": {}, "calibrated_leads": [],
+        "threshold_mm_h": None, "per_point_brier": {},
+        "mode": "none", "cv_folds": 0, "fold": None,
     }
     table = _read_corpus_valid(Path(path), outcome_column)
     if table is None or table.num_rows == 0:
@@ -430,15 +536,29 @@ def reliability_from_corpus(
         else [""] * table.num_rows
     )
 
-    # --- window, frame age, threshold — over the valid rows ---------------
+    # --- window, folds, frame age, threshold — over the valid rows --------
     stamps: list[datetime] = []
     events: set[str] = set()
+    fold_all = np.array([""] * table.num_rows, dtype=object)
+    fold_name: str | None = None
     if "event_time" in names:
-        for raw_stamp in table.column("event_time").to_pylist():
+        raw_times = table.column("event_time").to_pylist()
+        for raw_stamp in raw_times:
             stamp = _parse_ts(raw_stamp)
             if stamp is not None:
                 stamps.append(stamp)
                 events.add(stamp.isoformat())
+        months, days = _fold_labels(raw_times)
+        # Months are the natural fold: a month of radar is many weather
+        # regimes, and holding one out leaves plenty to fit on. A corpus
+        # spanning less than two months falls back to days rather than
+        # giving up on cross-validation entirely.
+        if len({m for m in months if m}) >= 2:
+            fold_all = np.array(months, dtype=object)
+            fold_name = "month"
+        elif len({d for d in days if d}) >= 2:
+            fold_all = np.array(days, dtype=object)
+            fold_name = "day"
     frame_age: tuple[float, float] | None = None
     if "frame_age_min" in names:
         ages = np.asarray(
@@ -456,8 +576,9 @@ def reliability_from_corpus(
 
     leads = _served_leads(inputs, np.unique(lead_all).tolist(), curves)
     out_curves: list[dict] = []
-    calibrated_leads: list[int] = []
     per_point_brier: dict[int, dict[str, float]] = {}
+    modes: set[str] = set()
+    cv_folds = 0
     for lead in leads:
         keep = lead_all == lead
         if not keep.any():
@@ -465,29 +586,47 @@ def reliability_from_corpus(
         raw_prob = prob_all[keep]
         y = y_all[keep]
         w = w_all[keep]
-        curve = curves.get(lead)
-        if curve is not None:
-            # The site serves the calibrated probability, so that is the
-            # number this diagram must be about.
-            probs = np.asarray(curve.predict(raw_prob), dtype=np.float64)
-            calibrated_leads.append(int(lead))
+        rows = np.flatnonzero(keep)
+        mode = calibration
+        if calibration == "cv":
+            folded = _out_of_fold_calibrated(raw_prob, y, w, fold_all[keep])
+            if folded is None:
+                # One fold is no fold. Raw is the only thing left that is
+                # not a claim about the fit's own training data.
+                probs, mode = raw_prob, "raw"
+            else:
+                probs, ok, used = folded
+                probs, raw_prob = probs[ok], raw_prob[ok]
+                y, w, rows = y[ok], w[ok], rows[ok]
+                cv_folds = max(cv_folds, used)
+        elif calibration == "served":
+            curve = curves.get(lead)
+            if curve is None:
+                probs, mode = raw_prob, "raw"
+            else:
+                probs = np.asarray(curve.predict(raw_prob), dtype=np.float64)
         else:
-            probs = raw_prob
+            probs, mode = raw_prob, "raw"
         brier = _weighted_brier(probs, y, w)
         if brier is None:
             continue
+        modes.add(mode)
         out_curves.append({
             "lead_min": int(lead),
             "brier": _round(brier),
+            # Additive: the same rows with no calibration at all, so the
+            # methods block can state the improvement as a paired number.
+            "brier_raw": _round(_weighted_brier(raw_prob, y, w)),
             "n": int(probs.size),
             "eff_n": _round(_kish(w)),
             "bins": bin_statistics(probs, y, w),
         })
+        if not per_point:
+            continue
         # Per-point Brier, for the station map. Same weights, same probs.
         acc: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
-        indices = np.flatnonzero(keep)
         squares = w * (probs - y) * (probs - y)
-        for offset, row in enumerate(indices):
+        for offset, row in enumerate(rows):
             cell = acc[str(point_all[row])]
             cell[0] += float(w[offset])
             cell[1] += float(squares[offset])
@@ -507,10 +646,10 @@ def reliability_from_corpus(
         "frame_age": frame_age,
         "threshold_mm_h": threshold,
         "per_point_brier": per_point_brier,
-        "calibrated_leads": calibrated_leads,
+        "mode": "mixed" if len(modes) > 1 else (modes.pop() if modes else "none"),
+        "cv_folds": cv_folds,
+        "fold": fold_name if cv_folds else None,
     }
-
-
 def _closest_lead(curves: Sequence[dict], wanted: int) -> dict | None:
     """The served curve nearest ``wanted`` (ties go to the lower lead)."""
     if not curves:
@@ -518,24 +657,58 @@ def _closest_lead(curves: Sequence[dict], wanted: int) -> dict | None:
     return min(curves, key=lambda c: (abs(int(c["lead_min"]) - wanted), int(c["lead_min"])))
 
 
-def _headline_reliability(curves: Sequence[dict], inputs: QualityInputs) -> dict | None:
-    """"When we say 70 %, it rains X % of the time", at one lead.
+def _headline_bin(curve: Mapping[str, Any], inputs: QualityInputs) -> dict | None:
+    """The bin the headline sentence should be read from.
 
-    Null when the bin containing the headline probability is empty: there
-    is no honest sentence to make out of a bin nobody's forecast fell in.
+    The obvious choice — "the bin containing 70 %" — assumes the service
+    ever says 70 %. Calibration is a shrinking operation, and on this
+    corpus the calibrated probability tops out near 0.62 at lead 20 and
+    0.56 at lead 30: the 0.7 bin is EMPTY, and the card came out null
+    while the numbers behind it were perfectly good. So the rule is
+    "the most confident thing we actually say, often enough to mean
+    something": the HIGHEST bin carrying at least ``headline_min_n``
+    forecasts.
+
+    The fallback, when no bin clears that bar, is the most populated bin
+    above 0.3 — still a claim about confident forecasts, just one whose
+    sample size the page will have to caveat. Below 0.3 there is no
+    sentence worth writing, so that returns None and the card says "not
+    measured".
+    """
+    bins = curve.get("bins") or []
+    usable = [
+        (index, b) for index, b in enumerate(bins)
+        if b.get("forecast_mean") is not None and b.get("observed_freq") is not None
+    ]
+    confident = [(i, b) for i, b in usable if b["n"] >= inputs.headline_min_n]
+    if confident:
+        return max(confident, key=lambda pair: pair[0])[1]
+    upper = [(i, b) for i, b in usable if b["lo"] >= inputs.headline_min_prob]
+    if upper:
+        return max(upper, key=lambda pair: (pair[1]["n"], pair[0]))[1]
+    return None
+
+
+def _headline_reliability(curves: Sequence[dict], inputs: QualityInputs) -> dict | None:
+    """"When we say X %, it rains Y % of the time", at one lead.
+
+    Null when no bin at that lead is both populated and confident enough
+    to make a sentence out of — see :func:`_headline_bin`.
     """
     curve = _closest_lead(curves, inputs.headline_lead_min)
     if curve is None:
         return None
-    index = min(int(math.floor(inputs.headline_bin_prob * N_BINS)), N_BINS - 1)
-    binned = curve["bins"][index]
-    if binned["forecast_mean"] is None or binned["observed_freq"] is None:
+    binned = _headline_bin(curve, inputs)
+    if binned is None:
         return None
     return {
         "lead_min": int(curve["lead_min"]),
         "said_pct": _round(binned["forecast_mean"] * 100.0, 3),
         "happened_pct": _round(binned["observed_freq"] * 100.0, 3),
         "n": int(binned["n"]),
+        # Additive: which bin the two percentages came from. The page
+        # renders the sentence; the archive should be able to check it.
+        "bin": [binned["lo"], binned["hi"]],
     }
 
 
@@ -651,10 +824,17 @@ def _live_window(inputs: QualityInputs) -> dict | None:
 
 @dataclass
 class _GaugeTruth:
-    """Onsets per station, plus the wet flag of every decision's own slot."""
+    """Onsets per station, the wet flag of each decision's slot, and the edge.
+
+    ``known_until`` is the last slot end each station actually reported.
+    It is what keeps a warning sent ninety seconds ago from being graded
+    as a false alarm by a report built ninety seconds later — see
+    ``warning_score.score_warnings``.
+    """
 
     onsets: dict[str, list[datetime]] = field(default_factory=dict)
     wet_at: dict[tuple[str, datetime], bool | None] = field(default_factory=dict)
+    known_until: dict[str, datetime] = field(default_factory=dict)
     known_slots: int = 0
 
 
@@ -681,6 +861,7 @@ def _gauge_truth(
     store = StationObsStore(Path(corpus_dir))
     truth = _GaugeTruth()
     onset_sets: dict[str, set[datetime]] = defaultdict(set)
+    last_known: dict[str, datetime] = {}
     pad = timedelta(minutes=GAUGE_PAD_MIN)
     start, end = window
     for (year, month) in _months_between(start, end):
@@ -707,10 +888,14 @@ def _gauge_truth(
                 if wet is None:
                     continue
                 truth.known_slots += 1
+                previous = last_known.get(station)
+                if previous is None or stamp > previous:
+                    last_known[station] = stamp
                 key = (station, stamp)
                 if key in needed:
                     truth.wet_at[key] = wet
     truth.onsets = {sid: sorted(values) for sid, values in onset_sets.items()}
+    truth.known_until = last_known
     return truth
 
 
@@ -787,6 +972,7 @@ def _score_decisions(
             lead_min=inputs.lead_min,
             tolerance_min=inputs.tolerance_min,
             dry_min=inputs.dry_min,
+            known_until=truth.known_until.get(station),
         )
         for station in station_ids
     }
@@ -805,7 +991,13 @@ def _score_decisions(
         board.headline = {
             "window_days": int(board.window_days),
             "n_stations": len(station_ids),
+            # ``warnings`` is the SCORED count: hits + false_alarms adds up
+            # to it in the page's sentence. Warnings whose window has not
+            # closed yet are counted separately (additive keys; the client
+            # ignores them) rather than being graded early.
             "warnings": int(pooled["warnings"]),
+            "pending": int(pooled["pending"]),
+            "n_sent": int(pooled["n_sent"]),
             "hits": int(pooled["hits"]),
             "false_alarms": int(pooled["false_alarms"]),
             "misses": int(pooled["misses"]),
@@ -880,6 +1072,11 @@ def _score_decisions(
     for station, result in results.items():
         for warning in result.warnings:
             if warning.sent_utc < cutoff:
+                continue
+            if warning.outcome == "pending":
+                # Its window has not closed. The schema's outcome enum is
+                # hit|false_alarm, and there is no honest third answer to
+                # put in the table yet.
                 continue
             probability = p_rain_at.get((station, warning.sent_utc))
             if warning.eta_min is None or probability is None:
@@ -1070,12 +1267,54 @@ def _replay_summary(inputs: QualityInputs) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+#: How each truth's probability was produced, in one clause per mode.
+_MODE_WORDS = {
+    "cv": "calibrated out-of-sample, leave-one-{fold}-out CV",
+    "served": "the served curves",
+    "raw": "the raw ensemble exceedance fraction, uncalibrated",
+    "mixed": "a mix of calibrated and raw leads",
+    "none": "not measured",
+}
+
+
+def _mode_phrase(block: Mapping[str, Any] | None) -> str | None:
+    """The clause describing one truth's probability, or None if absent."""
+    if not block or not block.get("curves"):
+        return None
+    mode = str(block.get("mode") or "none")
+    return _MODE_WORDS.get(mode, mode).format(fold=block.get("fold") or "month")
+
+
+def _brier_improvement(
+    curves: Sequence[Mapping[str, Any]], lead: int,
+) -> str | None:
+    """"0.0249 raw -> 0.0241 calibrated (-3.2 %)" at the headline lead.
+
+    Paired: ``brier_raw`` is the same rows scored without calibration, so
+    the difference is what the calibration did rather than what two
+    different samples happened to contain.
+    """
+    curve = _closest_lead(list(curves), lead)
+    if curve is None:
+        return None
+    after = curve.get("brier")
+    before = curve.get("brier_raw")
+    if after is None or before is None or before <= 0:
+        return None
+    change = (after - before) / before * 100.0
+    return (
+        f"radar Brier at {int(curve['lead_min'])} min: {before:.4f} raw → "
+        f"{after:.4f} out-of-sample calibrated ({change:+.1f} %)"
+    )
+
+
 def _methods_section(
     inputs: QualityInputs,
     radar: Mapping[str, Any] | None,
     gauge: Mapping[str, Any] | None,
     summary: Mapping[str, Any],
-    calibrated: bool,
+    radar_curves: Sequence[Mapping[str, Any]],
+    gauge_curves: Sequence[Mapping[str, Any]],
 ) -> dict | None:
     """The rules the numbers were produced under, in the producer's words.
 
@@ -1127,17 +1366,41 @@ def _methods_section(
         ],
         "subscriber_rule": subscriber,
         "sources": {"radar": RADAR_SOURCE, "gauges": GAUGE_SOURCE},
-        # Additive: the client ignores it, the archive does not. Which
-        # probability the reliability diagrams are OF is the difference
-        # between a claim about the site and a claim about an internal.
-        "reliability_probability": (
-            "calibrated (national isotonic curves applied to the raw "
-            "ensemble fraction, as served)"
-            if calibrated else
-            "raw ensemble exceedance fraction — no calibration curves "
-            "were supplied, so this is NOT what the site served"
+        # Additive: the client ignores both, the archive does not. Which
+        # probability each diagram is OF is the difference between a claim
+        # about the service and a claim about a fit's own training data —
+        # the radar curves and the gauge curves are not the same claim and
+        # must not be described as though they were.
+        "reliability_probability": _reliability_sentence(radar, gauge),
+        "reliability_brier_improvement": _brier_improvement(
+            radar_curves, inputs.headline_lead_min,
+        ),
+        "headline_bin_rule": (
+            f"the highest bin at the headline lead with n ≥ "
+            f"{inputs.headline_min_n}; failing that, the most populated "
+            f"bin above {inputs.headline_min_prob:g}"
+        ),
+        "pending_rule": (
+            "a warning whose window (sent + lead + tolerance) reaches past "
+            "the last gauge slot the station reported, and which has "
+            "claimed no onset, is pending: excluded from hits, false "
+            "alarms, POD and FAR until the gauge can answer"
         ),
     }
+
+
+def _reliability_sentence(
+    radar: Mapping[str, Any] | None, gauge: Mapping[str, Any] | None,
+) -> str:
+    """Which probability each reliability diagram is of, named separately."""
+    parts = []
+    radar_phrase = _mode_phrase(radar)
+    if radar_phrase is not None:
+        parts.append(f"radar: {radar_phrase}")
+    gauge_phrase = _mode_phrase(gauge)
+    if gauge_phrase is not None:
+        parts.append(f"gauges: {gauge_phrase} against gauge truth")
+    return "; ".join(parts) if parts else "not measured"
 
 
 # ---------------------------------------------------------------------------
@@ -1159,15 +1422,24 @@ def build_quality_report(inputs: QualityInputs) -> dict:
 
     radar: dict | None = None
     if inputs.radar_corpus is not None and Path(inputs.radar_corpus).is_file():
+        # OUT-OF-SAMPLE. The served curves were fitted on this corpus, so
+        # applying them here would draw a perfect diagonal and call it a
+        # measurement. Leave-one-month-out CV grades a calibration that
+        # never saw the row.
         radar = reliability_from_corpus(
             Path(inputs.radar_corpus), outcome_column="outcome",
-            curves=curves, inputs=inputs,
+            curves=curves, inputs=inputs, calibration="cv",
         )
     gauge: dict | None = None
     if inputs.station_corpus is not None and Path(inputs.station_corpus).is_file():
+        # The SERVED curves, and legitimately so: the fit never saw
+        # ``gauge_outcome``. A rain gauge is an independent instrument, so
+        # "what we published against what the ground recorded" is already
+        # an out-of-sample claim.
         gauge = reliability_from_corpus(
             Path(inputs.station_corpus), outcome_column="gauge_outcome",
-            curves=curves, inputs=inputs,
+            curves=curves, inputs=inputs, calibration="served",
+            per_point=True,
         )
 
     radar_curves = list(radar["curves"]) if radar else []
@@ -1188,10 +1460,6 @@ def build_quality_report(inputs: QualityInputs) -> dict:
             )
 
     summary = _replay_summary(inputs)
-    calibrated = bool(
-        (radar and radar["calibrated_leads"])
-        or (gauge and gauge["calibrated_leads"])
-    )
 
     windows_radar = None
     if radar and radar["window"] and radar["window"]["from"]:
@@ -1247,7 +1515,9 @@ def build_quality_report(inputs: QualityInputs) -> dict:
         "raining_now": board.raining_now,
         "stations": _stations_section(board, geometry, gauge_brier),
         "events": events or None,
-        "methods": _methods_section(inputs, radar, gauge, summary, calibrated),
+        "methods": _methods_section(
+            inputs, radar, gauge, summary, radar_curves, gauge_curves,
+        ),
     }
 
 
@@ -1592,12 +1862,15 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     warnings = headline.get("warnings")
     if warnings:
         spread = warnings["lead_error_min"]
-        add(f"- **Warnings**: {warnings['warnings']:,} sent over "
+        pending = warnings.get("pending") or 0
+        add(f"- **Warnings**: {warnings['warnings']:,} scored over "
             f"{warnings['window_days']} measured days at "
             f"{warnings['n_stations']} stations — {warnings['hits']:,} hits, "
             f"{warnings['false_alarms']:,} false alarms, "
-            f"{warnings['misses']:,} misses. "
-            f"POD {_num(warnings['pod'])}, FAR {_num(warnings['far'])}. "
+            f"{warnings['misses']:,} misses"
+            + (f", {pending:,} still pending (window not closed)"
+               if pending else "")
+            + f". POD {_num(warnings['pod'])}, FAR {_num(warnings['far'])}. "
             f"Lead error p25/p50/p75 = {_num(spread['p25'], 1)} / "
             f"{_num(spread['p50'], 1)} / {_num(spread['p75'], 1)} min "
             f"(positive = late).")
@@ -1623,10 +1896,11 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             add("Not measured.")
             add("")
             continue
-        add("| lead | Brier | n | eff n |")
-        add("|---:|---:|---:|---:|")
+        add("| lead | Brier | Brier (raw) | n | eff n |")
+        add("|---:|---:|---:|---:|---:|")
         for curve in curves:
             add(f"| {curve['lead_min']} min | {_num(curve['brier'], 4)} | "
+                f"{_num(curve.get('brier_raw'), 4)} | "
                 f"{curve['n']:,} | {curve['eff_n']:,.0f} |")
         add("")
         headline_curve = _closest_lead(curves, 30)
@@ -1704,7 +1978,13 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"{rule['persistence_obs']:.0f} observation(s) of persistence, "
             f"{rule['rearm_after_min']:.0f} min disarmed after a warning.")
         if methods.get("reliability_probability"):
-            add(f"- Reliability is of the {methods['reliability_probability']}.")
+            add(f"- Reliability is of — {methods['reliability_probability']}.")
+        if methods.get("reliability_brier_improvement"):
+            add(f"- {methods['reliability_brier_improvement']}.")
+        if methods.get("headline_bin_rule"):
+            add(f"- Headline bin: {methods['headline_bin_rule']}.")
+        if methods.get("pending_rule"):
+            add(f"- Pending: {methods['pending_rule']}.")
         add(f"- Sources: {methods['sources']['radar']}; "
             f"{methods['sources']['gauges']}.")
     else:

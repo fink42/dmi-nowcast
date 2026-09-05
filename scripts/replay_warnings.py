@@ -778,6 +778,18 @@ def score(
             (row["generated_at"], row.get("eta_min"))
         )
 
+    # The last slot each station actually reported. A warning whose window
+    # reaches past it has not come due yet, and neither has an onset within
+    # tolerance of it — both come back "pending" rather than being graded
+    # on evidence that does not exist. Matters on the trailing edge of a
+    # replay run as much as it does live.
+    known_until = {
+        sid: max(
+            (ts for ts, wet in slots if wet is not None),
+            default=None,
+        )
+        for sid, slots in slot_lists.items()
+    }
     results = {
         sid: score_warnings(
             warnings_by_station.get(sid, []),
@@ -785,6 +797,7 @@ def score(
             lead_min=lead_min,
             tolerance_min=tolerance_min,
             dry_min=dry_min,
+            known_until=known_until.get(sid),
         )
         for sid in (p.id for p in points)
     }

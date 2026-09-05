@@ -426,3 +426,145 @@ def test_decision_schema_matches_the_declared_columns() -> None:
     for name in ("p_rain", "eta_min", "intensity_mm_h", "observed_mm_h",
                  "forecast_now_mm_h"):
         assert schema.field(name).nullable
+
+
+# ---------------------------------------------------------------------------
+# The pending boundary: not grading a promise that has not come due
+# ---------------------------------------------------------------------------
+#
+# The defect this fixes, verbatim from the first live report: two warnings
+# sent at 12:25Z appeared as false alarms in a report generated at 12:26Z.
+# The gauge had said nothing about 12:25-13:05 yet, so the only thing that
+# scoring measured was how recently the report was built.
+
+
+def _at(minutes: int) -> datetime:
+    return T0 + timedelta(minutes=minutes)
+
+
+def test_a_warning_whose_window_is_still_open_is_pending_not_a_false_alarm() -> None:
+    # Sent at T0+60; window closes at T0+100 (lead 30 + tolerance 10).
+    # The gauge has only reported to T0+65.
+    result = score_warnings(
+        [(_at(60), 20.0)], [], lead_min=30, tolerance_min=10,
+        known_until=_at(65),
+    )
+    assert [w.outcome for w in result.warnings] == ["pending"]
+    summary = result.summary
+    assert summary["pending"] == 1
+    assert summary["n_sent"] == 1
+    # Excluded from every rate, not counted as a failure.
+    assert summary["warnings"] == 0
+    assert summary["hits"] == 0
+    assert summary["false_alarms"] == 0
+    assert summary["far"] is None
+
+
+def test_the_same_warning_is_a_false_alarm_once_the_window_has_closed() -> None:
+    result = score_warnings(
+        [(_at(60), 20.0)], [], lead_min=30, tolerance_min=10,
+        known_until=_at(140),
+    )
+    assert [w.outcome for w in result.warnings] == ["false_alarm"]
+    assert result.summary["pending"] == 0
+    assert result.summary["false_alarms"] == 1
+    assert result.summary["far"] == 1.0
+
+
+def test_without_known_until_nothing_is_pending() -> None:
+    """A closed historical window scores exactly as it always did."""
+    result = score_warnings([(_at(60), 20.0)], [], lead_min=30, tolerance_min=10)
+    assert [w.outcome for w in result.warnings] == ["false_alarm"]
+    assert result.summary["pending"] == 0
+    assert result.summary["warnings"] == result.summary["n_sent"] == 1
+
+
+def test_a_claimed_onset_settles_a_warning_even_with_its_window_open() -> None:
+    """A confirmed hit is never demoted to pending.
+
+    Demoting it would take the hit out of POD's numerator while leaving
+    its onset in the denominator — turning a hit into a miss, which is
+    worse than the bug the rule fixes.
+    """
+    result = score_warnings(
+        [(_at(60), 20.0)], [_at(80)], lead_min=30, tolerance_min=10,
+        known_until=_at(85),   # window closes at 100; the onset is in hand
+    )
+    assert [w.outcome for w in result.warnings] == ["hit"]
+    assert [o.outcome for o in result.onsets] == ["hit"]
+    assert result.summary["pending"] == 0
+    assert result.summary["pod"] == 1.0
+
+
+def test_an_onset_near_the_edge_is_pending_not_a_miss() -> None:
+    """DMI backfills late reports; a slot at the edge can still move."""
+    result = score_warnings(
+        [], [_at(95)], lead_min=30, tolerance_min=10, known_until=_at(100),
+    )
+    assert [o.outcome for o in result.onsets] == ["pending"]
+    summary = result.summary
+    assert summary["pending_onsets"] == 1
+    assert summary["misses"] == 0
+    assert summary["pod"] is None
+
+
+def test_an_onset_well_inside_the_known_window_is_a_miss() -> None:
+    result = score_warnings(
+        [], [_at(40)], lead_min=30, tolerance_min=10, known_until=_at(100),
+    )
+    assert [o.outcome for o in result.onsets] == ["miss"]
+    assert result.summary["misses"] == 1
+    assert result.summary["pod"] == 0.0
+
+
+def test_the_counts_still_add_up_with_pending_in_the_mix() -> None:
+    """hits + false_alarms == warnings, and hits + misses == scored onsets."""
+    result = score_warnings(
+        [
+            (_at(0), 20.0),     # claims the onset at 20  → hit
+            (_at(60), 20.0),    # nothing follows, window closed → false alarm
+            (_at(306), 20.0),   # window open at known_until → pending
+        ],
+        # 305 is before the last warning was sent, so nothing can claim
+        # it, and it sits inside the tolerance of the edge → pending.
+        [_at(20), _at(200), _at(305)],
+        lead_min=30, tolerance_min=10, known_until=_at(310),
+    )
+    s = result.summary
+    assert [w.outcome for w in result.warnings] == [
+        "hit", "false_alarm", "pending",
+    ]
+    assert [o.outcome for o in result.onsets] == ["hit", "miss", "pending"]
+    assert s["hits"] + s["false_alarms"] == s["warnings"] == 2
+    assert s["pending"] == 1 and s["n_sent"] == 3
+    assert s["hits"] + s["misses"] == s["n_onsets"] - s["pending_onsets"] == 2
+    assert s["pod"] == 0.5
+    assert s["far"] == 0.5
+
+
+def test_pooled_summary_keeps_pending_out_of_the_national_rates() -> None:
+    settled = score_warnings(
+        [(_at(0), 20.0)], [_at(20)], lead_min=30, tolerance_min=10,
+        known_until=_at(400),
+    )
+    fresh = score_warnings(
+        [(_at(300), 20.0)], [], lead_min=30, tolerance_min=10,
+        known_until=_at(305),
+    )
+    pooled = pooled_summary([settled, fresh])
+    assert pooled["hits"] == 1
+    assert pooled["pending"] == 1
+    assert pooled["warnings"] == 1
+    assert pooled["false_alarms"] == 0
+    # One station's still-open window must not drag the national FAR up.
+    assert pooled["far"] == 0.0
+    assert pooled["pod"] == 1.0
+
+
+def test_a_pending_warning_contributes_no_lead_error() -> None:
+    result = score_warnings(
+        [(_at(300), 20.0)], [], lead_min=30, tolerance_min=10,
+        known_until=_at(305),
+    )
+    assert result.summary["lead_error_min"]["n"] == 0
+    assert result.summary["lead_error_min"]["p50"] is None

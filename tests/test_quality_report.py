@@ -27,6 +27,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from dmi_nowcast_core.quality_report import (
@@ -90,18 +91,24 @@ def _corpus_table(rows: list[dict], *, gauge: bool) -> "pa.Table":
     )
 
 
-def _corpus_rows(*, gauge: bool, n_events: int = 60) -> list[dict]:
+def _corpus_rows(
+    *, gauge: bool, n_events: int = 60, step_hours: int = 24,
+) -> list[dict]:
     """A corpus with every bin populated at every lead, and a real signal.
 
     ``raw_prob`` walks the whole [0, 1] range so no bin is empty at the
     headline lead, and the outcome is drawn deterministically from the
     probability so the reliability diagram is close to the diagonal rather
     than nonsense.
+
+    One event a day by default, so 60 events span two calendar months and
+    the radar reliability's leave-one-month-out folds are real months —
+    the production path, not the day-level fallback.
     """
     rows: list[dict] = []
     start = datetime(2026, 3, 1, tzinfo=UTC)
     for event in range(n_events):
-        stamp = (start + timedelta(hours=event)).isoformat()
+        stamp = (start + timedelta(hours=event * step_hours)).isoformat()
         for point_index, station in enumerate(STATIONS):
             for lead in LEADS:
                 # A deterministic spread over [0, 1), one step per row.
@@ -159,6 +166,13 @@ def write_curves(path: Path) -> Path:
         },
     }))
     return path
+
+
+def write_and_load_curves(path: Path) -> dict:
+    """The curve file, already parsed into calibrators."""
+    from dmi_nowcast_core.calibrate import load_calibration_curves
+
+    return load_calibration_curves(write_curves(path))
 
 
 def _obs_rows(station: str, wet_slots: set[datetime]) -> list[dict]:
@@ -275,6 +289,13 @@ def _decision(
         "armed_after": action != "notify",
         "streak_after": 1,
     }
+
+
+def _iso_z(stamp: datetime) -> str:
+    """The producer's wire format for a timestamp."""
+    return stamp.astimezone(UTC).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z",
+    )
 
 
 def _wet_at(station: str, stamp: datetime) -> bool:
@@ -452,26 +473,46 @@ class TestFullReport:
         assert windows["radar"]["from"] == "2026-03-01T00:00:00Z"
         assert windows["live"]["days"] == 1
 
-    def test_headline_reads_the_bin_containing_seventy_percent(
+    def test_headline_reads_the_highest_well_populated_bin(
         self, full_inputs: QualityInputs,
     ) -> None:
+        """The card quotes the most confident thing we say often enough.
+
+        Not "the bin containing 0.7": calibration shrinks probabilities,
+        and on a real corpus that bin can be empty while every number
+        behind it is fine — which is exactly how the first live report
+        came out with a null headline card.
+        """
         report = build_quality_report(full_inputs)
-        headline = report["headline"]["reliability"]["radar"]
-        curve = next(
-            c for c in report["reliability"]["radar"]
-            if c["lead_min"] == headline["lead_min"]
-        )
-        binned = curve["bins"][7]
-        assert binned["lo"] == 0.7 and binned["hi"] == 0.8
-        # said_pct/happened_pct are percentages rounded for the wire, so
-        # they match the bin to a thousandth of a percent, not to the bit.
-        assert headline["said_pct"] == pytest.approx(
-            binned["forecast_mean"] * 100, abs=1e-3,
-        )
-        assert headline["happened_pct"] == pytest.approx(
-            binned["observed_freq"] * 100, abs=1e-3,
-        )
-        assert headline["n"] == binned["n"]
+        for truth in ("radar", "gauge"):
+            headline = report["headline"]["reliability"][truth]
+            assert headline is not None
+            curve = next(
+                c for c in report["reliability"][truth]
+                if c["lead_min"] == headline["lead_min"]
+            )
+            bins = curve["bins"]
+            binned = next(b for b in bins if [b["lo"], b["hi"]] == headline["bin"])
+            confident = [b for b in bins if b["n"] >= 200 and b["forecast_mean"]
+                         is not None]
+            if confident:
+                # The highest bin we say often enough to mean something.
+                assert binned is confident[-1]
+            else:
+                # Fallback: the most populated bin above 0.3, never below.
+                assert binned["lo"] >= 0.3
+                upper = [b for b in bins if b["lo"] >= 0.3
+                         and b["forecast_mean"] is not None]
+                assert binned["n"] == max(b["n"] for b in upper)
+            # said_pct/happened_pct are percentages rounded for the wire,
+            # so they match the bin to a thousandth of a percent.
+            assert headline["said_pct"] == pytest.approx(
+                binned["forecast_mean"] * 100, abs=1e-3,
+            )
+            assert headline["happened_pct"] == pytest.approx(
+                binned["observed_freq"] * 100, abs=1e-3,
+            )
+            assert headline["n"] == binned["n"]
 
     def test_persistence_margin_comes_from_the_study(
         self, full_inputs: QualityInputs,
@@ -524,7 +565,14 @@ class TestFullReport:
         assert methods["subscriber_rule"]["lead_min"] == 30
         assert "0.1 mm" in methods["gauge_wet_rule"]
         assert "30 minutes of known-dry" in methods["onset_rule"]
-        assert methods["reliability_probability"].startswith("calibrated")
+        # The two truths are two different claims and must be named as such.
+        assert methods["reliability_probability"] == (
+            "radar: calibrated out-of-sample, leave-one-month-out CV; "
+            "gauges: the served curves against gauge truth"
+        )
+        assert "raw →" in methods["reliability_brier_improvement"]
+        assert "n ≥ 200" in methods["headline_bin_rule"]
+        assert "pending" in methods["pending_rule"]
 
 
 # ---------------------------------------------------------------------------
@@ -688,33 +736,267 @@ class TestBinning:
         assert seen == len(expected)
 
 
-class TestCalibratedVersusRaw:
-    def test_curves_are_applied_before_binning(self, tmp_path: Path) -> None:
-        """The diagram must be of the probability the site served.
+def _noise_rows(base_rate_by_month: dict[str, float], per_month: int = 900) -> list[dict]:
+    """A corpus where ``raw_prob`` carries NO information about the outcome.
 
-        With curves, a raw 0.9 at lead 60 becomes 0.63 and moves two bins
-        to the left; without them it stays where the corpus put it. The
-        two documents must therefore differ, and ``methods`` must say
-        which one this is.
+    The probability is deterministic pseudo-noise; the outcome is
+    different pseudo-noise whose base rate depends only on the month. A
+    calibration fitted on these rows can do exactly one useful thing —
+    learn the pooled base rate — so:
+
+    - fitted and applied IN SAMPLE it lands every row on that base rate,
+      and the bin's forecast mean equals its observed frequency by
+      construction. A perfect diagonal that measures nothing.
+    - fitted out-of-fold it lands each month's rows on the OTHER month's
+      base rate, which is not that month's frequency. The diagram is
+      visibly off the diagonal, which is the truth.
+
+    That gap is the whole of defect (1), in a table small enough to check.
+    """
+    rows: list[dict] = []
+    for month_index, (month, base) in enumerate(sorted(base_rate_by_month.items())):
+        year, mm = (int(x) for x in month.split("-"))
+        for i in range(per_month):
+            # Two independent-looking deterministic sequences.
+            prob = ((i * 37 + month_index * 11) % 1000) / 1000.0
+            outcome = 1 if ((i * 61 + 7) % 1000) / 1000.0 < base else 0
+            stamp = datetime(year, mm, 1 + (i % 27), tzinfo=UTC).isoformat()
+            rows.append({
+                "event_time": stamp, "point_id": "06180",
+                "lat": 55.0, "lon": 10.0, "region": "Denmark",
+                "lead_min": 30, "raw_prob": prob, "outcome": outcome,
+                "sample_weight": 1.0, "frame_age_min": 15.0,
+                "threshold_mm_h": 0.5,
+            })
+    return rows
+
+
+def _diagonal_gap(curve: dict) -> float:
+    """The largest |forecast_mean − observed_freq| over the populated bins."""
+    return max(
+        abs(b["forecast_mean"] - b["observed_freq"])
+        for b in curve["bins"]
+        if b["forecast_mean"] is not None and b["n"] >= 50
+    )
+
+
+class TestOutOfSampleRadarReliability:
+    """Defect (1): the radar diagram must not grade a fit on its own data."""
+
+    @pytest.fixture
+    def noise_corpus(self, tmp_path: Path) -> Path:
+        path = tmp_path / "noise.parquet"
+        rows = _noise_rows({"2026-03": 0.2, "2026-04": 0.6})
+        pq.write_table(_corpus_table(rows, gauge=False), path)
+        return path
+
+    def test_in_sample_curves_would_draw_a_perfect_diagonal(
+        self, noise_corpus: Path,
+    ) -> None:
+        """The bug, pinned: this is what the first real report did.
+
+        Fit on the corpus, apply to the corpus, bin — and every bin lands
+        on the diagonal no matter how worthless the forecast is.
         """
-        corpus = write_radar_corpus(tmp_path / "radar.parquet")
-        raw = build_quality_report(QualityInputs(radar_corpus=corpus, now=NOW))
-        calibrated = build_quality_report(QualityInputs(
-            radar_corpus=corpus, national_curves=write_curves(tmp_path / "c.json"),
-            now=NOW,
-        ))
-        raw_60 = next(c for c in raw["reliability"]["radar"] if c["lead_min"] == 60)
-        cal_60 = next(
-            c for c in calibrated["reliability"]["radar"] if c["lead_min"] == 60
+        from dmi_nowcast_core.calibrate import fit_isotonic_weighted
+        from dmi_nowcast_core.quality_report import reliability_from_corpus
+
+        rows = _noise_rows({"2026-03": 0.2, "2026-04": 0.6})
+        in_sample = fit_isotonic_weighted(
+            np.array([r["raw_prob"] for r in rows]),
+            np.array([r["outcome"] for r in rows], dtype=float),
+            np.ones(len(rows)),
         )
+        served = reliability_from_corpus(
+            noise_corpus, curves={30: in_sample},
+            inputs=QualityInputs(served_leads=(30,)), calibration="served",
+        )
+        assert served["mode"] == "served"
+        # …to three decimals, exactly the symptom that was reported.
+        assert _diagonal_gap(served["curves"][0]) < 1e-3
+
+    def test_cross_validation_refuses_to_flatter_the_fit(
+        self, noise_corpus: Path,
+    ) -> None:
+        from dmi_nowcast_core.quality_report import reliability_from_corpus
+
+        cv = reliability_from_corpus(
+            noise_corpus, inputs=QualityInputs(served_leads=(30,)),
+            calibration="cv",
+        )
+        assert cv["mode"] == "cv"
+        assert cv["fold"] == "month"
+        assert cv["cv_folds"] == 2
+        # Each month is graded by the other month's base rate, which is
+        # 0.4 away. A diagonal here would mean the CV leaked.
+        assert _diagonal_gap(cv["curves"][0]) > 0.3
+
+    def test_the_report_uses_cv_for_radar_and_served_curves_for_gauges(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """Two truths, two different and correctly-labelled claims."""
+        report = build_quality_report(full_inputs)
+        assert report["methods"]["reliability_probability"] == (
+            "radar: calibrated out-of-sample, leave-one-month-out CV; "
+            "gauges: the served curves against gauge truth"
+        )
+
+    def test_every_curve_carries_the_paired_raw_brier(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(full_inputs)
+        for truth in ("radar", "gauge"):
+            for curve in report["reliability"][truth]:
+                assert isinstance(curve["brier_raw"], float)
+                assert 0.0 <= curve["brier_raw"] <= 1.0
+        improvement = report["methods"]["reliability_brier_improvement"]
+        assert "raw →" in improvement and "out-of-sample calibrated" in improvement
+
+    def test_a_single_month_falls_back_to_day_folds(self, tmp_path: Path) -> None:
+        """A short corpus still gets cross-validated, just more finely."""
+        from dmi_nowcast_core.quality_report import reliability_from_corpus
+
+        path = tmp_path / "short.parquet"
+        # Twelve events eight hours apart: four days inside one month.
+        rows = _corpus_rows(gauge=False, n_events=12, step_hours=8)
+        pq.write_table(_corpus_table(rows, gauge=False), path)
+        out = reliability_from_corpus(path, calibration="cv")
+        assert out["fold"] == "day"
+        assert out["mode"] == "cv"
+
+    def test_one_fold_means_no_cross_validation_and_says_so(
+        self, tmp_path: Path,
+    ) -> None:
+        """Raw, honestly labelled, rather than a fit grading itself."""
+        from dmi_nowcast_core.quality_report import reliability_from_corpus
+
+        path = tmp_path / "oneday.parquet"
+        rows = [
+            {**r, "event_time": datetime(2026, 3, 1, tzinfo=UTC).isoformat()}
+            for r in _corpus_rows(gauge=False, n_events=12, step_hours=1)
+        ]
+        pq.write_table(_corpus_table(rows, gauge=False), path)
+        out = reliability_from_corpus(path, calibration="cv")
+        assert out["mode"] == "raw"
+        assert out["cv_folds"] == 0 and out["fold"] is None
+
+        report = build_quality_report(QualityInputs(radar_corpus=path, now=NOW))
+        assert report["methods"]["reliability_probability"].startswith(
+            "radar: the raw ensemble exceedance fraction",
+        )
+
+
+class TestHeadlineBinRule:
+    """Defect (2): the card must not go null because 0.7 is never said."""
+
+    @staticmethod
+    def _curve(counts: list[int]) -> dict:
+        return {
+            "lead_min": 30,
+            "bins": [
+                {
+                    "lo": round(k / 10, 6), "hi": round((k + 1) / 10, 6),
+                    "forecast_mean": None if n == 0 else round(k / 10 + 0.05, 3),
+                    "observed_freq": None if n == 0 else round(k / 10 + 0.02, 3),
+                    "n": n, "eff_n": float(n),
+                }
+                for k, n in enumerate(counts)
+            ],
+        }
+
+    def test_it_takes_the_highest_bin_over_the_threshold(self) -> None:
+        from dmi_nowcast_core.quality_report import _headline_bin
+
+        # Calibrated probability tops out in bin 5 — exactly the shape of
+        # the real corpus, where bins 7-9 are empty.
+        curve = self._curve([9000, 4000, 2000, 900, 400, 250, 0, 0, 0, 0])
+        chosen = _headline_bin(curve, QualityInputs())
+        assert [chosen["lo"], chosen["hi"]] == [0.5, 0.6]
+
+    def test_a_thin_bin_above_the_top_one_is_not_chosen(self) -> None:
+        from dmi_nowcast_core.quality_report import _headline_bin
+
+        curve = self._curve([9000, 4000, 2000, 900, 400, 250, 12, 0, 0, 0])
+        chosen = _headline_bin(curve, QualityInputs())
+        assert [chosen["lo"], chosen["hi"]] == [0.5, 0.6]
+        assert chosen["n"] == 250
+
+    def test_the_fallback_is_the_fullest_bin_above_a_third(self) -> None:
+        from dmi_nowcast_core.quality_report import _headline_bin
+
+        # Nothing clears n >= 200 anywhere, so the primary rule is out.
+        curve = self._curve([190, 180, 190, 150, 40, 12, 0, 0, 0, 0])
+        chosen = _headline_bin(curve, QualityInputs())
+        assert [chosen["lo"], chosen["hi"]] == [0.3, 0.4]
+        assert chosen["n"] == 150
+
+    def test_nothing_confident_enough_is_no_sentence_at_all(self) -> None:
+        from dmi_nowcast_core.quality_report import _headline_bin
+
+        # Nothing over the threshold, and nothing at all above 0.3:
+        # there is no "when we say X %" worth making.
+        curve = self._curve([190, 100, 190, 0, 0, 0, 0, 0, 0, 0])
+        assert _headline_bin(curve, QualityInputs()) is None
+
+    def test_the_card_survives_a_corpus_that_never_says_seventy_percent(
+        self, tmp_path: Path,
+    ) -> None:
+        """The live symptom, end to end.
+
+        Curves that cap every lead at 0.55 empty bins 6-9 completely. The
+        old rule read bin 7 and returned null; the new one reads the
+        highest bin that exists.
+        """
+        curves = tmp_path / "shrunk.json"
+        curves.write_text(json.dumps({
+            "curves": {
+                str(lead): {"raw_breakpoints": [0.0, 1.0],
+                            "calibrated_values": [0.0, 0.55]}
+                for lead in LEADS
+            },
+        }))
+        report = build_quality_report(QualityInputs(
+            station_corpus=write_station_corpus(tmp_path / "station.parquet"),
+            national_curves=curves, now=NOW,
+        ))
+        headline = report["headline"]["reliability"]["gauge"]
+        assert headline is not None
+        curve = next(
+            c for c in report["reliability"]["gauge"]
+            if c["lead_min"] == headline["lead_min"]
+        )
+        assert curve["bins"][7]["n"] == 0      # the old rule's bin: empty
+        assert headline["bin"][1] <= 0.6       # …and we quoted a real one
+        assert headline["n"] > 0
+
+
+class TestGaugeCurves:
+    def test_the_gauge_diagram_uses_the_served_curves(
+        self, tmp_path: Path,
+    ) -> None:
+        """Legitimate: the fit never saw ``gauge_outcome``.
+
+        With curves the probabilities shrink and the top bin empties;
+        without them the raw values stay where the corpus put them.
+        """
+        from dmi_nowcast_core.quality_report import reliability_from_corpus
+
+        corpus = write_station_corpus(tmp_path / "station.parquet")
+        raw = reliability_from_corpus(
+            corpus, outcome_column="gauge_outcome", calibration="raw",
+        )
+        served = reliability_from_corpus(
+            corpus, outcome_column="gauge_outcome",
+            curves=write_and_load_curves(tmp_path / "c.json"),
+            calibration="served",
+        )
+        raw_60 = next(c for c in raw["curves"] if c["lead_min"] == 60)
+        cal_60 = next(c for c in served["curves"] if c["lead_min"] == 60)
         assert raw_60["bins"][9]["n"] > 0
         # The curve caps lead 60 at 0.7, so the top bin must empty out.
         assert cal_60["bins"][9]["n"] == 0
         assert cal_60["brier"] != raw_60["brier"]
-        assert raw["methods"]["reliability_probability"].startswith("raw")
-        assert calibrated["methods"]["reliability_probability"].startswith(
-            "calibrated",
-        )
+        assert served["mode"] == "served"
 
     def test_the_served_leads_are_the_leads_with_curves(
         self, tmp_path: Path,
@@ -853,6 +1135,99 @@ class TestDecisions:
         ))
         assert len(report["events"]) == 20
         assert validate_report(report) == []
+
+
+class TestFreshWarningsArePending:
+    """Defect (3): a promise is not graded before it comes due.
+
+    The gauge fixture stops reporting at the end of the fixture day. A
+    warning sent minutes before that edge promises rain over the next
+    forty minutes, and the gauge has said nothing about them — calling it
+    a false alarm measures only how recently the report was built.
+    """
+
+    @pytest.fixture
+    def corpus_dir(self, tmp_path: Path) -> Path:
+        out = tmp_path / "corpus"
+        out.mkdir()
+        write_gauge_store(out)
+        write_points(out)
+        write_catalogue(out)
+        return out
+
+    #: The gauge store's last slot is exactly here.
+    LAST_SLOT = DAY + timedelta(days=1)
+
+    def _report(self, tmp_path: Path, corpus_dir: Path, rows: list[dict]) -> dict:
+        write_replay(tmp_path / "replay", decision_rows(live=False) + rows)
+        return build_quality_report(QualityInputs(
+            replay_dir=tmp_path / "replay", corpus_dir=corpus_dir, now=NOW,
+        ))
+
+    def test_a_warning_past_the_gauges_last_word_is_not_a_false_alarm(
+        self, tmp_path: Path, corpus_dir: Path,
+    ) -> None:
+        # Sent ten minutes before the last known slot: its window runs to
+        # +30 min past it, and no gauge data covers that.
+        fresh = self.LAST_SLOT - timedelta(minutes=10)
+        report = self._report(tmp_path, corpus_dir, [
+            _decision(fresh, "06182", action="notify", eta=20.0, p_rain=0.85,
+                      observed=0.0, forecast=2.0),
+        ])
+        warnings = report["headline"]["warnings"]
+        assert warnings["pending"] == 1
+        assert warnings["n_sent"] == len(WARNINGS) + 1
+        # Not counted anywhere it could look like a failure.
+        assert warnings["warnings"] == len(WARNINGS)
+        assert warnings["hits"] + warnings["false_alarms"] == warnings["warnings"]
+        assert warnings["false_alarms"] == 2
+
+    def test_a_pending_warning_never_reaches_the_events_table(
+        self, tmp_path: Path, corpus_dir: Path,
+    ) -> None:
+        """The schema's outcome enum is hit|false_alarm — and stays that way."""
+        fresh = self.LAST_SLOT - timedelta(minutes=10)
+        report = self._report(tmp_path, corpus_dir, [
+            _decision(fresh, "06182", action="notify", eta=20.0, p_rain=0.85,
+                      observed=0.0, forecast=2.0),
+        ])
+        stamps = {e["warned_at_utc"] for e in report["events"]}
+        assert _iso_z(fresh) not in stamps
+        assert {e["outcome"] for e in report["events"]} <= {"hit", "false_alarm"}
+        assert validate_report(report) == []
+
+    def test_a_warning_whose_window_closed_is_still_graded(
+        self, tmp_path: Path, corpus_dir: Path,
+    ) -> None:
+        """The fix must not swallow real false alarms near the edge."""
+        settled = self.LAST_SLOT - timedelta(minutes=120)
+        report = self._report(tmp_path, corpus_dir, [
+            _decision(settled, "06182", action="notify", eta=20.0, p_rain=0.85,
+                      observed=0.0, forecast=2.0),
+        ])
+        warnings = report["headline"]["warnings"]
+        assert warnings["pending"] == 0
+        assert warnings["false_alarms"] == 3
+        assert _iso_z(settled) in {e["warned_at_utc"] for e in report["events"]}
+
+    def test_the_station_scores_exclude_pending_too(
+        self, tmp_path: Path, corpus_dir: Path,
+    ) -> None:
+        fresh = self.LAST_SLOT - timedelta(minutes=10)
+        report = self._report(tmp_path, corpus_dir, [
+            _decision(fresh - timedelta(minutes=10 * k), "06182",
+                      action="notify", eta=20.0, p_rain=0.85,
+                      observed=0.0, forecast=2.0)
+            for k in range(3)
+        ])
+        props = {
+            f["properties"]["station_id"]: f["properties"]
+            for f in report["stations"]["features"]
+        }["06182"]
+        # All three are still open, so the station has no scored warnings
+        # and therefore no rate to report — null, never 100 % false.
+        assert props["warnings"] == 0
+        assert props["warn_far"] is None
 
 
 # ---------------------------------------------------------------------------
