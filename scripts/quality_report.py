@@ -7,7 +7,7 @@ faking it, so this is safe to run before the whole corpus exists: the first
 report can be a window and a persistence margin, and it grows as the
 evidence does.
 
-Usage — the nightly build on the private VM, all five inputs::
+Usage — the nightly build on the private VM, every input::
 
     python scripts/quality_report.py \\
         --radar-corpus /var/lib/dmi-nowcast-corpus/calibration/latest.parquet \\
@@ -16,6 +16,7 @@ Usage — the nightly build on the private VM, all five inputs::
         --corpus-dir /var/lib/dmi-nowcast-corpus \\
         --persistence-json /var/lib/dmi-nowcast-corpus/pva/results.json \\
         --national-curves /var/lib/dmi-nowcast/national_curves.json \\
+        --thresholds /var/lib/dmi-nowcast/push_thresholds.json \\
         --out-json /var/lib/dmi-nowcast/nowcast/quality.json \\
         --out-md /var/lib/dmi-nowcast-corpus/quality_reports/$(date -u +%Y%m%d).md
 
@@ -76,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--national-curves", type=Path, default=None,
                    help="the served national isotonic curves; without them "
                         "reliability is of the RAW ensemble fraction")
+    p.add_argument("--thresholds", type=Path, default=None,
+                   help="push_thresholds.json from sweep_thresholds.py: the "
+                        "fitted horizon->threshold table the push rule serves")
     p.add_argument("--live-days", type=int, default=90,
                    help="how far back live stations/eval rows are read")
     p.add_argument("--live-days-secondary", type=int, default=30,
@@ -99,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         corpus_dir=args.corpus_dir,
         persistence_json=args.persistence_json,
         national_curves=args.national_curves,
+        thresholds_path=args.thresholds,
         live_days=args.live_days,
         live_days_secondary=args.live_days_secondary,
         headline_lead_min=args.headline_lead_min,
@@ -116,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
 
     filled = [
         key for key in ("windows", "headline", "reliability", "raining_now",
-                        "stations", "events", "methods")
+                        "stations", "events", "methods", "thresholds")
         if report.get(key) is not None
     ]
     print(json.dumps({

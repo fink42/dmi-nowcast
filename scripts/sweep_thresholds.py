@@ -46,20 +46,55 @@ with ``pooled_summary``. Stations the gauge store has nothing for are left
 out of the pool entirely: without a measurement every warning there would
 score as a false alarm, which measures the archive rather than the rule.
 
-Reading the output
-------------------
-POD and FAR move in opposite directions across a threshold column and one
-number cannot rank them, so two picks are reported per lead:
+The objective: F1, with a minimum useful lead
+---------------------------------------------
+The subscriber chooses a horizon. The threshold that horizon warns at is
+fitted here, and "best" is **F1** — the harmonic mean of
 
-* **max CSI** — ``hits / (hits + misses + false alarms)``, the usual
-  single-number summary of a warning system, ties broken toward the
-  higher threshold (fewer notifications for the same skill);
-* **max POD subject to FAR ≤ cap** — the product question: given that
-  more than ``--far-cap`` of notifications being wrong is not shippable,
-  how much rain can still be caught?
+* precision = ``hits / (hits + false alarms)``: of the notifications sent,
+  how many were followed by rain;
+* recall = ``hits / (hits + misses + late)``: of the rain that came, how
+  much was usefully warned about.
 
-Both sit beside the "do nothing" row — no warnings, no false alarms, every
-covered onset a miss — which is the floor any rule has to beat.
+"Usefully" is ``--min-useful-lead-min`` (5). A warning whose rain arrives
+less than five minutes later is **late**: not a hit, still on the recall
+side (the rain came and nobody was told in time), and NOT a false alarm
+(the rain did come — precision is not charged for it). That asymmetry is
+the whole point of the knob: a rule that fires thirty seconds before the
+first drop must not be able to buy a high score with warnings nobody could
+act on. See ``warning_score`` for the definitions themselves.
+
+The pick per lead is the **plateau midpoint**, not the argmax. F1 across a
+threshold column is flat near its top and the argmax of a flat curve is
+noise: the set of thresholds scoring at least ``--plateau-frac`` (0.95) of
+the lead's best F1 is the plateau, and the pick is its midpoint rounded to
+the nearest 5 (ties upward, toward the quieter rule). The bounds are
+reported, so a reader can see how wide the flat region was — a one-cell
+plateau is a warning sign in itself. Max CSI and the FAR-capped pick stay
+in the output as secondary information for meteorologists.
+
+A lead whose scored warnings across the entire grid number fewer than
+``--min-warnings`` (30) gets NO pick and is marked ``insufficient``: the
+service falls back to the shipping threshold rather than to a number
+fitted on a handful of events.
+
+The radar set: a self-consistency check, not a second truth
+-----------------------------------------------------------
+``--radar-decisions-dir`` takes the same replay run over the *radar
+calibration points*, where the truth is the corpus ``outcome`` — the radar
+observing itself — rather than a gauge. Onsets there are derived from the
+decision rows' own ``observed_mm_h`` (≥ 0.5 mm/h is wet, on 10-minute
+slots at ``radar_ts``) through the same :func:`onsets` rule, and swept
+identically. Its plateau per lead is reported beside the gauge one, with
+``agrees_with_radar`` saying whether the gauge pick falls inside it.
+
+**This is not independent evidence.** The radar produced both the forecast
+and its truth, so it shares every bias in the composite — column-max
+reflectivity, bright band, virga that never reaches the ground. Agreement
+means the fit is not an artefact of the ~100 gauge points; disagreement
+means the two instruments disagree about what rain is. Neither promotes
+the radar number over the gauge number, and the gauge pick is always the
+one that ships.
 
 Usage (on the VM that holds the corpus)::
 
@@ -68,7 +103,8 @@ Usage (on the VM that holds the corpus)::
         --decisions-dir /var/lib/dmi-nowcast-corpus/stations/eval \\
         --corpus-dir /var/lib/dmi-nowcast-corpus \\
         --leads 10,20,30,45,60 --thresholds 20:80:5 --workers 8 \\
-        --out-json sweep.json --out-md sweep.md --out-csv sweep.csv
+        --out-json sweep.json --out-md sweep.md --out-csv sweep.csv \\
+        --out-thresholds push_thresholds.json
 
 Later ``--decisions-dir`` wins on a ``(radar_ts, station_id)`` collision:
 the live row is the decision the service actually took, the replay's is a
@@ -81,6 +117,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import multiprocessing as mp
 import os
 import sys
@@ -89,7 +126,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT / "src") not in sys.path:
@@ -98,6 +135,11 @@ _SIDECAR = _REPO_ROOT / "sidecar"
 if str(_SIDECAR) not in sys.path:
     sys.path.insert(0, str(_SIDECAR))
 
+from dmi_nowcast_core.push_thresholds import (  # noqa: E402
+    DEFAULT_FALLBACK_THRESHOLD_PCT,
+    SCHEMA_VERSION as THRESHOLDS_SCHEMA_VERSION,
+    validate_thresholds,
+)
 from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
@@ -105,6 +147,7 @@ from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_TOLERANCE_MIN,
     PRECIP_DUR_PARAM,
     PRECIP_PARAM,
+    SLOT_MIN,
     align_decision_table,
     coverage_runs,
     decision_leads_in,
@@ -112,6 +155,7 @@ from dmi_nowcast_core.warning_score import (  # noqa: E402
     p_rain_column,
     pooled_summary,
     score_warnings,
+    slot_end_of,
 )
 from dmi_nowcast_core.warning_score import onsets as gauge_onsets  # noqa: E402
 
@@ -131,11 +175,31 @@ GAUGE_PAD_MIN = 120
 #: Above this share of wrong notifications a rule is not shippable.
 DEFAULT_FAR_CAP = 0.30
 
+#: A warning whose rain arrives sooner than this is late, not a hit. The
+#: scorer's own default is 0.0 — nothing late — because the historical
+#: quality numbers were produced before this existed; the FIT asks for
+#: five minutes, and this is the fit.
+FIT_MIN_USEFUL_LEAD_MIN = 5.0
+
+#: A threshold scoring at least this share of the lead's best F1 is on the
+#: plateau, and the pick is the plateau's midpoint.
+DEFAULT_PLATEAU_FRAC = 0.95
+
+#: Fewer scored warnings than this across the whole grid at one lead and
+#: the lead gets no pick at all.
+DEFAULT_MIN_WARNINGS = 30
+
+#: Picks are rounded to whole multiples of this many percent. The grid is
+#: usually stepped by 5 too, so a rounded midpoint is a cell that was
+#: actually measured.
+PICK_ROUNDING_PCT = 5
+
 #: The columns of the per-cell CSV, in order.
 CSV_COLUMNS = (
     "lead_min", "threshold_pct", "warnings", "n_sent", "pending", "hits",
-    "false_alarms", "misses", "pending_onsets", "uncovered_onsets",
-    "n_onsets", "pod", "far", "csi", "lead_error_p25", "lead_error_p50",
+    "false_alarms", "late", "misses", "pending_onsets", "uncovered_onsets",
+    "n_onsets", "pod", "far", "precision", "recall", "f1", "f_beta_0.5",
+    "f_beta_2", "csi", "lead_error_p25", "lead_error_p50",
     "lead_error_p75", "lead_error_n", "warnings_per_station_day",
     "n_stations", "n_days", "n_rows",
 )
@@ -438,6 +502,56 @@ def gauge_truth(
     return onsets_by_station, known_until, known_slots
 
 
+def radar_truth(
+    tracks: Mapping[str, Sequence[tuple]],
+    *,
+    dry_min: int = DEFAULT_DRY_MIN,
+    slot_min: int = SLOT_MIN,
+    threshold_mm_h: float = RAIN_THRESHOLD_MM_H,
+) -> tuple[dict[str, list[datetime]], dict[str, datetime]]:
+    """``(onsets per point, known_until per point)`` from the radar itself.
+
+    The radar decision set has no gauge behind it. Its truth is the rain
+    rate the composite observed at the point — ``observed_mm_h``, the same
+    column the engine's "already raining" silence reads — binned onto the
+    same 10-minute slot grid the gauges report on and pushed through the
+    same :func:`onsets` rule, so the two sweeps differ in their truth and
+    in nothing else.
+
+    A null ``observed_mm_h`` is off-coverage or nodata: it leaves the slot
+    UNKNOWN, exactly as an unreported gauge slot does, and an unknown slot
+    resets the dry run rather than certifying it. The grid is filled
+    contiguously between the first and last frame so a gap in the rows
+    cannot be mistaken for a dry spell.
+
+    This is a self-consistency check. The forecast and the truth come from
+    the same instrument, so agreement is evidence that the gauge fit is
+    not an artefact of a hundred points — not evidence that either number
+    is right.
+    """
+    step = timedelta(minutes=slot_min)
+    onsets_by_point: dict[str, list[datetime]] = {}
+    known_until: dict[str, datetime] = {}
+    for point, track in tracks.items():
+        seen: dict[datetime, bool] = {}
+        for record in track:
+            observed = record[_OBSERVED]
+            if observed is None:
+                continue
+            slot = slot_end_of(record[_RADAR_TS], slot_min=slot_min)
+            seen[slot] = seen.get(slot, False) or (observed >= threshold_mm_h)
+        if not seen:
+            continue
+        slots: list[tuple[datetime, bool | None]] = []
+        cursor, last = min(seen), max(seen)
+        while cursor <= last:
+            slots.append((cursor, seen.get(cursor)))
+            cursor += step
+        onsets_by_point[point] = gauge_onsets(slots, dry_min, slot_min=slot_min)
+        known_until[point] = last
+    return onsets_by_point, known_until
+
+
 def _months_between(start: datetime, end: datetime) -> list[tuple[int, int]]:
     out: list[tuple[int, int]] = []
     year, month = start.year, start.month
@@ -544,32 +658,45 @@ def score_cell(shared: dict, lead: int, threshold_pct: int | None) -> dict:
             dry_min=shared["dry_min"],
             known_until=shared["known_until"].get(station),
             coverage=shared["coverage"][int(lead)].get(station, ()),
+            min_useful_lead_min=shared["min_useful_lead_min"],
         ))
     pooled = pooled_summary(results)
     return _cell(pooled, lead, threshold_pct, shared)
 
 
 def _cell(pooled: dict, lead: int, threshold_pct: int | None, shared: dict) -> dict:
-    """A pooled summary, plus the derived numbers the report ranks on."""
-    hits = pooled["hits"]
-    denom = hits + pooled["misses"] + pooled["false_alarms"]
+    """A pooled summary, plus the derived numbers the report ranks on.
+
+    Every rate comes from ``pooled_summary``, which recomputes it from the
+    pooled counts: precision and recall as the fit's objective reads them
+    (late warnings out of precision, on the miss side of recall), CSI with
+    late on the miss side too, and FAR over every graded warning — so FAR
+    is NOT ``1 − precision`` once a lead has lates, and both are printed.
+    """
     station_days = max(1, shared["station_days"])
     spread = pooled["lead_error_min"]
+    f_beta = pooled["f_beta"]
     return {
         "lead_min": int(lead),
         "threshold_pct": None if threshold_pct is None else int(threshold_pct),
         "warnings": pooled["warnings"],
         "n_sent": pooled["n_sent"],
         "pending": pooled["pending"],
-        "hits": hits,
+        "hits": pooled["hits"],
         "false_alarms": pooled["false_alarms"],
+        "late": pooled["late"],
         "misses": pooled["misses"],
         "pending_onsets": pooled["pending_onsets"],
         "uncovered_onsets": pooled["uncovered_onsets"],
         "n_onsets": pooled["n_onsets"],
         "pod": pooled["pod"],
         "far": pooled["far"],
-        "csi": (hits / denom) if denom else None,
+        "precision": pooled["precision"],
+        "recall": pooled["recall"],
+        "f1": pooled["f1"],
+        "f_beta_0.5": f_beta.get("0.5"),
+        "f_beta_2": f_beta.get("2"),
+        "csi": pooled["csi"],
         "lead_error_min": spread,
         "warnings_per_station_day": pooled["n_sent"] / station_days,
         "n_stations": len(shared["stations"]),
@@ -591,6 +718,18 @@ _SHARED: dict | None = None
 def _init_worker(shared: dict) -> None:
     global _SHARED
     _SHARED = shared
+
+
+def release_shared() -> None:
+    """Drop the parent's payload reference between two sweeps.
+
+    ``run_sweep`` plants the payload in a module global so a forked worker
+    inherits it for free; that global also keeps the whole gauge set alive
+    after the sweep is over, and the radar cross-check would then load a
+    second one beside it. Dropping the local name is not enough — this is.
+    """
+    global _SHARED
+    _SHARED = None
 
 
 def _worker(task: tuple[int, int | None]) -> dict:
@@ -668,6 +807,74 @@ def run_sweep(
 # ---------------------------------------------------------------------------
 
 
+def scored_warnings(cells: Sequence[dict]) -> int:
+    """Total graded warnings a lead produced across the whole grid.
+
+    The evidence test for a pick. Summed over thresholds, so it double
+    counts the same rain seen at 40 % and at 45 % — deliberately: it is not
+    a sample size, it is the question "did this horizon ever do anything
+    worth fitting on?", and a lead that fired twice at every threshold
+    should fail it.
+    """
+    return sum(int(c.get("warnings") or 0) for c in cells)
+
+
+def round_to(value: float, step: int = PICK_ROUNDING_PCT) -> int:
+    """Nearest multiple of ``step``, halves rounded UP (the quieter rule)."""
+    return int(math.floor(value / step + 0.5) * step)
+
+
+def pick_plateau(
+    cells: Sequence[dict], plateau_frac: float = DEFAULT_PLATEAU_FRAC,
+) -> dict | None:
+    """The F1 plateau and its midpoint — the pick that ships.
+
+    Every threshold scoring at least ``plateau_frac`` of the lead's best
+    F1 is on the plateau; the pick is the midpoint of its bounds, rounded
+    to :data:`PICK_ROUNDING_PCT` with halves going up. Taking the midpoint
+    rather than the argmax is the whole point: two thresholds five percent
+    apart whose F1 differs in the third decimal are not distinguishable on
+    this much data, and the middle of the flat region is the choice that
+    survives the next month of it.
+
+    ``cell`` is the measured cell the reported metrics come from: the one
+    at the pick when the grid has it (a step-5 grid always does), else the
+    nearest cell on the plateau, so no number in the output is an
+    interpolation. The pick is clamped into the plateau bounds, which only
+    ever bites on a grid whose thresholds are not multiples of five — the
+    edge of a measured plateau beats a round number outside it. ``None``
+    when no cell at this lead has an F1 at all.
+    """
+    scored = [c for c in cells if c.get("f1") is not None]
+    if not scored:
+        return None
+    best = max(float(c["f1"]) for c in scored)
+    if best <= 0.0:
+        # Every cell scored zero: there is no plateau to be in the middle
+        # of, and a "pick" here would be an arbitrary threshold dressed up
+        # as a measurement.
+        return None
+    on_plateau = [
+        c for c in scored if float(c["f1"]) >= plateau_frac * best
+    ]
+    thresholds = sorted(int(c["threshold_pct"]) for c in on_plateau)
+    lo, hi = thresholds[0], thresholds[-1]
+    pick = round_to((lo + hi) / 2.0)
+    pick = min(max(pick, lo), hi)
+    cell = min(
+        on_plateau,
+        key=lambda c: (abs(int(c["threshold_pct"]) - pick), -int(c["threshold_pct"])),
+    )
+    return {
+        "threshold_pct": pick,
+        "plateau": [lo, hi],
+        "plateau_frac": float(plateau_frac),
+        "max_f1": best,
+        "n_thresholds": len(thresholds),
+        "cell": cell,
+    }
+
+
 def pick_max_csi(cells: Sequence[dict]) -> dict | None:
     """The highest-CSI cell; ties go to the higher threshold (less noise)."""
     scored = [c for c in cells if c["csi"] is not None]
@@ -694,6 +901,227 @@ def pick_max_pod_under_far(
     return max(eligible, key=lambda c: (c["pod"], c["threshold_pct"]))
 
 
+def radar_sweep(
+    directories: Sequence[Path],
+    leads: Sequence[int],
+    thresholds: Sequence[int],
+    *,
+    coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
+    tolerance_min: int = DEFAULT_TOLERANCE_MIN,
+    dry_min: int = DEFAULT_DRY_MIN,
+    persistence_obs: int = 1,
+    rearm_after_min: int = 60,
+    min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN,
+    raining_now_mm_h: float = RAIN_THRESHOLD_MM_H,
+    workers: int = 1,
+    log=None,
+) -> tuple[list[dict], dict]:
+    """The same grid over the radar calibration points, against the radar.
+
+    Identical machinery to the gauge sweep — same loader, same tracks,
+    same replay, same scorer, same thresholds — with exactly one thing
+    swapped: the onsets come from :func:`radar_truth` rather than from the
+    gauge store. That is what makes the two plateaus comparable at all.
+
+    Returns ``(cells, info)``; ``info`` describes the set even when it is
+    empty, so a caller can say "no radar rows" rather than "no agreement".
+    """
+    rows, file_leads, counts = load_decisions(directories, leads_min=(), log=log)
+    info: dict[str, Any] = {
+        "dirs": [str(d) for d in directories],
+        "rows": len(rows),
+        "files": counts["files"],
+        "points": 0,
+        "onsets": 0,
+        "leads": [],
+    }
+    if not rows:
+        return [], info
+    usable = [lead for lead in leads if lead in file_leads]
+    missing = [lead for lead in leads if lead not in file_leads]
+    if missing and log:
+        log(
+            "radar set has no column for lead(s): "
+            + ", ".join(str(lead) for lead in missing)
+        )
+    if not usable:
+        return [], info
+    tracks, frames = build_tracks(rows, usable, coverage_gap_min=coverage_gap_min)
+    n_rows = len(rows)
+    del rows
+    onsets_by_point, known_until = radar_truth(tracks, dry_min=dry_min)
+    points = sorted(p for p in tracks if p in known_until)
+    days_by_point = {
+        point: {record[_GENERATED].date() for record in tracks[point]}
+        for point in points
+    }
+    days = set().union(*days_by_point.values()) if days_by_point else set()
+    info.update({
+        "points": len(points),
+        "onsets": sum(len(onsets_by_point.get(p, ())) for p in points),
+        "leads": list(usable),
+        "days": len(days),
+        "rows": n_rows,
+    })
+    if not points:
+        return [], info
+    shared = {
+        "leads": list(usable),
+        "stations": points,
+        "tracks": {p: tracks[p] for p in points},
+        "onsets": onsets_by_point,
+        "known_until": known_until,
+        "coverage": {
+            lead: {
+                point: coverage_runs(
+                    frames[point],
+                    max_gap_min=coverage_gap_min,
+                    extend_min=lead + tolerance_min,
+                )
+                for point in points
+            }
+            for lead in usable
+        },
+        "tolerance_min": int(tolerance_min),
+        "dry_min": int(dry_min),
+        "min_useful_lead_min": float(min_useful_lead_min),
+        "persistence_obs": int(persistence_obs),
+        "rearm_after_min": int(rearm_after_min),
+        "raining_now_mm_h": float(raining_now_mm_h),
+        "station_days": sum(len(days_by_point[p]) for p in points),
+        "n_days": len(days),
+        "n_rows": n_rows,
+    }
+    del tracks, frames
+    cells, _ = run_sweep(shared, usable, thresholds, workers=workers, log=log)
+    return cells, info
+
+
+def build_picks(
+    cells: Sequence[dict],
+    leads: Sequence[int],
+    *,
+    far_cap: float = DEFAULT_FAR_CAP,
+    plateau_frac: float = DEFAULT_PLATEAU_FRAC,
+    min_warnings: int = DEFAULT_MIN_WARNINGS,
+    radar_cells: Sequence[dict] | None = None,
+) -> dict[str, dict]:
+    """Every pick for every lead, plus the radar cross-check.
+
+    The plateau pick is the one that ships and it is withheld — no pick,
+    ``insufficient`` true — when the lead's whole grid produced fewer than
+    ``min_warnings`` graded warnings. Max CSI and the FAR-capped pick are
+    reported regardless: they are secondary information, and a reader
+    comparing them against a withheld plateau learns something about how
+    thin the evidence was.
+
+    ``agrees_with_radar`` is true when the gauge pick lands inside the
+    radar plateau, false when it does not, and null when either sweep had
+    no plateau to compare — never quietly true.
+    """
+    out: dict[str, dict] = {}
+    for lead in leads:
+        lead_cells = [c for c in cells if c["lead_min"] == lead]
+        total = scored_warnings(lead_cells)
+        insufficient = total < int(min_warnings)
+        plateau = (
+            None if insufficient else pick_plateau(lead_cells, plateau_frac)
+        )
+        radar_plateau = None
+        if radar_cells is not None:
+            radar_plateau = pick_plateau(
+                [c for c in radar_cells if c["lead_min"] == lead], plateau_frac,
+            )
+        agrees: bool | None = None
+        if plateau is not None and radar_plateau is not None:
+            lo, hi = radar_plateau["plateau"]
+            agrees = lo <= plateau["threshold_pct"] <= hi
+        out[str(lead)] = {
+            "plateau": plateau,
+            "insufficient": insufficient,
+            "scored_warnings": total,
+            "min_warnings": int(min_warnings),
+            "max_csi": pick_max_csi(lead_cells),
+            "max_pod_far_capped": pick_max_pod_under_far(lead_cells, far_cap),
+            "radar_plateau": radar_plateau,
+            "agrees_with_radar": agrees,
+        }
+    return out
+
+
+def build_thresholds_document(
+    payload: dict,
+    *,
+    fallback_threshold_pct: int = DEFAULT_FALLBACK_THRESHOLD_PCT,
+) -> dict:
+    """The small file the service reads: one threshold per horizon.
+
+    Everything the sweep learned, reduced to what a request-time lookup
+    needs plus enough provenance to argue with it: the objective and the
+    rule constants it was fitted under, the window of evidence, and per
+    lead the pick, the counts behind it, the plateau, and the radar
+    cross-check. ``push_thresholds.validate_thresholds`` is the contract;
+    ``push_thresholds.effective_threshold`` is the reader.
+
+    A lead with no pick carries null rates and zero counts: those fields
+    describe the picked cell, and where there is no pick there is no cell
+    to describe. ``insufficient`` says which of the two reasons applies —
+    too little evidence, or a grid on which nothing scored at all.
+    """
+    settings = payload["settings"]
+    window = payload["window"]
+    leads: dict[str, dict] = {}
+    for lead in payload["leads"]:
+        pick = payload["picks"].get(str(lead), {})
+        plateau = pick.get("plateau")
+        cell = (plateau or {}).get("cell") or {}
+        radar = pick.get("radar_plateau")
+        leads[str(lead)] = {
+            "threshold_pct": None if plateau is None else int(
+                plateau["threshold_pct"]
+            ),
+            "insufficient": bool(pick.get("insufficient")),
+            "f1": cell.get("f1"),
+            "precision": cell.get("precision"),
+            "recall": cell.get("recall"),
+            "far": cell.get("far"),
+            "csi": cell.get("csi"),
+            "warnings": int(cell.get("warnings") or 0),
+            "hits": int(cell.get("hits") or 0),
+            "false_alarms": int(cell.get("false_alarms") or 0),
+            "misses": int(cell.get("misses") or 0),
+            "late": int(cell.get("late") or 0),
+            "plateau": None if plateau is None else list(plateau["plateau"]),
+            "radar_plateau": None if radar is None else list(radar["plateau"]),
+            "agrees_with_radar": pick.get("agrees_with_radar"),
+        }
+    return {
+        "schema_version": THRESHOLDS_SCHEMA_VERSION,
+        "fitted_at_utc": payload["generated_at_utc"],
+        "objective": {
+            "metric": "f1",
+            "min_useful_lead_min": float(settings["min_useful_lead_min"]),
+            "plateau_frac": float(settings["plateau_frac"]),
+            "min_warnings": int(settings["min_warnings"]),
+            "rearm_after_min": int(settings["rearm_after_min"]),
+            "persistence_obs": int(settings["persistence_obs"]),
+            "tolerance_min": int(settings["tolerance_min"]),
+            "dry_min": int(settings["dry_min"]),
+        },
+        "window": {
+            "from": window["from"],
+            "to": window["to"],
+            "days": int(window["days"]),
+            # The stations that carried gauge truth — the ones the fit
+            # actually stands on, not every station with a decision row.
+            "stations": int(window["stations_scored"]),
+            "rows": int(window["rows"]),
+        },
+        "fallback_threshold_pct": int(fallback_threshold_pct),
+        "leads": leads,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -713,6 +1141,10 @@ def _minutes(value: float | None) -> str:
 
 def _plural(count: int, word: str) -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def _threshold_of(cell: Mapping[str, Any] | None) -> int | None:
+    return None if cell is None else cell.get("threshold_pct")
 
 
 def _find(cells: Sequence[dict], lead: int, threshold: int) -> dict | None:
@@ -753,17 +1185,36 @@ def render_markdown(payload: dict) -> str:
         f"{settings['dry_min']} min dry run before an onset, coverage gap "
         f"{settings['coverage_gap_min']} min"
     )
-    lines.append(f"- FAR cap for the second pick: {_pct(settings['far_cap'])}")
+    lines.append(
+        f"- Objective: max F1, plateau ≥ "
+        f"{settings['plateau_frac'] * 100:.0f} % of the lead's best, "
+        f"minimum useful lead {settings['min_useful_lead_min']:.0f} min, "
+        f"at least {settings['min_warnings']} scored warnings per lead"
+    )
+    lines.append(f"- FAR cap for the secondary pick: {_pct(settings['far_cap'])}")
+    if payload.get("radar"):
+        radar = payload["radar"]
+        lines.append(
+            f"- Radar cross-check: {radar['points']} calibration point(s), "
+            f"{radar['rows']} decision row(s) — a self-consistency check "
+            "against the composite's own `observed_mm_h`, NOT independent "
+            "truth. The gauge pick is the one that ships."
+        )
     lines.append("")
     lines.append(
-        "POD is the share of covered rain onsets a warning caught; FAR the "
-        "share of warnings no rain followed; CSI the two together "
-        "(`hits / (hits + misses + false alarms)`). Lead error is "
-        "`eta − (onset − sent)` in minutes: positive means the rain beat "
-        "the ETA and the warning was late. Every column adds up: "
-        "`hits + false alarms + pending = sent`, and a pending warning is "
-        "one whose window the gauge record does not yet cover, held out of "
-        "both rates rather than graded on evidence that does not exist."
+        "Precision is the share of warnings rain followed usefully; recall "
+        "(= POD) the share of covered onsets usefully warned about; F1 "
+        "their harmonic mean, and the objective. A **late** warning — rain "
+        f"less than {settings['min_useful_lead_min']:.0f} min after it was "
+        "sent — is not a hit and not a false alarm: it stays on the recall "
+        "side only, so FAR is not `1 − precision` wherever the late column "
+        "is non-zero. CSI (`hits / (hits + misses + late + false alarms)`) "
+        "is kept for comparison with the meteorological literature. Lead "
+        "error is `eta − (onset − sent)` in minutes over the hits: positive "
+        "means the rain beat the ETA. Every column adds up: `hits + late + "
+        "false alarms + pending = sent`, and a pending warning is one whose "
+        "window the gauge record does not yet cover, held out of every rate "
+        "rather than graded on evidence that does not exist."
     )
     lines.append("")
 
@@ -776,17 +1227,19 @@ def render_markdown(payload: dict) -> str:
         lines.append(f"## Lead {lead} min")
         lines.append("")
         lines.append(
-            "| threshold | sent | hits | false alarms | pending | misses | "
-            "POD | FAR | CSI | lead err p50 | sent / station-day |"
+            "| threshold | sent | hits | late | false alarms | pending | "
+            "misses | precision | recall (POD) | F1 | F0.5 | F2 | FAR | CSI "
+            "| lead err p50 | sent / station-day |"
         )
         lines.append(
             "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-            "| ---: | ---: |"
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         )
         if nothing:
             lines.append(
-                f"| no rule | 0 | 0 | 0 | 0 | {nothing['misses']} | "
-                f"{_fmt(nothing['pod'])} | – | {_fmt(nothing['csi'])} | – | 0.00 |"
+                f"| no rule | 0 | 0 | 0 | 0 | 0 | {nothing['misses']} | – | "
+                f"{_fmt(nothing['pod'])} | – | – | – | – | "
+                f"{_fmt(nothing['csi'])} | – | 0.00 |"
             )
         for cell in lead_cells:
             current = (
@@ -798,14 +1251,17 @@ def render_markdown(payload: dict) -> str:
                 label = f"**{label}** (shipping today)"
             lines.append(
                 f"| {label} | {cell['n_sent']} | {cell['hits']} | "
-                f"{cell['false_alarms']} | {cell['pending']} | "
+                f"{cell['late']} | {cell['false_alarms']} | {cell['pending']} | "
                 f"{cell['misses']} | "
-                f"{_fmt(cell['pod'])} | {_fmt(cell['far'])} | "
+                f"{_fmt(cell['precision'])} | {_fmt(cell['recall'])} | "
+                f"{_fmt(cell['f1'])} | {_fmt(cell['f_beta_0.5'])} | "
+                f"{_fmt(cell['f_beta_2'])} | {_fmt(cell['far'])} | "
                 f"{_fmt(cell['csi'])} | "
                 f"{_minutes(cell['lead_error_min'].get('p50'))} | "
                 f"{cell['warnings_per_station_day']:.2f} |"
             )
         lines.append("")
+        lines.extend(_plateau_lines(picks, settings))
         best_csi = picks.get("max_csi")
         best_far = picks.get("max_pod_far_capped")
         if best_csi:
@@ -834,6 +1290,47 @@ def render_markdown(payload: dict) -> str:
         lines.append(_lead_paragraph(lead, lead_cells, nothing, picks, payload))
         lines.append("")
     return "\n".join(lines) + "\n"
+
+
+def _plateau_lines(picks: Mapping[str, Any], settings: Mapping[str, Any]) -> list[str]:
+    """The shipping pick for one lead: the plateau, or why there is none."""
+    plateau = picks.get("plateau")
+    if plateau is None:
+        if picks.get("insufficient"):
+            return [
+                f"- **Pick: none.** Only {picks.get('scored_warnings', 0)} "
+                f"scored warning(s) across the whole grid at this lead, "
+                f"under the {picks.get('min_warnings', DEFAULT_MIN_WARNINGS)} "
+                "this fit requires. The horizon keeps the fallback threshold.",
+            ]
+        return [
+            "- **Pick: none.** No threshold at this lead produced an F1 at "
+            "all — nothing was both warned about and verifiable.",
+        ]
+    lo, hi = plateau["plateau"]
+    cell = plateau["cell"]
+    out = [
+        f"- **Pick: {plateau['threshold_pct']} %** — the midpoint of the F1 "
+        f"plateau [{lo} %, {hi} %] "
+        f"({plateau['n_thresholds']} threshold(s) within "
+        f"{settings['plateau_frac'] * 100:.0f} % of the best F1 "
+        f"{_fmt(plateau['max_f1'])}). At the pick: precision "
+        f"{_fmt(cell['precision'])}, recall {_fmt(cell['recall'])}, F1 "
+        f"{_fmt(cell['f1'])}, {cell['hits']} hit(s), {cell['late']} late, "
+        f"{cell['false_alarms']} false alarm(s), {cell['misses']} miss(es).",
+    ]
+    radar = picks.get("radar_plateau")
+    agrees = picks.get("agrees_with_radar")
+    if radar is not None:
+        rlo, rhi = radar["plateau"]
+        out.append(
+            f"- **Radar cross-check:** plateau [{rlo} %, {rhi} %] "
+            f"(pick {radar['threshold_pct']} %) — the gauge pick "
+            + ("is inside it" if agrees else "falls OUTSIDE it")
+            + ". Same instrument produced forecast and truth, so this is "
+            "consistency, not confirmation."
+        )
+    return out
 
 
 def _lead_paragraph(
@@ -952,6 +1449,11 @@ def build_parser() -> argparse.ArgumentParser:
                    action="extend", dest="decisions_dirs",
                    help="directory tree of decision parquet files; repeatable, "
                         "later directories win a (radar_ts, station_id) tie")
+    p.add_argument("--radar-decisions-dir", type=Path, nargs="+",
+                   action="extend", dest="radar_decisions_dirs", default=None,
+                   help="optional second decision set over the radar "
+                        "calibration points, scored against the radar's own "
+                        "observed_mm_h; a self-consistency check, not truth")
     p.add_argument("--corpus-dir", type=Path, required=True,
                    help="gauge store root (the directory holding stations/)")
     p.add_argument("--leads", default=",".join(
@@ -969,9 +1471,25 @@ def build_parser() -> argparse.ArgumentParser:
                         "restarts every subscription armed")
     p.add_argument("--far-cap", type=float, default=DEFAULT_FAR_CAP,
                    help="the ceiling the second pick's false-alarm rate obeys")
+    p.add_argument("--min-useful-lead-min", type=float,
+                   default=FIT_MIN_USEFUL_LEAD_MIN,
+                   help="rain arriving sooner than this after a warning "
+                        "makes it LATE: not a hit, not a false alarm, still "
+                        "counted against recall")
+    p.add_argument("--plateau-frac", type=float, default=DEFAULT_PLATEAU_FRAC,
+                   help="share of the lead's best F1 a threshold must reach "
+                        "to be on the plateau the pick is the midpoint of")
+    p.add_argument("--min-warnings", type=int, default=DEFAULT_MIN_WARNINGS,
+                   help="a lead with fewer scored warnings than this across "
+                        "the whole grid gets no pick at all")
+    p.add_argument("--fallback-threshold-pct", type=int,
+                   default=DEFAULT_FALLBACK_THRESHOLD_PCT,
+                   help="the threshold a lead with no pick falls back to")
     p.add_argument("--out-json", type=Path, default=None)
     p.add_argument("--out-md", type=Path, default=None)
     p.add_argument("--out-csv", type=Path, default=None)
+    p.add_argument("--out-thresholds", type=Path, default=None,
+                   help="the fitted push_thresholds.json the service reads")
     p.add_argument("--workers", type=int, default=1,
                    help="processes over (lead, threshold) cells")
     return p
@@ -995,6 +1513,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if not 0.0 < args.far_cap <= 1.0:
         print("error: --far-cap must be in (0, 1]", file=sys.stderr)
+        return 2
+    if not 0.0 < args.plateau_frac <= 1.0:
+        print("error: --plateau-frac must be in (0, 1]", file=sys.stderr)
+        return 2
+    if args.min_useful_lead_min < 0:
+        print("error: --min-useful-lead-min must not be negative", file=sys.stderr)
+        return 2
+    if args.min_warnings < 0:
+        print("error: --min-warnings must not be negative", file=sys.stderr)
+        return 2
+    if not 0 < args.fallback_threshold_pct < 100:
+        print(
+            "error: --fallback-threshold-pct must be in (0, 100)",
+            file=sys.stderr,
+        )
         return 2
 
     rows, file_leads, counts = load_decisions(
@@ -1090,6 +1623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "coverage": coverage,
         "tolerance_min": int(args.tolerance_min),
         "dry_min": int(args.dry_min),
+        "min_useful_lead_min": float(args.min_useful_lead_min),
         "persistence_obs": int(args.persistence_obs),
         "rearm_after_min": int(args.rearm_after_min),
         "raining_now_mm_h": RAIN_THRESHOLD_MM_H,
@@ -1102,17 +1636,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     cells, do_nothing = run_sweep(
         shared, leads, thresholds, workers=int(args.workers), log=log,
     )
-    picks = {
-        str(lead): {
-            "max_csi": pick_max_csi(
-                [c for c in cells if c["lead_min"] == lead]
-            ),
-            "max_pod_far_capped": pick_max_pod_under_far(
-                [c for c in cells if c["lead_min"] == lead], float(args.far_cap),
-            ),
-        }
-        for lead in leads
-    }
+    del shared
+    release_shared()
+
+    radar_cells: list[dict] | None = None
+    radar_info: dict | None = None
+    if args.radar_decisions_dirs:
+        log("sweeping the radar cross-check set")
+        radar_cells, radar_info = radar_sweep(
+            args.radar_decisions_dirs, leads, thresholds,
+            coverage_gap_min=args.coverage_gap_min,
+            tolerance_min=args.tolerance_min,
+            dry_min=args.dry_min,
+            persistence_obs=args.persistence_obs,
+            rearm_after_min=args.rearm_after_min,
+            min_useful_lead_min=float(args.min_useful_lead_min),
+            workers=int(args.workers),
+            log=log,
+        )
+        log(
+            f"radar set: {radar_info['points']} point(s), "
+            f"{radar_info['rows']} row(s), {radar_info['onsets']} onset(s), "
+            f"{len(radar_cells)} cell(s)"
+        )
+        if not radar_cells:
+            radar_cells = None
+
+    picks = build_picks(
+        cells, leads,
+        far_cap=float(args.far_cap),
+        plateau_frac=float(args.plateau_frac),
+        min_warnings=int(args.min_warnings),
+        radar_cells=radar_cells,
+    )
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(
             timespec="seconds"
@@ -1131,6 +1687,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "dry_min": int(args.dry_min),
             "coverage_gap_min": int(args.coverage_gap_min),
             "far_cap": float(args.far_cap),
+            "min_useful_lead_min": float(args.min_useful_lead_min),
+            "plateau_frac": float(args.plateau_frac),
+            "min_warnings": int(args.min_warnings),
+            "fallback_threshold_pct": int(args.fallback_threshold_pct),
+            "radar_decisions_dirs": [
+                str(d) for d in (args.radar_decisions_dirs or ())
+            ],
             "quiet_hours": False,
         },
         "window": {
@@ -1150,6 +1713,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "cells": cells,
         "do_nothing": do_nothing,
         "picks": picks,
+        "radar": None if radar_info is None else {
+            **radar_info, "cells": radar_cells or [],
+        },
         "current_rule": {
             "lead_min": CURRENT_LEAD_MIN,
             "threshold_pct": CURRENT_THRESHOLD_PCT,
@@ -1157,6 +1723,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
     }
 
+    thresholds_doc = build_thresholds_document(
+        payload, fallback_threshold_pct=int(args.fallback_threshold_pct),
+    )
+    problems = validate_thresholds(thresholds_doc)
+    for problem in problems:
+        log(f"thresholds schema: {problem}")
+    payload["thresholds"] = thresholds_doc
+
+    if args.out_thresholds:
+        _write_atomic(
+            args.out_thresholds, json.dumps(thresholds_doc, indent=1) + "\n",
+        )
+        log(f"wrote {args.out_thresholds}")
     if args.out_json:
         _write_atomic(
             args.out_json, json.dumps(payload, indent=1, default=str) + "\n",
@@ -1174,17 +1753,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "window": payload["window"],
         "picks": {
             lead: {
-                name: None if cell is None else {
-                    "threshold_pct": cell["threshold_pct"],
-                    "pod": cell["pod"],
-                    "far": cell["far"],
-                    "csi": cell["csi"],
-                    "warnings": cell["n_sent"],
-                }
-                for name, cell in per_lead.items()
+                # The fitted answer first, then the two secondary picks as
+                # bare thresholds — the whole cell is in the JSON output.
+                **{
+                    key: entry[key] for key in (
+                        "threshold_pct", "insufficient", "f1", "precision",
+                        "recall", "far", "csi", "late", "plateau",
+                        "radar_plateau", "agrees_with_radar",
+                    )
+                },
+                "max_csi_pct": _threshold_of(picks[lead].get("max_csi")),
+                "far_capped_pct": _threshold_of(
+                    picks[lead].get("max_pod_far_capped"),
+                ),
             }
-            for lead, per_lead in picks.items()
+            for lead, entry in thresholds_doc["leads"].items()
         },
+        "thresholds_schema_problems": len(problems),
     }, indent=2, default=str))
     return 0
 

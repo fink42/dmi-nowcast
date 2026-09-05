@@ -56,9 +56,10 @@ had never been running for.
 So pass ``coverage`` — the intervals the decision rows actually span, from
 :func:`coverage_runs` — and an unclaimed onset outside them is
 ``uncovered``: not a hit, not a miss, not in POD. A claimed onset is
-always a hit, coverage or not; the claim is evidence in itself, and the
-run's tail is where a warning's own window legitimately reaches past the
-last frame.
+settled by the claim, coverage or not — a hit, or ``miss_late`` when the
+warning that claimed it was too late to be useful; the claim is evidence
+in itself, and the run's tail is where a warning's own window legitimately
+reaches past the last frame.
 
 **Pending** is the third outcome, and the reason it exists is that a
 report is built while the weather is still happening. A warning sent two
@@ -90,6 +91,29 @@ warning claims it, so two warnings cannot both take credit for one rain
 event, and an onset left unclaimed is a **miss**. A warning that claims
 nothing is a **false alarm**.
 
+**Late** is the fourth outcome, and it exists because a warning that
+arrives while the user is already reaching for the door handle is not a
+warning. Pass ``min_useful_lead_min`` and a claimed onset whose realised
+lead — ``onset − sent``, in minutes — falls short of it makes the warning
+``late`` and its onset ``miss_late``:
+
+* not a hit — nobody was warned in any useful sense;
+* still on the recall side — the rain came and the user was not usefully
+  told, so it stays in the denominator of POD / recall;
+* **not** a false alarm — the rain did arrive, and charging precision for
+  it would punish a correct forecast for being a few minutes tight.
+
+Precision therefore is ``hits / (hits + false_alarms)`` and does not see
+lates at all, while ``far`` keeps its old denominator (every graded
+warning, lates included), so ``far != 1 − precision`` as soon as a late
+exists. Both are reported; neither is derived from the other. The claim
+itself is unchanged: a late warning still consumes its onset, because the
+rain that fell two minutes after the notification IS the rain the
+notification was about, and letting a later onset be claimed instead
+would flatter a rule that only ever warns at the last moment. The default
+``min_useful_lead_min=0.0`` makes nothing late and leaves every number
+exactly what it was.
+
 Everything is timezone-aware UTC. A naive datetime is a programming
 error and is raised on rather than guessed at.
 """
@@ -109,6 +133,8 @@ __all__ = [
     "DEFAULT_DRY_MIN",
     "DEFAULT_LEAD_MIN",
     "DEFAULT_TOLERANCE_MIN",
+    "DEFAULT_MIN_USEFUL_LEAD_MIN",
+    "F_BETAS",
     "DECISION_COLUMNS",
     "DEFAULT_PRODUCT_LEADS_MIN",
     "align_decision_table",
@@ -129,6 +155,8 @@ __all__ = [
     "OnsetOutcome",
     "ScoreResult",
     "score_warnings",
+    "pooled_summary",
+    "skill_scores",
     "raining_now_agreement",
 ]
 
@@ -150,6 +178,17 @@ DEFAULT_DRY_MIN = 30
 #: The live subscription's lead, and the grace period allowed on top of it.
 DEFAULT_LEAD_MIN = 30
 DEFAULT_TOLERANCE_MIN = 10
+
+#: Minutes of realised lead below which a warning is ``late`` rather than a
+#: hit. Zero here — the scorer's own default changes nothing — because the
+#: historical numbers on the quality page were produced without it. The
+#: threshold fit (``scripts/sweep_thresholds.py``) passes 5.
+DEFAULT_MIN_USEFUL_LEAD_MIN = 0.0
+
+#: The β values ``f_beta`` reports, keyed by their string form: β < 1
+#: weights precision (fewer wasted notifications), β > 1 weights recall
+#: (less rain missed), β = 1 is F1, the objective the horizon fit maximises.
+F_BETAS: tuple[float, ...] = (0.5, 1.0, 2.0)
 
 #: The longest gap between consecutive decision rows that still counts as
 #: continuous coverage: two radar cycles at DMI's 10-minute cadence. One
@@ -590,8 +629,10 @@ class WarningOutcome:
 
     sent_utc: datetime
     eta_min: float | None
-    #: ``"hit"``, ``"false_alarm"``, or ``"pending"`` — the last only when
-    #: ``known_until`` says the window has not closed yet.
+    #: ``"hit"``, ``"late"`` (an onset claimed with less than
+    #: ``min_useful_lead_min`` of realised lead), ``"false_alarm"``, or
+    #: ``"pending"`` — the last only when ``known_until`` says the window
+    #: has not closed yet.
     outcome: str
     onset_utc: datetime | None = None
     #: ``eta - (onset - sent)``, minutes. POSITIVE = the rain arrived
@@ -606,9 +647,10 @@ class OnsetOutcome:
     """One gauge onset and the warning (if any) that claimed it."""
 
     onset_utc: datetime
-    #: ``"hit"``, ``"miss"``, ``"pending"`` (an unclaimed onset too close
-    #: to ``known_until`` for the gauge's word to be final), or
-    #: ``"uncovered"`` (no decision row was watching that instant).
+    #: ``"hit"``, ``"miss_late"`` (claimed, but too late to be useful),
+    #: ``"miss"``, ``"pending"`` (an unclaimed onset too close to
+    #: ``known_until`` for the gauge's word to be final), or ``"uncovered"``
+    #: (no decision row was watching that instant).
     outcome: str
     sent_utc: datetime | None = None
     lead_error_min: float | None = None
@@ -646,6 +688,58 @@ def _quantiles(values: Sequence[float]) -> dict[str, float | None]:
     return {"p25": q(0.25), "p50": q(0.5), "p75": q(0.75), "n": n}
 
 
+def _f_beta(precision: float | None, recall: float | None, beta: float) -> float | None:
+    """``(1 + β²)·P·R / (β²·P + R)``, or ``None`` where it has no value.
+
+    Undefined means undefined: if either rate could not be measured, or if
+    both are zero (a rule that caught nothing, warned about nothing, or
+    both), there is no harmonic mean to report and a 0.0 would read as a
+    measurement rather than an absence.
+    """
+    if precision is None or recall is None:
+        return None
+    b2 = float(beta) ** 2
+    denom = b2 * precision + recall
+    if denom <= 0.0:
+        return None
+    return (1.0 + b2) * precision * recall / denom
+
+
+def skill_scores(
+    hits: int, false_alarms: int, misses: int, late: int = 0,
+) -> dict[str, Any]:
+    """Precision / recall / F-scores / CSI from one confusion count.
+
+    One definition, shared by the per-station summary and the pooled one,
+    so a national number and a station number cannot drift apart:
+
+    * ``precision = hits / (hits + false_alarms)`` — lates are absent from
+      both halves: the rain came, so the notification was not wrong.
+    * ``recall = hits / (hits + misses + late)`` — a late warning leaves
+      the rain effectively unwarned, so it sits with the misses.
+    * ``csi = hits / (hits + misses + late + false_alarms)`` — the
+      meteorologists' single number, with late on the miss side exactly as
+      in recall.
+
+    Every rate is ``None`` when its denominator is empty. A rate over no
+    events is not zero.
+    """
+    predicted = hits + false_alarms
+    actual = hits + misses + late
+    precision = (hits / predicted) if predicted else None
+    recall = (hits / actual) if actual else None
+    denom = hits + misses + late + false_alarms
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": _f_beta(precision, recall, 1.0),
+        "f_beta": {
+            f"{beta:g}": _f_beta(precision, recall, beta) for beta in F_BETAS
+        },
+        "csi": (hits / denom) if denom else None,
+    }
+
+
 def score_warnings(
     warnings: Iterable[tuple[datetime, float | None]],
     onset_times: Sequence[datetime],
@@ -655,6 +749,7 @@ def score_warnings(
     dry_min: int = DEFAULT_DRY_MIN,
     known_until: datetime | None = None,
     coverage: Sequence[tuple[datetime, datetime]] | None = None,
+    min_useful_lead_min: float = DEFAULT_MIN_USEFUL_LEAD_MIN,
 ) -> ScoreResult:
     """Match warnings to onsets; return per-warning, per-onset and totals.
 
@@ -667,9 +762,19 @@ def score_warnings(
     claims the earliest still-unclaimed onset inside its window
     ``(sent, sent + lead_min + tolerance_min]``. Warnings that claim
     nothing are false alarms; onsets nothing claimed are misses. Hence
-    ``hits + false_alarms == warnings`` and ``hits + misses == n_onsets −
-    pending_onsets − uncovered_onsets`` always hold, which is what makes
-    POD and FAR readable side by side.
+    ``hits + late + false_alarms == warnings`` and ``hits + misses + late
+    == n_onsets − pending_onsets − uncovered_onsets`` always hold, which is
+    what makes POD and FAR readable side by side.
+
+    ``min_useful_lead_min`` is the shortest realised lead — ``onset −
+    sent`` — that still counts as a warning. A claim below it is ``late``
+    (the onset ``miss_late``): out of the hits, out of precision's
+    denominator, still in recall's. The default 0.0 makes nothing late.
+    Lead-error quantiles stay a property of the HITS, so a late warning's
+    error is recorded on its own row but does not move the median: the
+    spread answers "when we warned in time, how close was the ETA?", and
+    folding in the warnings that arrived too late would answer two
+    questions with one number.
 
     ``coverage`` is that station's decision runs from :func:`coverage_runs`.
     Give it and an unclaimed onset outside every run is ``uncovered``
@@ -714,11 +819,14 @@ def score_warnings(
     onset_list = sorted(_as_utc(o, "onset") for o in onset_times)
     claimed_by: list[datetime | None] = [None] * len(onset_list)
     claimed_error: list[float | None] = [None] * len(onset_list)
+    claimed_late: list[bool] = [False] * len(onset_list)
 
     warning_rows: list[WarningOutcome] = []
     lead_errors: list[float] = []
     hits = 0
     pending = 0
+    late = 0
+    useful = float(min_useful_lead_min)
     for sent, eta in sent_list:
         pick: int | None = None
         for i, onset in enumerate(onset_list):
@@ -740,21 +848,34 @@ def score_warnings(
             warning_rows.append(WarningOutcome(sent, eta, "false_alarm"))
             continue
         onset = onset_list[pick]
+        realised = (onset - sent).total_seconds() / 60.0
+        # A claim below the useful lead is still a claim — the onset is
+        # consumed either way — but the warning did not do its job.
+        in_time = realised >= useful
         error: float | None = None
         if eta is not None:
             # Predicted lead minus delivered lead: positive = the rain beat
             # the ETA, so the warning was late. See the module docstring.
-            error = float(eta) - (onset - sent).total_seconds() / 60.0
-            lead_errors.append(error)
+            error = float(eta) - realised
+            if in_time:
+                lead_errors.append(error)
         claimed_by[pick] = sent
         claimed_error[pick] = error
-        hits += 1
-        warning_rows.append(WarningOutcome(sent, eta, "hit", onset, error))
+        claimed_late[pick] = not in_time
+        if in_time:
+            hits += 1
+        else:
+            late += 1
+        warning_rows.append(WarningOutcome(
+            sent, eta, "hit" if in_time else "late", onset, error,
+        ))
 
     onset_rows = tuple(
         OnsetOutcome(
             onset,
-            _onset_outcome(claimed_by[i], onset, horizon, grace, runs),
+            _onset_outcome(
+                claimed_by[i], claimed_late[i], onset, horizon, grace, runs,
+            ),
             claimed_by[i],
             claimed_error[i],
         )
@@ -762,29 +883,40 @@ def score_warnings(
     )
     n_sent = len(warning_rows)
     scored = n_sent - pending
-    false_alarms = scored - hits
+    false_alarms = scored - hits - late
     pending_onsets = sum(1 for row in onset_rows if row.outcome == "pending")
     uncovered = sum(1 for row in onset_rows if row.outcome == "uncovered")
-    misses = len(onset_list) - hits - pending_onsets - uncovered
+    misses = len(onset_list) - hits - late - pending_onsets - uncovered
+    skill = skill_scores(hits, false_alarms, misses, late)
     summary = {
-        # ``warnings`` is the SCORED count, so hits + false_alarms adds up
-        # to it in the sentence the page writes. ``n_sent`` keeps the raw
-        # total honest alongside.
+        # ``warnings`` is the SCORED count, so hits + late + false_alarms
+        # adds up to it in the sentence the page writes. ``n_sent`` keeps
+        # the raw total honest alongside.
         "warnings": scored,
         "n_sent": n_sent,
         "pending": pending,
         "hits": hits,
+        "late": late,
         "false_alarms": false_alarms,
         "misses": misses,
         "pending_onsets": pending_onsets,
         "uncovered_onsets": uncovered,
         "n_onsets": len(onset_list),
-        "pod": (hits / (hits + misses)) if (hits + misses) else None,
+        # POD and recall are the same number by construction, kept under
+        # both names so a meteorologist and a product decision can read the
+        # same summary without translating.
+        "pod": skill["recall"],
         "far": (false_alarms / scored) if scored else None,
+        "precision": skill["precision"],
+        "recall": skill["recall"],
+        "f1": skill["f1"],
+        "f_beta": skill["f_beta"],
+        "csi": skill["csi"],
         "lead_error_min": _quantiles(lead_errors),
         "lead_min": int(lead_min),
         "tolerance_min": int(tolerance_min),
         "dry_min": int(dry_min),
+        "min_useful_lead_min": float(min_useful_lead_min),
         "known_until": horizon,
         "coverage_runs": 0 if runs is None else len(runs),
     }
@@ -793,14 +925,17 @@ def score_warnings(
 
 def _onset_outcome(
     claimed_by: datetime | None,
+    claimed_late: bool,
     onset: datetime,
     horizon: datetime | None,
     grace: timedelta,
     runs: Sequence[tuple[datetime, datetime]] | None,
 ) -> str:
-    """``hit`` / ``miss`` / ``pending`` / ``uncovered`` for one onset.
+    """``hit`` / ``miss_late`` / ``miss`` / ``pending`` / ``uncovered``.
 
-    A claimed onset is a hit and nothing downgrades it. An unclaimed one
+    A claimed onset is settled — a hit, or ``miss_late`` when the warning
+    that claimed it arrived too late to be useful — and neither coverage
+    nor the gauge's horizon downgrades it further. An unclaimed one
     is a miss only where the service could have caught it: inside a
     decision run (else ``uncovered`` — nobody was watching), and far
     enough from the gauge's last word for that word to be final (else
@@ -809,7 +944,7 @@ def _onset_outcome(
     instant a warning would have had to match).
     """
     if claimed_by is not None:
-        return "hit"
+        return "miss_late" if claimed_late else "hit"
     if runs is not None and not _covered(onset, runs):
         return "uncovered"
     if horizon is not None and onset + grace > horizon:
@@ -820,10 +955,10 @@ def _onset_outcome(
 def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
     """Totals over several stations' :class:`ScoreResult`.
 
-    Counts add; POD, FAR and the lead-error quantiles are recomputed from
-    the pooled populations rather than averaged, because a station with
-    two warnings and a station with two hundred must not carry the same
-    weight in a national number.
+    Counts add; POD, FAR, precision, recall, the F-scores, CSI and the
+    lead-error quantiles are recomputed from the pooled populations rather
+    than averaged, because a station with two warnings and a station with
+    two hundred must not carry the same weight in a national number.
 
     Pending and uncovered onsets, and pending warnings, pool as their own
     counts and stay out of every rate, exactly as they do per station — a
@@ -836,25 +971,39 @@ def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
     warnings = [w for r in rows for w in r.warnings]
     onset_rows = [o for r in rows for o in r.onsets]
     hits = sum(1 for w in warnings if w.outcome == "hit")
+    late = sum(1 for w in warnings if w.outcome == "late")
     pending = sum(1 for w in warnings if w.outcome == "pending")
     scored = len(warnings) - pending
-    false_alarms = scored - hits
+    false_alarms = scored - hits - late
     misses = sum(1 for o in onset_rows if o.outcome == "miss")
     pending_onsets = sum(1 for o in onset_rows if o.outcome == "pending")
     uncovered = sum(1 for o in onset_rows if o.outcome == "uncovered")
-    errors = [w.lead_error_min for w in warnings if w.lead_error_min is not None]
+    # The quantiles are over the HITS, exactly as they are per station: a
+    # late warning has an error, and it is on its own row, but it is not
+    # part of "how close was the ETA when we warned in time?".
+    errors = [
+        w.lead_error_min for w in warnings
+        if w.outcome == "hit" and w.lead_error_min is not None
+    ]
+    skill = skill_scores(hits, false_alarms, misses, late)
     out = {
         "warnings": scored,
         "n_sent": len(warnings),
         "pending": pending,
         "hits": hits,
+        "late": late,
         "false_alarms": false_alarms,
         "misses": misses,
         "pending_onsets": pending_onsets,
         "uncovered_onsets": uncovered,
         "n_onsets": len(onset_rows),
-        "pod": (hits / (hits + misses)) if (hits + misses) else None,
+        "pod": skill["recall"],
         "far": (false_alarms / scored) if scored else None,
+        "precision": skill["precision"],
+        "recall": skill["recall"],
+        "f1": skill["f1"],
+        "f_beta": skill["f_beta"],
+        "csi": skill["csi"],
         "lead_error_min": _quantiles(errors),
     }
     out.update(params)

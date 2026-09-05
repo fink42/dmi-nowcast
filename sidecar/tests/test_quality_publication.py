@@ -67,6 +67,9 @@ DOC = {
     "stations": None,
     "events": None,
     "methods": None,
+    # Every top-level section is present-as-null, thresholds included:
+    # the checker treats an absent key as a producer bug, not a null.
+    "thresholds": None,
 }
 
 CURVES = {

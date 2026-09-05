@@ -16,7 +16,7 @@ on disk comes out as ``None`` and the page says so in words.
 What goes in
 ------------
 
-Five optional inputs, each nulling only what it feeds:
+Six optional inputs, each nulling only what it feeds:
 
 ``radar_corpus``
     The national calibration corpus Parquet (``event_time``, ``point_id``,
@@ -39,6 +39,10 @@ Five optional inputs, each nulling only what it feeds:
 ``persistence_json``
     ``scripts/persistence_vs_advection.py``'s ``results.json``. Feeds
     ``headline.persistence_margin`` and nothing else.
+``thresholds_path``
+    ``scripts/sweep_thresholds.py --out-thresholds``: the fitted
+    horizon→threshold table the push rule serves. Feeds ``thresholds``,
+    and only if it passes ``push_thresholds.validate_thresholds``.
 
 Reliability, and *whose* probability it is
 ------------------------------------------
@@ -87,6 +91,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from .push_thresholds import (
+    OBJECTIVE_SPEC as THRESHOLDS_OBJECTIVE_SPEC,
+    load_thresholds,
+    validate_leads_table,
+)
 from .warning_score import (
     DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
@@ -166,6 +175,10 @@ class QualityInputs:
     corpus_dir: Path | None = None
     persistence_json: Path | None = None
     national_curves: Path | None = None
+    #: ``scripts/sweep_thresholds.py --out-thresholds`` output: the fitted
+    #: horizon→threshold table the push rule serves. Feeds ``thresholds``
+    #: and nothing else.
+    thresholds_path: Path | None = None
     live_days: int = 90
     live_days_secondary: int = 30
     #: Overrides ``datetime.now(timezone.utc)``; tests pin it.
@@ -1275,6 +1288,36 @@ def _persistence_margin(inputs: QualityInputs) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# The fitted push thresholds
+# ---------------------------------------------------------------------------
+
+
+def _thresholds_section(inputs: QualityInputs) -> dict | None:
+    """The fitted horizon→threshold table, as the page shows it.
+
+    ``scripts/sweep_thresholds.py`` produces the document; this copies four
+    of its five parts through verbatim — when it was fitted, the objective
+    it was fitted under, the fallback, and the per-lead table. The window
+    is left behind: this report has its own windows section, and two
+    windows on one page disagreeing by a day would be a puzzle rather than
+    a fact.
+
+    Null when the file is absent, unreadable, or fails
+    ``push_thresholds.validate_thresholds``. A half-parsed threshold table
+    is exactly the kind of number this page exists not to print.
+    """
+    doc = load_thresholds(inputs.thresholds_path)
+    if doc is None:
+        return None
+    return {
+        "fitted_at_utc": doc["fitted_at_utc"],
+        "objective": doc["objective"],
+        "fallback_threshold_pct": doc["fallback_threshold_pct"],
+        "leads": doc["leads"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Methods
 # ---------------------------------------------------------------------------
 
@@ -1550,6 +1593,7 @@ def build_quality_report(inputs: QualityInputs) -> dict:
         "methods": _methods_section(
             inputs, radar, gauge, summary, radar_curves, gauge_curves,
         ),
+        "thresholds": _thresholds_section(inputs),
     }
 
 
@@ -1630,7 +1674,7 @@ def validate_report(report: Any) -> list[str]:
         problems.append("generated_at_utc: missing or not an ISO timestamp")
 
     for key in ("windows", "headline", "reliability", "raining_now",
-                "stations", "events", "methods"):
+                "stations", "events", "methods", "thresholds"):
         if key not in report:
             problems.append(f"{key}: missing (use null, never absent)")
 
@@ -1821,7 +1865,42 @@ def validate_report(report: Any) -> list[str]:
             (methods or {}).get("sources"), {"radar": str, "gauges": str},
             "methods.sources", problems,
         )
+
+    if report.get("thresholds") is not None:
+        _check_thresholds(report["thresholds"], problems)
     return problems
+
+
+def _check_thresholds(block: Any, problems: list[str]) -> None:
+    """The fitted-threshold section, checked against its own module.
+
+    The lead rows go through ``push_thresholds.validate_leads_table`` — the
+    same function the writer's self-check runs — so this page cannot start
+    accepting a shape the service would refuse to read.
+    """
+    if not isinstance(block, dict):
+        problems.append(
+            f"thresholds: expected an object, got {type(block).__name__}",
+        )
+        return
+    if _parse_ts(block.get("fitted_at_utc")) is None:
+        problems.append("thresholds.fitted_at_utc: missing or not an ISO timestamp")
+    fallback = block.get("fallback_threshold_pct")
+    if isinstance(fallback, bool) or not isinstance(fallback, int):
+        problems.append("thresholds.fallback_threshold_pct: expected an integer")
+    elif not 0 < fallback < 100:
+        problems.append(
+            f"thresholds.fallback_threshold_pct: {fallback} out of range (0, 100)",
+        )
+    _check_block(
+        block.get("objective"), THRESHOLDS_OBJECTIVE_SPEC,
+        "thresholds.objective", problems,
+    )
+    leads = block.get("leads")
+    if not isinstance(leads, dict):
+        problems.append("thresholds.leads: expected an object keyed by lead minutes")
+        return
+    problems.extend(validate_leads_table(leads, "thresholds.leads"))
 
 
 # ---------------------------------------------------------------------------
@@ -1835,6 +1914,20 @@ def _pct(value: float | None, places: int = 1) -> str:
 
 def _num(value: float | None, places: int = 3) -> str:
     return "—" if value is None else f"{value:.{places}f}"
+
+
+def _range(pair: Any) -> str:
+    """``[40, 55]`` → "40–55 %"; null → an em dash, never "0–0"."""
+    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+        return "—"
+    return f"{pair[0]}–{pair[1]} %"
+
+
+def _yes_no(value: Any) -> str:
+    """A tri-state: yes / no / not compared."""
+    if value is None:
+        return "—"
+    return "yes" if value else "no"
 
 
 def render_markdown(report: Mapping[str, Any]) -> str:
@@ -2024,6 +2117,49 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             add(f"- Pending: {methods['pending_rule']}.")
         add(f"- Sources: {methods['sources']['radar']}; "
             f"{methods['sources']['gauges']}.")
+    else:
+        add("Not measured.")
+    add("")
+
+    add("## Push thresholds")
+    add("")
+    thresholds = report.get("thresholds")
+    if thresholds:
+        objective = thresholds.get("objective") or {}
+        add(f"Fitted {thresholds['fitted_at_utc']} by maximising "
+            f"{objective.get('metric', '—')} with a minimum useful lead of "
+            f"{_num(objective.get('min_useful_lead_min'), 0)} min: a warning "
+            "whose rain arrives sooner than that is late — not a hit, not a "
+            "false alarm, still counted against recall. The pick is the "
+            "midpoint of the plateau within "
+            f"{_pct(objective.get('plateau_frac'), 0)} of the lead's best "
+            "score. A lead with fewer than "
+            f"{objective.get('min_warnings', '—')} scored warnings gets no "
+            "pick and falls back to "
+            f"{thresholds['fallback_threshold_pct']} %.")
+        add("")
+        add("| horizon | threshold | plateau | F1 | precision | recall | "
+            "FAR | CSI | warnings | hits | late | false alarms | misses | "
+            "radar plateau | agrees |")
+        add("|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+        for lead in sorted(thresholds.get("leads") or {}, key=int):
+            row = thresholds["leads"][lead]
+            pick = (
+                f"{row['threshold_pct']} %" if row.get("threshold_pct") is not None
+                else ("— (insufficient)" if row.get("insufficient") else "—")
+            )
+            add(f"| {lead} min | {pick} | {_range(row.get('plateau'))} | "
+                f"{_num(row.get('f1'))} | {_num(row.get('precision'))} | "
+                f"{_num(row.get('recall'))} | {_num(row.get('far'))} | "
+                f"{_num(row.get('csi'))} | {row.get('warnings', 0):,} | "
+                f"{row.get('hits', 0):,} | {row.get('late', 0):,} | "
+                f"{row.get('false_alarms', 0):,} | {row.get('misses', 0):,} | "
+                f"{_range(row.get('radar_plateau'))} | "
+                f"{_yes_no(row.get('agrees_with_radar'))} |")
+        add("")
+        add("The radar column is a self-consistency check — the composite "
+            "scoring its own forecast — not independent truth. The gauge "
+            "pick is the one that ships.")
     else:
         add("Not measured.")
     add("")

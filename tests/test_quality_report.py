@@ -467,6 +467,52 @@ def write_persistence(path: Path) -> Path:
     return path
 
 
+def write_thresholds(path: Path, **overrides) -> Path:
+    """A fitted push_thresholds.json, as sweep_thresholds.py writes it."""
+    lead = {
+        "threshold_pct": 45,
+        "insufficient": False,
+        "f1": 0.41,
+        "precision": 0.47,
+        "recall": 0.36,
+        "far": 0.53,
+        "csi": 0.26,
+        "warnings": 212,
+        "hits": 99,
+        "false_alarms": 113,
+        "misses": 160,
+        "late": 17,
+        "plateau": [40, 55],
+        "radar_plateau": [35, 60],
+        "agrees_with_radar": True,
+    }
+    thin = {
+        **lead, "threshold_pct": None, "insufficient": True, "f1": None,
+        "precision": None, "recall": None, "far": None, "csi": None,
+        "warnings": 4, "hits": 1, "false_alarms": 3, "misses": 9, "late": 0,
+        "plateau": None, "radar_plateau": None, "agrees_with_radar": None,
+    }
+    doc = {
+        "schema_version": 1,
+        "fitted_at_utc": "2026-09-05T02:11:07+00:00",
+        "objective": {
+            "metric": "f1", "min_useful_lead_min": 5.0, "plateau_frac": 0.95,
+            "min_warnings": 30, "rearm_after_min": 60, "persistence_obs": 1,
+            "tolerance_min": 10, "dry_min": 30,
+        },
+        "window": {
+            "from": "2026-07-01T00:00:00+00:00",
+            "to": "2026-09-01T00:00:00+00:00",
+            "days": 62, "stations": 97, "rows": 1841203,
+        },
+        "fallback_threshold_pct": 40,
+        "leads": {"20": {**lead, "threshold_pct": 50}, "30": lead, "60": thin},
+    }
+    doc.update(overrides)
+    path.write_text(json.dumps(doc))
+    return path
+
+
 @pytest.fixture
 def full_inputs(tmp_path: Path) -> QualityInputs:
     """Every input present — the report with nothing missing."""
@@ -483,6 +529,7 @@ def full_inputs(tmp_path: Path) -> QualityInputs:
         corpus_dir=corpus_dir,
         persistence_json=write_persistence(tmp_path / "pva.json"),
         national_curves=write_curves(tmp_path / "curves.json"),
+        thresholds_path=write_thresholds(tmp_path / "push_thresholds.json"),
         now=NOW,
     )
 
@@ -497,7 +544,7 @@ class TestFullReport:
         report = build_quality_report(full_inputs)
         assert report["schema_version"] == SCHEMA_VERSION
         for key in ("windows", "headline", "reliability", "raining_now",
-                    "stations", "events", "methods"):
+                    "stations", "events", "methods", "thresholds"):
             assert report[key] is not None, f"{key} should be measured here"
         assert report["windows"]["radar"] is not None
         assert report["windows"]["gauge"] is not None
@@ -1510,3 +1557,86 @@ class TestMarkdown:
         assert text.count("Not measured.") >= 4
         assert "not measured" in text
         assert "## Stations" in text
+
+
+# ---------------------------------------------------------------------------
+# The fitted push thresholds (Phase G, G1)
+# ---------------------------------------------------------------------------
+
+
+class TestThresholdsSection:
+    def test_the_document_is_copied_through_with_its_provenance(
+        self, tmp_path: Path,
+    ) -> None:
+        path = write_thresholds(tmp_path / "push_thresholds.json")
+        report = build_quality_report(
+            QualityInputs(thresholds_path=path, now=NOW),
+        )
+        section = report["thresholds"]
+        assert section["fitted_at_utc"] == "2026-09-05T02:11:07+00:00"
+        assert section["objective"]["metric"] == "f1"
+        assert section["objective"]["min_useful_lead_min"] == 5.0
+        assert section["fallback_threshold_pct"] == 40
+        assert section["leads"]["30"]["threshold_pct"] == 45
+        assert section["leads"]["60"]["insufficient"] is True
+        # The fit's own window is NOT copied: this page has one windows
+        # section, and a second one disagreeing by a day would be a puzzle.
+        assert "window" not in section
+        assert validate_report(report) == []
+
+    def test_no_file_nulls_the_section_rather_than_faking_a_threshold(
+        self, tmp_path: Path,
+    ) -> None:
+        report = build_quality_report(
+            QualityInputs(thresholds_path=tmp_path / "absent.json", now=NOW),
+        )
+        assert report["thresholds"] is None
+        assert "thresholds" in report            # null, never absent
+        assert validate_report(report) == []
+
+    @pytest.mark.parametrize("payload", ["{not json", '{"schema_version": 99}'])
+    def test_an_unreadable_document_nulls_the_section(
+        self, tmp_path: Path, payload: str,
+    ) -> None:
+        """Half a threshold table is worse than none: it would still warn."""
+        path = tmp_path / "broken.json"
+        path.write_text(payload)
+        report = build_quality_report(
+            QualityInputs(thresholds_path=path, now=NOW),
+        )
+        assert report["thresholds"] is None
+
+    def test_the_checker_catches_a_broken_lead_row(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(full_inputs)
+        report["thresholds"]["leads"]["30"]["insufficient"] = True
+        problems = validate_report(report)
+        assert any("thresholds.leads.30" in p for p in problems)
+
+    def test_the_checker_catches_a_bad_objective_and_fallback(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(full_inputs)
+        del report["thresholds"]["objective"]["plateau_frac"]
+        report["thresholds"]["fallback_threshold_pct"] = 140
+        problems = validate_report(report)
+        assert any("thresholds.objective.plateau_frac" in p for p in problems)
+        assert any("thresholds.fallback_threshold_pct" in p for p in problems)
+
+    def test_the_markdown_prints_the_per_lead_table(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        text = render_markdown(build_quality_report(full_inputs))
+        assert "## Push thresholds" in text
+        assert "| 30 min | 45 % | 40–55 % |" in text
+        # A lead with too little evidence says so instead of showing a pick.
+        assert "— (insufficient)" in text
+        assert "self-consistency check" in text
+
+    def test_the_markdown_says_not_measured_without_a_fit(self) -> None:
+        text = render_markdown(build_quality_report(QualityInputs(now=NOW)))
+        assert "## Push thresholds" in text
+        assert text.split("## Push thresholds")[1].strip().startswith(
+            "Not measured."
+        )

@@ -867,3 +867,158 @@ def test_raining_now_agreement_only_ever_looks_at_decision_rows() -> None:
     assert out["n_rows"] == 2
     assert out["n_scored"] == 2
     assert out["forecast_now"]["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The minimum useful lead: hit, or late?
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_makes_nothing_late() -> None:
+    """Rain thirty seconds after the warning still scores as a hit at 0.0.
+
+    The historical numbers on the quality page were produced without this
+    knob, so the scorer's own default has to leave them untouched.
+    """
+    res = score_warnings([(_at(0), 5.0)], [_at(0.5)])
+    assert res.summary["late"] == 0
+    assert res.summary["hits"] == 1
+    assert res.summary["min_useful_lead_min"] == 0.0
+    assert res.warnings[0].outcome == "hit"
+
+
+def test_exactly_the_minimum_useful_lead_is_still_a_hit() -> None:
+    """The boundary is inclusive: five minutes is five minutes of warning."""
+    res = score_warnings([(_at(0), 5.0)], [_at(5)], min_useful_lead_min=5.0)
+    assert res.summary["hits"] == 1
+    assert res.summary["late"] == 0
+    assert res.warnings[0].outcome == "hit"
+    assert res.onsets[0].outcome == "hit"
+
+
+def test_a_shorter_lead_is_late_and_lands_on_the_recall_side() -> None:
+    res = score_warnings([(_at(0), 5.0)], [_at(4)], min_useful_lead_min=5.0)
+    s = res.summary
+    assert res.warnings[0].outcome == "late"
+    assert res.onsets[0].outcome == "miss_late"
+    assert (s["hits"], s["late"], s["false_alarms"], s["misses"]) == (0, 1, 0, 0)
+    # The rain came and nobody was usefully told: recall counts it, and
+    # POD stays equal to recall by construction.
+    assert s["recall"] == 0.0
+    assert s["pod"] == s["recall"]
+    # Precision never saw it: no warning was wrong, so its denominator is
+    # empty and the rate is undefined rather than zero.
+    assert s["precision"] is None
+    assert s["f1"] is None
+    assert s["csi"] == 0.0
+
+
+def test_a_late_warning_is_not_a_false_alarm_so_far_is_not_one_minus_precision() -> None:
+    """The documented asymmetry, in one case.
+
+    One warning whose rain lands two minutes later (late) and one warning
+    nothing followed (a false alarm). FAR counts both in its denominator;
+    precision counts only the second.
+    """
+    res = score_warnings(
+        [(_at(0), 10.0), (_at(600), 10.0)], [_at(2)],
+        min_useful_lead_min=5.0,
+    )
+    s = res.summary
+    assert [w.outcome for w in res.warnings] == ["late", "false_alarm"]
+    assert (s["hits"], s["late"], s["false_alarms"], s["warnings"]) == (0, 1, 1, 2)
+    assert s["far"] == pytest.approx(0.5)
+    assert s["precision"] == 0.0
+    assert s["far"] != 1.0 - s["precision"]
+
+
+def test_a_late_claim_still_consumes_its_onset() -> None:
+    """Two warnings, one onset: the first claims it even though it is late.
+
+    Letting the second warning re-claim the onset as a hit would let a
+    rule that only ever fires at the last moment launder its lates into
+    hits by sending twice.
+    """
+    res = score_warnings(
+        [(_at(0), 10.0), (_at(1), 10.0)], [_at(3)], min_useful_lead_min=5.0,
+    )
+    assert [w.outcome for w in res.warnings] == ["late", "false_alarm"]
+    assert res.summary["n_onsets"] == 1
+    assert res.summary["misses"] == 0
+
+
+def test_the_counts_balance_with_late_in_the_mix() -> None:
+    """``hits + misses + late == n_onsets − pending − uncovered``."""
+    warnings = [(_at(0), 20.0), (_at(200), 20.0)]
+    onset_times = [_at(2), _at(225), _at(600)]
+    s = score_warnings(
+        warnings, onset_times, known_until=_at(2000), min_useful_lead_min=5.0,
+    ).summary
+    assert (s["hits"], s["late"], s["misses"]) == (1, 1, 1)
+    assert s["hits"] + s["misses"] + s["late"] == (
+        s["n_onsets"] - s["pending_onsets"] - s["uncovered_onsets"]
+    )
+    assert s["hits"] + s["late"] + s["false_alarms"] == s["warnings"]
+
+
+def test_a_late_warning_keeps_its_lead_error_but_stays_out_of_the_quantiles() -> None:
+    """The spread answers "when we warned in time, how close was the ETA?"."""
+    res = score_warnings(
+        [(_at(0), 30.0), (_at(600), 30.0)], [_at(2), _at(625)],
+        min_useful_lead_min=5.0,
+    )
+    late = res.warnings[0]
+    assert late.outcome == "late"
+    assert late.lead_error_min == pytest.approx(28.0)
+    spread = res.summary["lead_error_min"]
+    assert spread["n"] == 1
+    assert spread["p50"] == pytest.approx(5.0)
+
+
+def test_f_scores_are_the_textbook_harmonic_means() -> None:
+    from dmi_nowcast_core.warning_score import skill_scores
+
+    skill = skill_scores(hits=3, false_alarms=1, misses=1, late=2)
+    assert skill["precision"] == pytest.approx(0.75)
+    assert skill["recall"] == pytest.approx(0.5)
+    assert skill["f1"] == pytest.approx(0.6)
+    assert skill["f_beta"]["1"] == skill["f1"]
+    # β < 1 leans on precision, β > 1 on recall.
+    assert skill["f_beta"]["0.5"] == pytest.approx(0.6818181818, rel=1e-9)
+    assert skill["f_beta"]["2"] == pytest.approx(0.5357142857, rel=1e-9)
+    # Late sits on the miss side of CSI: 3 / (3 hits + 1 miss + 2 late
+    # + 1 false alarm).
+    assert skill["csi"] == pytest.approx(3 / 7)
+
+
+def test_undefined_rates_are_none_not_zero() -> None:
+    from dmi_nowcast_core.warning_score import skill_scores
+
+    nothing = skill_scores(hits=0, false_alarms=0, misses=0, late=0)
+    assert nothing["precision"] is None
+    assert nothing["recall"] is None
+    assert nothing["f1"] is None
+    assert nothing["csi"] is None
+    # Both rates defined but zero: still no harmonic mean to report.
+    empty = skill_scores(hits=0, false_alarms=1, misses=1, late=0)
+    assert empty["precision"] == 0.0
+    assert empty["recall"] == 0.0
+    assert empty["f1"] is None
+
+
+def test_pooled_summary_pools_the_late_column_and_recomputes_the_scores() -> None:
+    prompt = score_warnings(
+        [(_at(0), 20.0)], [_at(20)], min_useful_lead_min=5.0,
+    )                                                   # 1 hit
+    tardy = score_warnings(
+        [(_at(0), 20.0), (_at(600), 20.0)], [_at(2)], min_useful_lead_min=5.0,
+    )                                                   # 1 late, 1 false alarm
+    pooled = pooled_summary([prompt, tardy], lead_min=30)
+    assert (pooled["hits"], pooled["late"], pooled["false_alarms"]) == (1, 1, 1)
+    assert pooled["precision"] == pytest.approx(0.5)     # 1 / (1 + 1)
+    assert pooled["recall"] == pytest.approx(0.5)        # 1 / (1 + 0 + 1)
+    assert pooled["pod"] == pooled["recall"]
+    assert pooled["f1"] == pytest.approx(0.5)
+    assert pooled["csi"] == pytest.approx(1 / 3)         # 1 / (1 + 0 + 1 + 1)
+    assert pooled["far"] == pytest.approx(1 / 3)         # 1 wrong of 3 sent
+    assert pooled["lead_error_min"]["n"] == 1

@@ -46,6 +46,10 @@ sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 import sweep_thresholds as sweep  # noqa: E402  (after the sys.path edit)
 
 from dmi_nowcast_core.metobs import Observation  # noqa: E402
+from dmi_nowcast_core.push_thresholds import (  # noqa: E402
+    effective_threshold,
+    validate_thresholds,
+)
 from dmi_nowcast_core.station_store import StationObsStore  # noqa: E402
 from dmi_nowcast_core.warning_score import decision_table  # noqa: E402
 
@@ -429,10 +433,12 @@ def test_workers_greater_than_one_gives_the_same_grid(
 
 
 def _grid_cell(threshold: int, pod: float | None, far: float | None,
-               csi: float | None) -> dict:
+               csi: float | None, f1: float | None = None,
+               warnings: int = 100, lead: int = 30) -> dict:
     return {
-        "lead_min": 30, "threshold_pct": threshold,
-        "pod": pod, "far": far, "csi": csi,
+        "lead_min": lead, "threshold_pct": threshold,
+        "pod": pod, "far": far, "csi": csi, "f1": f1,
+        "warnings": warnings,
     }
 
 
@@ -511,3 +517,340 @@ def test_an_empty_decisions_tree_is_an_error(tmp_path: Path, corpus: Path) -> No
         "--decisions-dir", str(empty),
         "--corpus-dir", str(corpus / "corpus"),
     ]) == 2
+
+
+# ---------------------------------------------------------------------------
+# The plateau pick, on a hand-made F1 curve
+# ---------------------------------------------------------------------------
+
+
+def _f1_curve(values: dict[int, float | None], warnings: int = 100) -> list[dict]:
+    """Cells carrying only what the picks read: threshold, F1, warnings."""
+    return [
+        _grid_cell(threshold, None, None, None, f1=f1, warnings=warnings)
+        for threshold, f1 in sorted(values.items())
+    ]
+
+
+def test_the_plateau_is_every_threshold_within_the_fraction() -> None:
+    """0.95 of the best F1 is on the plateau; 0.94 is not."""
+    cells = _f1_curve({20: 0.50, 30: 0.95, 40: 1.00, 50: 0.96, 60: 0.94})
+    pick = sweep.pick_plateau(cells, 0.95)
+    assert pick["plateau"] == [30, 50]
+    assert pick["n_thresholds"] == 3
+    assert pick["max_f1"] == pytest.approx(1.0)
+    # The midpoint of [30, 50], not the argmax at 40 — which happens to be
+    # the same cell here, and the next test separates them.
+    assert pick["threshold_pct"] == 40
+
+
+def test_the_pick_is_the_midpoint_not_the_argmax() -> None:
+    cells = _f1_curve({30: 1.00, 40: 0.97, 50: 0.96, 60: 0.50})
+    pick = sweep.pick_plateau(cells, 0.95)
+    assert pick["plateau"] == [30, 50]
+    assert pick["threshold_pct"] == 40          # argmax would say 30
+    assert pick["cell"]["threshold_pct"] == 40  # a measured cell, not a fit
+
+
+def test_a_half_way_midpoint_rounds_to_the_higher_threshold() -> None:
+    """[30, 45] has midpoint 37.5: ties go up, to the quieter rule."""
+    cells = _f1_curve({30: 1.00, 45: 0.99, 60: 0.10})
+    pick = sweep.pick_plateau(cells, 0.95)
+    assert pick["plateau"] == [30, 45]
+    assert pick["threshold_pct"] == 40
+    # 40 is not on this grid, so the metrics come from the nearest cell on
+    # the plateau rather than from an interpolation.
+    assert pick["cell"]["threshold_pct"] == 45
+
+
+def test_a_grid_with_no_f1_at_all_has_no_plateau() -> None:
+    assert sweep.pick_plateau(_f1_curve({20: None, 30: None}), 0.95) is None
+    # Everything scored zero: there is no flat top to stand in the middle of.
+    assert sweep.pick_plateau(_f1_curve({20: 0.0, 30: 0.0}), 0.95) is None
+
+
+def test_a_lead_with_too_few_warnings_gets_no_pick() -> None:
+    thin = _f1_curve({30: 0.8, 40: 0.9, 50: 0.85}, warnings=9)
+    picks = sweep.build_picks(thin, [30], min_warnings=30)["30"]
+    assert picks["insufficient"] is True
+    assert picks["plateau"] is None
+    assert picks["scored_warnings"] == 27
+    # One more warning and the same grid is fitted.
+    ok = sweep.build_picks(thin, [30], min_warnings=27)["30"]
+    assert ok["insufficient"] is False
+    assert ok["plateau"]["threshold_pct"] == 40
+
+
+def test_agrees_with_radar_says_yes_no_and_not_compared() -> None:
+    gauge = _f1_curve({30: 1.00, 40: 0.99, 50: 0.20})
+    inside = _f1_curve({30: 0.96, 40: 1.00, 50: 0.99})   # plateau [30, 50]
+    outside = _f1_curve({50: 1.00, 60: 0.99, 30: 0.10})  # plateau [50, 60]
+
+    agreeing = sweep.build_picks(gauge, [30], min_warnings=1, radar_cells=inside)
+    assert agreeing["30"]["plateau"]["threshold_pct"] == 35
+    assert agreeing["30"]["radar_plateau"]["plateau"] == [30, 50]
+    assert agreeing["30"]["agrees_with_radar"] is True
+
+    disagreeing = sweep.build_picks(
+        gauge, [30], min_warnings=1, radar_cells=outside,
+    )
+    assert disagreeing["30"]["agrees_with_radar"] is False
+
+    alone = sweep.build_picks(gauge, [30], min_warnings=1)
+    assert alone["30"]["radar_plateau"] is None
+    assert alone["30"]["agrees_with_radar"] is None
+
+
+# ---------------------------------------------------------------------------
+# Radar truth: onsets from the composite's own observed rate
+# ---------------------------------------------------------------------------
+
+
+def _radar_track(rates: list[float | None]) -> list[tuple]:
+    """A track at 10-minute spacing carrying only ``observed_mm_h``."""
+    out = []
+    for i, rate in enumerate(rates):
+        stamp = _at(1, 7 * 60 + 10 * i)
+        out.append((stamp, stamp, 25.0, 1.2, rate, 0.0, 0, (0.1,)))
+    return out
+
+
+def test_radar_onsets_need_the_same_dry_run_the_gauges_do() -> None:
+    track = _radar_track([0.0, 0.0, 0.0, 1.2, 1.2, 0.0])
+    onsets, known_until = sweep.radar_truth({"P1": track})
+    assert onsets["P1"] == [_at(1, 7 * 60 + 30)]
+    assert known_until["P1"] == _at(1, 7 * 60 + 50)
+
+    # Two dry slots are not enough, exactly as at a gauge.
+    too_soon, _ = sweep.radar_truth({"P1": _radar_track([0.0, 0.0, 1.2])})
+    assert too_soon["P1"] == []
+
+
+def test_the_detection_threshold_is_inclusive_and_a_null_is_unknown() -> None:
+    at_threshold, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0, 0.0, 0.0, 0.5])},
+    )
+    assert at_threshold["P1"] == [_at(1, 7 * 60 + 30)]
+    just_under, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0, 0.0, 0.0, 0.49])},
+    )
+    assert just_under["P1"] == []
+    # A null is nodata, not a dry slot: it resets the dry run, so the wet
+    # slot behind it cannot be an onset.
+    with_hole, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0, 0.0, None, 0.0, 1.2])},
+    )
+    assert with_hole["P1"] == []
+
+
+# ---------------------------------------------------------------------------
+# The new columns, and the late outcome
+# ---------------------------------------------------------------------------
+
+
+def test_every_cell_carries_the_objective_columns(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    out_csv = tmp_path / "sweep.csv"
+    payload = _run(tmp_path, corpus, "--out-csv", str(out_csv))
+    cell = _cell(payload, 30, 40)
+    # 1 hit, 1 false alarm, 1 miss, no lates at the 5-minute default.
+    assert cell["late"] == 0
+    assert cell["precision"] == pytest.approx(0.5)
+    assert cell["recall"] == pytest.approx(0.5)
+    assert cell["f1"] == pytest.approx(0.5)
+    assert cell["f_beta_0.5"] == pytest.approx(0.5)
+    assert cell["f_beta_2"] == pytest.approx(0.5)
+    assert cell["recall"] == cell["pod"]
+    header = out_csv.read_text().splitlines()[0].split(",")
+    for column in ("late", "precision", "recall", "f1", "f_beta_0.5", "f_beta_2"):
+        assert column in header
+
+
+def test_a_lead_shorter_than_the_useful_minimum_is_late_not_a_hit(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    """The 07:30 warning gets 30 minutes of lead; demand 35 and it is late."""
+    payload = _run(tmp_path, corpus, "--min-useful-lead-min", "35")
+    cell = _cell(payload, 30, 40)
+    assert cell["hits"] == 0
+    assert cell["late"] == 1
+    assert cell["false_alarms"] == 1     # the day-2 warning is still wrong
+    assert cell["misses"] == 1
+    assert cell["precision"] == 0.0
+    assert cell["recall"] == 0.0
+    assert cell["f1"] is None            # no harmonic mean of two zeroes
+    assert payload["settings"]["min_useful_lead_min"] == 35.0
+
+
+# ---------------------------------------------------------------------------
+# The thresholds document
+# ---------------------------------------------------------------------------
+
+
+def test_a_thin_grid_gets_no_pick_and_says_so(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    """Two warnings is not evidence; the lead keeps the fallback."""
+    out = tmp_path / "push_thresholds.json"
+    payload = _run(tmp_path, corpus, "--out-thresholds", str(out))
+    assert payload["picks"]["30"]["insufficient"] is True
+    assert payload["picks"]["30"]["plateau"] is None
+
+    doc = json.loads(out.read_text())
+    assert validate_thresholds(doc) == []
+    assert doc["leads"]["30"]["insufficient"] is True
+    assert doc["leads"]["30"]["threshold_pct"] is None
+    assert effective_threshold(doc, 30) == doc["fallback_threshold_pct"] == 40
+
+
+def test_the_thresholds_document_validates_and_round_trips(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    out = tmp_path / "push_thresholds.json"
+    payload = _run(
+        tmp_path, corpus, "--min-warnings", "1", "--out-thresholds", str(out),
+    )
+    doc = json.loads(out.read_text())
+    assert validate_thresholds(doc) == []
+    assert doc["schema_version"] == 1
+    assert doc["objective"] == {
+        "metric": "f1", "min_useful_lead_min": 5.0, "plateau_frac": 0.95,
+        "min_warnings": 1, "rearm_after_min": 60, "persistence_obs": 1,
+        "tolerance_min": 10, "dry_min": 30,
+    }
+    assert doc["window"]["days"] == 2
+    assert doc["window"]["stations"] == 2
+
+    # 40 % and 50 % tie on F1 and 70 % sends nothing: the plateau is
+    # [40, 50] and its midpoint is 45.
+    lead30 = doc["leads"]["30"]
+    assert lead30["plateau"] == [40, 50]
+    assert lead30["threshold_pct"] == 45
+    assert lead30["insufficient"] is False
+    assert lead30["hits"] == 1 and lead30["false_alarms"] == 1
+    assert lead30["late"] == 0
+    assert lead30["f1"] == pytest.approx(0.5)
+    assert lead30["radar_plateau"] is None
+    assert lead30["agrees_with_radar"] is None
+    assert effective_threshold(doc, 30) == 45
+    # A lead nobody fitted is not an error, it is the fallback.
+    assert effective_threshold(doc, 45) == 40
+    assert payload["picks"]["30"]["max_csi"]["threshold_pct"] == 50
+
+
+def test_the_markdown_reports_the_pick_and_the_plateau(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    out_md = tmp_path / "sweep.md"
+    _run(tmp_path, corpus, "--min-warnings", "1", "--out-md", str(out_md))
+    text = out_md.read_text()
+    assert "**Pick: 45 %**" in text
+    assert "F1 plateau [40 %, 50 %]" in text
+    assert "late" in text
+    assert str(corpus) not in text
+
+
+# ---------------------------------------------------------------------------
+# The radar cross-check, end to end
+# ---------------------------------------------------------------------------
+
+#: Radar points, and the frames their probability crosses at.
+RADAR_POINTS = ("P1", "P2")
+
+
+def _radar_rows() -> list[dict]:
+    """Two calibration points; truth is the rows' own ``observed_mm_h``.
+
+    P1 crosses at 07:30 and the composite starts raining there at 08:00 —
+    a hit at every lead. P2 never crosses and starts raining at 08:30 — a
+    miss. The same shape as the gauge fixture, with the gauge swapped for
+    the radar's own observation.
+    """
+    rows: list[dict] = []
+    for minute in range(FIRST_FRAME_MIN, LAST_FRAME_MIN + 1, 10):
+        radar_ts = _at(1, minute)
+        hhmm = _hhmm(radar_ts)
+        for point in RADAR_POINTS:
+            if point == "P1":
+                p = 0.60 if hhmm in ("07:30", "07:40") else 0.10
+                observed = 1.2 if hhmm in ("08:00", "08:10") else 0.0
+            else:
+                p = 0.10
+                observed = 1.2 if hhmm in ("08:30", "08:40") else 0.0
+            rows.append({
+                "radar_ts": radar_ts,
+                "generated_at": radar_ts,
+                "station_id": point,
+                "p_rain": 0.99,
+                "action": "none",
+                "p_rain_10": p,
+                "p_rain_30": p,
+                "eta_min": 25.0,
+                "intensity_mm_h": 1.2,
+                "observed_mm_h": observed,
+                "forecast_now_mm_h": 0.0,
+                "armed_after": True,
+                "streak_after": 0,
+            })
+    return rows
+
+
+def test_the_radar_set_is_swept_and_reported_beside_the_gauge_pick(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    radar_dir = tmp_path / "radar"
+    _write_decisions(radar_dir, _radar_rows(), "2026-06-01.parquet")
+    out = tmp_path / "push_thresholds.json"
+    out_md = tmp_path / "with_radar.md"
+    payload = _run(
+        tmp_path, corpus, "--min-warnings", "1",
+        "--radar-decisions-dir", str(radar_dir),
+        "--out-thresholds", str(out), "--out-md", str(out_md),
+    )
+    assert payload["radar"]["points"] == 2
+    assert payload["radar"]["onsets"] == 2
+
+    doc = json.loads(out.read_text())
+    assert validate_thresholds(doc) == []
+    lead30 = doc["leads"]["30"]
+    # The radar sees the same crossing and the same rain: 40 % and 50 %
+    # both score, 70 % sends nothing, so the plateau matches the gauges'
+    # and the gauge pick of 45 % sits inside it.
+    assert lead30["radar_plateau"] == [40, 50]
+    assert lead30["agrees_with_radar"] is True
+
+    text = out_md.read_text()
+    assert "Radar cross-check" in text
+    assert "is inside it" in text
+    assert "NOT independent truth" in text
+
+
+def test_a_radar_pick_that_disagrees_is_reported_as_a_disagreement(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    """The radar set is allowed to disagree, and then it says so.
+
+    Its probabilities are shifted down so only the 40 % column fires: the
+    radar plateau collapses to [40, 40] and the gauge pick of 45 % is
+    outside it.
+    """
+    rows = []
+    for row in _radar_rows():
+        shifted = dict(row)
+        for column in ("p_rain_10", "p_rain_30"):
+            if shifted[column] > 0.5:
+                shifted[column] = 0.45
+        rows.append(shifted)
+    radar_dir = tmp_path / "radar_low"
+    _write_decisions(radar_dir, rows, "2026-06-01.parquet")
+    out = tmp_path / "push_thresholds.json"
+    _run(
+        tmp_path, corpus, "--min-warnings", "1",
+        "--radar-decisions-dir", str(radar_dir), "--out-thresholds", str(out),
+    )
+    doc = json.loads(out.read_text())
+    assert doc["leads"]["30"]["radar_plateau"] == [40, 40]
+    assert doc["leads"]["30"]["agrees_with_radar"] is False
+    # The gauge pick still ships: the radar set never overrides it.
+    assert doc["leads"]["30"]["threshold_pct"] == 45
