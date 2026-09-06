@@ -960,3 +960,375 @@ def test_an_absent_previous_file_is_a_first_fit(
     row = json.loads(out.read_text())["leads"]["30"]
     assert row["threshold_pct"] == 45
     assert row["guard"] == "first_fit"
+
+
+# ---------------------------------------------------------------------------
+# Seasons: --strata season
+# ---------------------------------------------------------------------------
+#
+# A second, deliberately two-regime fixture. Four stations, three days, one
+# crossing each at 07:30 and (on a wet day) rain at 08:00:
+#
+#   2026-03-02  winter, p = 0.75, rain      → 4 hits wherever 75 % fires
+#   2026-03-03  winter, p = 0.45, no rain   → 4 false alarms below 45 %
+#   2026-05-04  summer, p = 0.55, rain      → 4 hits wherever 55 % fires
+#
+# so on a 30/40/50/60/70 grid the F1 columns are, by hand:
+#
+#   summer  30–50: 1.00        60,70: nothing sent   → plateau [30, 50] → 40 %
+#   winter  30,40: 0.67 (4 FA) 50–70: 1.00           → plateau [50, 70] → 60 %
+#   pooled  30,40: 0.80        50: 1.00  60,70: 0.67 → plateau [50, 50] → 50 %
+#
+# The pooled pick sits exactly between the two seasonal ones, twenty points
+# apart — which is the case the flag exists to name.
+
+SEASON_STATIONS = ("06180", "06120", "06110", "06060")
+
+#: ``(day, probability at the 07:30 crossing, does it rain at 08:00)``.
+SPLIT_DAYS = (
+    (datetime(2026, 3, 2, tzinfo=timezone.utc), 0.75, True),
+    (datetime(2026, 3, 3, tzinfo=timezone.utc), 0.45, False),
+    (datetime(2026, 5, 4, tzinfo=timezone.utc), 0.55, True),
+)
+#: The same shape with the winter noise removed: both seasons then want the
+#: same threshold, and the flag must stay off.
+AGREEING_DAYS = (
+    (datetime(2026, 3, 2, tzinfo=timezone.utc), 0.55, True),
+    (datetime(2026, 5, 4, tzinfo=timezone.utc), 0.55, True),
+)
+#: SPLIT_DAYS plus an April day — a shoulder month, reported on its own.
+SHOULDER_DAYS = SPLIT_DAYS + (
+    (datetime(2026, 4, 6, tzinfo=timezone.utc), 0.55, True),
+)
+
+
+def _episode_rows(date_utc: datetime, p_crossing: float) -> list[dict]:
+    """One day of frames for every season station, crossing at 07:30."""
+    rows: list[dict] = []
+    for minute in range(FIRST_FRAME_MIN, LAST_FRAME_MIN + 1, 10):
+        radar_ts = date_utc + timedelta(minutes=minute)
+        p = p_crossing if _hhmm(radar_ts) == "07:30" else 0.10
+        for station in SEASON_STATIONS:
+            rows.append({
+                "radar_ts": radar_ts,
+                "generated_at": radar_ts,
+                "station_id": station,
+                "p_rain": 0.99,
+                "action": "none",
+                "p_rain_10": p,
+                "p_rain_30": p,
+                "eta_min": 25.0,
+                "intensity_mm_h": 1.2,
+                "observed_mm_h": 0.0,
+                "forecast_now_mm_h": 0.0,
+                "armed_after": True,
+                "streak_after": 0,
+            })
+    return rows
+
+
+def _season_corpus(root: Path, days) -> Path:
+    """Decisions and gauge for a list of ``(day, p, wet)`` episodes."""
+    observations: list[Observation] = []
+    for date_utc, p_crossing, wet in days:
+        _write_decisions(
+            root / "decisions", _episode_rows(date_utc, p_crossing),
+            f"{date_utc:%Y-%m-%d}.parquet",
+        )
+        for station in SEASON_STATIONS:
+            for minute in range(FIRST_SLOT_MIN, LAST_SLOT_MIN + 1, 10):
+                stamp = date_utc + timedelta(minutes=minute)
+                rainy = wet and _hhmm(stamp) in ("08:00", "08:10")
+                observations.append(Observation(
+                    station_id=station,
+                    observed_utc=stamp,
+                    parameter_id="precip_past10min",
+                    value=0.5 if rainy else 0.0,
+                ))
+    StationObsStore(root / "corpus").append(observations)
+    return root
+
+
+def _run_seasons(out_dir: Path, root: Path, *extra: str) -> dict:
+    out_json = out_dir / "sweep.json"
+    argv = [
+        "--decisions-dir", str(root / "decisions"),
+        "--corpus-dir", str(root / "corpus"),
+        "--leads", "30",
+        "--thresholds", "30,40,50,60,70",
+        "--min-warnings", "1",
+        "--out-json", str(out_json),
+        *extra,
+    ]
+    assert sweep.main(argv) == 0
+    return json.loads(out_json.read_text())
+
+
+def _season_pick(payload: dict, season: str, lead: int = 30) -> int | None:
+    entry = payload["strata"]["season"][season]["picks"][str(lead)]
+    return (entry["plateau"] or {}).get("threshold_pct")
+
+
+# -- the month → stratum mapping --------------------------------------------
+
+
+@pytest.mark.parametrize(("month", "season"), [
+    (1, "winter"), (2, "winter"), (3, "winter"),    # March is still winter
+    (4, "shoulder"),                                # April is neither
+    (5, "summer"), (6, "summer"), (7, "summer"),
+    (8, "summer"), (9, "summer"),                   # September is still summer
+    (10, "shoulder"), (11, "shoulder"),             # October is neither
+    (12, "winter"),
+])
+def test_every_month_maps_to_exactly_one_season(month: int, season: str) -> None:
+    assert sweep.season_of(datetime(2026, month, 15, tzinfo=timezone.utc)) == season
+    assert month in sweep.SEASON_MONTHS[season]
+    others = [name for name in sweep.SEASON_ORDER if name != season]
+    assert all(month not in sweep.SEASON_MONTHS[name] for name in others)
+
+
+def test_the_seasons_partition_the_year_without_overlapping() -> None:
+    """Twelve months, three disjoint buckets — nothing lost, nothing double."""
+    buckets = [set(sweep.SEASON_MONTHS[name]) for name in sweep.SEASON_ORDER]
+    assert set().union(*buckets) == set(range(1, 13))
+    assert sum(len(bucket) for bucket in buckets) == 12
+    # The shoulder is its own stratum, never folded into a season.
+    assert set(sweep.SEASON_MONTHS["shoulder"]) == {4, 10, 11}
+
+
+def test_only_known_strata_are_accepted() -> None:
+    assert sweep.parse_strata(["season", "season"]) == ("season",)
+    assert sweep.parse_strata(None) == ()
+    with pytest.raises(ValueError, match="unknown stratum"):
+        sweep.parse_strata(["region"])
+
+
+# -- slicing the tracks ------------------------------------------------------
+
+
+def _stamped_track(stamps: list[datetime]) -> list[tuple]:
+    return [(ts, ts, 25.0, 1.2, 0.0, 0.0, 0, (0.6,)) for ts in stamps]
+
+
+def test_a_slice_keeps_only_its_months_and_re_runs_the_coverage_index() -> None:
+    """The seam where the other season was cut out is a gap, not a carry."""
+    march = datetime(2026, 3, 2, 7, tzinfo=timezone.utc)
+    may = datetime(2026, 5, 4, 7, tzinfo=timezone.utc)
+    track = _stamped_track([
+        march, march + timedelta(minutes=10),
+        may, may + timedelta(minutes=10),
+        may + timedelta(days=1),  # a second summer run, a day later
+    ])
+
+    summer = sweep.filter_tracks_by_months({"A": track}, (5, 6, 7, 8, 9))
+    assert [record[0] for record in summer["A"]] == [
+        may, may + timedelta(minutes=10), may + timedelta(days=1),
+    ]
+    # Re-derived from what survived: two frames in run 0, the next day in 1.
+    assert [record[6] for record in summer["A"]] == [0, 0, 1]
+
+    winter = sweep.filter_tracks_by_months({"A": track}, (12, 1, 2, 3))
+    assert [record[6] for record in winter["A"]] == [0, 0]
+    # A station with nothing in the slice drops out rather than arriving empty.
+    assert sweep.filter_tracks_by_months({"A": track}, (10,)) == {}
+
+
+# -- the two-regime fixture, end to end -------------------------------------
+
+
+def test_the_seasons_pick_apart_and_the_pool_lands_between(tmp_path: Path) -> None:
+    root = _season_corpus(tmp_path / "split", SPLIT_DAYS)
+    payload = _run_seasons(tmp_path, root, "--strata", "season")
+
+    # No April, October or November in the window: two strata, not three.
+    assert set(payload["strata"]["season"]) == {"summer", "winter"}
+    assert payload["settings"]["strata"] == ["season"]
+
+    assert _season_pick(payload, "summer") == 40
+    assert _season_pick(payload, "winter") == 60
+    assert payload["picks"]["30"]["plateau"]["threshold_pct"] == 50
+
+    summer = payload["strata"]["season"]["summer"]
+    winter = payload["strata"]["season"]["winter"]
+    assert summer["months"] == [5, 6, 7, 8, 9]
+    assert winter["months"] == [12, 1, 2, 3]
+    assert summer["window"]["onsets"] == 4
+    assert winter["window"]["onsets"] == 4
+    # A stratum is scored on its own rows: one summer day, two winter days.
+    assert summer["window"]["days"] == 1
+    assert winter["window"]["days"] == 2
+
+    def cell(group: dict, threshold: int) -> dict:
+        for entry in group["cells"]:
+            if entry["threshold_pct"] == threshold:
+                return entry
+        raise AssertionError(threshold)
+
+    # Summer: four warnings, four hits, nothing false, at 30 through 50.
+    assert cell(summer, 40)["hits"] == 4
+    assert cell(summer, 40)["false_alarms"] == 0
+    assert cell(summer, 60)["n_sent"] == 0
+    assert cell(summer, 60)["misses"] == 4
+    # Winter: the 45 % noise day is four false alarms below 50 % and silent
+    # above it — which is the whole reason the two seasons disagree.
+    assert cell(winter, 40)["false_alarms"] == 4
+    assert cell(winter, 50)["false_alarms"] == 0
+    assert cell(winter, 50)["hits"] == 4
+    # A stratum's picks carry the pooled shape, radar fields included.
+    entry = winter["picks"]["30"]
+    assert entry["insufficient"] is False
+    assert entry["radar_plateau"] is None and entry["agrees_with_radar"] is None
+    assert entry["min_warnings"] == 1
+    assert entry["plateau"]["plateau"] == [50, 70]
+
+
+def test_a_thin_stratum_is_marked_insufficient_like_the_pool(
+    tmp_path: Path,
+) -> None:
+    """The evidence test is per replay, so a season can fail it alone."""
+    root = _season_corpus(tmp_path / "thin", SPLIT_DAYS)
+    payload = _run_seasons(
+        tmp_path, root, "--strata", "season", "--min-warnings", "16",
+    )
+    summer = payload["strata"]["season"]["summer"]["picks"]["30"]
+    winter = payload["strata"]["season"]["winter"]["picks"]["30"]
+    # Summer grades 12 warnings across the grid, winter 28.
+    assert summer["scored_warnings"] == 12
+    assert summer["insufficient"] is True
+    assert summer["plateau"] is None
+    assert winter["scored_warnings"] == 28
+    assert winter["insufficient"] is False
+
+
+def test_a_shoulder_month_is_its_own_stratum(tmp_path: Path) -> None:
+    """April is reported beside the seasons, never folded into one."""
+    root = _season_corpus(tmp_path / "shoulder", SHOULDER_DAYS)
+    payload = _run_seasons(tmp_path, root, "--strata", "season")
+    seasons = payload["strata"]["season"]
+    assert set(seasons) == {"summer", "winter", "shoulder"}
+    assert seasons["shoulder"]["months"] == [4, 10, 11]
+    assert seasons["shoulder"]["window"]["onsets"] == 4
+    # The April day did not join the summer slice: one summer day still.
+    assert seasons["summer"]["window"]["days"] == 1
+    assert seasons["summer"]["window"]["onsets"] == 4
+
+
+def test_the_strata_do_not_touch_the_pooled_fit(tmp_path: Path) -> None:
+    """Analysis output: same cells, same picks, same document."""
+    root = _season_corpus(tmp_path / "same", SPLIT_DAYS)
+    out_plain = tmp_path / "plain.json"
+    out_split = tmp_path / "split.json"
+    plain = _run_seasons(
+        tmp_path / "a", root, "--out-thresholds", str(out_plain),
+    )
+    with_strata = _run_seasons(
+        tmp_path / "b", root, "--strata", "season",
+        "--out-thresholds", str(out_split),
+    )
+    assert plain["strata"] == {}
+    assert plain["cells"] == with_strata["cells"]
+    assert plain["picks"] == with_strata["picks"]
+    assert plain["do_nothing"] == with_strata["do_nothing"]
+    assert plain["window"] == with_strata["window"]
+
+    def without_stamp(path: Path) -> dict:
+        doc = json.loads(path.read_text())
+        doc.pop("fitted_at_utc")
+        return doc
+
+    assert without_stamp(out_plain) == without_stamp(out_split)
+    assert validate_thresholds(json.loads(out_split.read_text())) == []
+    assert json.loads(out_split.read_text())["leads"]["30"]["threshold_pct"] == 50
+
+
+# -- the CSV's stratum column ------------------------------------------------
+
+
+def test_the_csv_labels_the_pooled_rows_all_and_the_slices_by_name(
+    tmp_path: Path,
+) -> None:
+    import csv as csv_module
+
+    root = _season_corpus(tmp_path / "csv", SPLIT_DAYS)
+    out_csv = tmp_path / "sweep.csv"
+    payload = _run_seasons(
+        tmp_path, root, "--strata", "season", "--out-csv", str(out_csv),
+    )
+    text = out_csv.read_text()
+    # Appended, not prepended: a reader pinned to the leading columns lives.
+    assert text.splitlines()[0].startswith("lead_min,threshold_pct,")
+    assert text.splitlines()[0].endswith(",stratum")
+
+    rows = list(csv_module.DictReader(text.splitlines()))
+    by_stratum: dict[str, list[dict]] = {}
+    for row in rows:
+        by_stratum.setdefault(row["stratum"], []).append(row)
+    assert set(by_stratum) == {"all", "summer", "winter"}
+
+    leads = len(payload["leads"])
+    assert len(by_stratum["all"]) == len(payload["cells"]) + leads
+    for season in ("summer", "winter"):
+        group = payload["strata"]["season"][season]
+        assert len(by_stratum[season]) == len(group["cells"]) + leads
+    # The pooled block is written first and is the fit; the slices follow.
+    assert rows[0]["stratum"] == "all"
+    assert {row["stratum"] for row in rows[:len(by_stratum["all"])]} == {"all"}
+    winter_40 = next(
+        row for row in by_stratum["winter"]
+        if row["threshold_pct"] == "40" and row["lead_min"] == "30"
+    )
+    assert winter_40["false_alarms"] == "4"
+
+
+def test_without_strata_the_csv_still_says_all(tmp_path: Path, corpus: Path) -> None:
+    out_csv = tmp_path / "plain.csv"
+    payload = _run(tmp_path, corpus, "--out-csv", str(out_csv))
+    rows = out_csv.read_text().splitlines()
+    assert len(rows) == 1 + len(payload["cells"]) + len(payload["leads"])
+    assert all(row.endswith(",all") for row in rows[1:])
+
+
+# -- the markdown comparison and its flag ------------------------------------
+
+
+def test_the_markdown_compares_the_seasons_and_raises_the_flag(
+    tmp_path: Path,
+) -> None:
+    root = _season_corpus(tmp_path / "flag", SPLIT_DAYS)
+    out_md = tmp_path / "sweep.md"
+    _run_seasons(tmp_path, root, "--strata", "season", "--out-md", str(out_md))
+    text = out_md.read_text()
+
+    assert "| threshold | F1 all | F1 summer | F1 winter |" in text
+    assert "**Seasons at lead 30 min.**" in text
+    # Pooled 50 %, summer ten points under it, winter ten points over.
+    assert (
+        "- **Seasonal picks:** pooled 50 %; summer 40 % (-10 points), "
+        "winter 60 % (+10 points)." in text
+    )
+    assert "20 points apart — **seasonal split worth considering**" in text
+    assert "Summer is May–September, winter December–March" in text
+    assert str(root) not in text
+
+
+def test_the_flag_stays_down_when_the_seasons_agree(tmp_path: Path) -> None:
+    root = _season_corpus(tmp_path / "agree", AGREEING_DAYS)
+    out_md = tmp_path / "sweep.md"
+    payload = _run_seasons(
+        tmp_path, root, "--strata", "season", "--out-md", str(out_md),
+    )
+    assert _season_pick(payload, "summer") == _season_pick(payload, "winter") == 40
+    text = out_md.read_text()
+    assert "seasonal split worth considering" not in text
+    assert "0 points apart, under the 10-point mark" in text
+    assert "| F1 summer | F1 winter |" in text
+
+
+def test_no_strata_means_no_season_block_in_the_markdown(
+    tmp_path: Path, corpus: Path,
+) -> None:
+    out_md = tmp_path / "plain.md"
+    _run(tmp_path, corpus, "--out-md", str(out_md))
+    text = out_md.read_text()
+    assert "F1 summer" not in text
+    assert "Seasonal picks" not in text

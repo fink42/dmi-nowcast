@@ -95,6 +95,26 @@ means the two instruments disagree about what rain is. Neither promotes
 the radar number over the gauge number, and the gauge pick is always the
 one that ships.
 
+Seasons: a second reading, never a second table
+-----------------------------------------------
+``--strata season`` scores the same grid again over summer (May–September)
+and winter (December–March) rows alone, and over the shoulder months
+(April, October, November) as a third slice when the window has any. Each
+slice is a **self-contained replay**: the months are filtered out of the
+tracks BEFORE the state machine runs, so the coverage runs, the arming and
+the re-arm clock start fresh inside the slice rather than being carried
+across a season that was cut away. The onsets are cut by the same filter,
+because a winter onset is not something a summer rule could have missed.
+
+Denmark's rain changes character across the year — convective cells in
+summer, frontal sheets in winter, and roughly three times the skill on the
+second than the first (Imhoff et al. 2020) — so a pooled threshold is an
+average over two regimes. This says how far apart they pull. It does NOT
+change what ships: ``payload["thresholds"]`` is fitted on the pool and on
+nothing else, and a stratum's pick has no path into it. When summer and
+winter pick ten points apart or more the markdown says so, and a human
+decides whether that is worth a per-season table.
+
 Two callers, one implementation
 -------------------------------
 This module is the fit. :func:`run_fit` takes a :class:`SweepOptions` and
@@ -192,14 +212,44 @@ DEFAULT_MIN_WARNINGS = 30
 #: actually measured.
 PICK_ROUNDING_PCT = 5
 
-#: The columns of the per-cell CSV, in order.
+#: The label the pooled rows carry in the CSV's ``stratum`` column.
+POOLED_STRATUM = "all"
+
+#: The strata this fit knows how to cut. One, for now; the machinery is
+#: written for a list because the next one would be the same shape.
+KNOWN_STRATA = ("season",)
+
+#: Months per season. Summer is the convective half — May through
+#: September; winter the stratiform one — December through March. April,
+#: October and November are neither: a shoulder month carries convective
+#: and frontal rain in the same week, and folding it into either season
+#: would contaminate the contrast the split exists to measure. It is
+#: reported as its own stratum when the window contains one, and left out
+#: of the comparison entirely otherwise.
+SEASON_MONTHS: dict[str, tuple[int, ...]] = {
+    "summer": (5, 6, 7, 8, 9),
+    "winter": (12, 1, 2, 3),
+    "shoulder": (4, 10, 11),
+}
+
+#: Reporting order: the two seasons the split is about, then the leftover.
+SEASON_ORDER = ("summer", "winter", "shoulder")
+
+#: Summer and winter picks this many points apart or more and the markdown
+#: says a per-season table is worth considering. Not a decision — the
+#: table that ships stays pooled either way.
+SEASONAL_SPLIT_POINTS = 10
+
+#: The columns of the per-cell CSV, in order. ``stratum`` is last so a
+#: reader pinned to the leading columns keeps working; ``all`` is the
+#: pooled run and every other value is one slice of one stratum.
 CSV_COLUMNS = (
     "lead_min", "threshold_pct", "warnings", "n_sent", "pending", "hits",
     "false_alarms", "late", "misses", "pending_onsets", "uncovered_onsets",
     "n_onsets", "pod", "far", "precision", "recall", "f1", "f_beta_0.5",
     "f_beta_2", "csi", "lead_error_p25", "lead_error_p50",
     "lead_error_p75", "lead_error_n", "warnings_per_station_day",
-    "n_stations", "n_days", "n_rows",
+    "n_stations", "n_days", "n_rows", "stratum",
 )
 
 
@@ -257,6 +307,37 @@ def parse_thresholds(spec: str | None) -> tuple[int, ...]:
         if not 0 < value < 100:
             raise ValueError(f"threshold {value} out of range (0, 100)")
     return tuple(out)
+
+
+def parse_strata(names: Iterable[str] | None) -> tuple[str, ...]:
+    """Validate and deduplicate the requested strata, keeping their order."""
+    out: list[str] = []
+    for name in names or ():
+        name = str(name).strip().lower()
+        if not name:
+            continue
+        if name not in KNOWN_STRATA:
+            raise ValueError(
+                f"unknown stratum {name!r}; known: "
+                + ", ".join(KNOWN_STRATA)
+            )
+        if name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def season_of(when: datetime) -> str:
+    """``"summer"``, ``"winter"`` or ``"shoulder"`` for one instant.
+
+    The month decides, not the date: this is a coarse cut over a year of
+    radar, not a meteorological season definition, and a rule anyone can
+    check on a calendar is worth more here than a precise one nobody can.
+    """
+    month = when.month
+    for name in SEASON_ORDER:
+        if month in SEASON_MONTHS[name]:
+            return name
+    raise ValueError(f"month {month} belongs to no season")  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +509,42 @@ def _opt_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return None if out != out else out  # NaN is missing, not a probability
+
+
+def filter_tracks_by_months(
+    tracks: Mapping[str, Sequence[tuple]],
+    months: Iterable[int],
+    *,
+    coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
+) -> dict[str, list[tuple]]:
+    """The tracks cut down to the frames whose ``radar_ts`` is in ``months``.
+
+    The coverage-run index is RE-DERIVED over what survives, so a stratum
+    is a self-contained replay: the machine starts armed at the head of
+    every run the stratum actually has, and the seam where the other
+    season was cut out is a gap like any other outage — never a carried
+    arm that no subscription could have held across three months of
+    silence. A station left with no frames at all drops out of the slice
+    rather than appearing in it empty.
+    """
+    wanted = frozenset(int(month) for month in months)
+    gap = timedelta(minutes=coverage_gap_min)
+    out: dict[str, list[tuple]] = {}
+    for station, track in tracks.items():
+        kept: list[tuple] = []
+        run = 0
+        previous: datetime | None = None
+        for record in track:
+            radar_ts = record[_RADAR_TS]
+            if radar_ts.month not in wanted:
+                continue
+            if previous is not None and radar_ts - previous > gap:
+                run += 1
+            previous = radar_ts
+            kept.append(record[:_RUN] + (run,) + record[_RUN + 1:])
+        if kept:
+            out[station] = kept
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +820,79 @@ def _cell(pooled: dict, lead: int, threshold_pct: int | None, shared: dict) -> d
 
 
 # ---------------------------------------------------------------------------
+# The payload one sweep runs over
+# ---------------------------------------------------------------------------
+
+
+def build_shared(
+    tracks: Mapping[str, Sequence[tuple]],
+    stations: Sequence[str],
+    leads: Sequence[int],
+    *,
+    onsets: Mapping[str, Sequence[datetime]],
+    known_until: Mapping[str, datetime],
+    coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
+    tolerance_min: int = DEFAULT_TOLERANCE_MIN,
+    dry_min: int = DEFAULT_DRY_MIN,
+    min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN,
+    persistence_obs: int = 1,
+    rearm_after_min: int = 60,
+    raining_now_mm_h: float = RAIN_THRESHOLD_MM_H,
+    n_days: int | None = None,
+    n_rows: int | None = None,
+) -> dict:
+    """The frozen payload every cell of one sweep reads.
+
+    One function so the pooled run and a stratum's run cannot drift: the
+    coverage runs, the station-day count and the rule constants are built
+    here for both. ``n_days`` and ``n_rows`` override the counts derived
+    from ``stations`` — the pooled run reports days and rows over EVERY
+    station it loaded, including the ones no gauge could score, and those
+    are window facts rather than facts about the scored pool.
+    """
+    stations = list(stations)
+    frames = {
+        station: [record[_RADAR_TS] for record in tracks[station]]
+        for station in stations
+    }
+    days_by_station = {
+        station: {record[_GENERATED].date() for record in tracks[station]}
+        for station in stations
+    }
+    days: set = set().union(*days_by_station.values()) if days_by_station else set()
+    return {
+        "leads": list(leads),
+        "stations": stations,
+        "tracks": {station: tracks[station] for station in stations},
+        "onsets": dict(onsets),
+        "known_until": dict(known_until),
+        "coverage": {
+            lead: {
+                station: coverage_runs(
+                    frames[station],
+                    max_gap_min=coverage_gap_min,
+                    extend_min=lead + tolerance_min,
+                )
+                for station in stations
+            }
+            for lead in leads
+        },
+        "tolerance_min": int(tolerance_min),
+        "dry_min": int(dry_min),
+        "min_useful_lead_min": float(min_useful_lead_min),
+        "persistence_obs": int(persistence_obs),
+        "rearm_after_min": int(rearm_after_min),
+        "raining_now_mm_h": float(raining_now_mm_h),
+        "station_days": sum(len(days_by_station[s]) for s in stations),
+        "n_days": len(days) if n_days is None else int(n_days),
+        "n_rows": (
+            sum(len(tracks[s]) for s in stations) if n_rows is None
+            else int(n_rows)
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # The grid, in parallel
 # ---------------------------------------------------------------------------
 
@@ -962,33 +1152,20 @@ def radar_sweep(
     })
     if not points:
         return [], info
-    shared = {
-        "leads": list(usable),
-        "stations": points,
-        "tracks": {p: tracks[p] for p in points},
-        "onsets": onsets_by_point,
-        "known_until": known_until,
-        "coverage": {
-            lead: {
-                point: coverage_runs(
-                    frames[point],
-                    max_gap_min=coverage_gap_min,
-                    extend_min=lead + tolerance_min,
-                )
-                for point in points
-            }
-            for lead in usable
-        },
-        "tolerance_min": int(tolerance_min),
-        "dry_min": int(dry_min),
-        "min_useful_lead_min": float(min_useful_lead_min),
-        "persistence_obs": int(persistence_obs),
-        "rearm_after_min": int(rearm_after_min),
-        "raining_now_mm_h": float(raining_now_mm_h),
-        "station_days": sum(len(days_by_point[p]) for p in points),
-        "n_days": len(days),
-        "n_rows": n_rows,
-    }
+    shared = build_shared(
+        tracks, points, usable,
+        onsets=onsets_by_point,
+        known_until=known_until,
+        coverage_gap_min=coverage_gap_min,
+        tolerance_min=tolerance_min,
+        dry_min=dry_min,
+        min_useful_lead_min=min_useful_lead_min,
+        persistence_obs=persistence_obs,
+        rearm_after_min=rearm_after_min,
+        raining_now_mm_h=raining_now_mm_h,
+        n_days=len(days),
+        n_rows=n_rows,
+    )
     del tracks, frames
     cells, _ = run_sweep(shared, usable, thresholds, workers=workers, log=log)
     return cells, info
@@ -1043,6 +1220,126 @@ def build_picks(
             "radar_plateau": radar_plateau,
             "agrees_with_radar": agrees,
         }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Strata: the same grid over one slice of the rows at a time
+# ---------------------------------------------------------------------------
+
+
+def run_strata(
+    names: Sequence[str],
+    tracks: Mapping[str, Sequence[tuple]],
+    stations: Sequence[str],
+    leads: Sequence[int],
+    thresholds: Sequence[int],
+    *,
+    onsets: Mapping[str, Sequence[datetime]],
+    known_until: Mapping[str, datetime],
+    options: "SweepOptions",
+    log=None,
+) -> dict[str, dict]:
+    """Score every requested stratum, each as a self-contained replay.
+
+    A stratum is a month filter applied to the tracks BEFORE the state
+    machine runs, so nothing about the slice is a post-hoc partition of
+    pooled results: the coverage runs, the arming, the persistence streak
+    and the re-arm clock all start fresh inside the slice, exactly as they
+    would if the service had only ever seen those months. The onsets are
+    cut by the same filter — a winter onset is not something a summer rule
+    could have missed — and the gauge's ``known_until`` is NOT, because
+    the record covering a warning sent on the last day of September runs
+    into October whatever season the warning belongs to.
+
+    The one seam this leaves is at the month boundary: an onset in the
+    first hour of a shoulder month, warned about from the last frame of a
+    season, is a false alarm in that season's slice because its onset now
+    belongs to another stratum. Two hours a year per boundary, against a
+    partition rule anyone can check on a calendar.
+
+    Empty slices are dropped rather than reported empty — which is how a
+    window with no shoulder month reports two seasons and not three.
+
+    Returns ``{stratum: {slice: {months, window, cells, do_nothing,
+    picks}}}`` with the cell and pick shapes of the pooled run. Analysis
+    output: no caller may promote a stratum's pick into the served table.
+    """
+    out: dict[str, dict] = {}
+    pool = set(stations)
+    for name in parse_strata(names):
+        if name != "season":  # pragma: no cover — parse_strata gate-keeps
+            raise ValueError(f"unknown stratum {name!r}")
+        slices: dict[str, dict] = {}
+        for season in SEASON_ORDER:
+            months = SEASON_MONTHS[season]
+            sliced = filter_tracks_by_months(
+                tracks, months, coverage_gap_min=options.coverage_gap_min,
+            )
+            sliced = {s: t for s, t in sliced.items() if s in pool}
+            if not sliced:
+                if log:
+                    log(f"stratum season={season}: no rows, not reported")
+                continue
+            slice_stations = sorted(sliced)
+            slice_onsets = {
+                station: [
+                    onset for onset in onsets.get(station, ())
+                    if onset.month in months
+                ]
+                for station in slice_stations
+            }
+            stamps = [
+                record[_RADAR_TS]
+                for station in slice_stations
+                for record in sliced[station]
+            ]
+            shared = build_shared(
+                sliced, slice_stations, leads,
+                onsets=slice_onsets,
+                known_until=known_until,
+                coverage_gap_min=options.coverage_gap_min,
+                tolerance_min=options.tolerance_min,
+                dry_min=options.dry_min,
+                min_useful_lead_min=options.min_useful_lead_min,
+                persistence_obs=options.persistence_obs,
+                rearm_after_min=options.rearm_after_min,
+            )
+            if log:
+                log(
+                    f"stratum season={season}: {len(slice_stations)} station(s), "
+                    f"{shared['n_rows']} row(s), "
+                    f"{sum(len(v) for v in slice_onsets.values())} onset(s)"
+                )
+            window = {
+                "from": min(stamps).isoformat(),
+                "to": max(stamps).isoformat(),
+                "days": shared["n_days"],
+                "stations": len(slice_stations),
+                "rows": shared["n_rows"],
+                "station_days": shared["station_days"],
+                "onsets": sum(len(v) for v in slice_onsets.values()),
+            }
+            cells, do_nothing = run_sweep(
+                shared, leads, thresholds,
+                workers=int(options.workers),
+                log=(None if log is None else lambda m, s=season: log(f"[{s}] {m}")),
+            )
+            del shared
+            release_shared()
+            slices[season] = {
+                "months": list(months),
+                "window": window,
+                "cells": cells,
+                "do_nothing": do_nothing,
+                "picks": build_picks(
+                    cells, leads,
+                    far_cap=float(options.far_cap),
+                    plateau_frac=float(options.plateau_frac),
+                    min_warnings=int(options.min_warnings),
+                ),
+            }
+        out[name] = slices
     return out
 
 
@@ -1189,6 +1486,20 @@ def render_markdown(payload: dict) -> str:
         f"at least {settings['min_warnings']} scored warnings per lead"
     )
     lines.append(f"- FAR cap for the secondary pick: {_pct(settings['far_cap'])}")
+    seasons = (payload.get("strata") or {}).get("season") or {}
+    if seasons:
+        lines.append(
+            "- Seasons reported beside the pool: "
+            + ", ".join(
+                f"{name} ({seasons[name]['window']['rows']} row(s), "
+                f"{seasons[name]['window']['onsets']} onset(s))"
+                for name in SEASON_ORDER if name in seasons
+            )
+            + ". Summer is May–September, winter December–March; April, "
+            "October and November are shoulder months and are never folded "
+            "into either. Each season is replayed on its own rows, and none "
+            "of them moves the shipping table."
+        )
     if payload.get("radar"):
         radar = payload["radar"]
         lines.append(
@@ -1286,7 +1597,93 @@ def render_markdown(payload: dict) -> str:
         lines.append("")
         lines.append(_lead_paragraph(lead, lead_cells, nothing, picks, payload))
         lines.append("")
+        lines.extend(_season_lines(lead, lead_cells, picks, payload))
     return "\n".join(lines) + "\n"
+
+
+def _season_lines(
+    lead: int,
+    lead_cells: Sequence[dict],
+    picks: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> list[str]:
+    """The per-season comparison for one lead, or nothing if unrequested.
+
+    An F1 column per season beside the pooled one, then the picks side by
+    side in points. The seasons are separate replays over separate months,
+    so a season column is thinner evidence than the pooled one by
+    construction and a blank cell means that season's grid produced no F1
+    there at all — not a zero.
+    """
+    seasons = (payload.get("strata") or {}).get("season") or {}
+    present = [name for name in SEASON_ORDER if name in seasons]
+    if not present:
+        return []
+    by_season = {
+        name: {
+            cell["threshold_pct"]: cell
+            for cell in seasons[name]["cells"] if cell["lead_min"] == lead
+        }
+        for name in present
+    }
+    lines = [
+        f"**Seasons at lead {lead} min.** The same grid replayed over each "
+        "season's rows alone — a self-contained replay per season, not a "
+        "partition of the pooled numbers. The table that ships is the "
+        "pooled fit whatever this says.",
+        "",
+        "| threshold | F1 all |" + "".join(f" F1 {name} |" for name in present),
+        "| ---: | ---: |" + " ---: |" * len(present),
+    ]
+    for cell in lead_cells:
+        threshold = cell["threshold_pct"]
+        row = f"| {threshold} % | {_fmt(cell['f1'])} |"
+        for name in present:
+            other = by_season[name].get(threshold)
+            row += f" {_fmt(None if other is None else other['f1'])} |"
+        lines.append(row)
+    lines.append("")
+
+    pooled_pick = (picks.get("plateau") or {}).get("threshold_pct")
+    season_picks: dict[str, int | None] = {}
+    for name in present:
+        entry = seasons[name]["picks"].get(str(lead), {})
+        season_picks[name] = (entry.get("plateau") or {}).get("threshold_pct")
+    parts: list[str] = []
+    for name in present:
+        pick = season_picks[name]
+        if pick is None:
+            entry = seasons[name]["picks"].get(str(lead), {})
+            why = (
+                "too few scored warnings" if entry.get("insufficient")
+                else "nothing scored"
+            )
+            parts.append(f"{name} no pick ({why})")
+        elif pooled_pick is None:
+            parts.append(f"{name} {pick} %")
+        else:
+            parts.append(f"{name} {pick} % ({pick - pooled_pick:+d} points)")
+    lines.append(
+        "- **Seasonal picks:** pooled "
+        + ("no pick" if pooled_pick is None else f"{pooled_pick} %")
+        + "; " + ", ".join(parts) + "."
+    )
+    summer, winter = season_picks.get("summer"), season_picks.get("winter")
+    if summer is not None and winter is not None:
+        gap = abs(summer - winter)
+        if gap >= SEASONAL_SPLIT_POINTS:
+            lines.append(
+                f"- Summer and winter pick {gap} points apart — **seasonal "
+                "split worth considering**: one table is being asked to "
+                "serve two different kinds of rain."
+            )
+        else:
+            lines.append(
+                f"- Summer and winter pick {gap} points apart, under the "
+                f"{SEASONAL_SPLIT_POINTS}-point mark — one table still fits both."
+            )
+    lines.append("")
+    return lines
 
 
 def _plateau_lines(picks: Mapping[str, Any], settings: Mapping[str, Any]) -> list[str]:
@@ -1401,22 +1798,40 @@ def _lead_paragraph(
     return " ".join(parts)
 
 
-def write_csv(path: Path, cells: Sequence[dict], do_nothing: dict) -> None:
-    """Every cell as one CSV row; the do-nothing rows have a blank threshold."""
-    rows = list(cells) + [
-        do_nothing[key] for key in sorted(do_nothing, key=int)
+def write_csv(
+    path: Path,
+    cells: Sequence[dict],
+    do_nothing: dict,
+    strata: Mapping[str, Mapping[str, dict]] | None = None,
+) -> None:
+    """Every cell as one CSV row; the do-nothing rows have a blank threshold.
+
+    The pooled rows carry ``stratum = "all"`` and come first, then each
+    stratum's slices in turn under their own name, so a reader that only
+    wants the fit filters on one column and a reader comparing seasons
+    groups on it.
+    """
+    rows: list[tuple[str, dict]] = [(POOLED_STRATUM, cell) for cell in cells]
+    rows += [
+        (POOLED_STRATUM, do_nothing[key]) for key in sorted(do_nothing, key=int)
     ]
+    for slices in (strata or {}).values():
+        for name, group in slices.items():
+            rows += [(name, cell) for cell in group["cells"]]
+            floor = group.get("do_nothing") or {}
+            rows += [(name, floor[key]) for key in sorted(floor, key=int)]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(CSV_COLUMNS))
         writer.writeheader()
-        for cell in rows:
+        for stratum, cell in rows:
             spread = cell["lead_error_min"]
             flat = {name: cell.get(name) for name in CSV_COLUMNS}
             flat["lead_error_p25"] = spread.get("p25")
             flat["lead_error_p50"] = spread.get("p50")
             flat["lead_error_p75"] = spread.get("p75")
             flat["lead_error_n"] = spread.get("n")
+            flat["stratum"] = stratum
             writer.writerow(flat)
 
 
@@ -1476,6 +1891,10 @@ class SweepOptions:
     min_warnings: int = DEFAULT_MIN_WARNINGS
     fallback_threshold_pct: int = DEFAULT_FALLBACK_THRESHOLD_PCT
     workers: int = 1
+    #: Extra cuts to score beside the pool (``"season"``). Analysis only:
+    #: the pooled fit is what ``payload["thresholds"]`` carries, and a
+    #: stratum never moves it.
+    strata: Sequence[str] = ()
 
 
 def run_fit(options: SweepOptions, *, log=None) -> dict:
@@ -1492,6 +1911,7 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
     """
     requested_leads = tuple(sorted({int(lead) for lead in options.leads}))
     thresholds = tuple(sorted({int(t) for t in options.thresholds}))
+    strata_names = parse_strata(options.strata)
 
     rows, file_leads, counts = load_decisions(
         options.decisions_dirs, leads_min=(), log=log,
@@ -1558,42 +1978,39 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
     if not scored_stations:
         raise SweepError("no station has gauge observations")
 
-    station_days = sum(len(days_by_station[s]) for s in scored_stations)
-    coverage = {
-        lead: {
-            station: coverage_runs(
-                frames[station],
-                max_gap_min=options.coverage_gap_min,
-                extend_min=lead + options.tolerance_min,
-            )
-            for station in scored_stations
-        }
-        for lead in leads
-    }
-    shared = {
-        "leads": list(leads),
-        "stations": scored_stations,
-        "tracks": {s: tracks[s] for s in scored_stations},
-        "onsets": onsets_by_station,
-        "known_until": known_until,
-        "coverage": coverage,
-        "tolerance_min": int(options.tolerance_min),
-        "dry_min": int(options.dry_min),
-        "min_useful_lead_min": float(options.min_useful_lead_min),
-        "persistence_obs": int(options.persistence_obs),
-        "rearm_after_min": int(options.rearm_after_min),
-        "raining_now_mm_h": RAIN_THRESHOLD_MM_H,
-        "station_days": station_days,
-        "n_days": len(days),
-        "n_rows": n_rows,
-    }
+    # The scored pool, held once: the pooled sweep runs over it and every
+    # stratum re-slices it, so the record tuples are never copied.
+    scored_tracks = {s: tracks[s] for s in scored_stations}
     del tracks, frames
+    shared = build_shared(
+        scored_tracks, scored_stations, leads,
+        onsets=onsets_by_station,
+        known_until=known_until,
+        coverage_gap_min=options.coverage_gap_min,
+        tolerance_min=options.tolerance_min,
+        dry_min=options.dry_min,
+        min_useful_lead_min=options.min_useful_lead_min,
+        persistence_obs=options.persistence_obs,
+        rearm_after_min=options.rearm_after_min,
+        n_days=len(days),
+        n_rows=n_rows,
+    )
+    station_days = shared["station_days"]
 
     cells, do_nothing = run_sweep(
         shared, leads, thresholds, workers=int(options.workers), log=log,
     )
     del shared
     release_shared()
+
+    strata = run_strata(
+        strata_names, scored_tracks, scored_stations, leads, thresholds,
+        onsets=onsets_by_station,
+        known_until=known_until,
+        options=options,
+        log=log,
+    )
+    del scored_tracks
 
     radar_cells: list[dict] | None = None
     radar_info: dict | None = None
@@ -1652,6 +2069,7 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
             "radar_decisions_dirs": [
                 str(d) for d in (options.radar_decisions_dirs or ())
             ],
+            "strata": list(strata_names),
             "quiet_hours": False,
         },
         "window": {
@@ -1671,6 +2089,10 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
         "cells": cells,
         "do_nothing": do_nothing,
         "picks": picks,
+        # Analysis only — the same grid over one slice of the rows at a
+        # time. ``payload["thresholds"]`` is fitted on the pool and on
+        # nothing else, whatever a stratum says.
+        "strata": strata,
         "radar": None if radar_info is None else {
             **radar_info, "cells": radar_cells or [],
         },
@@ -1701,17 +2123,25 @@ __all__ = [
     "DEFAULT_MIN_WARNINGS",
     "DEFAULT_PLATEAU_FRAC",
     "FIT_MIN_USEFUL_LEAD_MIN",
+    "KNOWN_STRATA",
     "PICK_ROUNDING_PCT",
+    "POOLED_STRATUM",
     "RAIN_THRESHOLD_MM_H",
+    "SEASONAL_SPLIT_POINTS",
+    "SEASON_MONTHS",
+    "SEASON_ORDER",
     "SweepError",
     "SweepOptions",
     "build_picks",
+    "build_shared",
     "build_thresholds_document",
     "build_tracks",
     "decision_parquets",
+    "filter_tracks_by_months",
     "gauge_truth",
     "load_decisions",
     "parse_leads",
+    "parse_strata",
     "parse_thresholds",
     "pick_max_csi",
     "pick_max_pod_under_far",
@@ -1723,9 +2153,11 @@ __all__ = [
     "replay_station",
     "round_to",
     "run_fit",
+    "run_strata",
     "run_sweep",
     "score_cell",
     "scored_warnings",
+    "season_of",
     "write_atomic",
     "write_csv",
 ]

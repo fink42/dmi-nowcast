@@ -24,6 +24,7 @@ Usage (on the VM that holds the corpus)::
         --decisions-dir /var/lib/dmi-nowcast-corpus/stations/eval \\
         --corpus-dir /var/lib/dmi-nowcast-corpus \\
         --leads 10,20,30,45,60 --thresholds 20:80:5 --workers 8 \\
+        --strata season \\
         --out-json sweep.json --out-md sweep.md --out-csv sweep.csv \\
         --out-thresholds push_thresholds.json \\
         --previous /var/lib/dmi-nowcast/push_thresholds.json
@@ -69,10 +70,12 @@ from dmi_nowcast_sidecar.threshold_sweep import (  # noqa: E402
     DEFAULT_MIN_WARNINGS,
     DEFAULT_PLATEAU_FRAC,
     FIT_MIN_USEFUL_LEAD_MIN,
+    KNOWN_STRATA,
     SweepError,
     SweepOptions,
     _threshold_of,
     parse_leads,
+    parse_strata,
     parse_thresholds,
     render_markdown,
     run_fit,
@@ -126,6 +129,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fallback-threshold-pct", type=int,
                    default=DEFAULT_FALLBACK_THRESHOLD_PCT,
                    help="the threshold a lead with no pick falls back to")
+    p.add_argument("--strata", action="append", dest="strata", default=None,
+                   choices=list(KNOWN_STRATA),
+                   help="also score the whole grid over one slice of the rows "
+                        "at a time and report the picks side by side; "
+                        "repeatable. `season` cuts summer (May–Sep), winter "
+                        "(Dec–Mar) and — only when the window holds one — the "
+                        "shoulder months (Apr, Oct, Nov), each as a "
+                        "self-contained replay. Analysis output only: the "
+                        "fitted push_thresholds.json stays the pooled fit.")
     p.add_argument("--previous", type=Path, default=None,
                    help="the table currently in service; the stability guard "
                         "keeps its value for any lead the new fit does not "
@@ -153,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         requested_leads = parse_leads(args.leads)
         thresholds = parse_thresholds(args.thresholds)
+        strata = parse_strata(args.strata)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -200,6 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_warnings=int(args.min_warnings),
         fallback_threshold_pct=int(args.fallback_threshold_pct),
         workers=int(args.workers),
+        strata=strata,
     )
     try:
         payload = run_fit(options, log=log)
@@ -238,9 +252,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_atomic(args.out_md, render_markdown(payload))
         log(f"wrote {args.out_md}")
     if args.out_csv:
-        write_csv(Path(args.out_csv), cells, payload["do_nothing"])
+        write_csv(
+            Path(args.out_csv), cells, payload["do_nothing"],
+            payload.get("strata"),
+        )
         log(f"wrote {args.out_csv}")
 
+    for kind, slices in (payload.get("strata") or {}).items():
+        for name, group in slices.items():
+            picked = ", ".join(
+                f"{lead} min: "
+                + str((entry.get("plateau") or {}).get("threshold_pct") or "none")
+                for lead, entry in sorted(group["picks"].items(), key=lambda kv: int(kv[0]))
+            )
+            log(
+                f"{kind}={name}: {group['window']['rows']} row(s), "
+                f"{group['window']['onsets']} onset(s) — {picked}"
+            )
     log(f"swept {len(cells)} cell(s) in {time.time() - started:.1f}s")
     picks = payload["picks"]
     print(json.dumps({
