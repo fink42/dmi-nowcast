@@ -23,12 +23,31 @@ Why its own ``AsyncIOScheduler`` rather than the radar cycle's, exactly as
 the report is not an input to a nowcast, and a corpus read that takes two
 minutes must not be able to delay a cycle.
 
-Async discipline: the build is entirely numpy/pyarrow/Parquet work, so it
-goes to a thread via ``asyncio.to_thread`` and never touches the event
-loop. The write is tmp + rename in the target directory, so the HTTP route
-can never serve a half-written document — and, on failure, the previous
-report stays exactly where it was. A quality page is allowed to be a day
-stale; it is not allowed to be truncated.
+**The build runs in a child process**, not in a thread of this one
+(:mod:`dmi_nowcast_sidecar.quality_job`). It reads the whole evidence base
+into Arrow and numpy — two multi-million-row corpora, every decision row,
+the gauge store behind them — and neither Arrow's memory pool nor
+CPython's allocator returns that memory afterwards. Built in-process it
+took the live service from ~0.9 GB to 5.5 GB anon RSS and got it
+OOM-killed beside a batch replay. A process that exits gives the memory
+back, and a build that crashes, hangs or is itself OOM-killed costs a log
+line rather than the service: the parent sees a non-zero exit or a
+``quality_report.timeout_s`` timeout and keeps serving yesterday's
+document.
+
+What stays in the parent is the in-process hook: after a successful fit
+the running ``push.thresholds.ThresholdTable`` is told to re-read. The
+child cannot reach the parent's objects, and does not need to — the file
+is on disk by the time it exits.
+
+Async discipline: the parent only awaits a subprocess, so nothing blocks
+the event loop. When a test injects a builder (or a renderer, or a
+fitter) the same job runs in-process via ``asyncio.to_thread``, because a
+lambda cannot cross a process boundary. Either way the writes are tmp +
+rename in the target directory, so the HTTP route can never serve a
+half-written document — and, on failure, the previous report stays
+exactly where it was. A quality page is allowed to be a day stale; it is
+not allowed to be truncated.
 
 Private-instance only. ``Config`` refuses ``enabled`` under
 ``server.public_mode`` at load; :func:`build_quality_report_task` checks
@@ -39,8 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import tempfile
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +70,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from .config import Config
 from .push.paths import resolved_thresholds_path
+from .quality_job import JOB_MODULE, inputs_to_json, run_job, sweep_options_to_json
 
 _log = structlog.get_logger(__name__)
 
@@ -61,22 +80,24 @@ _log = structlog.get_logger(__name__)
 QUALITY_FILENAME = "quality.json"
 
 
+#: How long to wait for a killed child to be reaped before giving up on it.
+_REAP_TIMEOUT_S = 10.0
+
+#: Longest excerpt of the child's stderr carried into a log line. Enough
+#: to see the exception; short enough not to flood the log with a
+#: traceback the child already printed in full.
+_STDERR_TAIL = 500
+
+
 def quality_path(config: Config) -> Path:
     """``<storage.data_dir>/nowcast/quality.json`` — what the route serves."""
     return Path(config.storage.data_dir) / "nowcast" / QUALITY_FILENAME
 
 
-def _write_atomic(path: Path, text: str) -> None:
-    """tmp + rename in the target directory; a reader never sees a half file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+def _tail(stream: bytes | None) -> str:
+    """The last useful line(s) of a child's stderr, for one log field."""
+    text = (stream or b"").decode("utf-8", "replace").strip()
+    return text[-_STDERR_TAIL:] if text else ""
 
 
 @dataclass
@@ -101,9 +122,16 @@ class QualityBuildResult:
 class QualityReportTask:
     """Builds the quality report once a day and writes it where it is served.
 
-    ``builder`` is injectable so tests exercise the whole task — the
-    schedule, the executor hop, the atomic write, the failure policy —
-    without a corpus on disk.
+    The build itself runs in a child process
+    (:mod:`dmi_nowcast_sidecar.quality_job`) so its gigabytes leave with
+    it; this class owns the schedule, the timeout, the summary and the
+    one hook that has to stay in the parent.
+
+    ``builder`` / ``renderer`` / ``fitter`` are injectable so tests
+    exercise the whole job — the guard, the atomic writes, the failure
+    policy — without a corpus on disk; injecting any of them runs the job
+    in a worker thread instead of a child, because a Python callable
+    cannot be handed to one.
     """
 
     def __init__(
@@ -114,6 +142,7 @@ class QualityReportTask:
         renderer: Callable[[dict], str] | None = None,
         fitter: Callable[[Any], dict] | None = None,
         thresholds: Any = None,
+        executable: str | None = None,
     ) -> None:
         self.config = config
         self.settings = config.quality_report
@@ -127,6 +156,9 @@ class QualityReportTask:
         #: to re-read after a successful fit. ``None`` means the file
         #: still lands; it just takes a restart to take effect.
         self._thresholds = thresholds
+        #: The interpreter the child is spawned with. Overridable so a
+        #: test can point it at a stub that records its argv.
+        self._executable = executable or sys.executable
         self._scheduler = AsyncIOScheduler(timezone=timezone.utc)
         self._started = False
         self._last: QualityBuildResult | None = None
@@ -134,6 +166,19 @@ class QualityReportTask:
     @property
     def last_result(self) -> QualityBuildResult | None:
         return self._last
+
+    @property
+    def in_process(self) -> bool:
+        """True when something injectable was supplied — a test.
+
+        Production injects nothing and the job is spawned; a builder, a
+        renderer or a fitter is a Python object that cannot cross a
+        process boundary, so it runs in a worker thread instead.
+        """
+        return any(
+            hook is not None
+            for hook in (self._builder, self._renderer, self._fitter)
+        )
 
     # -- inputs -----------------------------------------------------------
 
@@ -206,125 +251,168 @@ class QualityReportTask:
             workers=int(settings.workers),
         )
 
-    def fit_thresholds(self) -> QualityBuildResult:
-        """Refit the push thresholds and publish the guarded table.
+    def job_config(self) -> dict:
+        """Everything the job needs, resolved, as one JSON-able document.
 
-        Blocking (the sweep is minutes of CPU over a season of decision
-        rows) — called from :meth:`_build_sync`, which is already in a
-        worker thread. Returns a partial result carrying only the fields
-        this step owns; :meth:`_build_sync` merges them into the build's.
-
-        Never raises. Every failure — no corpus, no rows, a sweep that
-        blew up — leaves the table already in service exactly where it
-        was, which is the same failure policy as the report itself.
+        This is the whole contract with the child: paths already resolved
+        against the config, the sweep's options already reduced to the
+        live rule's constants. The child reads no YAML and no
+        environment, so what the parent decided is what runs.
         """
-        from dmi_nowcast_core.push_thresholds import (
-            apply_stability_guard,
-            load_thresholds,
-        )
-
-        from .threshold_sweep import SweepError, run_fit, write_atomic
-
-        settings = self.settings.fit_thresholds
-        out = self.thresholds_out()
-        try:
-            fit = self._fitter or run_fit
-            payload = fit(self._fit_options())
-            new_doc = payload["thresholds"]
-            # Guard against the table in service, which is the file we are
-            # about to overwrite — read it BEFORE the write, obviously,
-            # and treat an unusable one as a first fit.
-            previous = load_thresholds(out)
-            doc = apply_stability_guard(
-                new_doc, previous,
-                min_delta_pct=int(settings.min_delta_pct),
-                min_warnings=int(settings.min_warnings),
-            )
-            write_atomic(out, json.dumps(doc, indent=1) + "\n")
-        except SweepError as exc:
-            # Nothing to fit on: not a bug, and not worth a warning every
-            # night while the corpus is still filling up.
-            _log.info("quality_report_fit_skipped", reason=str(exc))
-            return QualityBuildResult(thresholds_error=str(exc))
-        except Exception as exc:  # noqa: BLE001 - the report still builds
-            _log.warning(
-                "quality_report_fit_failed",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            return QualityBuildResult(
-                thresholds_error=f"{type(exc).__name__}: {exc}",
-            )
-        guard = {
-            key: str(entry.get("guard"))
-            for key, entry in (doc.get("leads") or {}).items()
-            if isinstance(entry, dict)
+        settings = self.settings
+        fit = settings.fit_thresholds
+        payload: dict = {
+            "quality": {
+                "out_json": str(quality_path(self.config)),
+                "markdown_dir": (
+                    None if settings.markdown_dir is None
+                    else str(settings.markdown_dir)
+                ),
+                "inputs": inputs_to_json(self.inputs()),
+            },
+            "fit": {"enabled": False},
         }
-        # The service re-reads at the start of its next fan-out; without
-        # this hook the file still lands and takes effect on restart.
-        note = getattr(self._thresholds, "note_changed", None)
-        if callable(note):
-            note()
-        _log.info(
-            "quality_report_fit_done",
-            path=str(out),
-            fitted_at=doc.get("fitted_at_utc"),
-            guard=guard,
-            reloaded=callable(note),
-        )
-        return QualityBuildResult(thresholds_path=out, thresholds_guard=guard)
+        if fit.enabled:
+            payload["fit"] = {
+                "enabled": True,
+                "thresholds_out": str(self.thresholds_out()),
+                "min_delta_pct": int(fit.min_delta_pct),
+                "min_warnings": int(fit.min_warnings),
+                "options": sweep_options_to_json(self._fit_options()),
+            }
+        return payload
+
+    def child_argv(self, payload: dict | None = None) -> list[str]:
+        """The command line the nightly build is spawned as."""
+        config = self.job_config() if payload is None else payload
+        return [
+            self._executable, "-m", JOB_MODULE,
+            "--config-json", json.dumps(config, sort_keys=True),
+        ]
 
     # -- the job ----------------------------------------------------------
 
-    def _build_sync(self) -> QualityBuildResult:
-        """The blocking half: read every corpus, produce, validate, write."""
-        from dmi_nowcast_core.quality_report import (
-            build_quality_report,
-            render_markdown,
-            validate_report,
-        )
-
-        build = self._builder or build_quality_report
-        render = self._renderer or render_markdown
-        # The fit first, so ``inputs()`` hands the builder tonight's table
-        # and ``quality.json``'s thresholds section describes the rule the
-        # service is on as of now.
-        fit = (
-            self.fit_thresholds()
-            if self.settings.fit_thresholds.enabled
-            else QualityBuildResult()
-        )
-        report = build(self.inputs())
-        problems = validate_report(report)
-        payload = json.dumps(report, indent=1, sort_keys=False)
-        path = quality_path(self.config)
-        _write_atomic(path, payload)
-
-        markdown_dir = self.settings.markdown_dir
-        if markdown_dir is not None:
-            stamp = str(report.get("generated_at_utc") or "")[:10] or (
-                datetime.now(timezone.utc).date().isoformat()
-            )
+    @staticmethod
+    def _summary_of(stdout: bytes) -> dict | None:
+        """The child's last stdout line, parsed. ``None`` if it is not one."""
+        for line in reversed(stdout.decode("utf-8", "replace").splitlines()):
+            text = line.strip()
+            if not text:
+                continue
             try:
-                _write_atomic(Path(markdown_dir) / f"{stamp}.md", render(report))
-            except Exception as exc:  # noqa: BLE001 — the archive twin is a nicety
-                _log.warning("quality_report_markdown_failed", error=str(exc))
+                parsed = json.loads(text)
+            except ValueError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
 
+    @staticmethod
+    def _result_of(summary: dict) -> QualityBuildResult:
+        """One job summary as the result this task reports and logs."""
+        thresholds = summary.get("thresholds_path")
+        path = summary.get("path")
         return QualityBuildResult(
-            ok=True,
-            path=path,
-            bytes_written=len(payload.encode("utf-8")),
-            thresholds_path=fit.thresholds_path,
-            thresholds_guard=fit.thresholds_guard,
-            thresholds_error=fit.thresholds_error,
-            sections=[
-                key for key in (
-                    "windows", "headline", "reliability", "raining_now",
-                    "stations", "events", "methods",
-                )
-                if isinstance(report, dict) and report.get(key) is not None
+            ok=bool(summary.get("ok")),
+            path=Path(path) if path else None,
+            bytes_written=int(summary.get("bytes") or 0),
+            sections=[str(s) for s in (summary.get("sections") or [])],
+            schema_problems=[
+                str(p) for p in (summary.get("schema_problems") or [])
             ],
-            schema_problems=problems,
+            error=summary.get("error"),
+            thresholds_path=Path(thresholds) if thresholds else None,
+            thresholds_guard={
+                str(k): str(v)
+                for k, v in (summary.get("thresholds_guard") or {}).items()
+            },
+            thresholds_error=summary.get("thresholds_error"),
         )
+
+    @staticmethod
+    async def _kill(proc: "asyncio.subprocess.Process") -> None:
+        """SIGKILL and reap, so a hung build cannot outlive its slot."""
+        try:
+            proc.kill()
+        except ProcessLookupError:  # pragma: no cover — it just exited
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_S)
+        except (asyncio.TimeoutError, TimeoutError):  # pragma: no cover
+            _log.warning("quality_report_child_unreaped", pid=proc.pid)
+
+    async def _run_child(self, payload: dict) -> QualityBuildResult:
+        """Spawn the job, await it under a timeout, read its summary.
+
+        Every failure mode ends the same way: a result with ``ok=False``
+        and an error string. The service is untouched by all of them —
+        the report on disk is last night's, and the process that held the
+        gigabytes is gone.
+        """
+        argv = self.child_argv(payload)
+        timeout = float(self.settings.timeout_s)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            return QualityBuildResult(
+                ok=False, error=f"spawn failed: {type(exc).__name__}: {exc}",
+            )
+        try:
+            # communicate(), not wait(): it drains both pipes, so a chatty
+            # build cannot fill a pipe buffer and deadlock against us.
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            await self._kill(proc)
+            return QualityBuildResult(
+                ok=False, error=f"timed out after {timeout:g}s",
+            )
+        summary = self._summary_of(stdout)
+        if summary is None:
+            tail = _tail(stderr)
+            return QualityBuildResult(
+                ok=False,
+                error=(
+                    f"no summary from the job (exit {proc.returncode})"
+                    + (f": {tail}" if tail else "")
+                ),
+            )
+        result = self._result_of(summary)
+        if proc.returncode != 0 and result.ok:
+            # A summary that claims success under a non-zero exit is a bug
+            # in the job, not a report worth trusting.
+            return QualityBuildResult(
+                ok=False,
+                error=f"job exited {proc.returncode} after claiming success",
+            )
+        if not result.ok and result.error is None:
+            result.error = _tail(stderr) or f"exit {proc.returncode}"
+        return result
+
+    async def _run_in_process(self, payload: dict) -> QualityBuildResult:
+        """The injected-hook path: the same job, in a worker thread.
+
+        Only tests reach it (see :attr:`in_process`), and it exists so
+        they exercise the real job — the guard, the atomic writes, the
+        summary — rather than a second implementation of it.
+        """
+        try:
+            summary = await asyncio.to_thread(
+                run_job,
+                payload,
+                builder=self._builder,
+                renderer=self._renderer,
+                fitter=self._fitter,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return QualityBuildResult(
+                ok=False, error=f"{type(exc).__name__}: {exc}",
+            )
+        return self._result_of(summary)
 
     async def build_once(self) -> QualityBuildResult:
         """One build. Never raises: a failure leaves the previous report.
@@ -335,13 +423,23 @@ class QualityReportTask:
         """
         started = datetime.now(timezone.utc)
         try:
-            result = await asyncio.to_thread(self._build_sync)
+            # Resolving the config can fail on its own (a fit configured
+            # without a corpus dir, say), and this method promises never
+            # to raise — so it is inside the guard with everything else.
+            payload = self.job_config()
         except Exception as exc:  # noqa: BLE001
             result = QualityBuildResult(
-                ok=False, error=f"{type(exc).__name__}: {exc}",
+                ok=False, error=f"job config failed: {type(exc).__name__}: {exc}",
             )
-            _log.warning("quality_report_build_failed", error=str(exc))
         else:
+            result = await (
+                self._run_in_process(payload) if self.in_process
+                else self._run_child(payload)
+            )
+        elapsed = round(
+            (datetime.now(timezone.utc) - started).total_seconds(), 1,
+        )
+        if result.ok:
             _log.info(
                 "quality_report_built",
                 path=str(result.path),
@@ -352,12 +450,32 @@ class QualityReportTask:
                     else str(result.thresholds_path)
                 ),
                 schema_problems=len(result.schema_problems),
-                elapsed_s=round(
-                    (datetime.now(timezone.utc) - started).total_seconds(), 1,
-                ),
+                in_process=self.in_process,
+                elapsed_s=elapsed,
             )
             for problem in result.schema_problems:
                 _log.warning("quality_report_schema_problem", problem=problem)
+        else:
+            _log.warning(
+                "quality_report_build_failed",
+                error=result.error,
+                elapsed_s=elapsed,
+            )
+        if result.thresholds_error:
+            _log.info("quality_report_fit_not_applied", reason=result.thresholds_error)
+        # The hook the child cannot call: the service re-reads the table at
+        # the start of its next fan-out. Without it the file still landed
+        # and takes effect on restart.
+        if result.thresholds_path is not None:
+            note = getattr(self._thresholds, "note_changed", None)
+            if callable(note):
+                note()
+            _log.info(
+                "quality_report_fit_done",
+                path=str(result.thresholds_path),
+                guard=result.thresholds_guard,
+                reloaded=callable(note),
+            )
         self._last = result
         return result
 

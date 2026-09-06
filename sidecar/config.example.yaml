@@ -213,10 +213,21 @@ station_obs:
 # exists. Build the first one by hand with deploy/quality_report.sh —
 # the page 503s until a document is on disk.
 #
+# The build runs in a CHILD PROCESS (dmi_nowcast_sidecar.quality_job) and
+# the memory leaves with it. In-process it took this service from ~0.9 GB
+# to 5.5 GB of RSS — the corpora, the decision rows and the gauge store
+# all land in Arrow, and neither Arrow nor CPython gives that back — and
+# the kernel's OOM killer then chose it over the batch job beside it.
+#
 quality_report:
   enabled: true
   # UTC. After the overnight replay, well away from a cycle's busy minute.
   at_utc: "03:30"
+  # How long the child gets before it is killed. Generous on purpose: the
+  # report is minutes over a season of rows and the fit below adds more.
+  # What this really bounds is a job wedged on a corrupt parquet — and a
+  # timeout costs one log line and yesterday's report, nothing else.
+  timeout_s: 1800
   # The national calibration corpus (stamped per calibrate.sh run — point
   # this at the newest one, or at a stable symlink you maintain).
   radar_corpus: /var/lib/dmi-nowcast-corpus/calibration/latest.parquet

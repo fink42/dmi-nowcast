@@ -31,11 +31,15 @@ import numpy as np
 import pytest
 
 from dmi_nowcast_core.quality_report import (
+    CORPUS_COLUMNS,
+    DECISION_COLUMNS_READ,
+    GAUGE_PAD_MIN,
     N_BINS,
     SCHEMA_VERSION,
     QualityInputs,
     bin_statistics,
     build_quality_report,
+    decision_bounds,
     render_markdown,
     validate_report,
 )
@@ -532,6 +536,150 @@ def full_inputs(tmp_path: Path) -> QualityInputs:
         thresholds_path=write_thresholds(tmp_path / "push_thresholds.json"),
         now=NOW,
     )
+
+
+# ---------------------------------------------------------------------------
+# How much of the corpus is read
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedReads:
+    """What the builder is allowed to pull into memory.
+
+    Not a performance nicety: this build runs beside a live service on a
+    12 GB VM, and reading the full width of two multi-million-row corpora
+    plus a season of decision rows plus the whole gauge archive is what
+    took the sidecar to 5.5 GB and got it OOM-killed. Every read here is
+    pinned — a widening has to be deliberate.
+    """
+
+    def test_the_corpus_column_list_is_pinned(self) -> None:
+        """The eight columns the reliability diagrams are built from."""
+        assert CORPUS_COLUMNS == (
+            "event_time", "point_id", "lead_min", "raw_prob", "sample_weight",
+            "frame_age_min", "threshold_mm_h",
+        )
+
+    def test_the_decision_column_list_is_pinned(self) -> None:
+        """The report scores warnings; the per-lead columns are the sweep's."""
+        assert DECISION_COLUMNS_READ == (
+            "radar_ts", "generated_at", "station_id", "p_rain", "eta_min",
+            "observed_mm_h", "forecast_now_mm_h", "action",
+        )
+        for column in ("intensity_mm_h", "armed_after", "streak_after"):
+            assert column not in DECISION_COLUMNS_READ
+        assert not any(c.startswith("p_rain_") for c in DECISION_COLUMNS_READ)
+
+    def test_every_parquet_read_names_its_columns(
+        self, full_inputs: QualityInputs, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No ``read_table(path)`` without a projection, anywhere in a build."""
+        seen: list[dict] = []
+        real = pq.read_table
+
+        def recording(source, *args, **kwargs):
+            seen.append({"source": str(source), **kwargs})
+            return real(source, *args, **kwargs)
+
+        monkeypatch.setattr(pq, "read_table", recording)
+        build_quality_report(full_inputs)
+
+        assert seen, "the build read no parquet at all"
+        for call in seen:
+            # Either an explicit projection, or a schema that IS the
+            # projection: the gauge store's four columns are all of it.
+            narrow = call.get("schema") is not None and len(call["schema"]) <= 4
+            assert call.get("columns") or narrow, (
+                f"unprojected read of {call['source']}"
+            )
+
+        corpora = [c for c in seen if c["source"].endswith(("radar.parquet", "station.parquet"))]
+        assert len(corpora) == 2
+        for call in corpora:
+            assert set(call["columns"]) <= set(CORPUS_COLUMNS) | {
+                "outcome", "gauge_outcome",
+            }
+
+        decisions = [c for c in seen if "decisions" in c["source"] or "/eval/" in c["source"]]
+        assert decisions, "the decision rows were not read"
+        for call in decisions:
+            assert call["columns"] == list(DECISION_COLUMNS_READ)
+
+    def test_the_gauge_store_is_read_by_month_and_station(
+        self, full_inputs: QualityInputs, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The rows decide the window; the archive never does.
+
+        The gauge archive is backfilled months deep and carries every
+        station DMI publishes. What may be read is the months the decision
+        rows span (padded, because the onset rule needs the dry slots in
+        front of an event) and the stations those rows name.
+        """
+        from dmi_nowcast_core import station_store
+
+        calls: list[dict] = []
+        real_cls = station_store.StationObsStore
+
+        class Recording(real_cls):  # type: ignore[misc, valid-type]
+            def read(self, start_utc, end_utc, parameter_ids=None, station_ids=None):
+                calls.append({
+                    "start": start_utc, "end": end_utc,
+                    "parameters": None if parameter_ids is None else list(parameter_ids),
+                    "stations": None if station_ids is None else list(station_ids),
+                })
+                return super().read(start_utc, end_utc, parameter_ids, station_ids)
+
+        monkeypatch.setattr(station_store, "StationObsStore", Recording)
+        report = build_quality_report(full_inputs)
+        # The fixture's scoreboard is scored, so the gauge really was read.
+        assert report["headline"]["warnings"] is not None
+        assert calls, "the gauge store was not read at all"
+
+        rows, _counts = _load_decisions_for_test(full_inputs)
+        bounds = decision_bounds(rows)
+        assert bounds is not None
+        window_from, window_to, stations = bounds
+        pad = timedelta(minutes=GAUGE_PAD_MIN)
+        # A month partition is read whole and then filtered, so the read
+        # bounds are month edges — but never outside the months the rows
+        # touch, padded.
+        floor = (window_from - pad).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0,
+        ) - pad
+        for call in calls:
+            assert call["start"] >= floor
+            assert call["end"] <= _month_after(window_to) + pad
+            assert call["stations"] is not None, "read every station"
+            assert set(call["stations"]) <= set(stations)
+            assert call["parameters"] is not None, "read every parameter"
+
+    def test_bounds_come_from_the_rows(self) -> None:
+        rows = [
+            {"station_id": "06180", "generated_at": DAY + timedelta(hours=1)},
+            {"station_id": "06181", "generated_at": DAY + timedelta(hours=5)},
+            {"station_id": "06180", "generated_at": None},
+        ]
+        window_from, window_to, stations = decision_bounds(rows)
+        assert window_from == DAY + timedelta(hours=1)
+        assert window_to == DAY + timedelta(hours=5)
+        assert stations == ["06180", "06181"]
+
+    def test_no_usable_row_means_nothing_to_read_for(self) -> None:
+        assert decision_bounds([]) is None
+        assert decision_bounds([{"station_id": "06180"}]) is None
+
+
+def _load_decisions_for_test(inputs: QualityInputs):
+    from dmi_nowcast_core.quality_report import _load_decisions
+
+    return _load_decisions(inputs)
+
+
+def _month_after(stamp: datetime) -> datetime:
+    if stamp.month == 12:
+        return datetime(stamp.year + 1, 1, 1, tzinfo=UTC)
+    return datetime(stamp.year, stamp.month + 1, 1, tzinfo=UTC)
+
 
 
 # ---------------------------------------------------------------------------

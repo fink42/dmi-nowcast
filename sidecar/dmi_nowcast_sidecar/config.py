@@ -547,6 +547,12 @@ class QualityReportConfig(BaseModel):
     #: calibration and any overnight replay, and nowhere near the busy
     #: minute of a radar cycle.
     at_utc: str = "03:30"
+    #: How long the child process gets before it is killed. The build is
+    #: minutes over a season of rows and the fit adds more, so the default
+    #: is generous; what it really bounds is a job wedged on a corrupt
+    #: parquet or a filesystem that stopped answering. A timeout costs one
+    #: log line and yesterday's report.
+    timeout_s: Annotated[float, Field(gt=0, le=86400)] = 1800.0
     radar_corpus: Path | None = None
     station_corpus: Path | None = None
     replay_dir: Path | None = None

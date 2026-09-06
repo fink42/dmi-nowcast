@@ -7,8 +7,16 @@
 # poor way to learn it.
 #
 # Same shape as calibrate.sh: run on the *host*, mount the repo into a
-# throwaway container so scripts/ is available (the runtime image stays
-# lean), write into the volumes the service already has.
+# throwaway container so the working tree's code is what runs (the
+# runtime image stays lean), write into the volumes the service already
+# has.
+#
+# It runs the SAME module the nightly task spawns —
+# ``python -m dmi_nowcast_sidecar.quality_job`` — so the manual first
+# build and the 03:30 one cannot drift. This script's job is only to
+# resolve the paths and hand them over as one JSON document. A throwaway
+# container is also why the memory never lands on the live service: this
+# path has always been out of process, and now the nightly one is too.
 #
 # Every input is OPTIONAL. A missing one nulls its section of the report
 # instead of faking it, so this is safe to run before the whole corpus
@@ -54,6 +62,7 @@
 #   QUALITY_FIT_GRID          threshold grid (default 20:80:5)
 #   QUALITY_FIT_WORKERS       processes over cells (default 4)
 #   QUALITY_FIT_MIN_WARNINGS  evidence floor per lead (default 30)
+#   QUALITY_FIT_MIN_DELTA     points a pick must move to be published (5)
 #   QUALITY_SWEEP_JSON        also keep the full sweep record here
 #                             (default $CORPUS_DIR/thresholds/sweep.json)
 #
@@ -89,6 +98,7 @@ fit_leads=${QUALITY_FIT_LEADS:-20,30,45,60}
 fit_grid=${QUALITY_FIT_GRID:-20:80:5}
 fit_workers=${QUALITY_FIT_WORKERS:-4}
 fit_min_warnings=${QUALITY_FIT_MIN_WARNINGS:-30}
+fit_min_delta=${QUALITY_FIT_MIN_DELTA:-5}
 sweep_json=${QUALITY_SWEEP_JSON:-$corpus_dir/thresholds/sweep.json}
 
 # Bring scripts/ into the container on demand — the runtime image does not
@@ -97,7 +107,7 @@ run_in_repo() {
     docker compose run --rm \
         -v "$DEPLOY_DIR/../..:/repo:ro" \
         --workdir /repo \
-        -e PYTHONPATH=/repo/src \
+        -e PYTHONPATH=/repo/src:/repo/sidecar \
         sidecar \
         "$@"
 }
@@ -116,14 +126,13 @@ PY
 )
 fi
 
-# Only pass the flags whose inputs actually exist: an absent path and an
-# omitted flag mean the same thing to the builder (that section is null),
-# and omitting it keeps the log free of "file not found" noise.
-args=(--out-json "$out" --out-md "$md_dir/$(date -u +%Y-%m-%d).md"
-      --corpus-dir "$corpus_dir" --live-days "$live_days")
-add_if_exists() {   # add_if_exists <flag> <path> <test-flag>
+# Only name the inputs that actually exist: an absent path and an omitted
+# key mean the same thing to the builder (that section is null), and
+# leaving it out keeps the log free of "file not found" noise.
+inputs=()
+add_if_exists() {   # add_if_exists <json-key> <path> <test-flag>
     if run_in_repo python -c "import sys,os; sys.exit(0 if os.path.$3(sys.argv[1]) else 1)" "$2"; then
-        args+=("$1" "$2")
+        inputs+=("$1=$2")
         echo "    $1 $2"
     else
         echo "    (skipping $1 — $2 not present; that section will be null)"
@@ -132,62 +141,97 @@ add_if_exists() {   # add_if_exists <flag> <path> <test-flag>
 
 # --- optional: fit the push thresholds first --------------------------
 # Before the report, so quality.json embeds the table this run produced.
-# --previous is the file already in service: the stability guard keeps its
-# value for any lead the new fit does not clearly improve on. On the very
-# first run that file does not exist, which the guard reads as a first fit.
+# The stability guard is against the file already in service: the job
+# reads it before it overwrites it, and an absent one reads as a first
+# fit. That is the same code the nightly task runs.
+fit_on=false
 if [[ "$fit_thresholds" == "1" ]]; then
     echo "==> Fitting the push thresholds (Phase G)"
     echo "    decisions → $decisions_dirs"
     echo "    leads $fit_leads over grid $fit_grid, $fit_workers worker(s)"
     echo "    out → $thresholds_out"
-    run_in_repo python -c "from pathlib import Path; \
-        Path('$(dirname "$thresholds_out")').mkdir(parents=True, exist_ok=True); \
-        Path('$(dirname "$sweep_json")').mkdir(parents=True, exist_ok=True)"
-    fit_args=(--corpus-dir "$corpus_dir"
-              --leads "$fit_leads" --thresholds "$fit_grid"
-              --workers "$fit_workers" --min-warnings "$fit_min_warnings"
-              --out-thresholds "$thresholds_out"
-              --out-json "$sweep_json")
-    for d in $decisions_dirs; do
-        fit_args+=(--decisions-dir "$d")
-    done
-    # An `if`, not `[[ ... ]] && ...`: under `set -e` a false test as a
-    # bare compound command would end the script.
-    if [[ -n "$radar_decisions" ]]; then
-        fit_args+=(--radar-decisions-dir "$radar_decisions")
-    fi
-    # Guard against whatever is in service right now; absent on run one.
+    echo "    full sweep record → $sweep_json"
+    fit_on=true
     if run_in_repo python -c "import sys,os; sys.exit(0 if os.path.isfile(sys.argv[1]) else 1)" "$thresholds_out"; then
-        fit_args+=(--previous "$thresholds_out")
         echo "    guarding against the table in service"
     else
         echo "    no table in service yet — this is the first fit"
     fi
-    run_in_repo python scripts/sweep_thresholds.py "${fit_args[@]}"
-    args+=(--thresholds "$thresholds_out")
     echo "    the running service re-reads it at its next fan-out"
 else
     echo "==> Skipping the push-threshold fit (QUALITY_FIT_THRESHOLDS=1 to run it)"
-    if run_in_repo python -c "import sys,os; sys.exit(0 if os.path.isfile(sys.argv[1]) else 1)" "$thresholds_out"; then
-        args+=(--thresholds "$thresholds_out")
-    fi
 fi
 
 echo "==> Building the quality report"
 echo "    corpus dir → $corpus_dir"
-[[ -n "$radar_corpus" ]] && add_if_exists --radar-corpus "$radar_corpus" isfile
-add_if_exists --station-corpus "$station_corpus" isfile
-add_if_exists --replay-dir "$replay_dir" isdir
-add_if_exists --persistence-json "$persistence_json" isfile
-add_if_exists --national-curves "$curves" isfile
+[[ -n "$radar_corpus" ]] && add_if_exists radar_corpus "$radar_corpus" isfile
+add_if_exists station_corpus "$station_corpus" isfile
+add_if_exists replay_dir "$replay_dir" isdir
+add_if_exists persistence_json "$persistence_json" isfile
+add_if_exists national_curves "$curves" isfile
+# The fitted table: tonight's once the step above has run, otherwise
+# whatever is in service. A missing file nulls that section, it is not an
+# error, so this is named whenever there is any chance of one.
+if [[ "$fit_on" == "true" ]] || run_in_repo python -c "import sys,os; sys.exit(0 if os.path.isfile(sys.argv[1]) else 1)" "$thresholds_out"; then
+    inputs+=("thresholds_path=$thresholds_out")
+fi
 echo "    out → $out"
 echo "    markdown → $md_dir"
 
-run_in_repo python -c "from pathlib import Path; \
-    Path('$(dirname "$out")').mkdir(parents=True, exist_ok=True); \
-    Path('$md_dir').mkdir(parents=True, exist_ok=True)"
+# The job config, built by the same code that parses the threshold grid
+# for the nightly task, printed as one line of JSON. What this script
+# resolved is exactly what the job runs — no second set of defaults.
+config_json=$(run_in_repo python - \
+    "$corpus_dir" "$out" "$md_dir" "$live_days" \
+    "$fit_on" "$thresholds_out" "$sweep_json" "$fit_leads" "$fit_grid" \
+    "$fit_workers" "$fit_min_warnings" "$fit_min_delta" \
+    "$radar_decisions" "$decisions_dirs" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
+import json
+import sys
 
-run_in_repo python scripts/quality_report.py "${args[@]}"
+from dmi_nowcast_sidecar.threshold_sweep import parse_thresholds
+
+(corpus_dir, out, md_dir, live_days, fit_on, thresholds_out, sweep_json,
+ leads, grid, workers, min_warnings, min_delta, radar_decisions,
+ decisions_dirs, *pairs) = sys.argv[1:]
+
+inputs = {"corpus_dir": corpus_dir, "live_days": int(live_days)}
+for pair in pairs:
+    key, _, value = pair.partition("=")
+    inputs[key] = value
+
+config = {
+    "quality": {
+        "out_json": out,
+        "markdown_dir": md_dir or None,
+        "inputs": inputs,
+    },
+    "fit": {"enabled": False},
+}
+if fit_on == "true":
+    config["fit"] = {
+        "enabled": True,
+        "thresholds_out": thresholds_out,
+        "sweep_json": sweep_json or None,
+        "min_delta_pct": int(min_delta),
+        "min_warnings": int(min_warnings),
+        "options": {
+            "decisions_dirs": decisions_dirs.split(),
+            "corpus_dir": corpus_dir,
+            "radar_decisions_dirs": [radar_decisions] if radar_decisions else None,
+            "leads": [int(v) for v in leads.split(",") if v.strip()],
+            "thresholds": list(parse_thresholds(grid)),
+            "workers": int(workers),
+            "min_warnings": int(min_warnings),
+        },
+    }
+print(json.dumps(config, sort_keys=True))
+CFG
+)
+
+# One process, both steps, exactly as the nightly task runs them. Its
+# stdout is one line of JSON: the summary.
+run_in_repo python -m dmi_nowcast_sidecar.quality_job --config-json "$config_json"
 
 echo
 echo "==> Done. The running sidecar serves it immediately — no restart needed:"

@@ -203,6 +203,25 @@ The builder is `dmi_nowcast_core.quality_report`; every input path is
 optional and a missing one nulls only its own section, so the feature can
 be turned on before the whole corpus exists.
 
+**It runs out of process.** The nightly task spawns
+`python -m dmi_nowcast_sidecar.quality_job` with the resolved paths as
+one JSON argument, waits for it under `quality_report.timeout_s` (default
+1800 s) and reads a one-line JSON summary from its stdout; the manual
+`deploy/quality_report.sh` runs the same module in a throwaway container,
+so the two paths cannot drift. The reason is memory: the build pulls both
+calibration corpora, every replay and live decision row and the gauge
+store behind them into Arrow and numpy, and neither Arrow's pool nor
+CPython's allocator returns that to the kernel — built in a thread of the
+service it took RSS from ~0.9 GB to 5.5 GB and the host's OOM killer took
+the service down (exit 137) while a batch replay ran beside it. A child
+process gives the memory back by exiting, and a build that crashes,
+hangs, or is itself OOM-killed now costs one log line and a day-old
+report. The compose files add `oom_score_adj: -500` and a
+`mem_reservation` so that, if the host runs short anyway, the kernel
+picks the batch jobs first. Only one thing stays in the parent: after a
+successful threshold fit the running service is told to re-read its
+table.
+
 Build the FIRST report by hand — the route 503s until a document is on
 disk, and waiting until 03:30 to find out a path was wrong is a poor way
 to learn it:

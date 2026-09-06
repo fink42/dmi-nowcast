@@ -22,6 +22,22 @@ services:
       context: ../..
       dockerfile: sidecar/deploy/Dockerfile
     restart: unless-stopped
+    # Survive the host's memory pressure. Batch work runs on this same VM
+    # — the nightly quality build (now its own child process), corpus
+    # backfills, replays — and any of them can be gigabytes. These two
+    # settings make the kernel pick THOSE first:
+    #   oom_score_adj: -500  biases the global OOM killer away from the
+    #     live service. The batch jobs keep the default 0 and are killed
+    #     before it. (The service was itself killed at exit 137 in
+    #     September 2026, while a replay ran beside a 5.5 GB in-process
+    #     report build.)
+    #   mem_reservation      a SOFT floor: under pressure the kernel
+    #     reclaims from containers above their reservation first. Not a
+    #     limit — deliberately no ``mem_limit`` here, because a hard cap
+    #     would turn a transient spike in the live cycle into a kill of
+    #     the one process that must not die.
+    oom_score_adj: -500
+    mem_reservation: 1500m
     ports:
       # Publish only where you mean to. Set HOST_PORT to an explicit
       # ``address:port`` (e.g. 127.0.0.1:8081) to bind one interface

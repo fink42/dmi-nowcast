@@ -21,12 +21,22 @@ that split to be safe, and they are what this module tests:
    ``/calibration/national_curves.json`` stays private, because the public
    instance reads that file, it does not republish it.
 
-Fully synthetic: a fake builder, a stubbed HTTP transport, no corpus and
-no network.
+5. **The build cannot take the service down with it.** It runs in a
+   child process that exits — the corpora it pulls into Arrow are
+   gigabytes and neither Arrow nor CPython hands that back — and the
+   parent survives every way that child can end: a non-zero exit, a
+   summary it never printed, a hang past ``timeout_s``.
+
+Fully synthetic: a fake builder, a fake interpreter, a stubbed HTTP
+transport, no corpus and no network.
 """
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +48,15 @@ from dmi_nowcast_sidecar.app import _PUBLIC_PATHS, _is_public_path, create_app
 from dmi_nowcast_sidecar.compute import CycleEngine
 from dmi_nowcast_sidecar.config import Config
 from dmi_nowcast_sidecar.push.paths import resolved_thresholds_path
+from dmi_nowcast_sidecar.quality_job import (
+    JOB_MODULE,
+    inputs_from_json,
+    inputs_to_json,
+    main as job_main,
+    run_job,
+    sweep_options_from_json,
+    sweep_options_to_json,
+)
 from dmi_nowcast_sidecar.quality_report import (
     QualityReportTask,
     build_quality_report_task,
@@ -585,6 +604,394 @@ class TestNightlyThresholdFit:
         assert QualityReportTask(config).thresholds_out() == (
             tmp_path / "elsewhere.json"
         )
+
+
+# ---------------------------------------------------------------------------
+# The build runs in a child process
+# ---------------------------------------------------------------------------
+
+
+def _fake_interpreter(
+    tmp_path: Path,
+    *,
+    summary: dict | None = None,
+    exit_code: int = 0,
+    sleep_s: float = 0.0,
+    stderr: str = "",
+    name: str = "fake_python",
+) -> tuple[Path, Path]:
+    """A stand-in for ``sys.executable``: records argv, then behaves as told.
+
+    The task spawns ``<executable> -m <module> --config-json <json>``, so
+    a script here sees exactly the argv the real interpreter would — which
+    is what makes the command line itself testable.
+    """
+    script = tmp_path / name
+    record = tmp_path / f"{name}.argv.json"
+    script.write_text(textwrap.dedent(f"""\
+        #!{sys.executable}
+        import json, sys, time
+        with open({str(record)!r}, "w") as fh:
+            json.dump(sys.argv[1:], fh)
+        time.sleep({float(sleep_s)!r})
+        if {stderr!r}:
+            print({stderr!r}, file=sys.stderr)
+        summary = {summary!r}
+        if summary is not None:
+            print(json.dumps(summary))
+        sys.exit({int(exit_code)})
+    """))
+    script.chmod(0o755)
+    return script, record
+
+
+def _ok_summary(path: Path, **overrides) -> dict:
+    summary = {
+        "ok": True,
+        "path": str(path),
+        "bytes": 1234,
+        "sections": ["windows", "methods"],
+        "schema_problems": [],
+        "thresholds_path": None,
+        "thresholds_guard": {},
+        "thresholds_error": None,
+        "error": None,
+    }
+    summary.update(overrides)
+    return summary
+
+
+class TestTheChildProcess:
+    """The nightly build is spawned, not run here.
+
+    In-process it took the live sidecar from ~0.9 GB to 5.5 GB of anon
+    RSS and the kernel killed it (exit 137) while a batch replay ran
+    beside it. What these tests pin is the containment: the exact command
+    line, and that every way the child can fail costs a log line and
+    yesterday's report — never the service.
+    """
+
+    def test_the_command_line_is_the_job_module_and_a_config(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _config(tmp_path, quality_report={"enabled": True})
+        fake, record = _fake_interpreter(
+            tmp_path, summary=_ok_summary(quality_path(config)),
+        )
+        task = QualityReportTask(config, executable=str(fake))
+        assert task.in_process is False
+        result = anyio_run(task.build_once())
+        assert result.ok
+
+        argv = json.loads(record.read_text())
+        assert argv[0] == "-m"
+        assert argv[1] == JOB_MODULE == "dmi_nowcast_sidecar.quality_job"
+        assert argv[2] == "--config-json"
+        payload = json.loads(argv[3])
+        assert payload["quality"]["out_json"] == str(quality_path(config))
+        assert payload["quality"]["inputs"]["corpus_dir"] == str(
+            config.storage.corpus_dir,
+        )
+        assert payload["quality"]["inputs"]["national_curves"] == str(
+            config.calibration.national_curves_path,
+        )
+        # Nothing to fit tonight, and the child is told so explicitly.
+        assert payload["fit"] == {"enabled": False}
+
+    def test_the_fit_travels_with_it_as_the_live_rule(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _fit_config(tmp_path)
+        config.push.rearm_after_min = 45
+        fake, record = _fake_interpreter(
+            tmp_path, summary=_ok_summary(quality_path(config)),
+        )
+        anyio_run(QualityReportTask(config, executable=str(fake)).build_once())
+
+        fit = json.loads(json.loads(record.read_text())[3])["fit"]
+        assert fit["enabled"] is True
+        assert fit["thresholds_out"] == str(resolved_thresholds_path(config))
+        assert fit["options"]["thresholds"] == [40, 50, 60]
+        assert fit["options"]["rearm_after_min"] == 45
+        assert fit["options"]["corpus_dir"] == str(config.storage.corpus_dir)
+        # The whole config is one argv element: valid JSON, no shell in sight.
+        assert sweep_options_from_json(fit["options"]).rearm_after_min == 45
+
+    def test_a_successful_child_is_the_build_result(self, tmp_path: Path) -> None:
+        config = _fit_config(tmp_path)
+        out = resolved_thresholds_path(config)
+        table = _FakeTable()
+        fake, _ = _fake_interpreter(tmp_path, summary=_ok_summary(
+            quality_path(config),
+            sections=["windows", "headline"],
+            schema_problems=["stations: bad type"],
+            thresholds_path=str(out),
+            thresholds_guard={"30": "changed"},
+        ))
+        task = QualityReportTask(config, executable=str(fake), thresholds=table)
+        result = anyio_run(task.build_once())
+
+        assert result.ok
+        assert result.path == quality_path(config)
+        assert result.bytes_written == 1234
+        assert result.sections == ["windows", "headline"]
+        assert result.schema_problems == ["stations: bad type"]
+        assert result.thresholds_path == out
+        assert result.thresholds_guard == {"30": "changed"}
+        # The one hook that cannot live in the child fires in the parent.
+        assert table.nudged == 1
+        assert task.last_result is result
+
+    def test_a_non_zero_exit_keeps_the_previous_report(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _config(tmp_path, quality_report={"enabled": True})
+        path = quality_path(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(DOC))
+        table = _FakeTable()
+        fake, _ = _fake_interpreter(
+            tmp_path, exit_code=1,
+            summary={"ok": False, "error": "RuntimeError: corpus on fire"},
+        )
+        result = anyio_run(
+            QualityReportTask(
+                config, executable=str(fake), thresholds=table,
+            ).build_once(),
+        )
+        assert result.ok is False
+        assert "corpus on fire" in (result.error or "")
+        assert json.loads(path.read_text()) == DOC
+        assert table.nudged == 0
+
+    def test_a_child_that_prints_nothing_is_a_failure_with_its_stderr(
+        self, tmp_path: Path,
+    ) -> None:
+        """An OOM-killed child says nothing at all — that must not read as ok."""
+        config = _config(tmp_path, quality_report={"enabled": True})
+        fake, _ = _fake_interpreter(
+            tmp_path, exit_code=137, summary=None, stderr="Killed",
+        )
+        result = anyio_run(
+            QualityReportTask(config, executable=str(fake)).build_once(),
+        )
+        assert result.ok is False
+        assert "137" in (result.error or "")
+        assert "Killed" in (result.error or "")
+        assert not quality_path(config).exists()
+
+    def test_a_hung_child_is_killed_at_the_timeout(self, tmp_path: Path) -> None:
+        config = _config(tmp_path, quality_report={
+            "enabled": True, "timeout_s": 0.3,
+        })
+        fake, _ = _fake_interpreter(
+            tmp_path, sleep_s=30.0, summary=_ok_summary(quality_path(config)),
+        )
+        started = datetime.now(timezone.utc)
+        result = anyio_run(
+            QualityReportTask(config, executable=str(fake)).build_once(),
+        )
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        assert result.ok is False
+        assert "timed out" in (result.error or "")
+        assert elapsed < 20, "the parent waited for a child it had given up on"
+        assert not quality_path(config).exists()
+
+    def test_an_unspawnable_child_is_a_failure_not_a_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _config(tmp_path, quality_report={"enabled": True})
+        task = QualityReportTask(config, executable=str(tmp_path / "nope"))
+        result = anyio_run(task.build_once())
+        assert result.ok is False
+        assert "spawn failed" in (result.error or "")
+
+    def test_a_summary_claiming_success_under_a_bad_exit_is_refused(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _config(tmp_path, quality_report={"enabled": True})
+        fake, _ = _fake_interpreter(
+            tmp_path, exit_code=2, summary=_ok_summary(quality_path(config)),
+        )
+        result = anyio_run(
+            QualityReportTask(config, executable=str(fake)).build_once(),
+        )
+        assert result.ok is False
+        assert "exited 2" in (result.error or "")
+
+    def test_the_hook_stays_quiet_when_the_fit_did_not_publish(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _fit_config(tmp_path)
+        table = _FakeTable()
+        fake, _ = _fake_interpreter(tmp_path, summary=_ok_summary(
+            quality_path(config), thresholds_error="no decision rows found",
+        ))
+        result = anyio_run(
+            QualityReportTask(
+                config, executable=str(fake), thresholds=table,
+            ).build_once(),
+        )
+        # The report is the point of the task; the fit is a step of it.
+        assert result.ok is True
+        assert result.thresholds_error == "no decision rows found"
+        assert table.nudged == 0
+
+    def test_an_injected_builder_still_runs_in_this_process(
+        self, tmp_path: Path,
+    ) -> None:
+        """The tests above this file's line — and only they — stay in-process."""
+        config = _config(tmp_path, quality_report={"enabled": True})
+        task = QualityReportTask(config, builder=lambda _inputs: dict(DOC))
+        assert task.in_process is True
+        assert anyio_run(task.build_once()).ok
+
+
+# ---------------------------------------------------------------------------
+# The job module itself
+# ---------------------------------------------------------------------------
+
+
+def _job_config(tmp_path: Path, **quality) -> dict:
+    out = tmp_path / "data" / "nowcast" / "quality.json"
+    payload = {
+        "quality": {
+            "out_json": str(out),
+            "markdown_dir": str(tmp_path / "archive"),
+            # No corpora at all: every section nulls itself, which is a
+            # complete and honest document — and the cheapest possible
+            # end-to-end run of the real builder.
+            "inputs": {"live_days": 90, "now": "2026-09-05T03:30:00+00:00"},
+        },
+        "fit": {"enabled": False},
+    }
+    payload["quality"].update(quality)
+    return payload
+
+
+class TestQualityJobModule:
+    def test_main_writes_both_files_and_prints_one_summary(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        config = _job_config(tmp_path)
+        code = job_main(["--config-json", json.dumps(config)])
+        assert code == 0
+
+        captured = capsys.readouterr()
+        lines = [line for line in captured.out.splitlines() if line.strip()]
+        assert len(lines) == 1, "stdout must carry the summary and nothing else"
+        summary = json.loads(lines[0])
+        assert summary["ok"] is True
+        assert summary["path"] == config["quality"]["out_json"]
+        assert summary["bytes"] > 0
+        assert summary["thresholds_path"] is None
+
+        document = json.loads(Path(summary["path"]).read_text())
+        assert document["schema_version"] == 1
+        assert document["generated_at_utc"] == "2026-09-05T03:30:00Z"
+        # The markdown twin is stamped by the report's own date.
+        assert (tmp_path / "archive" / "2026-09-05.md").is_file()
+
+    def test_it_runs_as_a_real_subprocess(self, tmp_path: Path) -> None:
+        """The command line the task spawns, end to end, for real."""
+        config = _job_config(tmp_path)
+        env = {
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(p for p in sys.path if p),
+        }
+        proc = subprocess.run(
+            [sys.executable, "-m", JOB_MODULE,
+             "--config-json", json.dumps(config)],
+            capture_output=True, text=True, timeout=300, env=env,
+            cwd=str(tmp_path),
+        )
+        assert proc.returncode == 0, proc.stderr
+        summary = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert summary["ok"] is True
+        assert Path(summary["path"]).is_file()
+
+    def test_a_config_it_cannot_use_exits_one_without_writing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        assert job_main(["--config-json", "{}"]) == 1
+        summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert summary["ok"] is False
+        assert "quality" in (summary["error"] or "")
+
+    def test_a_builder_that_raises_never_touches_the_report(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _job_config(tmp_path)
+        out = Path(config["quality"]["out_json"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("{}")
+
+        def explode(_inputs):
+            raise RuntimeError("corpus unreadable")
+
+        with pytest.raises(RuntimeError):
+            run_job(config, builder=explode)
+        assert out.read_text() == "{}"
+
+    def test_the_fit_publishes_the_table_and_the_full_record(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _job_config(tmp_path)
+        out = tmp_path / "push_thresholds.json"
+        sweep = tmp_path / "sweep.json"
+        config["fit"] = {
+            "enabled": True,
+            "thresholds_out": str(out),
+            "sweep_json": str(sweep),
+            "min_delta_pct": 5,
+            "min_warnings": 30,
+            "options": {"decisions_dirs": [str(tmp_path)],
+                        "corpus_dir": str(tmp_path)},
+        }
+        summary = run_job(
+            config,
+            builder=lambda _inputs: dict(DOC),
+            fitter=lambda options: {
+                "thresholds": _thresholds_doc({"30": 45}), "cells": [],
+            },
+        )
+        assert summary["thresholds_path"] == str(out)
+        assert summary["thresholds_guard"] == {"30": "first_fit"}
+        assert json.loads(out.read_text())["leads"]["30"]["threshold_pct"] == 45
+        assert "cells" in json.loads(sweep.read_text())
+
+    def test_a_failing_fit_still_produces_a_report(self, tmp_path: Path) -> None:
+        config = _job_config(tmp_path)
+        config["fit"] = {
+            "enabled": True,
+            "thresholds_out": str(tmp_path / "push_thresholds.json"),
+            "options": {"decisions_dirs": [], "corpus_dir": str(tmp_path)},
+        }
+
+        def explode(_options):
+            raise RuntimeError("parquet on fire")
+
+        summary = run_job(
+            config, builder=lambda _inputs: dict(DOC), fitter=explode,
+        )
+        assert summary["ok"] is True
+        assert "parquet on fire" in summary["thresholds_error"]
+        assert summary["thresholds_path"] is None
+        assert not (tmp_path / "push_thresholds.json").exists()
+
+    def test_the_dataclasses_survive_the_process_boundary(
+        self, tmp_path: Path,
+    ) -> None:
+        """A round trip through JSON is the child's whole input contract."""
+        config = _fit_config(tmp_path)
+        task = QualityReportTask(config)
+        inputs = task.inputs()
+        assert inputs_from_json(inputs_to_json(inputs)) == inputs
+        options = task._fit_options()
+        assert sweep_options_from_json(sweep_options_to_json(options)) == options
+        # And the whole document is JSON, not a repr of one.
+        assert json.loads(json.dumps(task.job_config()))["fit"]["enabled"] is True
+
 
 
 # ---------------------------------------------------------------------------

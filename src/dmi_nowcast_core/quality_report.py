@@ -125,6 +125,9 @@ __all__ = [
     "validate_report",
     "reliability_from_corpus",
     "bin_statistics",
+    "decision_bounds",
+    "CORPUS_COLUMNS",
+    "DECISION_COLUMNS_READ",
 ]
 
 #: The contract version ``frontend/src/lib/quality/schema.ts`` pins.
@@ -151,6 +154,29 @@ GAUGE_PAD_MIN = 120
 #: Per-station scores below this many warnings are reported as null: POD
 #: and FAR over one or two warnings are noise with a decimal point.
 MIN_STATION_WARNINGS = 3
+
+#: The ONLY columns this module reads from a calibration corpus. The
+#: corpora carry far more (every strata column, the point geometry, the
+#: per-lead diagnostics), and a corpus is millions of rows: reading the
+#: whole width to use eight of it is how a nightly build ends up holding
+#: gigabytes it never looks at. Pinned by a test — widening the builder
+#: means widening this list deliberately.
+CORPUS_COLUMNS: tuple[str, ...] = (
+    "event_time", "point_id", "lead_min", "raw_prob", "sample_weight",
+    "frame_age_min", "threshold_mm_h",
+)
+
+#: The ONLY decision-row columns this module reads. The written schema is
+#: wider — ``intensity_mm_h``, ``armed_after``, ``streak_after`` and a
+#: ``p_rain_<lead>`` column per served lead — and every one of those is
+#: the threshold sweep's business, not the report's. This is the biggest
+#: read in the build (a season of replay rows for a hundred stations,
+#: materialised as Python dicts), so the width of it is the difference
+#: between hundreds of megabytes and gigabytes. Pinned by a test.
+DECISION_COLUMNS_READ: tuple[str, ...] = (
+    "radar_ts", "generated_at", "station_id", "p_rain", "eta_min",
+    "observed_mm_h", "forecast_now_mm_h", "action",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -365,10 +391,7 @@ def _read_corpus_valid(path: Path, outcome_column: str):
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
-    wanted = [
-        "event_time", "point_id", "lead_min", "raw_prob", outcome_column,
-        "sample_weight", "frame_age_min", "threshold_mm_h",
-    ]
+    wanted = [*CORPUS_COLUMNS, outcome_column]
     available = set(pq.ParquetFile(path).schema_arrow.names)
     table = pq.read_table(path, columns=[c for c in wanted if c in available])
     if outcome_column not in available or "raw_prob" not in available:
@@ -736,10 +759,21 @@ def _headline_reliability(curves: Sequence[dict], inputs: QualityInputs) -> dict
 
 
 def _read_decision_parquet(path: Path) -> list[dict]:
+    """One decision file as row dicts, narrowed to what the report reads.
+
+    ``schema=`` aligns a day written before a column existed (it reads
+    back null rather than raising); ``columns=`` then keeps only
+    :data:`DECISION_COLUMNS_READ`. The projection is the memory
+    difference: the same rows at half the width, and the per-lead
+    probability columns — which only the threshold sweep scores — never
+    leave the file.
+    """
     from .warning_score import decision_schema
     import pyarrow.parquet as pq
 
-    return pq.read_table(path, schema=decision_schema()).to_pylist()
+    return pq.read_table(
+        path, schema=decision_schema(), columns=list(DECISION_COLUMNS_READ),
+    ).to_pylist()
 
 
 def _load_decisions(inputs: QualityInputs) -> tuple[list[dict], dict[str, int]]:
@@ -856,6 +890,29 @@ class _GaugeTruth:
     known_slots: int = 0
 
 
+def decision_bounds(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[datetime, datetime, list[str]] | None:
+    """``(from, to, stations)`` the decision rows actually cover.
+
+    The gauge store is read through this and nothing else. The archive is
+    backfilled months deep and holds every station DMI publishes — ten
+    million rows of ten-minute observations — while the decisions cover
+    the days the service was watching and the hundred-odd stations in the
+    benchmark. Reading the store by the rows' own bounds rather than by
+    the archive's is the difference between a hundred megabytes and all
+    of it.
+
+    ``None`` when no row carries a usable ``generated_at``: nothing to
+    read for, so nothing is read.
+    """
+    stamps = [s for s in (_parse_ts(r.get("generated_at")) for r in rows) if s]
+    if not stamps:
+        return None
+    stations = sorted({str(r.get("station_id")) for r in rows})
+    return min(stamps), max(stamps), stations
+
+
 def _gauge_truth(
     corpus_dir: Path,
     station_ids: Sequence[str],
@@ -912,6 +969,10 @@ def _gauge_truth(
                 key = (station, stamp)
                 if key in needed:
                     truth.wet_at[key] = wet
+        # Explicitly, because the loop variable would otherwise keep a
+        # month of observations alive while the next month is read — two
+        # months of Arrow buffers live at the peak instead of one.
+        del table
     truth.onsets = {sid: sorted(values) for sid, values in onset_sets.items()}
     truth.known_until = last_known
     return truth
@@ -946,11 +1007,12 @@ def _score_decisions(
     if not rows or inputs.corpus_dir is None:
         return board
 
-    stamps = [s for s in (_parse_ts(r.get("generated_at")) for r in rows) if s]
-    if not stamps:
+    bounds = decision_bounds(rows)
+    if bounds is None:
         return board
+    window_from, window_to, station_ids = bounds
+    stamps = [s for s in (_parse_ts(r.get("generated_at")) for r in rows) if s]
     board.window_days = len({s.date() for s in stamps})
-    station_ids = sorted({str(r.get("station_id")) for r in rows})
 
     needed = {
         (str(r.get("station_id")), slot_end_of(stamp))
@@ -959,8 +1021,9 @@ def _score_decisions(
         )
         if stamp is not None
     }
+    # Months and stations the rows cover, never the whole archive.
     truth = _gauge_truth(
-        Path(inputs.corpus_dir), station_ids, (min(stamps), max(stamps)),
+        Path(inputs.corpus_dir), station_ids, (window_from, window_to),
         needed, dry_min=inputs.dry_min,
     )
     if truth.known_slots == 0:
