@@ -41,6 +41,38 @@ Modifications from upstream
 3. `utils/interface.py` reduced to FFT-only dispatch. STEPS only calls
    `utils.get_method("numpy")` etc.; the upstream dispatcher imported a
    dozen unrelated utility modules we'd otherwise have to vendor.
+4. `nowcasts/utils.py:compute_dilated_mask` — the grayscale rim is built
+   with one taxicab distance transform instead of `mask_rim` successive
+   3x3-cross dilations. The two are equal ELEMENT FOR ELEMENT (i cross
+   dilations == "cityblock distance <= i", so the accumulated rim is
+   `clip(r + 1 - d1, 0, r + 1)`), not merely close; the equality —
+   including the empty-mask 0/0 -> NaN case — is pinned by
+   `tests/test_vendored_steps_utils.py`. Reason: STEPS calls this once per
+   ensemble member per timestep and it was ~20% of a 16-member run's
+   scipy time (18.6 ms -> 4.6 ms on the 432x496 corpus grid). This is the
+   only vendoring change that touches numerics-adjacent code; the
+   ensemble output is bitwise unchanged.
+5. `nowcasts/steps.py` — the final
+   `np.stack([np.stack(precip_forecast[j]) ...])` is skipped when
+   `nowcast_main_loop` already returned a stacked ndarray (it always
+   does under `return_output=True`). Upstream re-stacks an array into an
+   identical array, holding two extra full copies of the output.
+6. `nowcasts/utils.py:stack_forecast_output` — the output stack at the
+   end of `nowcast_main_loop` fills a preallocated array member by member
+   and releases each slab as it is copied, instead of `np.stack` holding
+   the lists and the result at once.
+7. `nowcasts/utils.py:nowcast_main_loop` — the RETURNED forecast is
+   accumulated in float32. Output only: the cascades, the AR state and
+   `precip_forecast_prev`/`_new` stay float64, and `probabilistic.
+   db_to_rain` casts the whole array to float32 as its first act anyway,
+   so the same rounding happens on the same values, only sooner.
+
+Modifications 5-7 are peak-memory changes; together with 4 they took a
+calibration-corpus worker from 2591 MB / 13.65 s per event to 1649 MB /
+10.94 s, with the returned ensemble bitwise identical (SHA-256 of the
+`run_ensemble` output over three real radar events, before and after).
+`tests/test_vendored_steps_utils.py` pins the two rewritten helpers
+against reference implementations of the upstream code.
 
 If pysteps becomes installable on HA OS (via wheels.home-assistant.io
 or upstream musllinux wheels), this whole directory can be deleted and

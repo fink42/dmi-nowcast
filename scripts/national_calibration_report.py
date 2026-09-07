@@ -71,21 +71,52 @@ QUERY_FILES = (
 # ---------------------------------------------------------------------------
 
 
+def _slug(name: str) -> str:
+    """Filesystem-safe form of a point-set name, for artifact filenames."""
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(name))
+
+
 def _sql_quote_path(path: Path) -> str:
     """A single-quoted SQL string literal for the Parquet path."""
     return "'" + str(path).replace("'", "''") + "'"
 
 
-def run_query(con, name: str, corpus: Path) -> tuple[list[str], list[tuple]]:
-    """Execute ``sql/<name>`` with ``{corpus}`` substituted; return
-    (column_names, rows)."""
-    sql = (SQL_DIR / name).read_text().replace("{corpus}", _sql_quote_path(corpus))
+def corpus_source_sql(corpus: Path, point_set: str = "all") -> str:
+    """The SQL relation every query reads the corpus through.
+
+    ``"all"`` (the default) is a bare ``read_parquet(...)`` — byte for
+    byte the pre-union expression. A concrete point set wraps it in a
+    filter instead, so one union corpus reports exactly like the
+    separately-built corpus for that ``--points`` file, and the ``sql/``
+    files stay untouched (they name the source once, as
+    ``read_parquet({corpus})``).
+    """
+    src = f"read_parquet({_sql_quote_path(corpus)})"
+    if str(point_set) == "all":
+        return src
+    literal = "'" + str(point_set).replace("'", "''") + "'"
+    return f"(SELECT * FROM {src} WHERE point_set = {literal})"
+
+
+def run_query(
+    con, name: str, corpus: Path, point_set: str = "all"
+) -> tuple[list[str], list[tuple]]:
+    """Execute ``sql/<name>`` against the corpus; return (column_names, rows).
+
+    The query text names its source once as ``read_parquet({corpus})``;
+    that whole expression is replaced by :func:`corpus_source_sql`, which
+    is how ``--point-set`` reaches every query without editing ``sql/``.
+    """
+    text = (SQL_DIR / name).read_text()
+    source = corpus_source_sql(corpus, point_set)
+    sql = text.replace("read_parquet({corpus})", source)
+    sql = sql.replace("{corpus}", _sql_quote_path(corpus))
     res = con.execute(sql)
     cols = [d[0] for d in res.description]
     return cols, res.fetchall()
 
 
-def frame_age_summary(con, corpus: Path) -> Optional[str]:
+def frame_age_summary(con, corpus: Path, point_set: str = "all") -> Optional[str]:
     """One-line description of the corpus's simulated frame age.
 
     ``None`` for a pre-frame-age corpus (no ``frame_age_min`` column):
@@ -93,6 +124,7 @@ def frame_age_summary(con, corpus: Path) -> Optional[str]:
     ``L + frame_age``, so the distinction belongs in the report header.
     """
     quoted = _sql_quote_path(corpus)
+    source = corpus_source_sql(corpus, point_set)
     cols = {
         row[0]
         for row in con.execute(
@@ -106,7 +138,7 @@ def frame_age_summary(con, corpus: Path) -> Optional[str]:
     )
     declared, lo, hi, mean = con.execute(
         f"SELECT {declared_expr}, min(frame_age_min), max(frame_age_min), "
-        f"avg(frame_age_min) FROM read_parquet({quoted})"
+        f"avg(frame_age_min) FROM {source}"
     ).fetchone()
     if lo is None:  # empty corpus, or the column is present but all null
         return f"`{declared}` min (no rows)" if declared else None
@@ -246,9 +278,13 @@ def render_reliability_pngs(
     pooled_cols: list[str],
     pooled_rows: list[tuple],
     regional: dict[tuple, tuple[np.ndarray, np.ndarray]],
+    suffix: str = "",
 ) -> Optional[dict[int, str]]:
     """One reliability diagram PNG per lead. Returns {lead: filename} or
-    None when matplotlib is unavailable (report degrades to tables)."""
+    None when matplotlib is unavailable (report degrades to tables).
+
+    ``suffix`` distinguishes the point sets of a union corpus so two
+    reports in one ``--out-dir`` do not overwrite each other's charts."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -285,7 +321,7 @@ def render_reliability_pngs(
         ax.set_title(f"Reliability — lead +{lead} min")
         ax.legend(fontsize=7, loc="upper left", ncol=2)
         ax.grid(alpha=0.25)
-        fname = f"national_reliability_lead{lead:02d}.png"
+        fname = f"national_reliability_lead{lead:02d}{suffix}.png"
         fig.tight_layout()
         fig.savefig(out_dir / fname, dpi=130)
         plt.close(fig)
@@ -298,27 +334,44 @@ def render_reliability_pngs(
 # ---------------------------------------------------------------------------
 
 
-def build_report(corpus: Path, out_dir: Path) -> Path:
+def build_report(corpus: Path, out_dir: Path, point_set: str = "all") -> Path:
     import duckdb
 
     out_dir.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect()
+    source = corpus_source_sql(corpus, point_set)
+    if str(point_set) != "all":
+        available = [
+            r[0]
+            for r in con.execute(
+                "SELECT DISTINCT point_set FROM "
+                f"read_parquet({_sql_quote_path(corpus)}) ORDER BY 1"
+            ).fetchall()
+        ]
+        if point_set not in available:
+            raise SystemExit(
+                f"--point-set {point_set!r} is not in {corpus} "
+                f"(available: {available})"
+            )
 
     # Corpus header facts (inline — the sql/ files are the analysis queries).
     hdr = con.execute(
         "SELECT count(*), count(DISTINCT event_time), count(DISTINCT point_id), "
         "       min(settings_hash), count(DISTINCT settings_hash), "
         "       min(lead_min), max(lead_min) "
-        f"FROM read_parquet({_sql_quote_path(corpus)})"
+        f"FROM {source}"
     ).fetchone()
     n_rows, n_events, n_points, settings_hash, n_hashes, *_ = hdr
 
-    pooled_cols, pooled_rows = run_query(con, "reliability_pooled.sql", corpus)
-    region_cols, region_rows = run_query(con, "reliability_by_region.sql", corpus)
-    season_cols, season_rows = run_query(con, "reliability_by_season.sql", corpus)
-    inten_cols, inten_rows = run_query(con, "base_rate_by_intensity.sql", corpus)
-    brier_cols, brier_rows = run_query(con, "brier_decomposition.sql", corpus)
-    effn_cols, effn_rows = run_query(con, "effective_n_by_stratum.sql", corpus)
+    def q(name: str):
+        return run_query(con, name, corpus, point_set)
+
+    pooled_cols, pooled_rows = q("reliability_pooled.sql")
+    region_cols, region_rows = q("reliability_by_region.sql")
+    season_cols, season_rows = q("reliability_by_season.sql")
+    inten_cols, inten_rows = q("base_rate_by_intensity.sql")
+    brier_cols, brier_rows = q("brier_decomposition.sql")
+    effn_cols, effn_rows = q("effective_n_by_stratum.sql")
 
     # Criterion inputs.
     pooled_arrays = _rows_to_bin_arrays(pooled_rows, pooled_cols, ("lead_min",))
@@ -327,7 +380,12 @@ def build_report(corpus: Path, out_dir: Path) -> Path:
     regional = {(str(r), int(l)): v for (r, l), v in regional_arrays.items()}
     divergence, flagged = flag_regions(pooled_by_lead, regional)
 
-    pngs = render_reliability_pngs(out_dir, pooled_cols, pooled_rows, regional)
+    # A per-set suffix on every artifact, so reporting both point sets of a
+    # union corpus into one --out-dir keeps two reports instead of one.
+    suffix = "" if str(point_set) == "all" else f"_{_slug(point_set)}"
+    pngs = render_reliability_pngs(
+        out_dir, pooled_cols, pooled_rows, regional, suffix
+    )
 
     leads = sorted(pooled_by_lead)
     pidx = {c: i for i, c in enumerate(pooled_cols)}
@@ -338,13 +396,14 @@ def build_report(corpus: Path, out_dir: Path) -> Path:
     md.append(f"Generated {datetime.now(timezone.utc).isoformat()} (Phase B, B3).")
     md.append("")
     md.append(f"- Corpus: `{corpus}`")
+    md.append(f"- Point set: `{point_set}`")
     md.append(f"- Rows: {n_rows} ({n_events} events x {n_points} points)")
     md.append(
         f"- Settings hash: `{settings_hash}`"
         + ("" if n_hashes == 1 else f" — **WARNING: {n_hashes} mixed hashes!**")
     )
     md.append(f"- Leads: {', '.join(f'+{ld} min' for ld in leads)}")
-    frame_age = frame_age_summary(con, corpus)
+    frame_age = frame_age_summary(con, corpus, point_set)
     md.append(
         f"- Simulated frame age: {frame_age}"
         if frame_age
@@ -463,7 +522,7 @@ def build_report(corpus: Path, out_dir: Path) -> Path:
     md.append(md_table(effn_cols, effn_rows))
     md.append("")
 
-    report_path = out_dir / "national_calibration_report.md"
+    report_path = out_dir / f"national_calibration_report{suffix}.md"
     report_path.write_text("\n".join(md))
     return report_path
 
@@ -479,6 +538,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument(
         "--out-dir", type=Path, default=Path("reports"),
         help="Directory for the markdown report + PNG charts (default: reports/)",
+    )
+    ap.add_argument(
+        "--point-set", type=str, default="all", metavar="NAME",
+        help="Report only the rows whose point_set column equals NAME — the "
+             "stem of one of the --points files the corpus was built from. "
+             "Default 'all' reports every row (and is the only option for a "
+             "pre-union corpus, which has no point_set column).",
     )
     args = ap.parse_args(argv)
 
@@ -497,7 +563,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"corpus not found: {args.corpus}", file=sys.stderr)
         return 2
 
-    report_path = build_report(args.corpus, args.out_dir)
+    report_path = build_report(args.corpus, args.out_dir, args.point_set)
     print(f"Wrote {report_path}")
     return 0
 

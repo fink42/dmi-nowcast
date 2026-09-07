@@ -404,12 +404,28 @@ class StepsNowcaster:
 
         # Stack and return the forecast output
         if self.__config.return_output:
-            self.__state.precip_forecast = np.stack(
-                [
-                    np.stack(self.__state.precip_forecast[j])
-                    for j in range(self.__config.n_ens_members)
-                ]
-            )
+            # VENDORING MODIFICATION 5 (peak memory, identical output).
+            # ``nowcast_main_loop`` already returns the stacked
+            # (n_members, n_timesteps, m, n) array, so upstream's
+            #     np.stack([np.stack(precip_forecast[j]) for j in range(n)])
+            # re-stacks an ndarray into an identical ndarray — an inner
+            # copy AND an outer copy of the whole output, ~440 MB of pure
+            # duplication on the calibration-corpus ensemble
+            # (16 x 8 x 432 x 496) in the last instruction of the run,
+            # which is exactly where a corpus worker's peak RSS sat.
+            # ``np.asarray`` is a no-op on that array; the list form is
+            # still handled, so the value is unchanged either way
+            # (bitwise-verified by SHA-256 of the returned array over real
+            # radar events).
+            forecast = self.__state.precip_forecast
+            if not isinstance(forecast, np.ndarray):
+                forecast = np.stack(
+                    [
+                        np.stack(forecast[j])
+                        for j in range(self.__config.n_ens_members)
+                    ]
+                )
+            self.__state.precip_forecast = forecast
             if self.__config.measure_time:
                 return (
                     self.__state.precip_forecast,

@@ -315,3 +315,93 @@ def test_per_lead_counts_are_reported(tmp_path: Path) -> None:
     lines = [ln.split() for ln in rc.stdout.splitlines() if ln.strip().startswith(("5 ", "20 "))]
     counts = {int(ln[0]): (int(ln[2]), int(ln[3])) for ln in lines}
     assert counts == {5: (1, 0), 20: (0, 1)}
+
+
+# ---------------------------------------------------------------------------
+# --point-set: a union corpus holds gauge points AND radar grid points
+#
+# One STEPS run per event serves both point sets, so the station corpus and
+# the national calibration corpus are now one build. Only the gauge points
+# can join a gauge observation — the radar points are grid coordinates, not
+# station ids — so the join takes the same --point-set selector the fit and
+# the report do.
+# ---------------------------------------------------------------------------
+
+
+def test_point_set_selects_only_the_station_rows(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    store = StationObsStore(corpus_dir)
+    store.append([
+        Observation("06126", EVENT + timedelta(minutes=30), "precip_past10min", 0.7),
+        Observation("06126", EVENT + timedelta(minutes=30), "precip_dur_past10min", 6.0),
+    ])
+
+    station_row = _corpus_row("06126", 5)
+    station_row["point_set"] = "station_points"
+    grid_row = _corpus_row("grid-0042", 5)
+    grid_row["point_set"] = "calibration_points_v2"
+    corpus = tmp_path / "union.parquet"
+    out = tmp_path / "out.parquet"
+    _write_corpus(corpus, [station_row, grid_row])
+
+    proc = _run_join(corpus, corpus_dir, out, "--point-set", "station_points")
+    assert proc.returncode == 0, proc.stderr
+    table = pq.read_table(out)
+    # Only the gauge point survives, and it joined.
+    assert table.column("point_id").to_pylist() == ["06126"]
+    assert table.column("point_set").to_pylist() == ["station_points"]
+    assert table.column("gauge_outcome").to_pylist() == [1]
+    assert "kept 1 rows" in proc.stdout
+
+
+def test_point_set_all_keeps_every_row_as_before(tmp_path: Path) -> None:
+    """Default behaviour is unchanged: non-station point_ids are kept with
+    null gauge columns, exactly as a pre-union corpus behaved."""
+    corpus_dir = tmp_path / "corpus"
+    StationObsStore(corpus_dir).append([
+        Observation("06126", EVENT + timedelta(minutes=30), "precip_past10min", 0.7),
+        Observation("06126", EVENT + timedelta(minutes=30), "precip_dur_past10min", 6.0),
+    ])
+    rows = [_corpus_row("06126", 5), _corpus_row("grid-0042", 5)]
+    rows[0]["point_set"] = "station_points"
+    rows[1]["point_set"] = "calibration_points_v2"
+    corpus = tmp_path / "union.parquet"
+    out = tmp_path / "out.parquet"
+    _write_corpus(corpus, rows)
+
+    proc = _run_join(corpus, corpus_dir, out)
+    assert proc.returncode == 0, proc.stderr
+    table = pq.read_table(out)
+    assert table.num_rows == 2
+    assert table.column("gauge_outcome").to_pylist() == [1, None]
+
+
+def test_point_set_on_a_corpus_without_the_column_is_refused(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    StationObsStore(corpus_dir)
+    schema = pa.schema([
+        f for f in bcc._parquet_schema() if f.name != "point_set"
+    ])
+    row = _corpus_row("06126", 5)
+    row.pop("point_set", None)
+    corpus = tmp_path / "old.parquet"
+    pq.write_table(pa.Table.from_pylist([row], schema=schema), corpus)
+
+    proc = _run_join(corpus, corpus_dir, tmp_path / "out.parquet",
+                     "--point-set", "station_points")
+    assert proc.returncode == 2
+    assert "no point_set column" in proc.stderr
+
+
+def test_unknown_point_set_is_refused_and_lists_what_exists(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    StationObsStore(corpus_dir)
+    row = _corpus_row("06126", 5)
+    row["point_set"] = "station_points"
+    corpus = tmp_path / "union.parquet"
+    _write_corpus(corpus, [row])
+
+    proc = _run_join(corpus, corpus_dir, tmp_path / "out.parquet",
+                     "--point-set", "not_a_set")
+    assert proc.returncode == 2
+    assert "station_points" in proc.stderr

@@ -217,6 +217,7 @@ Example::
 
     python scripts/build_calibration_corpus.py \\
         --points src/dmi_nowcast_core/calibration_points_v2.json \\
+        --points corpus/stations/station_points.json \\
         --days-back 125 --n-events 500 \\
         --wet-bias 0.15 --frame-age-range 12,18 \\
         --output reports/calibration_corpus.parquet \\
@@ -242,7 +243,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 
@@ -578,6 +579,12 @@ class CalibrationPoint:
     lat: float
     lon: float
     region: str
+    #: Which points FILE this point came from — the file's stem
+    #: (``calibration_points_v2``, ``station_points``, ...). Stamped onto
+    #: every row as the ``point_set`` column so one corpus built over the
+    #: union of several points files can be split back into the
+    #: per-file corpora it replaces (:func:`load_points_files`).
+    point_set: str = ""
 
 
 #: Points-file schema versions this builder understands. The point schema
@@ -586,11 +593,23 @@ class CalibrationPoint:
 SUPPORTED_POINTS_VERSIONS = (1, 2)
 
 
+def points_set_name(path: Path) -> str:
+    """The ``point_set`` label of a points file: its stem.
+
+    ``src/dmi_nowcast_core/calibration_points_v2.json`` →
+    ``calibration_points_v2``; ``.../stations/station_points.json`` →
+    ``station_points``. The stem, not the full path, so the label stays
+    stable across the machines a corpus is built and analysed on.
+    """
+    return Path(path).stem
+
+
 def load_points(path: Path) -> tuple[CalibrationPoint, ...]:
     """Load a ``calibration_points`` JSON file (schema version 1 or 2).
 
     Schema: ``{"version": 2, "points": [{"id", "lat", "lon", "region", ...}]}``.
     Extra keys per point (strata tags etc.) are tolerated and ignored.
+    Every point is stamped with :func:`points_set_name` of ``path``.
     """
     data = json.loads(path.read_text())
     if not isinstance(data, dict) or data.get("version") not in SUPPORTED_POINTS_VERSIONS:
@@ -613,6 +632,7 @@ def load_points(path: Path) -> tuple[CalibrationPoint, ...]:
                 lat=float(entry["lat"]),
                 lon=float(entry["lon"]),
                 region=str(entry["region"]),
+                point_set=points_set_name(path),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
@@ -622,6 +642,47 @@ def load_points(path: Path) -> tuple[CalibrationPoint, ...]:
             raise ValueError(f"{path}: duplicate point id {point.id!r}")
         seen.add(point.id)
         points.append(point)
+    return tuple(points)
+
+
+def load_points_files(paths: Sequence[Path]) -> tuple[CalibrationPoint, ...]:
+    """Load and concatenate several points files into one point set.
+
+    *Why*: one STEPS ensemble per event already serves every point on the
+    grid, so two corpora over two points files with identical settings are
+    two runs of the same 15-second ensemble to read out different pixels.
+    Building over the UNION runs it once. Each row keeps its own
+    ``point_id`` and gains a ``point_set`` column naming the file it came
+    from, so the union splits back into exactly the two corpora it
+    replaces (proved row-for-row by ``tests/test_calibration_corpus.py``).
+
+    Point ids must be unique across ALL files: the corpus keys rows on
+    ``(event_time, point_id, lead_min)`` and a collision would silently
+    merge two different locations. Two files with the same stem are
+    likewise refused — their rows would be indistinguishable afterwards.
+    """
+    if not paths:
+        raise ValueError("at least one --points file is required")
+    points: list[CalibrationPoint] = []
+    owner: dict[str, Path] = {}
+    set_names: dict[str, Path] = {}
+    for path in paths:
+        name = points_set_name(path)
+        if name in set_names:
+            raise ValueError(
+                f"--points {path} and {set_names[name]} have the same file "
+                f"stem {name!r}; point_set labels must be distinct"
+            )
+        set_names[name] = path
+        for point in load_points(path):
+            if point.id in owner:
+                raise ValueError(
+                    f"duplicate point id {point.id!r} in {path} — already "
+                    f"defined by {owner[point.id]}; ids must be unique "
+                    "across every --points file"
+                )
+            owner[point.id] = path
+            points.append(point)
     return tuple(points)
 
 
@@ -707,6 +768,7 @@ def build_event_rows(
             rows.append({
                 "event_time": event_time_iso,
                 "point_id": point.id,
+                "point_set": point.point_set,
                 "lat": point.lat,
                 "lon": point.lon,
                 "region": point.region,
@@ -1250,13 +1312,35 @@ def _score_outcomes(
 ) -> dict[str, dict[int, Optional[int]]]:
     """Outcomes per (point, lead): parse each verification frame ONCE, then
     sample every point's disc from it. Missing frame / parse failure / empty
-    disc → None (null in Parquet, filtered at fit time)."""
+    disc → None (null in Parquet, filtered at fit time).
+
+    Leads are grouped by the frame they verify against BEFORE anything is
+    parsed. Several nominal leads routinely snap to one radar instant —
+    at the live 12-18 min frame age the eight served leads
+    (5,10,15,20,25,30,45,60) resolve to only six distinct frames — and
+    parsing the same HDF5 twice to sample the same discs from it is pure
+    waste. The per-(point, lead) result is identical either way: the
+    outcome depends only on the frame, the point and the settings.
+    """
     outcomes: dict[str, dict[int, Optional[int]]] = {
         p.id: {int(lead): None for lead in settings.leads_min} for p in points
     }
+    # frame identity → the leads that verify against it, in lead order.
+    by_frame: dict[tuple, list[int]] = {}
     for lead in settings.leads_min:
         feature = truth.get(lead)
         if feature is None:
+            continue
+        key = (feature.datetime_utc, feature.filename)
+        by_frame.setdefault(key, []).append(int(lead))
+
+    for lead in settings.leads_min:
+        feature = truth.get(lead)
+        if feature is None:
+            continue
+        key = (feature.datetime_utc, feature.filename)
+        leads_here = by_frame.pop(key, None)
+        if leads_here is None:  # already handled with an earlier lead
             continue
         try:
             path = _resolve_frame(feature, cache_dir, corpus_dir)
@@ -1265,18 +1349,20 @@ def _score_outcomes(
             rain = dbz_to_rain_rate(
                 composite.reflectivity_dbz, zr_a=composite.zr_a, zr_b=composite.zr_b
             )
-        except Exception:  # noqa: BLE001 — frame-level failure nulls this lead
+        except Exception:  # noqa: BLE001 — frame-level failure nulls these leads
             continue
         for point in points:
             try:
                 stats = sample_disc(
                     rain, geo, point.lon, point.lat, radius_m=settings.disc_radius_m
                 )
-                outcomes[point.id][int(lead)] = outcome_from_stats(
+                value = outcome_from_stats(
                     stats, settings.detection_stat, settings.threshold_mm_h
                 )
             except Exception:  # noqa: BLE001 — point-level failure stays None
                 continue
+            for lead_here in leads_here:
+                outcomes[point.id][lead_here] = value
     return outcomes
 
 
@@ -1363,13 +1449,17 @@ def _process_event(
         )
         from dmi_nowcast_core.motion import phase_correlation_shift
 
-        rain_prev = dbz_to_rain_rate(composites[-2].reflectivity_dbz)
         rain_now = dbz_to_rain_rate(composite_now.reflectivity_dbz)
         try:
             vy, vx = dense_flow(
                 composites[-2].reflectivity_dbz, composite_now.reflectivity_dbz
             )
         except DenseFlowUnavailable:
+            # Only the fallback needs the PREVIOUS frame's rain rate, and
+            # the fallback is never taken with opencv installed — a
+            # native-grid array (14 MB) and a Z-R pass held for nothing on
+            # every event otherwise.
+            rain_prev = dbz_to_rain_rate(composites[-2].reflectivity_dbz)
             dy, dx = phase_correlation_shift(rain_prev, rain_now)
             vy = np.full(rain_now.shape, dy, dtype=np.float32)
             vx = np.full(rain_now.shape, dx, dtype=np.float32)
@@ -1392,6 +1482,10 @@ def _process_event(
         vx = np.nan_to_num(vx, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         vy = np.clip(vy, -MAX_PX, MAX_PX).astype(np.float32)
         vx = np.clip(vx, -MAX_PX, MAX_PX).astype(np.float32)
+        # Nothing below reads the native-grid rain field; STEPS is the
+        # memory high-water mark of the whole worker, so native arrays
+        # that survive into it are pure headroom lost.
+        del rain_now
 
         forecast = run_ensemble(
             dbz_frames, vy, vx,
@@ -1409,6 +1503,9 @@ def _process_event(
         # verification instants above, so the probability read out here and
         # the truth it is scored against describe one instant (module
         # docstring, "Frame-age convention").
+        # The ensemble is the only input to everything that follows; the
+        # native dBZ frames and their composites are dead from here.
+        del dbz_frames, composites, vy, vx
         products = national_products(
             forecast,
             leads_min=settings.leads_min,
@@ -1449,6 +1546,11 @@ def _parquet_schema():
     return pa.schema([
         ("event_time", pa.string()),
         ("point_id", pa.string()),
+        # Which --points file the row's point came from (that file's
+        # stem). Additive v2 column: a corpus built before the union
+        # build simply does not carry it, and every consumer defaults to
+        # "all" / no filter — see load_points_files().
+        ("point_set", pa.string()),
         ("lat", pa.float64()),
         ("lon", pa.float64()),
         ("region", pa.string()),
@@ -1495,6 +1597,13 @@ def check_existing_corpus(parquet_path: Path, settings_hash: str) -> set[str]:
             f"{parquet_path} is a legacy (v1) corpus without settings columns — "
             "pick a fresh --output path instead of appending to it"
         )
+    if "point_set" not in schema.names:
+        raise ValueError(
+            f"{parquet_path} predates the point_set column — its rows do not "
+            "record which --points file each point came from, so appending "
+            "would produce a corpus that cannot be split by point set. Pick a "
+            "fresh --output path."
+        )
     tbl = pq.read_table(parquet_path, columns=["event_time", "settings_hash"])
     hashes = set(tbl.column("settings_hash").to_pylist())
     if hashes and hashes != {settings_hash}:
@@ -1540,10 +1649,16 @@ def _write_progress(progress_path: Path, payload: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--points", type=Path, required=True,
+        "--points", type=Path, action="append", required=True, metavar="FILE",
         help="Calibration points JSON (version 1 or 2: {'version': 2, "
              "'points': [{'id', 'lat', 'lon', 'region', ...}]}). One STEPS "
-             "run per event serves every point.",
+             "run per event serves every point, so this flag is REPEATABLE: "
+             "pass every points file you need rows for and the whole union "
+             "is sampled from one ensemble per event. Point ids must be "
+             "unique across the files; each row records its source file's "
+             "stem in the point_set column, which "
+             "fit_national_calibration.py / national_calibration_report.py / "
+             "join_gauge_truth.py select with --point-set.",
     )
     ap.add_argument(
         "--days-back", type=int, default=125, metavar="DAYS",
@@ -1702,8 +1817,18 @@ def main() -> int:
     settings_cols = settings.settings_columns()
     _LOGGER.info("settings hash: %s  %s", settings.settings_hash, settings.to_dict())
 
-    points = load_points(args.points)
-    _LOGGER.info("loaded %d calibration points from %s", len(points), args.points)
+    try:
+        points = load_points_files(args.points)
+    except ValueError as exc:
+        ap.error(str(exc))
+    per_set: dict[str, int] = {}
+    for point in points:
+        per_set[point.point_set] = per_set.get(point.point_set, 0) + 1
+    _LOGGER.info(
+        "loaded %d calibration points from %d file(s): %s",
+        len(points), len(args.points),
+        ", ".join(f"{name}={n}" for name, n in sorted(per_set.items())),
+    )
 
     # Archive-first listing (module docstring): one index for the parent,
     # built before anything lists a window. Workers build their own
@@ -1790,6 +1915,7 @@ def main() -> int:
         "events_per_min": 0.0,
         "eta_min": None,
         "n_points": len(points),
+        "point_sets": per_set,
         "rows_per_event": rows_per_event,
         "settings": settings.to_dict(),
         "settings_hash": settings.settings_hash,

@@ -219,3 +219,105 @@ def test_aggregate_at_home_subpixel_disc_falls_back_to_nearest_pixel(geo):
         leads_min=(10.0, 60.0), downsample_factor=4,
     )
     assert agg.probability_by_lead == (0.5, 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Memory-shaped rewrites in run_ensemble's input/output path (2026-09-07).
+# Both are supposed to be EXACTLY equal to the expression form they replaced;
+# these tests are the proof, since a corpus is only comparable across
+# rebuilds if the ensemble is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _db_to_rain_reference(db: np.ndarray) -> np.ndarray:
+    """The expression form ``db_to_rain`` replaced (four whole-array
+    temporaries; ~440 MB of them on the calibration-corpus ensemble)."""
+    arr = np.asarray(db, dtype=np.float32)
+    out = np.power(np.float32(10.0), arr / np.float32(10.0))
+    return np.where(arr > ZERO_DB + 1e-3, out, np.float32(0.0))
+
+
+@pytest.mark.parametrize("shape", [(), (7,), (3, 4), (2, 3, 4), (4, 2, 5, 6)])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_db_to_rain_matches_the_expression_form_elementwise(shape, dtype):
+    rng = np.random.default_rng(20260907)
+    arr = (rng.random(shape) * 70.0 - 25.0).astype(dtype)
+    flat = arr.reshape(-1)
+    if flat.size >= 4:  # the values that decide the branch
+        flat[0], flat[1], flat[2], flat[3] = np.nan, ZERO_DB, np.inf, -np.inf
+    got, expected = db_to_rain(arr), _db_to_rain_reference(arr)
+    assert got.dtype == expected.dtype == np.float32
+    assert got.shape == expected.shape
+    # NaN input goes to 0.0 in BOTH (``NaN > threshold`` is False) — the
+    # trap the chunked form has to avoid, since ``NaN <= threshold`` is
+    # False as well.
+    assert np.array_equal(got, expected, equal_nan=True)
+
+
+def test_db_to_rain_does_not_mutate_its_input():
+    arr = np.array([[-20.0, 5.0], [ZERO_DB, 12.0]], dtype=np.float32)
+    before = arr.copy()
+    db_to_rain(arr)
+    assert np.array_equal(arr, before)
+
+
+@pytest.mark.parametrize("factor", [1, 2, 4])
+def test_zr_and_db_commute_with_stride_slicing(factor):
+    """``run_ensemble`` now strides the dBZ inputs BEFORE the Z-R and dB
+    conversions instead of after, to keep the two intermediate stacks at
+    1/f² of the native grid. Both conversions are elementwise, so the two
+    orders agree exactly — this is that identity, on a field that includes
+    the sub-threshold values where ``rain_to_db`` branches."""
+    from dmi_nowcast_core.transform import dbz_to_rain_rate
+
+    rng = np.random.default_rng(11)
+    dbz = (rng.random((32, 40)) * 90.0 - 32.0).astype(np.float32)
+    convert_then_slice = rain_to_db(dbz_to_rain_rate(dbz))[::factor, ::factor]
+    slice_then_convert = rain_to_db(dbz_to_rain_rate(dbz[::factor, ::factor]))
+    assert np.array_equal(convert_then_slice, slice_then_convert, equal_nan=True)
+
+
+def test_run_ensemble_velocity_downsampling_is_unchanged():
+    """The velocity is stride-sliced then divided by f, exactly as before
+    the input-path rewrite — a factor-of-f error here would rescale every
+    advected probability without changing any shape."""
+    from dmi_nowcast_core.probabilistic import run_ensemble
+
+    captured = {}
+
+    def _to_dbz(r):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (10.0 * np.log10(200.0)
+                    + 16.0 * np.log10(np.maximum(r, 1e-6))).astype(np.float32)
+
+    rng = np.random.default_rng(3)
+    H, W = 64, 64
+    base = rng.random((H, W)).astype(np.float32) * 5.0
+    frames = [_to_dbz(np.roll(base, s, 0)) for s in (4, 2, 0)]
+    vy = np.full((H, W), -3.0, dtype=np.float32)
+    vx = np.full((H, W), 6.0, dtype=np.float32)
+
+    from dmi_nowcast_core._vendor.pysteps_steps.nowcasts import steps as ps_steps
+
+    real = ps_steps.forecast
+
+    def spy(**kwargs):
+        captured["velocity"] = np.array(kwargs["velocity"])
+        captured["kmperpixel"] = kwargs["kmperpixel"]
+        captured["precip_shape"] = kwargs["precip"].shape
+        return real(**kwargs)
+
+    ps_steps.forecast = spy
+    try:
+        run_ensemble(
+            frames, vy, vx, n_ens_members=2, n_timesteps=2, n_cascade_levels=4,
+            downsample_factor=4, pixel_scale_m=500.0, seed=1,
+        )
+    finally:
+        ps_steps.forecast = real
+
+    assert captured["precip_shape"] == (3, 16, 16)
+    assert captured["kmperpixel"] == pytest.approx(2.0)  # 500 m x 4
+    # pysteps order is [vx, vy], both divided by the downsample factor.
+    assert np.allclose(captured["velocity"][0], 6.0 / 4)
+    assert np.allclose(captured["velocity"][1], -3.0 / 4)

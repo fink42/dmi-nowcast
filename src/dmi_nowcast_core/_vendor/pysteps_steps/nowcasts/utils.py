@@ -9,6 +9,7 @@ Module with common utilities used by nowcasts methods.
 
     binned_timesteps
     compute_dilated_mask
+    stack_forecast_output
     compute_percentile_mask
     nowcast_main_loop
     print_ar_params
@@ -19,7 +20,7 @@ Module with common utilities used by nowcasts methods.
 import time
 
 import numpy as np
-from scipy.ndimage import binary_dilation, generate_binary_structure
+from scipy.ndimage import binary_dilation, distance_transform_cdt
 
 from .. import extrapolation
 
@@ -66,6 +67,43 @@ def binned_timesteps(timesteps):
     return out
 
 
+def stack_forecast_output(members):
+    """``np.stack(members)`` for the nowcast output, at half the peak memory.
+
+    VENDORING MODIFICATION 6 (peak memory, identical output). Upstream
+    ends ``nowcast_main_loop`` with a plain ``np.stack(precip_forecast_out)``,
+    which holds the per-member Python lists AND the stacked array at the
+    same time — two full copies of the forecast (2 x 110 MB on the
+    calibration-corpus ensemble, 16 x 8 x 432 x 496 float32) in the last
+    instruction of the run, right where a worker's peak RSS sits. Filling
+    a preallocated array member by member and dropping each slab as it is
+    copied holds one copy plus one slab instead.
+
+    ``np.stack`` copies exactly these bytes in exactly this order, so the
+    result is identical, not merely close — pinned by
+    ``tests/test_vendored_steps_utils.py``. Ragged or empty input falls
+    back to ``np.stack``, so its error behaviour is unchanged.
+
+    NOTE: ``members`` is CONSUMED — its entries are set to None as they
+    are copied. The one caller drops the list immediately afterwards.
+    """
+    n_members = len(members)
+    n_steps = len(members[0]) if n_members else 0
+    if not n_members or not n_steps:
+        return np.stack(members)
+    if any(len(m) != n_steps for m in members):
+        return np.stack(members)
+    first = np.asarray(members[0][0])
+    stacked = np.empty((n_members, n_steps) + first.shape, dtype=first.dtype)
+    for i in range(n_members):
+        member = members[i]
+        for t in range(n_steps):
+            stacked[i, t] = member[t]
+            member[t] = None  # release as it is copied
+        members[i] = None
+    return stacked
+
+
 def compute_dilated_mask(input_mask, kr, r):
     """Buffer the input rain mask using the given kernel. Add a grayscale rim
     for smooth rain/no-rain transition by iteratively dilating the mask.
@@ -89,11 +127,37 @@ def compute_dilated_mask(input_mask, kr, r):
     mask_dilated = binary_dilation(input_mask, kr)
 
     # add grayscale rim
-    kr1 = generate_binary_structure(2, 1)
-    mask = mask_dilated.astype(float)
-    for _ in range(r):
-        mask_dilated = binary_dilation(mask_dilated, kr1)
-        mask += mask_dilated
+    #
+    # VENDORING MODIFICATION 4 (performance, bit-identical output). Upstream
+    # builds the rim by dilating ``mask_dilated`` r times with the 3x3 cross
+    # and accumulating:
+    #
+    #     kr1 = generate_binary_structure(2, 1)
+    #     mask = mask_dilated.astype(float)
+    #     for _ in range(r):
+    #         mask_dilated = binary_dilation(mask_dilated, kr1)
+    #         mask += mask_dilated
+    #
+    # i iterations of cross dilation is exactly "cityblock distance <= i",
+    # so the accumulated value at a pixel is
+    #     sum(i = 0..r) [d1 <= i] = clip(r + 1 - d1, 0, r + 1)
+    # with d1 the taxicab distance to the buffered mask. That is ONE
+    # distance transform instead of r dilations: at the calibration-corpus
+    # grid (432x496, r = 10) 18.6 ms -> 4.6 ms, and STEPS calls this once
+    # per member per timestep (~20% of a 16-member run's scipy time). The
+    # two forms are equal element for element, not merely close — pinned by
+    # tests/test_vendored_steps_utils.py over a grid of masks, kernels and
+    # r values, including the empty-mask 0/0 -> NaN case handled below.
+    if r > 0 and mask_dilated.any():
+        d1 = distance_transform_cdt(~mask_dilated, metric="taxicab")
+        mask = np.clip(float(r + 1) - d1.astype(float), 0.0, None)
+    else:
+        # r == 0: no rim at all. Empty mask: upstream's ``mask.max()`` is 0
+        # and the result is all-NaN — reproduced exactly by keeping the zero
+        # array and dividing by its own max below.
+        mask = mask_dilated.astype(float)
+        for _ in range(r):
+            mask += mask_dilated
 
     # normalize between 0 and 1
     return mask / mask.max()
@@ -459,7 +523,21 @@ def nowcast_main_loop(
 
                     precip_forecast_out_cur[i] = precip_forecast_ep[0]
                     if return_output:
-                        precip_forecast_out[i].append(precip_forecast_ep[0])
+                        # VENDORING MODIFICATION 7 (peak memory, identical
+                        # output). The RETURNED forecast accumulates in
+                        # float32 rather than float64. It is output only —
+                        # the cascades, the AR state and
+                        # ``precip_forecast_prev``/``_new`` all stay
+                        # float64, so no arithmetic changes — and
+                        # ``probabilistic.db_to_rain`` casts the whole
+                        # array to float32 as its first act anyway, so the
+                        # identical rounding happens on the identical
+                        # values, only sooner. Halves both the accumulating
+                        # lists and the array they stack into (219 MB ->
+                        # 110 MB each on the calibration-corpus ensemble).
+                        precip_forecast_out[i].append(
+                            np.asarray(precip_forecast_ep[0], dtype=np.float32)
+                        )
 
                 if DASK_IMPORTED and ensemble and num_ensemble_members > 1:
                     res = []
@@ -523,7 +601,7 @@ def nowcast_main_loop(
                 print("done.")
 
     if return_output:
-        precip_forecast_out = np.stack(precip_forecast_out)
+        precip_forecast_out = stack_forecast_output(precip_forecast_out)
         if not ensemble:
             precip_forecast_out = precip_forecast_out[0, :]
 

@@ -1622,3 +1622,227 @@ def test_settings_hash_ignores_the_sampling_window():
     keys = set(_settings().to_dict())
     assert "days_back" not in keys
     assert not any("window" in k for k in keys)
+
+
+# ---------------------------------------------------------------------------
+# One build, several point sets (2026-09-07) — --points is repeatable
+#
+# One STEPS ensemble per event already covers the whole national grid, so
+# sampling a second points file from it is free (measured: 0.00 s of point
+# sampling for 223 points against ~11 s of STEPS). Two corpora over the same
+# events and settings were therefore two runs of the same ensemble. These
+# tests pin the mechanism that lets one union build replace them: unique ids
+# across files, a point_set column per row, and consumers that can select
+# one set back out.
+# ---------------------------------------------------------------------------
+
+
+STATION_POINTS = {
+    "version": 2,
+    "points": [
+        {"id": "06180", "lat": 55.62, "lon": 12.65, "region": "sjaelland"},
+        {"id": "06060", "lat": 56.30, "lon": 10.63, "region": "midtjylland"},
+    ],
+}
+
+
+def _write_named_points(tmp_path: Path, name: str, payload: dict) -> Path:
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_points_set_name_is_the_file_stem(tmp_path: Path):
+    path = _write_named_points(tmp_path, "station_points", STATION_POINTS)
+    assert bcc.points_set_name(path) == "station_points"
+    # The stem only — a corpus is built and analysed on different machines.
+    assert bcc.points_set_name(Path("/a/b/calibration_points_v2.json")) == (
+        "calibration_points_v2"
+    )
+
+
+def test_load_points_stamps_the_point_set(tmp_path: Path):
+    points = bcc.load_points(
+        _write_named_points(tmp_path, "calibration_points_v2", POINTS_V2)
+    )
+    assert {p.point_set for p in points} == {"calibration_points_v2"}
+
+
+def test_load_points_files_unions_and_labels_each_source(tmp_path: Path):
+    national = _write_named_points(tmp_path, "calibration_points_v2", POINTS_V2)
+    stations = _write_named_points(tmp_path, "station_points", STATION_POINTS)
+    points = bcc.load_points_files([national, stations])
+
+    assert len(points) == len(POINTS_V2["points"]) + len(STATION_POINTS["points"])
+    # Order preserved, file by file; every point keeps its own id.
+    assert [p.id for p in points] == [
+        "fyn-centroid", "cph", "skagen", "06180", "06060",
+    ]
+    assert [p.point_set for p in points] == (
+        ["calibration_points_v2"] * 3 + ["station_points"] * 2
+    )
+
+
+def test_load_points_files_accepts_a_single_file(tmp_path: Path):
+    """Backwards compatibility: the pre-union single --points invocation."""
+    path = _write_named_points(tmp_path, "calibration_points_v2", POINTS_V2)
+    assert bcc.load_points_files([path]) == bcc.load_points(path)
+
+
+def test_load_points_files_refuses_duplicate_ids_across_files(tmp_path: Path):
+    """A collision would silently merge two locations: the corpus keys rows
+    on (event_time, point_id, lead_min)."""
+    a = _write_named_points(tmp_path, "set_a", POINTS_V2)
+    clash = {"version": 2, "points": [
+        {"id": "cph", "lat": 1.0, "lon": 2.0, "region": "elsewhere"},
+    ]}
+    b = _write_named_points(tmp_path, "set_b", clash)
+    with pytest.raises(ValueError, match="duplicate point id 'cph'"):
+        bcc.load_points_files([a, b])
+
+
+def test_load_points_files_refuses_two_files_with_one_stem(tmp_path: Path):
+    """Same stem = same point_set label = the rows could never be split."""
+    one = tmp_path / "a" / "points.json"
+    two = tmp_path / "b" / "points.json"
+    for path, payload in ((one, POINTS_V2), (two, STATION_POINTS)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="same file stem"):
+        bcc.load_points_files([one, two])
+
+
+def test_load_points_files_refuses_an_empty_list():
+    with pytest.raises(ValueError, match="at least one"):
+        bcc.load_points_files([])
+
+
+def test_build_event_rows_carry_the_point_set(tmp_path: Path):
+    points = bcc.load_points_files([
+        _write_named_points(tmp_path, "calibration_points_v2", POINTS_V2),
+        _write_named_points(tmp_path, "station_points", STATION_POINTS),
+    ])
+    rows = bcc.build_event_rows(
+        "2026-08-01T12:00:00+00:00", points, (5,), {}, {},
+    )
+    by_id = {r["point_id"]: r["point_set"] for r in rows}
+    assert by_id["cph"] == "calibration_points_v2"
+    assert by_id["06180"] == "station_points"
+
+
+def test_parquet_roundtrip_splits_back_into_the_per_file_corpora(tmp_path: Path):
+    """The union corpus's contract: filtering by point_set gives exactly the
+    rows a single-file build would have written — same rows, same order,
+    and no other column touched."""
+    national = _write_named_points(tmp_path, "calibration_points_v2", POINTS_V2)
+    stations = _write_named_points(tmp_path, "station_points", STATION_POINTS)
+    settings = _settings(leads_min=(5, 10))
+
+    def _rows(points):
+        rows = bcc.build_event_rows(
+            "2026-08-01T12:00:00+00:00", points, settings.leads_min,
+            {p.id: {5: 0.3, 10: 0.6} for p in points},
+            {p.id: {5: 1, 10: 0} for p in points},
+        )
+        for row in rows:
+            row["sample_weight"] = 1.0
+            row.update(settings.settings_columns())
+        return rows
+
+    union = tmp_path / "union.parquet"
+    bcc._append_rows(union, _rows(bcc.load_points_files([national, stations])))
+    solo = tmp_path / "solo.parquet"
+    bcc._append_rows(solo, _rows(bcc.load_points(stations)))
+
+    table = pq.read_table(union)
+    assert "point_set" in table.schema.names
+    slice_ = table.filter(
+        pa.compute.equal(table.column("point_set"), "station_points")
+    )
+    expected = pq.read_table(solo)
+    assert slice_.num_rows == expected.num_rows
+    for column in expected.schema.names:
+        if column == "point_set":
+            continue
+        assert slice_.column(column).to_pylist() == \
+            expected.column(column).to_pylist(), column
+
+
+def test_check_existing_corpus_refuses_a_pre_point_set_corpus(tmp_path: Path):
+    """Appending a union build onto a corpus whose rows do not say which
+    points file they came from would produce a corpus that cannot be split."""
+    settings = _settings()
+    rows = bcc.build_event_rows(
+        "2026-08-01T12:00:00+00:00",
+        bcc.load_points(_write_points(tmp_path, POINTS_V2)),
+        settings.leads_min, {}, {},
+    )
+    for row in rows:
+        row.pop("point_set")
+        row["sample_weight"] = 1.0
+        row.update(settings.settings_columns())
+    schema = pa.schema([
+        f for f in bcc._parquet_schema() if f.name != "point_set"
+    ])
+    out = tmp_path / "old.parquet"
+    pq.write_table(pa.Table.from_pylist(rows, schema=schema), out)
+    with pytest.raises(ValueError, match="predates the point_set column"):
+        bcc.check_existing_corpus(out, settings.settings_hash)
+
+
+def test_point_set_is_not_part_of_the_settings_hash(tmp_path: Path):
+    """Which points were sampled never defined a row's quantity, so a
+    per-set slice of a union corpus stays interchangeable with a corpus
+    built from that file alone."""
+    assert "point_set" not in _settings().to_dict()
+    assert "point_set" not in _settings().settings_columns()
+
+
+# ---------------------------------------------------------------------------
+# Verification frames are parsed once per FRAME, not once per lead
+# ---------------------------------------------------------------------------
+
+
+def test_score_outcomes_parses_each_verification_frame_once(
+    tmp_path: Path, monkeypatch
+):
+    """Several nominal leads snap onto one radar instant — at the live
+    12-18 min frame age the eight served leads resolve to six distinct
+    frames — and re-parsing the same HDF5 to sample the same discs from it
+    is pure waste. The per-(point, lead) outcome must be unchanged."""
+    points = bcc.load_points(_write_points(tmp_path, POINTS_V2))
+    settings = _settings(leads_min=(5, 10, 15, 20))
+
+    shared = _feature(datetime(2026, 8, 1, 12, 30, tzinfo=timezone.utc))
+    other = _feature(datetime(2026, 8, 1, 12, 40, tzinfo=timezone.utc))
+    # Leads 5/10/15 all verify against the same frame; lead 20 against another.
+    truth = {5: shared, 10: shared, 15: shared, 20: other}
+
+    parsed: list[str] = []
+    monkeypatch.setattr(bcc, "_resolve_frame", lambda f, *a: Path(f.filename))
+    monkeypatch.setattr(
+        bcc, "parse_composite",
+        lambda p: parsed.append(str(p)) or _FakeComposite(),
+    )
+    monkeypatch.setattr(
+        bcc, "CompositeGeo",
+        lambda c: FakeGeo({(p.lon, p.lat): (0.0, 0.0) for p in points}),
+    )
+    monkeypatch.setattr(
+        bcc, "dbz_to_rain_rate",
+        lambda *a, **k: np.full((4, 4), 5.0, dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        bcc, "sample_disc",
+        lambda *a, **k: DiscStats(5.0, 5.0, 5.0, 4, 4),
+    )
+
+    outcomes = bcc._score_outcomes(truth, points, settings, tmp_path, None)
+
+    assert parsed == [
+        "dk.com.202608011230.500_max.h5",
+        "dk.com.202608011240.500_max.h5",
+    ]
+    # Every (point, lead) still gets its outcome.
+    for point in points:
+        assert outcomes[point.id] == {5: 1, 10: 1, 15: 1, 20: 1}

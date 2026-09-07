@@ -612,3 +612,145 @@ def test_report_refuses_missing_corpus(tmp_path: Path, capsys):
     ])
     assert rc == 2
     assert "not found" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# --point-set: selecting one points file out of a union corpus (2026-09-07)
+#
+# One STEPS run per event serves every point, so the national corpus and the
+# station corpus are one build over the union of the two points files. These
+# tests pin the other half of that: a --point-set slice must fit and report
+# exactly like the corpus that points file would have built on its own.
+# ---------------------------------------------------------------------------
+
+
+def _union_rows() -> list[dict]:
+    """Two point sets with DIFFERENT miscalibrations, so a fit that ignored
+    the filter would land between them and fail visibly."""
+    rows: list[dict] = []
+    i = 0
+    for point_set, wet in (("calibration_points_v2", 3), ("station_points", 8)):
+        for lead in (10, 30):
+            for k in range(20):
+                rows.append(_row(
+                    i, lead, 0.125, int(k < wet), 1.0,
+                    overrides={"point_set": point_set},
+                ))
+                i += 1
+                rows.append(_row(
+                    i, lead, 0.875, int(k < 10), 1.0,
+                    overrides={"point_set": point_set},
+                ))
+                i += 1
+    return rows
+
+
+def test_load_v2_corpus_point_set_filter_selects_one_set(tmp_path: Path):
+    corpus = _write_corpus(tmp_path / "union.parquet", _union_rows())
+    everything = fnc.load_v2_corpus(corpus)
+    national = fnc.load_v2_corpus(corpus, point_set="calibration_points_v2")
+    stations = fnc.load_v2_corpus(corpus, point_set="station_points")
+
+    assert everything.point_set == "all"
+    assert national.point_set == "calibration_points_v2"
+    assert len(national.raw_prob) + len(stations.raw_prob) == len(everything.raw_prob)
+    # The two sets carry the two different base rates, and the unfiltered
+    # load carries their mixture — i.e. the filter really is selecting.
+    def _base(c):
+        m = fnc.valid_mask(c) & (c.raw_prob < 0.5)
+        return float(c.outcome[m].mean())
+    assert _base(national) == pytest.approx(3 / 20)
+    assert _base(stations) == pytest.approx(8 / 20)
+    assert _base(everything) == pytest.approx(11 / 40)
+
+
+def test_fit_on_a_point_set_slice_equals_fitting_that_set_alone(tmp_path: Path):
+    """The contract of the union build: the curves are identical either way."""
+    union_rows = _union_rows()
+    union = _write_corpus(tmp_path / "union.parquet", union_rows)
+    solo_rows = [r for r in union_rows if r["point_set"] == "station_points"]
+    solo = _write_corpus(tmp_path / "solo.parquet", solo_rows)
+
+    out_union = tmp_path / "union_curves.json"
+    out_solo = tmp_path / "solo_curves.json"
+    assert fnc.main([
+        "--corpus", str(union), "--output", str(out_union),
+        "--point-set", "station_points", "--min-samples-per-lead", "10",
+    ]) == 0
+    assert fnc.main([
+        "--corpus", str(solo), "--output", str(out_solo),
+        "--min-samples-per-lead", "10",
+    ]) == 0
+
+    a = json.loads(out_union.read_text())
+    b = json.loads(out_solo.read_text())
+    assert a["curves"] == b["curves"]
+    assert a["metadata"]["n_samples"] == b["metadata"]["n_samples"]
+    assert a["metadata"]["point_set"] == "station_points"
+    assert b["metadata"]["point_set"] == "all"
+
+
+def test_fit_default_point_set_is_all_and_needs_no_column(tmp_path: Path):
+    """Backwards compatibility: a pre-union corpus has no point_set column
+    at all and must still fit exactly as before."""
+    corpus = _write_corpus(
+        tmp_path / "old.parquet", _miscalibrated_rows(),
+        drop_columns=("point_set",),
+    )
+    corpus_obj = fnc.load_v2_corpus(corpus)
+    assert corpus_obj.point_set == "all"
+    assert fnc.main([
+        "--corpus", str(corpus), "--output", str(tmp_path / "curves.json"),
+        "--min-samples-per-lead", "10",
+    ]) == 0
+
+
+def test_fit_point_set_on_a_corpus_without_the_column_is_refused(tmp_path: Path):
+    corpus = _write_corpus(
+        tmp_path / "old.parquet", _miscalibrated_rows(),
+        drop_columns=("point_set",),
+    )
+    with pytest.raises(fnc.CorpusError, match="no point_set column"):
+        fnc.load_v2_corpus(corpus, point_set="station_points")
+
+
+def test_fit_unknown_point_set_is_refused_and_lists_what_exists(tmp_path: Path):
+    corpus = _write_corpus(tmp_path / "union.parquet", _union_rows())
+    with pytest.raises(fnc.CorpusError, match="station_points"):
+        fnc.load_v2_corpus(corpus, point_set="not_a_set")
+
+
+def test_report_point_set_filters_and_names_its_artifacts(tmp_path: Path):
+    """Two reports of a union corpus into one --out-dir must not overwrite
+    each other, and each must count only its own set's rows."""
+    pytest.importorskip("duckdb")
+    corpus = _write_corpus(tmp_path / "union.parquet", _union_rows())
+    out_dir = tmp_path / "reports"
+    assert ncr.main([
+        "--corpus", str(corpus), "--out-dir", str(out_dir),
+        "--point-set", "station_points",
+    ]) == 0
+    assert ncr.main([
+        "--corpus", str(corpus), "--out-dir", str(out_dir),
+        "--point-set", "calibration_points_v2",
+    ]) == 0
+
+    stations = (out_dir / "national_calibration_report_station_points.md").read_text()
+    national = (
+        out_dir / "national_calibration_report_calibration_points_v2.md"
+    ).read_text()
+    assert "- Point set: `station_points`" in stations
+    assert "- Point set: `calibration_points_v2`" in national
+    half = len(_union_rows()) // 2
+    assert f"- Rows: {half} " in stations
+    assert f"- Rows: {half} " in national
+
+
+def test_report_unknown_point_set_is_refused(tmp_path: Path):
+    pytest.importorskip("duckdb")
+    corpus = _write_corpus(tmp_path / "union.parquet", _union_rows())
+    with pytest.raises(SystemExit, match="not_a_set"):
+        ncr.main([
+            "--corpus", str(corpus), "--out-dir", str(tmp_path / "r"),
+            "--point-set", "not_a_set",
+        ])

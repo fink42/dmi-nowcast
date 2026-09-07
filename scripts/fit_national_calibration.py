@@ -121,6 +121,8 @@ class Corpus:
     settings: dict
     n_events: int
     n_points: int
+    #: Which ``--point-set`` this Corpus was loaded under ("all" = no filter).
+    point_set: str = "all"
 
 
 def kish_effective_n(weights: np.ndarray) -> float:
@@ -133,9 +135,19 @@ def kish_effective_n(weights: np.ndarray) -> float:
     return (sw * sw) / sw2 if sw2 > 0 else 0.0
 
 
-def load_v2_corpus(path: Path) -> Corpus:
+def load_v2_corpus(path: Path, point_set: str = "all") -> Corpus:
     """Read + validate the corpus Parquet. Raises :class:`CorpusError` on a
-    legacy / mixed / weight-less corpus — never fits through those."""
+    legacy / mixed / weight-less corpus — never fits through those.
+
+    ``point_set`` selects one ``--points`` file's rows out of a union
+    corpus (``build_calibration_corpus.py --points A --points B``); the
+    default ``"all"`` reads every row and is exactly the pre-union
+    behaviour, including on corpora that carry no ``point_set`` column.
+    Filtering happens before validation counts anything, so ``n_points``
+    and the fitted curves describe the selected set alone — a
+    ``--point-set`` slice of a union corpus is row-for-row the corpus
+    that points file would have built on its own.
+    """
     import pyarrow.parquet as pq
 
     if not path.exists():
@@ -158,9 +170,30 @@ def load_v2_corpus(path: Path) -> Corpus:
     if missing:
         raise CorpusError(f"{path} is missing corpus columns: {missing}")
 
-    tbl = pq.read_table(path, columns=list(_CORE_COLUMNS) + list(_SETTINGS_COLUMNS))
+    columns = list(_CORE_COLUMNS) + list(_SETTINGS_COLUMNS)
+    want_set = str(point_set)
+    if want_set != "all":
+        if "point_set" not in schema.names:
+            raise CorpusError(
+                f"{path} has no point_set column, so --point-set "
+                f"{want_set!r} cannot select anything. It predates the "
+                "union build; either use --point-set all or rebuild with "
+                "build_calibration_corpus.py --points <file> ..."
+            )
+        columns.append("point_set")
+    tbl = pq.read_table(path, columns=columns)
     if tbl.num_rows == 0:
         raise CorpusError(f"{path} is empty")
+    if want_set != "all":
+        import pyarrow.compute as pc
+
+        available = sorted(set(tbl.column("point_set").to_pylist()))
+        tbl = tbl.filter(pc.equal(tbl.column("point_set"), want_set))
+        if tbl.num_rows == 0:
+            raise CorpusError(
+                f"{path} has no rows with point_set == {want_set!r} "
+                f"(available: {available})"
+            )
 
     versions = sorted(set(tbl.column("schema_version").to_pylist()))
     if versions != [EXPECTED_SCHEMA_VERSION]:
@@ -192,6 +225,7 @@ def load_v2_corpus(path: Path) -> Corpus:
         settings=settings,
         n_events=len(set(tbl.column("event_time").to_pylist())),
         n_points=len(set(tbl.column("point_id").to_pylist())),
+        point_set=want_set,
     )
 
 
@@ -282,6 +316,7 @@ def build_output(
         "weighted": True,
         "n_events": int(corpus.n_events),
         "n_points": int(corpus.n_points),
+        "point_set": str(corpus.point_set),
         "n_samples": int(sum(f.n_samples for f in fits)),
         "brier_before": float(sum(f.sum_w_sq_before for f in fits) / total_w),
         "brier_after": float(sum(f.sum_w_sq_after for f in fits) / total_w),
@@ -319,6 +354,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="national_curves.json destination (load_calibration_curves format)",
     )
     ap.add_argument(
+        "--point-set", type=str, default="all", metavar="NAME",
+        help="Fit only the rows whose point_set column equals NAME — the "
+             "stem of one of the --points files the corpus was built from "
+             "(e.g. calibration_points_v2, station_points). Default 'all' "
+             "fits every row, which is what a single-points-file corpus "
+             "wants and what pre-union corpora (no point_set column) "
+             "require.",
+    )
+    ap.add_argument(
         "--min-samples-per-lead", type=int, default=500,
         help="Refuse to fit a lead with fewer valid samples than this — a "
              "thin lead produces a noise curve, not a calibration (default 500).",
@@ -326,7 +370,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        corpus = load_v2_corpus(args.corpus)
+        corpus = load_v2_corpus(args.corpus, point_set=args.point_set)
     except CorpusError as exc:
         print(f"refusing to fit: {exc}", file=sys.stderr)
         return 2
@@ -335,6 +379,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     leads = sorted(set(int(x) for x in corpus.lead_min[mask]))
     print(
         f"Corpus {args.corpus}: settings_hash={corpus.settings_hash}, "
+        f"point_set={corpus.point_set}, "
         f"{corpus.n_events} events × {corpus.n_points} points, "
         f"{int(mask.sum())} valid rows across leads {leads}"
     )

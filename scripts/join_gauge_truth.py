@@ -43,6 +43,16 @@ Usage::
         --corpus-dir /var/lib/dmi-nowcast-corpus \
         --out reports/station_corpus_gauge.parquet
 
+A corpus built over the UNION of several ``--points`` files (one STEPS
+run serving both the radar calibration points and the gauge points)
+carries a ``point_set`` column. Only the gauge points can join a gauge
+observation — the radar points are grid coordinates, not station ids —
+so pass ``--point-set station_points`` and the join runs on, and writes,
+exactly the rows a station-only corpus would have held. Without the flag
+(``all``, the default, and the only option for a pre-union corpus) every
+row is kept and non-station point_ids simply come back with null gauge
+columns, as before.
+
 Data licence of the gauge data: CC BY 4.0 (DMI Open Data).
 """
 from __future__ import annotations
@@ -176,6 +186,13 @@ def main() -> int:
     ap.add_argument("--corpus-dir", required=True, type=Path,
                     help="corpus root holding stations/obs/*")
     ap.add_argument("--out", required=True, type=Path, help="output Parquet")
+    ap.add_argument("--point-set", type=str, default="all", metavar="NAME",
+                    help="Join (and write) only the rows whose point_set "
+                         "column equals NAME — the stem of one of the "
+                         "--points files the corpus was built from, e.g. "
+                         "station_points. Default 'all' keeps every row; "
+                         "required to be 'all' for a corpus with no "
+                         "point_set column.")
     ap.add_argument("--wet-mm", type=float, default=DEFAULT_WET_MM,
                     help=f"mm in the 10-min slot that counts as wet (default {DEFAULT_WET_MM})")
     ap.add_argument("--wet-dur-min", type=float, default=DEFAULT_WET_DUR_MIN,
@@ -190,6 +207,28 @@ def main() -> int:
         print(f"no corpus at {args.corpus}", file=sys.stderr)
         return 2
     table = pq.read_table(args.corpus)
+    if args.point_set != "all":
+        if "point_set" not in table.schema.names:
+            print(
+                f"{args.corpus} has no point_set column, so --point-set "
+                f"{args.point_set!r} cannot select anything (it predates the "
+                "union build) — use --point-set all",
+                file=sys.stderr,
+            )
+            return 2
+        import pyarrow.compute as pc
+
+        available = sorted(set(table.column("point_set").to_pylist()))
+        table = table.filter(pc.equal(table.column("point_set"), args.point_set))
+        if table.num_rows == 0:
+            print(
+                f"{args.corpus} has no rows with point_set == "
+                f"{args.point_set!r} (available: {available})",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"point_set={args.point_set}: kept {table.num_rows} rows "
+              f"(available sets: {available})")
     n = table.num_rows
     print(f"corpus {args.corpus} rows={n}")
 
@@ -276,7 +315,9 @@ def main() -> int:
         print("WARNING: no corpus row matched a gauge slot — a corpus built on "
               "the radar calibration points cannot join, because its point_ids "
               "are grid points, not station ids. Rebuild it with "
-              "scripts/build_station_points.py output as --points.")
+              "scripts/build_station_points.py output as --points, or — on a "
+              "union corpus — select the gauge rows with "
+              "--point-set station_points.")
     print(f"wrote {args.out} ({out.num_rows} rows, {out.num_columns} columns)")
     return 0
 

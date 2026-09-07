@@ -70,11 +70,41 @@ def rain_to_db(rain: np.ndarray, threshold_mm_h: float = DB_THRESHOLD_MM_H) -> n
     return out
 
 
+#: Rows of the leading axis converted at a time by :func:`db_to_rain`.
+#: Affects peak memory only, never the result.
+_DB_TO_RAIN_CHUNK = 1
+
+
 def db_to_rain(db: np.ndarray) -> np.ndarray:
-    """Inverse of ``rain_to_db``. Values at ZERO_DB collapse to 0 mm/h."""
-    arr = np.asarray(db, dtype=np.float32)
-    out = np.power(np.float32(10.0), arr / np.float32(10.0))
-    out = np.where(arr > ZERO_DB + 1e-3, out, np.float32(0.0))
+    """Inverse of ``rain_to_db``. Values at ZERO_DB collapse to 0 mm/h.
+
+    Written as a preallocated output filled a slice at a time along the
+    leading axis. The expression form it replaced
+    (``np.where(arr > thr, 10 ** (arr / 10), 0)``) materialises four
+    whole-array temporaries at once; on the calibration-corpus ensemble
+    — the (16, 8, 432, 496) array STEPS returns — that was a ~440 MB
+    spike at the very end of every event. Slicing keeps the temporaries
+    at one member each for the same arithmetic, so the result is
+    unchanged element for element (pinned by
+    ``tests/test_probabilistic.py``), including the NaN convention:
+    ``NaN > threshold`` is False, so non-finite input becomes 0 mm/h.
+    """
+    arr = np.asarray(db)
+    thr = np.float32(ZERO_DB + 1e-3)
+    if arr.ndim == 0:
+        arr32 = arr.astype(np.float32, copy=False)
+        out0 = np.power(np.float32(10.0), arr32 / np.float32(10.0))
+        return np.where(arr32 > thr, out0, np.float32(0.0))
+    out = np.empty(arr.shape, dtype=np.float32)
+    for start in range(0, arr.shape[0], _DB_TO_RAIN_CHUNK):
+        sl = slice(start, start + _DB_TO_RAIN_CHUNK)
+        chunk = np.asarray(arr[sl], dtype=np.float32)
+        block = out[sl]
+        np.divide(chunk, np.float32(10.0), out=block)
+        np.power(np.float32(10.0), block, out=block)
+        # ``~(chunk > thr)`` and not ``chunk <= thr``: NaN fails BOTH
+        # comparisons, and the original np.where sent NaN to 0.0.
+        np.copyto(block, np.float32(0.0), where=~np.greater(chunk, thr))
     return out
 
 
@@ -117,26 +147,37 @@ def run_ensemble(
         raise ValueError(f"STEPS needs at least 3 input frames; got {len(dbz_frames)}")
     if downsample_factor < 1:
         raise ValueError(f"downsample_factor must be >= 1, got {downsample_factor}")
+    f = int(downsample_factor)
+    # Plain stride slicing — Gaussian + decimation would be more correct
+    # but the radar field is already smoothed by the composite-max and
+    # 5-min temporal aggregation; the difference doesn't show up in
+    # ensemble probabilities.
+    #
+    # The slice is taken FIRST, on the dBZ inputs, rather than after the
+    # Z-R and dB conversions. Both conversions are elementwise, so
+    # ``convert(x)[::f, ::f] == convert(x[::f, ::f])`` exactly — but in
+    # this order the two intermediate stacks are 1/f² of the native grid
+    # (2 x 3 MB instead of 2 x 41 MB at DMI's 1728x1984 and f = 4), which
+    # is pure waste otherwise: nothing downstream ever sees the
+    # native-resolution rain or dB fields.
     # pysteps wants ``(ar_order+1, h, w)`` — take the last 3.
+    frames_in = [np.asarray(d)[::f, ::f] for d in dbz_frames[-3:]]
     rain_frames = np.stack([
-        dbz_to_rain_rate(d, zr_a=zr_a, zr_b=zr_b) for d in dbz_frames[-3:]
+        dbz_to_rain_rate(d, zr_a=zr_a, zr_b=zr_b) for d in frames_in
     ])
     db_frames = rain_to_db(rain_frames, threshold_mm_h=threshold_mm_h)
+    del rain_frames, frames_in
 
     # pysteps velocity convention: shape (2, h, w) with [0]=vx (east), [1]=vy (south).
-    velocity = np.stack([vx, vy]).astype(np.float32)
+    velocity = np.stack([
+        np.asarray(vx)[::f, ::f], np.asarray(vy)[::f, ::f],
+    ]).astype(np.float32)
 
-    if downsample_factor > 1:
-        f = downsample_factor
-        # Plain stride slicing — Gaussian + decimation would be more correct
-        # but the radar field is already smoothed by the composite-max and
-        # 5-min temporal aggregation; the difference doesn't show up in
-        # ensemble probabilities.
-        db_frames = db_frames[:, ::f, ::f]
+    if f > 1:
         # Velocity is in pixels-per-frame on the NATIVE grid. After
         # downsampling, the same physical motion corresponds to fewer
         # downsampled pixels per frame — divide by ``f``.
-        velocity = velocity[:, ::f, ::f] / f
+        velocity /= f
         # Effective pixel size grows by ``f``.
         km_per_pixel = pixel_scale_m * f / 1000.0
     else:
