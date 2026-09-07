@@ -1,4 +1,7 @@
 [Unit]
+# calibrate.sh is the whole monthly routine: national recalibration, then
+# the station corpus + gauge join. Adding that second step needed no
+# change here, which is why it lives inside the script.
 Description=DMI nowcast — monthly recalibration job
 After=docker.service
 Requires=docker.service

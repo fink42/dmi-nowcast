@@ -427,12 +427,156 @@ the result. Gauge data is DMI Open Data, licence **CC BY 4.0** — attribute
 DMI in anything published from it. API keys are not required on
 `opendataapi.dmi.dk` (dropped 2025-12-02); fair use still applies.
 
-### Monthly recalibration
+### Monthly routine
 
-A systemd timer rebuilds the calibration corpus and refits curves once
-a month. The new curves land in the data volume at
-`/var/lib/dmi-nowcast/calibration_curves.json`, where the running
-sidecar picks them up immediately.
+`calibrate.sh` **is** the routine, and the existing `dmi-calibrate`
+systemd timer already runs it: **1st of the month, 03:00 UTC** (the VM's
+clock is UTC) plus up to 15 minutes of `RandomizedDelaySec`. There is no
+second scheduler to install — one timer, one entry point.
+
+It runs two steps, sequentially, ~3.5 h each (so ~7 h in all, finishing
+around 10:00 UTC):
+
+| step | what it produces | ~time |
+|---|---|---|
+| 1 national recalibration | isotonic curves (the sidecar is restarted onto them), reliability report, `calibration/latest.parquet` | ~3.5 h |
+| 2 station corpus (`station_corpus.sh`) | `stations/station_corpus_gauge.parquet` — the same corpus over gauge stations, widened with gauge truth | ~3.5 h |
+
+Step 2 runs **after** the restart, so the new curves are in service within
+minutes rather than after another 3.5 h, and it is never fatal: the curves
+are the product, the station corpus is a report input. A missing
+`stations/station_points.json` logs one line and is skipped;
+`CALIBRATION_STATIONS=0` skips it deliberately. The job's exit code
+reflects one thing only — whether the sidecar came back serving a newer
+`calibration_fitted_at` — so `systemctl --failed` means "the curves are
+not live", not "the gauge column is stale".
+
+The run overlaps the 03:30 UTC nightly quality report, which is harmless:
+the report is a child process of the sidecar, the batch work is in a
+separate capped container, and both stable filenames are published
+atomically (temp name, then rename) so the report can never read a
+half-written parquet.
+
+Nothing needs restarting afterwards.
+
+#### Memory rules (read before raising any worker count)
+
+The VM has 12 GB shared between the live sidecar, the public stack and
+whatever batch job is running. A STEPS worker (16 members, 432×496) holds
+1.3–2.0 GB of anonymous RSS. Uncapped `docker compose run` containers with
+3–5 workers got the **live** sidecar chosen by the kernel's global OOM
+killer 18 times over 2026-09-05/06 — `oom_score_adj: -500` biases that
+choice but cannot survive a machine that is genuinely out of memory.
+
+`sidecar/deploy/lib/batch.sh` encodes what works, and every batch script
+sources it:
+
+- **`BATCH_WORKERS=2`.** Not three, not five. It roughly doubles wall time
+  against a job that runs once a month.
+- **`BATCH_MEM_CAP=5000m`**, applied with `docker update` to the
+  `deploy-sidecar-run-*` container ~25 s after it starts. Under the cap the
+  *cgroup's* OOM killer fires first and takes a batch worker (the pool
+  restarts it) instead of the global one taking the service. The cap cannot
+  live in `docker-compose.yml`: it must land on the throwaway container,
+  and compose gives it and the service the same definition.
+- **One batch job at a time.** Every script refuses to start beside a
+  running `deploy-sidecar-run-*` container. `BATCH_FORCE=1` overrides it;
+  don't.
+
+The nightly quality report at 03:30 UTC is a *child process of the
+sidecar*, not a batch container, so the guard does not see it and it will
+land in the middle of step 1. That is survivable exactly because the batch
+container is capped — the report is the reason the cap exists.
+
+#### Where the outputs go
+
+```
+/var/lib/dmi-nowcast-corpus/
+  calibration/national_corpus_<stamp>.parquet   this run's corpus
+  calibration/latest.parquet                    a COPY of it — quality_report.radar_corpus
+  calibration/latest.md                         which run, which report dir
+  calibration_reports/<stamp>/                  reliability report
+  stations/station_corpus_<stamp>_gauge.parquet this run's gauge corpus
+  stations/station_corpus_gauge.parquet         a COPY of it — quality_report.station_corpus
+/var/lib/dmi-nowcast/national_curves.json       the served curves
+```
+
+`latest.parquet` and `station_corpus_gauge.parquet` are **copies, not
+symlinks**, published **atomically** (copy to a temp name in the same
+directory, then rename). Both are read through a docker bind-mount by a
+different container than the one that writes them, and by the report's
+child process, which resolves the configured path itself; a symlink into a
+stamped sibling breaks silently when the target moves or is pruned, and a
+plain `cp` onto a live path lets the 03:30 UTC report open a truncated
+parquet. A parquet is tens of MB — a copy once a month is the boring
+option.
+
+#### By hand
+
+The timer's output goes to journald; a hand-started run should keep its
+own log, because it is seven hours you do not want to re-run blind.
+
+```bash
+mkdir -p ~/dmi-nowcast-logs
+sidecar/deploy/calibrate.sh 2>&1 \
+    | tee ~/dmi-nowcast-logs/calibrate-$(date -u +%Y%m%d_%H%M%S).log
+
+CALIBRATION_STATIONS=0 sidecar/deploy/calibrate.sh        # curves only
+CALIBRATION_INPUT_MONTHS=6 sidecar/deploy/calibrate.sh    # fixed 6-month window
+sidecar/deploy/station_corpus.sh                          # step 2 on its own
+STATION_N_EVENTS=1000 sidecar/deploy/station_corpus.sh    # quick pass
+```
+
+Every script refuses to start beside a running batch container, so a hand
+run on the 1st cannot collide with the timer's.
+
+#### How to check it worked
+
+```bash
+journalctl -u dmi-calibrate.service -n 40 --no-pager      # or the tee'd log
+docker exec dmi-nowcast-sidecar cat /var/lib/dmi-nowcast-corpus/calibration/latest.md
+curl -fs http://localhost:8081/state.json | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["probabilistic"]["calibration_fitted_at"])'
+curl -fs http://localhost:8081/nowcast/quality.json | head -c 400   # after 03:30 UTC
+```
+
+The job's last lines summarise both steps. It fails loudly if the
+restarted sidecar does not serve a newer `calibration_fitted_at`, so a
+green run means the curves are live. The quality report picks the new
+corpora up on its next nightly run; `sidecar/deploy/quality_report.sh`
+builds one immediately.
+
+### Warning replays (only after a pipeline change)
+
+`replay.sh` (gauge stations) and `radar_replay.sh` (the 120 fixed radar
+points) re-derive warning decisions over a list of past days:
+
+```bash
+sidecar/deploy/replay.sh                                   # ~/replay_days.txt
+REPLAY_DAYS_FILE=~/august.txt sidecar/deploy/replay.sh
+sidecar/deploy/radar_replay.sh                             # the cross-check
+```
+
+These are **not** part of the monthly routine. The live gauge scoreboard
+(`station_eval`, one row per gauge per cycle) accumulates the same decision
+rows continuously and is strictly better evidence, because it is what the
+service actually served. Reach for a replay only when the history has to be
+re-derived under changed code: the push decision rule / thresholds / onset
+definition moved, the ensemble settings changed, the curves were refit in a
+way that shifts served probability, or a season of evidence is needed now
+and the live scoreboard is young.
+
+Output goes to `<corpus>/stations/replay` (`quality_report.replay_dir`) and
+`<corpus>/points/replay`; the replayed and live rows are scored as one
+table, deduplicated on `(radar_ts, station_id)` with the live row winning.
+Both honour `BATCH_WORKERS` / `BATCH_MEM_CAP` and the one-at-a-time guard.
+
+### Installing the monthly timer
+
+The schedule for the routine above: `dmi-calibrate.timer` runs
+`calibrate.sh` — both steps — on the 1st at 03:00 UTC, `Persistent=true`
+so a host that was off catches up. Already installed and active on the
+VM; this is for a rebuild or a second host.
 
 Install on the deploy host (one-time). The unit ships with
 `__DEPLOY_USER__` / `__DEPLOY_DIR__` placeholders — substitute your own
@@ -449,12 +593,7 @@ systemctl enable --now dmi-calibrate.timer
 systemctl list-timers dmi-calibrate.timer    # confirm next-run
 ```
 
-Run on demand (e.g. after a code change):
-
-```bash
-sidecar/deploy/calibrate.sh                       # default: the whole archive
-CALIBRATION_INPUT_MONTHS=6 sidecar/deploy/calibrate.sh   # fixed 6-month window
-```
+Running it by hand is covered under "Monthly routine" above.
 
 Notes:
 
@@ -476,7 +615,12 @@ Notes:
 - Wet/dry stratification uses the corpus builder's five spread national
   reference points by default; override with `CALIBRATION_WET_REFS`.
 - Archived raw frames aren't pruned by the timer — only the corpus
-  Parquet is regenerated each month.
+  Parquets are regenerated each month.
+- The unit's `ExecStart` is `calibrate.sh`, which now covers both steps of
+  the routine. Nothing in the unit file changed when step 2 was added, and
+  nothing needs to.
 - A new corpus Parquet lands at
-  `/var/lib/dmi-nowcast/calibration_corpus_<YYYYMMDD_HHMMSS>.parquet` so
-  past runs aren't overwritten.
+  `<corpus>/calibration/national_corpus_<YYYYMMDD_HHMMSS>.parquet` so past
+  runs aren't overwritten, and `calibration/latest.parquet` is refreshed to
+  a copy of it — that stable name is what `quality_report.radar_corpus`
+  reads.

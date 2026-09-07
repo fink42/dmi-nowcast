@@ -228,12 +228,19 @@ quality_report:
   # What this really bounds is a job wedged on a corrupt parquet — and a
   # timeout costs one log line and yesterday's report, nothing else.
   timeout_s: 1800
-  # The national calibration corpus (stamped per calibrate.sh run — point
-  # this at the newest one, or at a stable symlink you maintain).
+  # The national calibration corpus. deploy/calibrate.sh writes a stamped
+  # file per run and then refreshes `latest.parquet` as a COPY of it, so
+  # this path never needs editing. (A copy, not a symlink: a different
+  # container writes it than reads it, through a bind-mount, and the
+  # report resolves this path in its own child process — a symlink into a
+  # stamped sibling breaks silently when the target moves or is pruned.)
+  # Point it at a stamped file only to re-score a specific past run.
   radar_corpus: /var/lib/dmi-nowcast-corpus/calibration/latest.parquet
   # The same corpus over station points, widened with gauge truth by
   # scripts/join_gauge_truth.py. This is what makes the gauge column of
   # the page a measurement against the ground rather than against radar.
+  # Maintained by deploy/station_corpus.sh (step 2 of deploy/monthly.sh),
+  # which copies each run onto this stable name.
   station_corpus: /var/lib/dmi-nowcast-corpus/stations/station_corpus_gauge.parquet
   # scripts/replay_warnings.py output. Its decision rows and the live
   # station_eval rows are scored as one table, deduplicated on
