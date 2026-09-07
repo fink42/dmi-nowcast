@@ -18,6 +18,10 @@ from typing import Annotated, Literal
 
 import yaml
 from dmi_nowcast_core.metobs import DEFAULT_BASE_URL as METOBS_DEFAULT_BASE_URL
+from dmi_nowcast_core.warning_score import (
+    DEFAULT_DRY_MIN,
+    DEFAULT_ONSET_MIN_MM,
+)
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -514,6 +518,14 @@ class FitThresholdsConfig(BaseModel):
     plateau_frac: Annotated[float, Field(gt=0.0, le=1.0)] = 0.95
     min_warnings: Annotated[int, Field(ge=0)] = 30
     min_useful_lead_min: Annotated[float, Field(ge=0.0)] = 5.0
+    #: The gauge onset definition the fit scores against: a wet slot after
+    #: this many known-dry minutes, delivering ``onset_min_mm`` over itself
+    #: and the slot after it. The defaults are the shipped rule
+    #: (``warning_score``); moving them re-asks the question, so a fitted
+    #: table and the numbers on the quality page only compare against
+    #: another fit under the same two.
+    dry_min: Annotated[int, Field(ge=0)] = DEFAULT_DRY_MIN
+    onset_min_mm: Annotated[float, Field(ge=0.0)] = DEFAULT_ONSET_MIN_MM
     #: Stability guard (``push_thresholds.apply_stability_guard``): a
     #: lead's served threshold moves only when the new pick is at least
     #: this many points away AND stands on ``min_warnings`` scored

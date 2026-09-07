@@ -248,6 +248,10 @@ class QualityReportTask:
             min_useful_lead_min=float(settings.min_useful_lead_min),
             plateau_frac=float(settings.plateau_frac),
             min_warnings=int(settings.min_warnings),
+            # The onset definition the fit is scored under, carried into
+            # the thresholds document's ``objective``.
+            dry_min=int(settings.dry_min),
+            onset_min_mm=float(settings.onset_min_mm),
             workers=int(settings.workers),
         )
 

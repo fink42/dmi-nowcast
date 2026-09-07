@@ -289,6 +289,13 @@ quality_report:
     # Rain arriving sooner than this after a warning is LATE: not a hit,
     # not a false alarm, still counted against recall.
     min_useful_lead_min: 5.0
+    # The gauge onset the fit scores against: the first wet slot after
+    # this many known-dry minutes, and only if it delivers onset_min_mm
+    # over that slot and the next. 60 min matches the rule's own re-arm
+    # (a second shower inside the hour was never catchable) and 0.2 mm
+    # keeps drizzle out of the event count. 0.0 counts every wet slot.
+    dry_min: 60
+    onset_min_mm: 0.2
     workers: 4
 
 # --- Artifact sync (Phase F, F4) --------------------------------------

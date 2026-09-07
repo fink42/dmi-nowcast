@@ -69,7 +69,7 @@ DAYS = (1, 2)
 FIRST_FRAME_MIN = 7 * 60
 LAST_FRAME_MIN = 9 * 60
 #: Gauge slots: 06:00–10:00 UTC every 10 minutes, so every onset has its
-#: three dry slots behind it and every warning window closes inside the
+#: six dry slots behind it and every warning window closes inside the
 #: reported record (nothing is ever "pending").
 FIRST_SLOT_MIN = 6 * 60
 LAST_SLOT_MIN = 10 * 60
@@ -623,28 +623,69 @@ def _radar_track(rates: list[float | None]) -> list[tuple]:
 
 def test_radar_onsets_need_the_same_dry_run_the_gauges_do() -> None:
     track = _radar_track([0.0, 0.0, 0.0, 1.2, 1.2, 0.0])
-    onsets, known_until = sweep.radar_truth({"P1": track})
+    onsets, known_until = sweep.radar_truth({"P1": track}, dry_min=30)
     assert onsets["P1"] == [_at(1, 7 * 60 + 30)]
     assert known_until["P1"] == _at(1, 7 * 60 + 50)
 
     # Two dry slots are not enough, exactly as at a gauge.
-    too_soon, _ = sweep.radar_truth({"P1": _radar_track([0.0, 0.0, 1.2])})
+    too_soon, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0, 0.0, 1.2])}, dry_min=30,
+    )
     assert too_soon["P1"] == []
+
+    # And the shipped default asks for six, exactly as at a gauge.
+    default, _ = sweep.radar_truth({"P1": track})
+    assert default["P1"] == []
+    six_dry, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0] * 6 + [1.2, 1.2])},
+    )
+    assert six_dry["P1"] == [_at(1, 7 * 60 + 60)]
+
+
+def test_the_radar_amount_rule_reads_the_rate_as_millimetres() -> None:
+    """0.2 mm over two 10-minute slots is 1.2 mm/h between them.
+
+    The gauge reports a depth and the radar a rate, so the slot's rate is
+    read as sustained across the slot: ``mm = rate * 10 / 60``. Drizzle
+    that never adds up is not an event on either instrument.
+    """
+    drizzle, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0] * 6 + [0.5, 0.5])},
+    )
+    assert drizzle["P1"] == []          # 0.083 + 0.083 mm
+    # …and it was the amount that dropped it, not the dry run.
+    loose, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0] * 6 + [0.5, 0.5])}, onset_min_mm=0.0,
+    )
+    assert loose["P1"] == [_at(1, 7 * 60 + 60)]
+    # One slot can carry the floor alone: 1.5 mm/h is 0.25 mm, 1.1 is
+    # 0.18. (The bar sits at 1.2 mm/h, which is 0.2 mm to within a float.)
+    enough, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0] * 6 + [1.5, 0.0])},
+    )
+    assert enough["P1"] == [_at(1, 7 * 60 + 60)]
+    short, _ = sweep.radar_truth(
+        {"P1": _radar_track([0.0] * 6 + [1.1, 0.0])},
+    )
+    assert short["P1"] == []
 
 
 def test_the_detection_threshold_is_inclusive_and_a_null_is_unknown() -> None:
     at_threshold, _ = sweep.radar_truth(
         {"P1": _radar_track([0.0, 0.0, 0.0, 0.5])},
+        dry_min=30, onset_min_mm=0.0,
     )
     assert at_threshold["P1"] == [_at(1, 7 * 60 + 30)]
     just_under, _ = sweep.radar_truth(
         {"P1": _radar_track([0.0, 0.0, 0.0, 0.49])},
+        dry_min=30, onset_min_mm=0.0,
     )
     assert just_under["P1"] == []
     # A null is nodata, not a dry slot: it resets the dry run, so the wet
     # slot behind it cannot be an onset.
     with_hole, _ = sweep.radar_truth(
         {"P1": _radar_track([0.0, 0.0, None, 0.0, 1.2])},
+        dry_min=30, onset_min_mm=0.0,
     )
     assert with_hole["P1"] == []
 
@@ -723,7 +764,7 @@ def test_the_thresholds_document_validates_and_round_trips(
     assert doc["objective"] == {
         "metric": "f1", "min_useful_lead_min": 5.0, "plateau_frac": 0.95,
         "min_warnings": 1, "rearm_after_min": 60, "persistence_obs": 1,
-        "tolerance_min": 10, "dry_min": 30,
+        "tolerance_min": 10, "dry_min": 60, "onset_min_mm": 0.2,
     }
     assert doc["window"]["days"] == 2
     assert doc["window"]["stations"] == 2

@@ -32,7 +32,7 @@ import onset_sensitivity as sens  # noqa: E402  (after the sys.path edit)
 from dmi_nowcast_core.station_store import StationObsStore  # noqa: E402
 from dmi_nowcast_core.metobs import Observation  # noqa: E402
 from dmi_nowcast_core.warning_score import (  # noqa: E402
-    gauge_slots,
+    gauge_slot_amounts,
     gauge_truth_vectorised,
     onsets as gauge_onsets,
     score_warnings,
@@ -123,11 +123,11 @@ def test_each_variant_finds_exactly_its_own_onsets(name: str) -> None:
     assert [ts for ts, _mm in found] == [at(i) for i in EXPECTED[name]]
 
 
-def test_v0_reproduces_the_shipped_onset_rule() -> None:
-    """V0 must BE the definition the sweep was fitted on, not a lookalike.
+def test_v0_reproduces_the_rule_the_first_sweep_was_fitted_on() -> None:
+    """V0 must BE that definition, not a lookalike.
 
-    Same series, once through ``warning_score.gauge_slots`` +
-    ``warning_score.onsets`` (booleans) and once through the script's
+    Same series, once through ``warning_score.gauge_slot_amounts`` +
+    ``warning_score.onsets`` and once through the script's own
     amount-carrying path. A drift between the two would silently move the
     baseline every other variant is compared against.
     """
@@ -143,10 +143,34 @@ def test_v0_reproduces_the_shipped_onset_rule() -> None:
                 "station_id": "06180", "observed_utc": at(i),
                 "parameter_id": "precip_dur_past10min", "value": dur,
             })
-    slots = gauge_slots(rows, "06180", start_utc=at(0), end_utc=at(len(SERIES) - 1))
-    shipped = gauge_onsets(slots, 30)
+    slots = gauge_slot_amounts(
+        rows, "06180", start_utc=at(0), end_utc=at(len(SERIES) - 1),
+    )
+    reference = gauge_onsets(slots, 30, onset_min_mm=0.0)
     ours = [ts for ts, _mm in sens.variant_onsets(grid(), variant("V0"))]
-    assert ours == shipped
+    assert ours == reference
+
+
+def test_v2_reproduces_the_shipped_onset_rule() -> None:
+    """And V2 must BE what ``warning_score`` now scores by default."""
+    rows = []
+    for i, (mm, dur) in enumerate(SERIES):
+        if mm is not None:
+            rows.append({
+                "station_id": "06180", "observed_utc": at(i),
+                "parameter_id": "precip_past10min", "value": mm,
+            })
+        if dur is not None:
+            rows.append({
+                "station_id": "06180", "observed_utc": at(i),
+                "parameter_id": "precip_dur_past10min", "value": dur,
+            })
+    slots = gauge_slot_amounts(
+        rows, "06180", start_utc=at(0), end_utc=at(len(SERIES) - 1),
+    )
+    assert gauge_onsets(slots) == [
+        ts for ts, _mm in sens.variant_onsets(grid(), variant("V2"))
+    ]
 
 
 def test_the_two_slot_amount_spans_the_onset_slot_and_the_next() -> None:
@@ -220,12 +244,12 @@ def test_the_vectorised_load_finds_each_variant_s_own_onsets(
     spec = variant(name)
     truth = gauge_truth_vectorised(
         tmp_path, at(0), at(len(SERIES) - 1), ["06180"],
-        dry_min=spec.dry_min, min_mm_two_slots=spec.min_mm_two_slots,
+        dry_min=spec.dry_min, onset_min_mm=spec.onset_min_mm,
     )
     want = sens.variant_onsets(grid(), spec)
     assert truth.onsets["06180"] == [ts for ts, _mm in want]
     found = truth.series["06180"].onsets_with_amounts(
-        spec.dry_min, min_mm_two_slots=spec.min_mm_two_slots,
+        spec.dry_min, onset_min_mm=spec.onset_min_mm,
     )
     assert [mm for _ts, mm in found] == [pytest.approx(mm) for _ts, mm in want]
 
@@ -238,7 +262,7 @@ def test_one_archive_read_serves_every_variant(tmp_path: Path) -> None:
     )
     for spec in sens.VARIANTS:
         derived = truth.onsets_for(
-            spec.dry_min, min_mm_two_slots=spec.min_mm_two_slots,
+            spec.dry_min, onset_min_mm=spec.onset_min_mm,
         )
         assert [ts for ts, _mm in derived["06180"]] == [
             at(i) for i in EXPECTED[spec.name]
@@ -382,7 +406,7 @@ def test_the_markdown_renders_the_numbers_it_was_given() -> None:
     format error discovered at the end of it costs the whole run.
     """
     cell = {
-        "variant": "V0", "dry_min": 30, "min_mm_two_slots": None,
+        "variant": "V0", "dry_min": 30, "onset_min_mm": None,
         "lead_min": 30, "threshold_pct": 40,
         "n_onsets": 40, "covered_onsets": 20, "uncovered_onsets": 15,
         "pending_onsets": 5, "onsets_per_station_day": 2.0,
@@ -395,7 +419,7 @@ def test_the_markdown_renders_the_numbers_it_was_given() -> None:
         "station_days": 10, "n_stations": 2,
     }
     other = dict(
-        cell, variant="V2", dry_min=60, min_mm_two_slots=0.2,
+        cell, variant="V2", dry_min=60, onset_min_mm=0.2,
         covered_onsets=9, onsets_per_station_day=0.9, misses=5,
         recall=0.444, precision=0.4, f1=0.42, shadowed_misses=2,
         shadow_share=0.4, recall_excl_shadowed=0.571,

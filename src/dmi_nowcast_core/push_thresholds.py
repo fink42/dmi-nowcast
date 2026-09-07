@@ -15,7 +15,8 @@ Shape, version 1::
      "objective": {"metric": "f1", "min_useful_lead_min": 5,
                    "plateau_frac": 0.95, "min_warnings": 30,
                    "rearm_after_min": 60, "persistence_obs": 1,
-                   "tolerance_min": 10, "dry_min": 30},
+                   "tolerance_min": 10, "dry_min": 60,
+                   "onset_min_mm": 0.2},
      "window": {"from": ..., "to": ..., "days": 62, "stations": 97,
                 "rows": 1841203},
      "fallback_threshold_pct": 40,
@@ -61,6 +62,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "DEFAULT_FALLBACK_THRESHOLD_PCT",
     "OBJECTIVE_SPEC",
+    "OBJECTIVE_OPTIONAL_SPEC",
     "WINDOW_SPEC",
     "LEAD_SPEC",
     "DEFAULT_MIN_DELTA_PCT",
@@ -92,6 +94,16 @@ OBJECTIVE_SPEC: dict[str, type] = {
     "persistence_obs": int,
     "tolerance_min": int,
     "dry_min": int,
+}
+
+#: ``objective`` keys checked when present and never required. The onset
+#: definition gained an amount rule on 2026-09-07 and the fit records it,
+#: but a table fitted before it must keep loading: making the key
+#: mandatory would drop every lead to ``fallback_threshold_pct`` between a
+#: deploy and the next nightly refit, which is a change to who gets warned
+#: made by a schema check rather than by a measurement.
+OBJECTIVE_OPTIONAL_SPEC: dict[str, type] = {
+    "onset_min_mm": float,
 }
 
 #: ``window``: the evidence the fit stands on.
@@ -147,12 +159,15 @@ def _is_iso(value: Any) -> bool:
 def _check_block(
     block: Any, spec: Mapping[str, type], where: str, problems: list[str],
     *, nullable: frozenset[str] = frozenset(),
+    optional: Mapping[str, type] | None = None,
 ) -> None:
     if not isinstance(block, dict):
         problems.append(f"{where}: expected an object, got {type(block).__name__}")
         return
-    for key, kind in spec.items():
+    for key, kind in {**spec, **(optional or {})}.items():
         if key not in block:
+            if optional and key in optional:
+                continue
             problems.append(f"{where}.{key}: missing")
             continue
         value = block[key]
@@ -216,7 +231,10 @@ def validate_thresholds(doc: Any) -> list[str]:
     if not _is_iso(doc.get("fitted_at_utc")):
         problems.append("fitted_at_utc: missing or not an ISO timestamp")
 
-    _check_block(doc.get("objective"), OBJECTIVE_SPEC, "objective", problems)
+    _check_block(
+        doc.get("objective"), OBJECTIVE_SPEC, "objective", problems,
+        optional=OBJECTIVE_OPTIONAL_SPEC,
+    )
     _check_block(doc.get("window"), WINDOW_SPEC, "window", problems)
 
     fallback = doc.get("fallback_threshold_pct")

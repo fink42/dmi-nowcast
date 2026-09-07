@@ -26,15 +26,35 @@ dry. DMI's "trace of precipitation" sentinel (a negative amount, see
 as 0.0 here and can only make a slot wet through the duration arm.
 
 **An onset** is the first wet slot after at least ``dry_min`` minutes
-(three slots at the default 30) of *known dry* slots. An unknown slot
+(six slots at the default 60) of *known dry* slots, and it counts only
+where rain actually arrived: the onset slot's depth plus the FOLLOWING
+slot's must reach ``onset_min_mm``, 0.2 mm by default. An unknown slot
 cannot certify dryness, so it resets the dry run rather than extending
-it: no onset is ever declared on the strength of missing data. The onset
-timestamp is the slot END, which is the only instant the gauge actually
-reports; the true first drop fell somewhere in the preceding 10 minutes,
-so the measured gap between a warning and its onset is overstated by up
-to 10 minutes and every lead error here is biased that far NEGATIVE (see
-the sign convention below — negative reads as "the warning was early").
-Stated once, here, rather than hidden in a correction factor.
+it: no onset is ever declared on the strength of missing data. A
+candidate that fails the amount test is dropped as an onset but still
+resets the dry run — it rained, so the slot after it is not the start of
+a new event either.
+
+The amount is summed over two slots because DMI's 10-minute bins cut a
+shower in half as often as not: 0.1 mm and then 0.4 mm is one event of
+0.5 mm rather than two drizzles. A depth the station never reported and
+DMI's trace sentinel alike contribute zero millimetres, so a
+duration-only slot can be wet and still fail the amount test.
+``onset_min_mm=0.0`` restores the rule that shipped before 2026-09-07,
+where the wet flag alone made an onset.
+
+The per-slot WET rule is untouched by this, deliberately: "is it raining
+in this slot" — what certifies a dry spell, and what
+:func:`raining_now_agreement` scores — is a different question from "did
+a rain event start here".
+
+The onset timestamp is the slot END, which is the only instant the gauge
+actually reports; the true first drop fell somewhere in the preceding
+10 minutes, so the measured gap between a warning and its onset is
+overstated by up to 10 minutes and every lead error here is biased that
+far NEGATIVE (see the sign convention below — negative reads as "the
+warning was early"). Stated once, here, rather than hidden in a
+correction factor.
 
 **Lead error sign**: ``lead_error_min = eta_min − (onset − sent)``, in
 minutes. POSITIVE means the rain arrived sooner than the notification
@@ -131,6 +151,7 @@ __all__ = [
     "PRECIP_PARAM",
     "PRECIP_DUR_PARAM",
     "DEFAULT_DRY_MIN",
+    "DEFAULT_ONSET_MIN_MM",
     "DEFAULT_LEAD_MIN",
     "DEFAULT_TOLERANCE_MIN",
     "DEFAULT_MIN_USEFUL_LEAD_MIN",
@@ -149,6 +170,7 @@ __all__ = [
     "DEFAULT_COVERAGE_GAP_MIN",
     "slot_end_of",
     "gauge_slots",
+    "gauge_slot_amounts",
     "onsets",
     "DEFAULT_GAUGE_PAD_MIN",
     "StationSlots",
@@ -177,8 +199,17 @@ PRECIP_PARAM = "precip_past10min"
 PRECIP_DUR_PARAM = "precip_dur_past10min"
 
 #: Minutes of known-dry slots that must precede a wet slot for it to be
-#: an onset (three slots at the 10-min cadence).
-DEFAULT_DRY_MIN = 30
+#: an onset (six slots at the 10-min cadence). Matched to the push rule's
+#: own 60-minute re-arm: a "new" rain event the rule could never have
+#: warned about a second time is not evidence about the forecast.
+DEFAULT_DRY_MIN = 60
+
+#: Millimetres an onset must deliver over the onset slot AND the one
+#: after it. Below this the gauge saw drizzle, and a scoreboard that
+#: counts drizzle as a rain event measures the gauge's sensitivity rather
+#: than the service's skill. ``0.0`` is the pre-2026-09-07 rule: the wet
+#: flag alone, whatever it weighed.
+DEFAULT_ONSET_MIN_MM = 0.2
 #: The live subscription's lead, and the grace period allowed on top of it.
 DEFAULT_LEAD_MIN = 30
 DEFAULT_TOLERANCE_MIN = 10
@@ -450,15 +481,15 @@ def _amount_mm(value: Any) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def gauge_slots(
+def gauge_slot_amounts(
     table: Any,
     station_id: str,
     *,
     start_utc: datetime | None = None,
     end_utc: datetime | None = None,
     slot_min: int = SLOT_MIN,
-) -> list[tuple[datetime, bool | None]]:
-    """One station's 10-min slots over a contiguous grid: ``(slot_end, wet)``.
+) -> list[tuple[datetime, bool | None, float | None]]:
+    """One station's slots as ``(slot_end, wet, mm)`` over a contiguous grid.
 
     ``table`` is what ``StationObsStore.read`` returns (columns
     ``station_id`` / ``observed_utc`` / ``parameter_id`` / ``value``), or
@@ -467,13 +498,20 @@ def gauge_slots(
     The result is a **contiguous** grid — every slot between the first and
     last covered instant appears exactly once, in order — because the
     onset rule counts consecutive dry slots and cannot do that over a list
-    with silent holes. A slot the station did not report is ``None``.
+    with silent holes. A slot the station did not report is unknown.
 
-    ``wet`` is ``True`` when either arm of the rule fires, ``False`` when
-    at least one arm reported and neither fired, and ``None`` when the
-    station reported neither parameter for that slot. A station that
+    ``wet`` is ``True`` when either arm of the wet rule fires, ``False``
+    when at least one arm reported and neither fired, and ``None`` when
+    the station reported neither parameter for that slot. A station that
     reports only the duration parameter is therefore still scoreable —
     unknown means *nothing was said*, not *one thing was missing*.
+
+    ``mm`` is the largest ``precip_past10min`` the station reported in the
+    slot, with DMI's trace sentinel folded to 0.0, and ``None`` where it
+    reported no amount at all. The onset rule reads the two the same way
+    (neither contributes millimetres), but they are different statements —
+    "the gauge weighed nothing" against "the gauge said nothing" — and
+    only this grid can tell them apart.
 
     ``start_utc`` / ``end_utc`` pin the grid (both inclusive, snapped to
     slot ends); by default it spans the station's own rows. Pin them when
@@ -483,15 +521,15 @@ def gauge_slots(
     if slot_min <= 0:
         raise ValueError("slot_min must be positive")
     wanted = str(station_id)
-    #: slot end → [amount arm fired?, duration arm fired?] merged over rows
-    seen: dict[datetime, bool] = {}
+    #: slot end → the largest usable reading of each parameter in it
+    amounts: dict[datetime, float] = {}
+    durations: dict[datetime, float] = {}
     for row in _rows_of(table):
         if str(row.get("station_id")) != wanted:
             continue
         observed = row.get("observed_utc")
         if observed is None:
             continue
-        slot = slot_end_of(_as_utc(observed, "observed_utc"), slot_min=slot_min)
         param = str(row.get("parameter_id"))
         if param not in (PRECIP_PARAM, PRECIP_DUR_PARAM):
             continue  # some other parameter rode along in the read
@@ -500,63 +538,155 @@ def gauge_slots(
             # Reported but unusable (null / NaN) — says nothing either way,
             # so it must not turn an unknown slot into a dry one.
             continue
-        fired = (
-            value >= WET_PRECIP_MM
-            if param == PRECIP_PARAM
-            else value >= WET_DUR_MIN
-        )
-        seen[slot] = seen.get(slot, False) or fired
+        slot = slot_end_of(_as_utc(observed, "observed_utc"), slot_min=slot_min)
+        target = amounts if param == PRECIP_PARAM else durations
+        previous = target.get(slot)
+        if previous is None or value > previous:
+            target[slot] = value
 
+    reported = amounts.keys() | durations.keys()
     if start_utc is not None:
         first = slot_end_of(start_utc, slot_min=slot_min)
-    elif seen:
-        first = min(seen)
+    elif reported:
+        first = min(reported)
     else:
         return []
     if end_utc is not None:
         last = slot_end_of(end_utc, slot_min=slot_min)
-    elif seen:
-        last = max(seen)
+    elif reported:
+        last = max(reported)
     else:
         return []
     if last < first:
         return []
 
     step = timedelta(minutes=slot_min)
-    out: list[tuple[datetime, bool | None]] = []
+    out: list[tuple[datetime, bool | None, float | None]] = []
     cursor = first
     while cursor <= last:
-        out.append((cursor, seen.get(cursor)))
+        mm = amounts.get(cursor)
+        dur = durations.get(cursor)
+        if mm is None and dur is None:
+            wet: bool | None = None
+        else:
+            wet = (mm is not None and mm >= WET_PRECIP_MM) or (
+                dur is not None and dur >= WET_DUR_MIN
+            )
+        out.append((cursor, wet, mm))
         cursor += step
     return out
 
 
+def gauge_slots(
+    table: Any,
+    station_id: str,
+    *,
+    start_utc: datetime | None = None,
+    end_utc: datetime | None = None,
+    slot_min: int = SLOT_MIN,
+) -> list[tuple[datetime, bool | None]]:
+    """:func:`gauge_slot_amounts` without the depths: ``(slot_end, wet)``.
+
+    The shape every consumer of the wet flag alone wants — the dry-run
+    detection, ``raining_now_agreement``, the "was it raining here" lookup.
+    A series in this shape cannot answer the onset rule's amount test, and
+    :func:`onsets` says so rather than reading a missing depth as zero.
+    """
+    return [
+        (slot, wet)
+        for slot, wet, _mm in gauge_slot_amounts(
+            table, station_id,
+            start_utc=start_utc, end_utc=end_utc, slot_min=slot_min,
+        )
+    ]
+
+
+def _depth(mm: Any) -> float:
+    """Millimetres a slot contributes to an onset amount.
+
+    A depth the station never reported contributes nothing — a
+    duration-only slot measured no depth — and so does DMI's trace
+    sentinel, which is "below 0.1 mm" and never a negative amount: summing
+    it would let a trace *subtract* from the shower it belongs to.
+    """
+    if mm is None:
+        return 0.0
+    try:
+        value = float(mm)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value < 0.0:
+        return 0.0
+    return value
+
+
+def _two_slot_mm(
+    rows: Sequence[Sequence[Any]], index: int, step: timedelta,
+) -> float:
+    """The onset slot's depth plus the following slot's.
+
+    The neighbour counts only when it really is the next slot: a series
+    that ends here, or one with a seam after it, contributes the onset
+    slot alone rather than reaching across a gap for millimetres that were
+    measured somewhere else entirely.
+    """
+    total = _depth(rows[index][2])
+    if index + 1 >= len(rows):
+        return total
+    here = _as_utc(rows[index][0], "slot end")
+    following = rows[index + 1]
+    if _as_utc(following[0], "slot end") - here == step:
+        total += _depth(following[2])
+    return total
+
+
 def onsets(
-    slots: Sequence[tuple[datetime, bool | None]],
+    slots: Sequence[Sequence[Any]],
     dry_min: int = DEFAULT_DRY_MIN,
     *,
+    onset_min_mm: float | None = DEFAULT_ONSET_MIN_MM,
     slot_min: int = SLOT_MIN,
 ) -> list[datetime]:
-    """Onset instants: the first wet slot after ``dry_min`` of known dry.
+    """Onset instants: a wet slot after ``dry_min`` dry, that delivered rain.
 
-    ``ceil(dry_min / slot_min)`` consecutive dry slots are required — three
-    at the defaults, and *exactly* three is enough. An unknown slot resets
+    ``ceil(dry_min / slot_min)`` consecutive dry slots are required — six
+    at the defaults, and *exactly* six is enough. An unknown slot resets
     the run (missing data never certifies a dry spell), and so does a gap
     in the grid, so a list stitched from two separate days cannot invent
     an onset across the seam.
+
+    ``onset_min_mm`` is then the amount test: the onset slot's depth plus
+    the following slot's must reach it, an unreported depth and a trace
+    sentinel alike counting as zero millimetres. A candidate that fails is
+    dropped but still resets the dry run — it rained, so the slot after it
+    is not the start of a new event either. ``0.0`` (or ``None``) is the
+    older rule, where the wet flag alone made an onset.
+
+    ``slots`` is :func:`gauge_slot_amounts`' ``(slot_end, wet, mm)``. The
+    two-element shape :func:`gauge_slots` returns carries no depths, so it
+    is accepted only with the amount test off: reading a missing depth as
+    zero would silently drop every onset instead.
 
     The first slots of a record can never be onsets: there is no evidence
     about what came before them. That is deliberate — it costs the odd
     genuine event at a window edge and buys the guarantee that every onset
     reported here is one the gauge actually witnessed starting.
     """
+    rows = [tuple(row) for row in slots]
+    floor = 0.0 if onset_min_mm is None else float(onset_min_mm)
+    if floor > 0.0 and any(len(row) < 3 for row in rows):
+        raise ValueError(
+            "onset_min_mm needs a slot series carrying millimetres: build it "
+            "with gauge_slot_amounts, or pass onset_min_mm=0.0",
+        )
     need = max(1, math.ceil(dry_min / slot_min))
     step = timedelta(minutes=slot_min)
     out: list[datetime] = []
     dry_run = 0
     previous: datetime | None = None
-    for ts, wet in slots:
-        ts = _as_utc(ts, "slot end")
+    for index, row in enumerate(rows):
+        ts = _as_utc(row[0], "slot end")
+        wet = row[1]
         if previous is not None and ts - previous != step:
             dry_run = 0  # a hole in the grid is not a dry spell
         previous = ts
@@ -564,7 +694,9 @@ def onsets(
             dry_run = 0
             continue
         if wet:
-            if dry_run >= need:
+            if dry_run >= need and (
+                floor <= 0.0 or _two_slot_mm(rows, index, step) >= floor
+            ):
                 out.append(ts)
             dry_run = 0
         else:
@@ -592,7 +724,8 @@ def onsets(
 # * a slot nobody reported is UNKNOWN, and unknown is never dry;
 # * an onset is a wet slot preceded by ``ceil(dry_min / slot_min)``
 #   consecutive KNOWN DRY slots, counted by boolean run length rather
-#   than by a running counter.
+#   than by a running counter, and delivering ``onset_min_mm`` over
+#   itself and the slot after it.
 #
 # The grid is built ONCE over the whole window rather than per month, and
 # that is not merely faster, it is exactly what the month-by-month callers
@@ -730,7 +863,7 @@ class StationSlots:
         self,
         dry_min: int = DEFAULT_DRY_MIN,
         *,
-        min_mm_two_slots: float | None = None,
+        onset_min_mm: float | None = DEFAULT_ONSET_MIN_MM,
     ) -> list[tuple[datetime, float]]:
         """``[(onset, mm over the onset slot and the next)]``.
 
@@ -740,11 +873,12 @@ class StationSlots:
         the counter the reference carries is the run length ending at
         *i − 1*, and that is a maximum-accumulate away.
 
-        ``min_mm_two_slots`` is the variant analyses' amount test: the
-        onset slot's depth plus the following slot's must reach it, with
-        an unreported depth and a trace sentinel alike contributing zero.
-        A candidate that fails still resets the dry run, which happens for
-        free — every wet slot does, tested or not.
+        ``onset_min_mm`` is the amount test: the onset slot's depth plus
+        the following slot's must reach it, with an unreported depth and a
+        trace sentinel alike contributing zero. A candidate that fails
+        still resets the dry run, which happens for free — every wet slot
+        does, tested or not. ``0.0`` (or ``None``) is the older rule,
+        where the wet flag alone made an onset.
         """
         import numpy as np
 
@@ -766,8 +900,9 @@ class StationSlots:
         depth = np.nan_to_num(self.mm, nan=0.0, posinf=0.0, neginf=0.0)
         two = depth.astype(np.float64)
         two[:-1] += depth[1:]
-        if min_mm_two_slots is not None:
-            candidate = candidate & (two >= float(min_mm_two_slots))
+        floor = 0.0 if onset_min_mm is None else float(onset_min_mm)
+        if floor > 0.0:
+            candidate = candidate & (two >= floor)
         found = np.flatnonzero(candidate)
         return [
             (
@@ -781,12 +916,12 @@ class StationSlots:
         self,
         dry_min: int = DEFAULT_DRY_MIN,
         *,
-        min_mm_two_slots: float | None = None,
+        onset_min_mm: float | None = DEFAULT_ONSET_MIN_MM,
     ) -> list[datetime]:
         """The onset instants alone — :func:`onsets` over this grid."""
         return [
             instant for instant, _mm
-            in self.onsets_with_amounts(dry_min, min_mm_two_slots=min_mm_two_slots)
+            in self.onsets_with_amounts(dry_min, onset_min_mm=onset_min_mm)
         ]
 
 
@@ -821,7 +956,7 @@ class GaugeTruth:
         self,
         dry_min: int = DEFAULT_DRY_MIN,
         *,
-        min_mm_two_slots: float | None = None,
+        onset_min_mm: float | None = DEFAULT_ONSET_MIN_MM,
     ) -> dict[str, list[tuple[datetime, float]]]:
         """Every station's onsets under one alternative definition.
 
@@ -830,7 +965,7 @@ class GaugeTruth:
         """
         return {
             station: series.onsets_with_amounts(
-                dry_min, min_mm_two_slots=min_mm_two_slots,
+                dry_min, onset_min_mm=onset_min_mm,
             )
             for station, series in self.series.items()
         }
@@ -937,7 +1072,7 @@ def gauge_truth_vectorised(
     wet_mm: float = WET_PRECIP_MM,
     wet_dur_min: float = WET_DUR_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
-    min_mm_two_slots: float | None = None,
+    onset_min_mm: float | None = DEFAULT_ONSET_MIN_MM,
     slot_min: int = SLOT_MIN,
     pad_min: int = DEFAULT_GAUGE_PAD_MIN,
     log=None,
@@ -958,8 +1093,11 @@ def gauge_truth_vectorised(
     stations that actually reported, which is the test the callers use to
     decide whether a station can verify anything at all.
 
-    Identical in result to ``gauge_slots`` + ``onsets`` per station per
-    month, and about a thousand times faster; the equality is asserted
+    ``dry_min`` / ``onset_min_mm`` are the onset definition, exactly as
+    :func:`onsets` reads them.
+
+    Identical in result to ``gauge_slot_amounts`` + ``onsets`` per station
+    per month, and about a thousand times faster; the equality is asserted
     against the reference implementation in the tests, on hand-made series
     and on a real month of the archive.
     """
@@ -1051,7 +1189,7 @@ def gauge_truth_vectorised(
         )
         truth_series[station] = series
         onsets_by_station[station] = series.onsets(
-            dry_min, min_mm_two_slots=min_mm_two_slots,
+            dry_min, onset_min_mm=onset_min_mm,
         )
         last = series.known_until()
         if last is not None:
@@ -1270,6 +1408,7 @@ def score_warnings(
     lead_min: int = DEFAULT_LEAD_MIN,
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
+    onset_min_mm: float | None = DEFAULT_ONSET_MIN_MM,
     known_until: datetime | None = None,
     coverage: Sequence[tuple[datetime, datetime]] | None = None,
     min_useful_lead_min: float = DEFAULT_MIN_USEFUL_LEAD_MIN,
@@ -1321,9 +1460,9 @@ def score_warnings(
     counting it as a hit would hide exactly the spam this scoring exists
     to detect.
 
-    ``dry_min`` takes no part in the matching — the onsets arrive already
-    computed. It is carried into the summary so a stored result records
-    the onset definition it was produced under.
+    ``dry_min`` and ``onset_min_mm`` take no part in the matching — the
+    onsets arrive already computed. They are carried into the summary so a
+    stored result records the onset definition it was produced under.
     """
     window = timedelta(minutes=lead_min + tolerance_min)
     grace = timedelta(minutes=tolerance_min)
@@ -1439,6 +1578,7 @@ def score_warnings(
         "lead_min": int(lead_min),
         "tolerance_min": int(tolerance_min),
         "dry_min": int(dry_min),
+        "onset_min_mm": 0.0 if onset_min_mm is None else float(onset_min_mm),
         "min_useful_lead_min": float(min_useful_lead_min),
         "known_until": horizon,
         "coverage_runs": 0 if runs is None else len(runs),
@@ -1556,8 +1696,7 @@ def _skill(hits: int, misses: int, false_alarms: int, correct_neg: int) -> dict:
 
 def raining_now_agreement(
     rows: Iterable[Mapping[str, Any]],
-    slots_by_station: Mapping[str, Sequence[tuple[datetime, bool | None]]]
-    | None = None,
+    slots_by_station: Mapping[str, Sequence[Sequence[Any]]] | None = None,
     *,
     threshold_mm_h: float = 0.5,
     slot_min: int = SLOT_MIN,
@@ -1585,8 +1724,10 @@ def raining_now_agreement(
     """
     lookup: dict[str, dict[datetime, bool | None]] = {}
     for station, slots in (slots_by_station or {}).items():
+        # ``(slot_end, wet)`` or ``(slot_end, wet, mm)``: the depth is the
+        # onset rule's business, and this only ever asks the wet flag.
         lookup[str(station)] = {
-            _as_utc(ts, "slot end"): wet for ts, wet in slots
+            _as_utc(row[0], "slot end"): row[1] for row in slots
         }
 
     counts = {

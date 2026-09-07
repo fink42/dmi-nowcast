@@ -1,6 +1,6 @@
 """The vectorised gauge-truth load must equal the reference, exactly.
 
-``warning_score.gauge_slots`` + ``warning_score.onsets`` are the
+``warning_score.gauge_slot_amounts`` + ``warning_score.onsets`` are the
 definition of a wet slot and of an onset. ``gauge_truth_vectorised`` is a
 numpy rewrite of the loop that three consumers ran over them, and the
 only thing that makes the rewrite safe is that it is checked against the
@@ -27,9 +27,11 @@ from dmi_nowcast_core.station_store import StationObsStore
 from dmi_nowcast_core.warning_score import (
     DEFAULT_DRY_MIN,
     DEFAULT_GAUGE_PAD_MIN,
+    DEFAULT_ONSET_MIN_MM,
     PRECIP_DUR_PARAM,
     PRECIP_PARAM,
     SLOT_MIN,
+    gauge_slot_amounts,
     gauge_slots,
     gauge_truth_vectorised,
     onsets,
@@ -60,6 +62,7 @@ def reference_truth(
     end: datetime,
     *,
     dry_min: int = DEFAULT_DRY_MIN,
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
 ) -> tuple[dict[str, list[datetime]], dict[str, datetime], int, dict]:
     """``threshold_sweep.gauge_truth`` / ``quality_report._gauge_truth``.
 
@@ -83,13 +86,15 @@ def reference_truth(
             [PRECIP_PARAM, PRECIP_DUR_PARAM], list(stations),
         )
         for station in stations:
-            slots = gauge_slots(
+            slots = gauge_slot_amounts(
                 table, station, start_utc=month_start, end_utc=month_end,
             )
             if not slots:
                 continue
-            onset_sets.setdefault(station, set()).update(onsets(slots, dry_min))
-            for stamp, wet in slots:
+            onset_sets.setdefault(station, set()).update(
+                onsets(slots, dry_min, onset_min_mm=onset_min_mm),
+            )
+            for stamp, wet, _mm in slots:
                 if wet is None:
                     continue
                 known_slots += 1
@@ -105,12 +110,19 @@ def reference_truth(
     )
 
 
-def assert_same(root, stations, start, end, *, dry_min=DEFAULT_DRY_MIN):
+def assert_same(
+    root, stations, start, end,
+    *, dry_min=DEFAULT_DRY_MIN, onset_min_mm=DEFAULT_ONSET_MIN_MM,
+):
     """Both implementations, every field compared."""
     want_onsets, want_known, want_slots, want_wet = reference_truth(
-        root, stations, start, end, dry_min=dry_min,
+        root, stations, start, end,
+        dry_min=dry_min, onset_min_mm=onset_min_mm,
     )
-    truth = gauge_truth_vectorised(root, start, end, stations, dry_min=dry_min)
+    truth = gauge_truth_vectorised(
+        root, start, end, stations,
+        dry_min=dry_min, onset_min_mm=onset_min_mm,
+    )
     for station in stations:
         assert truth.onsets[station] == want_onsets.get(station, []), station
     assert truth.known_until == want_known
@@ -143,6 +155,8 @@ def _slot(n: int, base: datetime = DAY) -> datetime:
 
 
 def test_a_plain_dry_spell_then_rain_is_one_onset(tmp_path: Path) -> None:
+    # Six dry slots and 0.4 mm: an onset under the shipped defaults, which
+    # is what this case is pinned on.
     rows = [obs("06074", _slot(n), value=0.0) for n in range(6)]
     rows.append(obs("06074", _slot(6), value=0.4))
     write(tmp_path, rows)
@@ -152,13 +166,30 @@ def test_a_plain_dry_spell_then_rain_is_one_onset(tmp_path: Path) -> None:
     assert truth.onsets["06074"] == [_slot(6)]
 
 
+def test_rain_that_never_delivers_is_not_an_onset(tmp_path: Path) -> None:
+    """The same shape, drizzling: 0.1 mm and then nothing more."""
+    rows = [obs("06074", _slot(n), value=0.0) for n in range(6)]
+    rows.append(obs("06074", _slot(6), value=0.1))
+    rows.append(obs("06074", _slot(7), value=0.0))
+    write(tmp_path, rows)
+    truth = assert_same(tmp_path, ["06074"], DAY, DAY + timedelta(hours=2))
+    assert truth.onsets["06074"] == []
+    # …and it is the amount rule that dropped it, not the dry run.
+    loose = assert_same(
+        tmp_path, ["06074"], DAY, DAY + timedelta(hours=2), onset_min_mm=0.0,
+    )
+    assert loose.onsets["06074"] == [_slot(6)]
+
+
 def test_an_unreported_slot_never_certifies_a_dry_spell(tmp_path: Path) -> None:
     # Slots 0,1 dry, slot 2 missing, slot 3 dry, slot 4 wet: only two known
     # dry slots stand behind the rain, so it is not an onset.
     rows = [obs("06074", _slot(n), value=0.0) for n in (0, 1, 3)]
     rows.append(obs("06074", _slot(4), value=1.0))
     write(tmp_path, rows)
-    truth = assert_same(tmp_path, ["06074"], DAY, DAY + timedelta(hours=2))
+    truth = assert_same(
+        tmp_path, ["06074"], DAY, DAY + timedelta(hours=2), dry_min=30,
+    )
     assert truth.onsets["06074"] == []
 
 
@@ -171,7 +202,9 @@ def test_the_trace_sentinel_is_below_the_threshold_not_a_negative_depth(
     rows.append(obs("06074", _slot(4), value=0.2))
     rows.append(obs("06074", _slot(5), value=0.3))
     write(tmp_path, rows)
-    truth = assert_same(tmp_path, ["06074"], DAY, DAY + timedelta(hours=2))
+    truth = assert_same(
+        tmp_path, ["06074"], DAY, DAY + timedelta(hours=2), dry_min=30,
+    )
     assert truth.onsets["06074"] == [_slot(4)]
     series = truth.series["06074"]
     assert series.wet_at(_slot(0)) is False
@@ -184,7 +217,9 @@ def test_two_readings_in_one_slot_take_the_larger(tmp_path: Path) -> None:
     rows.append(obs("06074", _slot(4) - timedelta(minutes=9), value=0.0))
     rows.append(obs("06074", _slot(4) - timedelta(minutes=5), value=0.6))
     write(tmp_path, rows)
-    truth = assert_same(tmp_path, ["06074"], DAY, DAY + timedelta(hours=2))
+    truth = assert_same(
+        tmp_path, ["06074"], DAY, DAY + timedelta(hours=2), dry_min=30,
+    )
     assert truth.onsets["06074"] == [_slot(4)]
 
 
@@ -194,12 +229,16 @@ def test_the_duration_arm_alone_makes_a_slot_wet_and_known(
     rows = [obs("06074", _slot(n), PRECIP_DUR_PARAM, 0.0) for n in range(4)]
     rows.append(obs("06074", _slot(4), PRECIP_DUR_PARAM, 2.0))
     write(tmp_path, rows)
-    truth = assert_same(tmp_path, ["06074"], DAY, DAY + timedelta(hours=2))
+    truth = assert_same(
+        tmp_path, ["06074"], DAY, DAY + timedelta(hours=2),
+        dry_min=30, onset_min_mm=0.0,
+    )
     assert truth.onsets["06074"] == [_slot(4)]
     # No amount was ever reported, so the depth stays unknown — which the
-    # amount test reads as zero millimetres, not as evidence of rain.
+    # amount test reads as zero millimetres, not as evidence of rain. Under
+    # the shipped floor this wet slot is therefore not an onset at all.
     series = truth.series["06074"]
-    assert series.onsets_with_amounts(30, min_mm_two_slots=0.2) == []
+    assert series.onsets_with_amounts(30, onset_min_mm=0.2) == []
 
 
 def test_a_slot_end_exactly_on_the_boundary_stays_in_its_own_slot(
@@ -210,7 +249,9 @@ def test_a_slot_end_exactly_on_the_boundary_stays_in_its_own_slot(
     rows.append(obs("06074", _slot(4), value=0.9))
     rows.append(obs("06074", _slot(4) + timedelta(seconds=1), value=0.0))
     write(tmp_path, rows)
-    truth = assert_same(tmp_path, ["06074"], DAY, DAY + timedelta(hours=2))
+    truth = assert_same(
+        tmp_path, ["06074"], DAY, DAY + timedelta(hours=2), dry_min=30,
+    )
     assert truth.onsets["06074"] == [_slot(4)]
 
 
@@ -229,6 +270,7 @@ def test_an_onset_across_a_month_boundary_is_found_once(tmp_path: Path) -> None:
     truth = assert_same(
         tmp_path, ["06074"],
         boundary - timedelta(days=1), boundary + timedelta(days=1),
+        dry_min=30,
     )
     assert truth.onsets["06074"] == [boundary + timedelta(minutes=SLOT_MIN)]
 
@@ -244,6 +286,7 @@ def test_several_stations_never_borrow_each_others_slots(
     write(tmp_path, rows)
     truth = assert_same(
         tmp_path, ["06074", "06079"], DAY, DAY + timedelta(hours=2),
+        dry_min=30,
     )
     assert truth.onsets["06074"] == [_slot(4)]
     # 06079 rained through the whole record: no dry spell, no onset.
@@ -273,9 +316,10 @@ def test_a_missing_partition_is_not_an_error(tmp_path: Path) -> None:
     assert truth.known_slots == 0
 
 
+@pytest.mark.parametrize("onset_min_mm", [0.0, 0.2, 0.5])
 @pytest.mark.parametrize("dry_min", [10, 30, 60, 120])
 def test_every_dry_spell_length_matches_the_reference(
-    tmp_path: Path, dry_min: int,
+    tmp_path: Path, dry_min: int, onset_min_mm: float,
 ) -> None:
     rng = random.Random(4 + dry_min)
     rows = []
@@ -297,7 +341,8 @@ def test_every_dry_spell_length_matches_the_reference(
             rows.append(obs("06074", _slot(n), PRECIP_DUR_PARAM, minutes))
     write(tmp_path, rows)
     truth = assert_same(
-        tmp_path, ["06074"], DAY, DAY + timedelta(days=3), dry_min=dry_min,
+        tmp_path, ["06074"], DAY, DAY + timedelta(days=3),
+        dry_min=dry_min, onset_min_mm=onset_min_mm,
     )
     assert truth.onsets["06074"], "the fixture should produce some onsets"
 
@@ -335,7 +380,15 @@ def test_a_random_month_of_several_stations_matches_the_reference(
     truth = assert_same(
         tmp_path, stations, base, base + timedelta(days=8),
     )
-    assert sum(len(v) for v in truth.onsets.values()) > 10
+    strict = sum(len(v) for v in truth.onsets.values())
+    assert strict > 5, "the fixture should produce onsets under the shipped rule"
+    # The same archive under the rule that shipped before the amount test:
+    # strictly more onsets, and the two implementations agree on both.
+    loose = assert_same(
+        tmp_path, stations, base, base + timedelta(days=8),
+        dry_min=30, onset_min_mm=0.0,
+    )
+    assert sum(len(v) for v in loose.onsets.values()) > strict
 
 
 def test_an_alternative_onset_definition_costs_no_second_read(
@@ -364,9 +417,9 @@ def test_an_alternative_onset_definition_costs_no_second_read(
         for floor in (None, 0.2, 0.5):
             fresh = gauge_truth_vectorised(
                 tmp_path, start, end, ["06074"],
-                dry_min=dry_min, min_mm_two_slots=floor,
+                dry_min=dry_min, onset_min_mm=floor,
             )
-            again = truth.onsets_for(dry_min, min_mm_two_slots=floor)
+            again = truth.onsets_for(dry_min, onset_min_mm=floor)
             assert [t for t, _mm in again["06074"]] == fresh.onsets["06074"]
 
 
@@ -380,8 +433,8 @@ def test_the_amount_test_spans_the_onset_slot_and_the_next(
     truth = gauge_truth_vectorised(tmp_path, DAY, DAY + timedelta(hours=2), ["06074"])
     series = truth.series["06074"]
     assert [t for t, _mm in series.onsets_with_amounts(30)] == [_slot(4)]
-    assert series.onsets_with_amounts(30, min_mm_two_slots=0.4) != []
-    assert series.onsets_with_amounts(30, min_mm_two_slots=0.5) == []
+    assert series.onsets_with_amounts(30, onset_min_mm=0.4) != []
+    assert series.onsets_with_amounts(30, onset_min_mm=0.5) == []
 
 
 def test_a_failed_amount_test_still_resets_the_dry_run(tmp_path: Path) -> None:
@@ -392,11 +445,13 @@ def test_a_failed_amount_test_still_resets_the_dry_run(tmp_path: Path) -> None:
     write(tmp_path, rows)
     truth = gauge_truth_vectorised(tmp_path, DAY, DAY + timedelta(hours=2), ["06074"])
     series = truth.series["06074"]
-    # Without the amount test the first slot is the onset; with it, the
-    # candidate is dropped AND the second slot is not promoted, because the
-    # dry run behind it is zero.
-    assert [t for t, _mm in series.onsets_with_amounts(30)] == [_slot(4)]
-    assert series.onsets_with_amounts(30, min_mm_two_slots=2.5) == []
+    # Without the amount test the first slot is the onset; with a floor it
+    # cannot reach, the candidate is dropped AND the second slot is not
+    # promoted, because the dry run behind it is zero.
+    assert [t for t, _mm in series.onsets_with_amounts(30, onset_min_mm=0.0)] == [
+        _slot(4),
+    ]
+    assert series.onsets_with_amounts(30, onset_min_mm=2.5) == []
 
 
 def test_the_slot_list_matches_the_reference_grid(tmp_path: Path) -> None:

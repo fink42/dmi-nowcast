@@ -130,15 +130,16 @@ from dmi_nowcast_core.probabilistic import run_ensemble  # noqa: E402
 from dmi_nowcast_core.transform import dbz_to_rain_rate  # noqa: E402
 from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_DRY_MIN,
+    DEFAULT_ONSET_MIN_MM,
     DEFAULT_TOLERANCE_MIN,
     PRECIP_DUR_PARAM,
     PRECIP_PARAM,
     ScoreResult,
     align_decision_table,
-    decision_schema,
+    decision_schema,  # noqa: F401 — re-exported for the replay tests
     decision_table,
     coverage_runs,
-    gauge_slots,
+    gauge_slot_amounts,
     onsets,
     per_lead_columns,
     pooled_summary,
@@ -713,12 +714,16 @@ def day_slots(
     station_ids: Sequence[str],
     *,
     pad_min: int = GAUGE_PAD_MIN,
-) -> dict[str, list[tuple[datetime, bool | None]]]:
+) -> dict[str, list[tuple[datetime, bool | None, float | None]]]:
     """Gauge slots for one day ± ``pad_min``, per station.
 
+    ``(slot_end, wet, mm)``: the depth rides along because the onset rule
+    asks the onset slot and the one after it for millimetres, and a grid
+    of bare wet flags cannot answer that.
+
     The pad is what lets a 23:5x warning find its onset after midnight,
-    and what gives the first slots of the day the three dry slots the
-    onset rule needs behind them.
+    and what gives the first slots of the day the dry slots the onset rule
+    needs behind them.
     """
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) - timedelta(
         minutes=pad_min
@@ -728,33 +733,40 @@ def day_slots(
         start, end, [PRECIP_PARAM, PRECIP_DUR_PARAM], list(station_ids),
     )
     return {
-        sid: gauge_slots(table, sid, start_utc=start, end_utc=end)
+        sid: gauge_slot_amounts(table, sid, start_utc=start, end_utc=end)
         for sid in station_ids
     }
 
 
 def merge_slots(
-    into: dict[str, dict[datetime, bool | None]],
-    add: dict[str, list[tuple[datetime, bool | None]]],
+    into: dict[str, dict[datetime, tuple[bool | None, float | None]]],
+    add: dict[str, list[tuple[datetime, bool | None, float | None]]],
 ) -> None:
     """Union day windows, preferring a determined value over ``None``."""
     for sid, slots in add.items():
         target = into.setdefault(sid, {})
-        for ts, wet in slots:
+        for ts, wet, mm in slots:
             if wet is not None or ts not in target:
-                target[ts] = wet
+                target[ts] = (wet, mm)
 
 
 def score(
     decisions: Sequence[dict],
-    slots_by_day: Sequence[dict[str, list[tuple[datetime, bool | None]]]],
+    slots_by_day: Sequence[
+        dict[str, list[tuple[datetime, bool | None, float | None]]]
+    ],
     points: Sequence[StationPoint],
     *,
     lead_min: int,
     tolerance_min: int,
     dry_min: int,
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
     threshold_mm_h: float,
-) -> tuple[dict[str, ScoreResult], dict[str, list[tuple[datetime, bool | None]]], dict]:
+) -> tuple[
+    dict[str, ScoreResult],
+    dict[str, list[tuple[datetime, bool | None, float | None]]],
+    dict,
+]:
     """Per-station scores, the merged slot grid, and the pooled agreement.
 
     Onsets are computed per day window and then **deduplicated by instant**
@@ -764,13 +776,16 @@ def score(
     onset_by_station: dict[str, set[datetime]] = {p.id: set() for p in points}
     for window in slots_by_day:
         for sid, slots in window.items():
-            onset_by_station.setdefault(sid, set()).update(onsets(slots, dry_min))
+            onset_by_station.setdefault(sid, set()).update(
+                onsets(slots, dry_min, onset_min_mm=onset_min_mm),
+            )
 
-    merged: dict[str, dict[datetime, bool | None]] = {}
+    merged: dict[str, dict[datetime, tuple[bool | None, float | None]]] = {}
     for window in slots_by_day:
         merge_slots(merged, window)
     slot_lists = {
-        sid: sorted(grid.items()) for sid, grid in merged.items()
+        sid: [(ts, wet, mm) for ts, (wet, mm) in sorted(grid.items())]
+        for sid, grid in merged.items()
     }
 
     warnings_by_station: dict[str, list[tuple[datetime, float | None]]] = {
@@ -805,7 +820,7 @@ def score(
     # replay run as much as it does live.
     known_until = {
         sid: max(
-            (ts for ts, wet in slots if wet is not None),
+            (ts for ts, wet, _mm in slots if wet is not None),
             default=None,
         )
         for sid, slots in slot_lists.items()
@@ -817,6 +832,7 @@ def score(
             lead_min=lead_min,
             tolerance_min=tolerance_min,
             dry_min=dry_min,
+            onset_min_mm=onset_min_mm,
             known_until=known_until.get(sid),
             coverage=coverage_by_station.get(sid),
         )
@@ -878,6 +894,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--end-utc", help="clip each day at HH:MM (inclusive)")
     p.add_argument("--tolerance-min", type=int, default=DEFAULT_TOLERANCE_MIN)
     p.add_argument("--dry-min", type=int, default=DEFAULT_DRY_MIN)
+    p.add_argument("--onset-min-mm", type=float, default=DEFAULT_ONSET_MIN_MM,
+                   help="millimetres an onset must deliver over the onset "
+                        "slot and the one after it; 0 counts every wet slot "
+                        "after a dry spell")
     p.add_argument("--ensemble-size", type=int, default=ENSEMBLE_SIZE)
     p.add_argument("--cascade-levels", type=int, default=N_CASCADE_LEVELS)
     p.add_argument("--downsample-factor", type=int, default=DOWNSAMPLE_FACTOR)
@@ -1056,7 +1076,7 @@ def _score_and_write(
             windows.append({})
             print(f"gauge read failed for {d}: {exc}", file=sys.stderr)
     n_known = sum(
-        1 for w in windows for slots in w.values() for _, wet in slots
+        1 for w in windows for slots in w.values() for _ts, wet, _mm in slots
         if wet is not None
     )
     if n_known == 0:
@@ -1070,6 +1090,7 @@ def _score_and_write(
         lead_min=int(rules["lead_min"]),
         tolerance_min=int(args.tolerance_min),
         dry_min=int(args.dry_min),
+        onset_min_mm=float(args.onset_min_mm),
         threshold_mm_h=float(rules["raining_now_mm_h"]),
     )
     events = [
@@ -1108,7 +1129,8 @@ def _score_and_write(
             "region": point.region,
             "n_rows": len(rows),
             "n_slots_known": sum(
-                1 for _, wet in slot_lists.get(point.id, ()) if wet is not None
+                1 for _ts, wet, _mm in slot_lists.get(point.id, ())
+                if wet is not None
             ),
             "warnings": res.summary,
             "raining_now": raining_now_agreement(
@@ -1120,11 +1142,12 @@ def _score_and_write(
         "gauge": {
             "available": True,
             "dry_min": int(args.dry_min),
+            "onset_min_mm": float(args.onset_min_mm),
             "tolerance_min": int(args.tolerance_min),
             "n_known_slots": n_known,
             "n_stations_with_obs": sum(
                 1 for sid in slot_lists
-                if any(w is not None for _, w in slot_lists[sid])
+                if any(row[1] is not None for row in slot_lists[sid])
             ),
         },
         "pooled": {
@@ -1133,6 +1156,7 @@ def _score_and_write(
                 lead_min=int(rules["lead_min"]),
                 tolerance_min=int(args.tolerance_min),
                 dry_min=int(args.dry_min),
+                onset_min_mm=float(args.onset_min_mm),
             ),
             "raining_now": agreement,
         },

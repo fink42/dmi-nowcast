@@ -57,6 +57,7 @@ from dmi_nowcast_core.push_thresholds import (  # noqa: E402
 from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
+    DEFAULT_ONSET_MIN_MM,
     DEFAULT_PRODUCT_LEADS_MIN,
     DEFAULT_TOLERANCE_MIN,
 )
@@ -108,7 +109,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rearm-after-min", type=int, default=60)
     p.add_argument("--persistence-obs", type=int, default=1)
     p.add_argument("--tolerance-min", type=int, default=DEFAULT_TOLERANCE_MIN)
-    p.add_argument("--dry-min", type=int, default=DEFAULT_DRY_MIN)
+    p.add_argument("--dry-min", type=int, default=DEFAULT_DRY_MIN,
+                   help="minutes of known-dry gauge slots before a wet slot "
+                        "can be an onset")
+    p.add_argument("--onset-min-mm", type=float, default=DEFAULT_ONSET_MIN_MM,
+                   help="millimetres an onset must deliver over the onset "
+                        "slot and the one after it; 0 scores every wet slot "
+                        "after a dry spell, drizzle included")
     p.add_argument("--coverage-gap-min", type=int,
                    default=DEFAULT_COVERAGE_GAP_MIN,
                    help="a longer gap between frames ends a coverage run and "
@@ -206,6 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         persistence_obs=int(args.persistence_obs),
         tolerance_min=int(args.tolerance_min),
         dry_min=int(args.dry_min),
+        onset_min_mm=float(args.onset_min_mm),
         coverage_gap_min=int(args.coverage_gap_min),
         far_cap=float(args.far_cap),
         min_useful_lead_min=float(args.min_useful_lead_min),

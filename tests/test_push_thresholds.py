@@ -68,7 +68,8 @@ def _doc(**overrides) -> dict:
             "rearm_after_min": 60,
             "persistence_obs": 1,
             "tolerance_min": 10,
-            "dry_min": 30,
+            "dry_min": 60,
+            "onset_min_mm": 0.2,
         },
         "window": {
             "from": "2026-07-01T00:00:00+00:00",
@@ -101,6 +102,25 @@ def _doc(**overrides) -> dict:
 class TestValidator:
     def test_a_well_formed_document_has_no_problems(self) -> None:
         assert validate_thresholds(_doc()) == []
+
+    def test_an_objective_fitted_before_the_amount_rule_still_loads(self) -> None:
+        """The onset amount is recorded, not required.
+
+        A table fitted before ``onset_min_mm`` existed must keep loading:
+        rejecting it would drop every lead to the fallback between a
+        deploy and the next nightly refit — a change to who gets warned,
+        made by a schema check rather than by a measurement.
+        """
+        doc = _doc()
+        objective = dict(doc["objective"])
+        objective.pop("onset_min_mm")
+        assert validate_thresholds(_doc(objective=objective)) == []
+        # Present but nonsense is still a problem.
+        assert any(
+            "onset_min_mm" in problem for problem in validate_thresholds(
+                _doc(objective={**objective, "onset_min_mm": "lots"}),
+            )
+        )
 
     def test_a_wrong_version_is_a_problem(self) -> None:
         problems = validate_thresholds(_doc(schema_version=2))

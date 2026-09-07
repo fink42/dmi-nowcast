@@ -244,6 +244,9 @@ def test_quality_report_threshold_fit_is_off_by_default(
     assert (fit.min_warnings, fit.min_delta_pct) == (30, 5)
     assert fit.min_useful_lead_min == 5.0
     assert fit.thresholds_out is None
+    # The onset definition the fit scores against, defaulted to the
+    # shipped rule rather than restated here.
+    assert (fit.dry_min, fit.onset_min_mm) == (60, 0.2)
 
 
 def test_push_quiet_hours_must_be_hhmm(tmp_path: Path) -> None:

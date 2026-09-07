@@ -502,7 +502,7 @@ def write_thresholds(path: Path, **overrides) -> Path:
         "objective": {
             "metric": "f1", "min_useful_lead_min": 5.0, "plateau_frac": 0.95,
             "min_warnings": 30, "rearm_after_min": 60, "persistence_obs": 1,
-            "tolerance_min": 10, "dry_min": 30,
+            "tolerance_min": 10, "dry_min": 60, "onset_min_mm": 0.2,
         },
         "window": {
             "from": "2026-07-01T00:00:00+00:00",
@@ -820,7 +820,11 @@ class TestFullReport:
         assert methods["subscriber_rule"]["threshold_pct"] == 40
         assert methods["subscriber_rule"]["lead_min"] == 30
         assert "0.1 mm" in methods["gauge_wet_rule"]
-        assert "30 minutes of known-dry" in methods["onset_rule"]
+        # The onset rule, both halves: the dry spell and the amount.
+        assert methods["onset_rule"].startswith(
+            "first wet slot after ≥ 60 dry min, with ≥ 0.2 mm over that "
+            "slot and the next",
+        )
         # The two truths are two different claims and must be named as such.
         assert methods["reliability_probability"] == (
             "radar: calibrated out-of-sample, leave-one-month-out CV; "

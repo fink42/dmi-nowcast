@@ -100,6 +100,7 @@ from .warning_score import (
     DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
     DEFAULT_LEAD_MIN,
+    DEFAULT_ONSET_MIN_MM,
     DEFAULT_TOLERANCE_MIN,
     SLOT_MIN,
     WET_DUR_MIN,
@@ -221,6 +222,8 @@ class QualityInputs:
     lead_min: int = DEFAULT_LEAD_MIN
     tolerance_min: int = DEFAULT_TOLERANCE_MIN
     dry_min: int = DEFAULT_DRY_MIN
+    #: Millimetres an onset must deliver over its own slot and the next.
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM
     raining_now_mm_h: float = 0.5
     #: The longest gap between consecutive decision rows that still counts
     #: as continuous coverage (two radar cycles).
@@ -918,6 +921,7 @@ def _gauge_truth(
     needed: set[tuple[str, datetime]],
     *,
     dry_min: int,
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
 ) -> _GaugeTruth:
     """Read the gauge store for the rows' months; onsets and slot flags out.
 
@@ -930,8 +934,8 @@ def _gauge_truth(
     wet flag at each decision's own instant — but taking them a row at a
     time, rescanning a month's table once per station, is what ran the
     nightly report for hours and grew it to 5.5 GB before the VM killed
-    it. The rules are ``gauge_slots``' and ``onsets``' own, unchanged and
-    tested against them; only the loop is gone.
+    it. The rules are ``gauge_slot_amounts``' and ``onsets``' own,
+    unchanged and tested against them; only the loop is gone.
 
     ``needed`` keeps the wet flags bounded to the decisions that ask for
     one: the grid holds a slot every ten minutes for every station, and
@@ -942,7 +946,7 @@ def _gauge_truth(
     start, end = window
     loaded = gauge_truth_vectorised(
         Path(corpus_dir), start, end, list(station_ids),
-        dry_min=dry_min, pad_min=GAUGE_PAD_MIN,
+        dry_min=dry_min, onset_min_mm=onset_min_mm, pad_min=GAUGE_PAD_MIN,
     )
     truth = _GaugeTruth(
         onsets=loaded.onsets,
@@ -1002,7 +1006,7 @@ def _score_decisions(
     # Months and stations the rows cover, never the whole archive.
     truth = _gauge_truth(
         Path(inputs.corpus_dir), station_ids, (window_from, window_to),
-        needed, dry_min=inputs.dry_min,
+        needed, dry_min=inputs.dry_min, onset_min_mm=inputs.onset_min_mm,
     )
     if truth.known_slots == 0:
         return board
@@ -1047,6 +1051,7 @@ def _score_decisions(
             lead_min=inputs.lead_min,
             tolerance_min=inputs.tolerance_min,
             dry_min=inputs.dry_min,
+            onset_min_mm=inputs.onset_min_mm,
             known_until=truth.known_until.get(station),
             coverage=coverage_by_station.get(station, []),
         )
@@ -1057,6 +1062,7 @@ def _score_decisions(
         lead_min=inputs.lead_min,
         tolerance_min=inputs.tolerance_min,
         dry_min=inputs.dry_min,
+        onset_min_mm=inputs.onset_min_mm,
     )
     spread = pooled["lead_error_min"]
     if (
@@ -1465,8 +1471,9 @@ def _methods_section(
             f"precipitation, in a {SLOT_MIN}-minute gauge slot"
         ),
         "onset_rule": (
-            f"the first wet slot after {inputs.dry_min} minutes of known-dry "
-            f"slots; a warning is a hit when that onset falls within "
+            f"first wet slot after ≥ {inputs.dry_min} dry min, with "
+            f"≥ {inputs.onset_min_mm:g} mm over that slot and the next; a "
+            f"warning is a hit when that onset falls within "
             f"{inputs.lead_min} + {inputs.tolerance_min} minutes of it"
         ),
         "threshold_mm_h": _round(threshold, 3),

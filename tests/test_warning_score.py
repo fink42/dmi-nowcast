@@ -6,10 +6,10 @@ exactly the shape ``StationObsStore.read`` returns, so this suite pins the
 scoring contract without depending on the store being built.
 
 The cases that matter are the boundaries — a slot that is unknown rather
-than dry, an onset after *exactly* three dry slots, an onset landing on
-the last second of the tolerance window, and two warnings competing for
-one onset — because every one of them is a way for a scoreboard to
-flatter itself.
+than dry, an onset after *exactly* the dry run it needs, an onset that
+delivers *exactly* the millimetres it must, an onset landing on the last
+second of the tolerance window, and two warnings competing for one onset
+— because every one of them is a way for a scoreboard to flatter itself.
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ import pytest
 
 from dmi_nowcast_core.warning_score import (
     DECISION_COLUMNS,
+    DEFAULT_DRY_MIN,
+    DEFAULT_ONSET_MIN_MM,
     DEFAULT_PRODUCT_LEADS_MIN,
     decision_columns,
     p_rain_column,
@@ -27,6 +29,7 @@ from dmi_nowcast_core.warning_score import (
     PRECIP_DUR_PARAM,
     PRECIP_PARAM,
     gauge_slots,
+    gauge_slot_amounts,
     onsets,
     pooled_summary,
     raining_now_agreement,
@@ -165,7 +168,12 @@ def test_gauge_slots_accepts_an_arrow_table() -> None:
 
 
 def _slots(pattern: str) -> list[tuple[datetime, bool | None]]:
-    """``"ddw?"`` → dry, dry, wet, unknown — one character per slot."""
+    """``"ddw?"`` → dry, dry, wet, unknown — one character per slot.
+
+    Wet flags only, which is the shape the amount test cannot read: these
+    cases are about the dry-run bookkeeping, so they pass
+    ``onset_min_mm=0.0`` and say so once, here.
+    """
     mapping = {"d": False, "w": True, "?": None}
     return [
         (T0 + timedelta(minutes=10 * (i + 1)), mapping[ch])
@@ -173,47 +181,178 @@ def _slots(pattern: str) -> list[tuple[datetime, bool | None]]:
     ]
 
 
+def _dry_run_onsets(pattern: str, dry_min: int = 30) -> list[datetime]:
+    """:func:`onsets` over a wet-flag pattern, with the amount test off."""
+    return onsets(_slots(pattern), dry_min=dry_min, onset_min_mm=0.0)
+
+
+def _mm_slots(
+    series: list[tuple[str, float | None]],
+) -> list[tuple[datetime, bool | None, float | None]]:
+    """``[(flag, mm)]`` → the amount-carrying grid, one slot per entry.
+
+    ``"d"`` dry, ``"w"`` wet, ``"?"`` unknown; ``mm`` is that slot's
+    depth, ``None`` for a slot the gauge reported no amount for.
+    """
+    mapping = {"d": False, "w": True, "?": None}
+    return [
+        (T0 + timedelta(minutes=10 * (i + 1)), mapping[flag], mm)
+        for i, (flag, mm) in enumerate(series)
+    ]
+
+
 def test_onset_after_exactly_three_dry_slots() -> None:
-    got = onsets(_slots("dddw"))
-    assert got == [T0 + timedelta(minutes=40)]
+    assert _dry_run_onsets("dddw") == [T0 + timedelta(minutes=40)]
 
 
 def test_no_onset_after_only_two_dry_slots() -> None:
-    assert onsets(_slots("ddw")) == []
+    assert _dry_run_onsets("ddw") == []
+
+
+def test_the_default_dry_run_is_sixty_minutes() -> None:
+    # Six slots, matched to the push rule's own re-arm. Five is not enough.
+    assert DEFAULT_DRY_MIN == 60
+    assert _dry_run_onsets("dddddw", dry_min=DEFAULT_DRY_MIN) == []
+    assert _dry_run_onsets("ddddddw", dry_min=DEFAULT_DRY_MIN) == [
+        T0 + timedelta(minutes=70),
+    ]
 
 
 def test_wet_at_the_very_start_is_not_an_onset() -> None:
     # No evidence about what came before the record.
-    assert onsets(_slots("wwww")) == []
+    assert _dry_run_onsets("wwww") == []
 
 
 def test_only_the_first_wet_slot_of_a_spell_is_an_onset() -> None:
-    assert onsets(_slots("dddwww")) == [T0 + timedelta(minutes=40)]
+    assert _dry_run_onsets("dddwww") == [T0 + timedelta(minutes=40)]
 
 
 def test_a_second_spell_needs_its_own_dry_run() -> None:
-    assert onsets(_slots("dddwdddw")) == [
+    assert _dry_run_onsets("dddwdddw") == [
         T0 + timedelta(minutes=40), T0 + timedelta(minutes=80),
     ]
     # Only two dry slots between the spells → the second is not an onset.
-    assert onsets(_slots("dddwddw")) == [T0 + timedelta(minutes=40)]
+    assert _dry_run_onsets("dddwddw") == [T0 + timedelta(minutes=40)]
 
 
 def test_unknown_slot_resets_the_dry_run() -> None:
     # Missing data can never certify a dry spell.
-    assert onsets(_slots("dd?dw")) == []
-    assert onsets(_slots("dd?dddw")) == [T0 + timedelta(minutes=70)]
+    assert _dry_run_onsets("dd?dw") == []
+    assert _dry_run_onsets("dd?dddw") == [T0 + timedelta(minutes=70)]
 
 
 def test_a_hole_in_the_grid_resets_the_dry_run() -> None:
     slots = _slots("ddd")
     slots.append((T0 + timedelta(minutes=200), True))  # a seam, not a sequence
-    assert onsets(slots) == []
+    assert onsets(slots, onset_min_mm=0.0) == []
 
 
 def test_dry_min_is_configurable() -> None:
-    assert onsets(_slots("dw"), dry_min=10) == [T0 + timedelta(minutes=20)]
-    assert onsets(_slots("ddddw"), dry_min=50) == []
+    assert _dry_run_onsets("dw", dry_min=10) == [T0 + timedelta(minutes=20)]
+    assert _dry_run_onsets("ddddw", dry_min=50) == []
+
+
+# --- the amount rule ---------------------------------------------------
+
+
+def test_the_onset_amount_spans_the_onset_slot_and_the_next() -> None:
+    # 0.1 mm and then 0.15 mm is one 0.25 mm event, not two drizzles.
+    grid = _mm_slots(
+        [("d", 0.0), ("d", 0.0), ("d", 0.0), ("w", 0.1), ("w", 0.15)],
+    )
+    assert onsets(grid, dry_min=30) == [T0 + timedelta(minutes=40)]
+
+
+def test_exactly_the_floor_over_two_slots_counts() -> None:
+    grid = _mm_slots(
+        [("d", 0.0), ("d", 0.0), ("d", 0.0), ("w", 0.1), ("w", 0.1)],
+    )
+    assert DEFAULT_ONSET_MIN_MM == 0.2
+    assert onsets(grid, dry_min=30) == [T0 + timedelta(minutes=40)]
+
+
+def test_below_the_floor_over_two_slots_is_not_an_onset() -> None:
+    grid = _mm_slots(
+        [("d", 0.0), ("d", 0.0), ("d", 0.0), ("w", 0.1), ("w", 0.05)],
+    )
+    assert onsets(grid, dry_min=30) == []
+    # …and the old rule still finds it, which is what the argument is about.
+    assert onsets(grid, dry_min=30, onset_min_mm=0.0) == [
+        T0 + timedelta(minutes=40),
+    ]
+
+
+def test_a_trace_only_onset_delivers_nothing() -> None:
+    # Wet through the duration arm alone: no depth reported, and the trace
+    # sentinel in the next slot is "below 0.1 mm", never a negative depth.
+    grid = _mm_slots(
+        [("d", 0.0), ("d", 0.0), ("d", 0.0), ("w", None), ("w", -0.1)],
+    )
+    assert onsets(grid, dry_min=30) == []
+    assert onsets(grid, dry_min=30, onset_min_mm=0.0) == [
+        T0 + timedelta(minutes=40),
+    ]
+
+
+def test_a_missing_second_slot_leaves_the_first_alone_to_qualify() -> None:
+    ends = _mm_slots([("d", 0.0), ("d", 0.0), ("d", 0.0), ("w", 0.15)])
+    assert onsets(ends, dry_min=30) == []
+    enough = _mm_slots([("d", 0.0), ("d", 0.0), ("d", 0.0), ("w", 0.2)])
+    assert onsets(enough, dry_min=30) == [T0 + timedelta(minutes=40)]
+    # A seam after the onset is not the next slot either: the rain beyond
+    # a gap was measured somewhere else entirely.
+    seam = _mm_slots([("d", 0.0), ("d", 0.0), ("d", 0.0), ("w", 0.15)])
+    seam.append((T0 + timedelta(minutes=200), True, 5.0))
+    assert onsets(seam, dry_min=30) == []
+
+
+def test_a_candidate_that_fails_the_amount_still_resets_the_dry_run() -> None:
+    # Drizzle at slot 4, real rain at slot 5: the second is not an onset,
+    # because it rained in between and no new dry spell ever started.
+    grid = _mm_slots([
+        ("d", 0.0), ("d", 0.0), ("d", 0.0), ("w", 0.1), ("d", 0.0), ("w", 2.0),
+    ])
+    assert onsets(grid, dry_min=30) == []
+
+
+def test_the_wet_flag_alone_cannot_answer_the_amount_rule() -> None:
+    with pytest.raises(ValueError, match="millimetres"):
+        onsets(_slots("dddw"), dry_min=30)
+
+
+# --- gauge_slot_amounts ------------------------------------------------
+
+
+def test_gauge_slot_amounts_keeps_the_depth_beside_the_flag() -> None:
+    rows = [_amount("A", 10, 0.0), _amount("A", 20, 0.4)]
+    assert gauge_slot_amounts(rows, "A") == [
+        (T0 + timedelta(minutes=10), False, 0.0),
+        (T0 + timedelta(minutes=20), True, 0.4),
+    ]
+
+
+def test_gauge_slot_amounts_folds_the_trace_sentinel_to_zero() -> None:
+    slots = gauge_slot_amounts([_amount("A", 10, -0.1)], "A")
+    assert slots == [(T0 + timedelta(minutes=10), False, 0.0)]
+
+
+def test_gauge_slot_amounts_leaves_a_duration_slot_without_a_depth() -> None:
+    slots = gauge_slot_amounts([_dur("A", 10, 5.0)], "A")
+    assert slots == [(T0 + timedelta(minutes=10), True, None)]
+
+
+def test_gauge_slot_amounts_takes_the_largest_reading_in_a_slot() -> None:
+    rows = [_amount("A", 4, 0.3), _amount("A", 9, 0.7)]  # both in (00, 10]
+    assert gauge_slot_amounts(rows, "A") == [
+        (T0 + timedelta(minutes=10), True, 0.7),
+    ]
+
+
+def test_gauge_slots_is_gauge_slot_amounts_without_the_depths() -> None:
+    rows = [_amount("A", 10, 0.0), _dur("A", 20, 3.0), _amount("A", 40, 0.5)]
+    assert gauge_slots(rows, "A") == [
+        (slot, wet) for slot, wet, _mm in gauge_slot_amounts(rows, "A")
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +465,11 @@ def test_a_warning_without_an_eta_still_scores_but_adds_no_lead_error() -> None:
 
 
 def test_summary_echoes_the_definition_it_was_produced_under() -> None:
-    s = score_warnings([], [], lead_min=45, tolerance_min=5, dry_min=60).summary
+    s = score_warnings(
+        [], [], lead_min=45, tolerance_min=5, dry_min=60, onset_min_mm=0.5,
+    ).summary
     assert (s["lead_min"], s["tolerance_min"], s["dry_min"]) == (45, 5, 60)
+    assert s["onset_min_mm"] == 0.5
 
 
 def test_pooled_summary_recomputes_rather_than_averages() -> None:

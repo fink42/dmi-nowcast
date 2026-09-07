@@ -598,6 +598,13 @@ class TestNightlyThresholdFit:
         assert options.rearm_after_min == 45
         assert options.corpus_dir == config.storage.corpus_dir
         assert options.radar_decisions_dirs == [tmp_path / "radar"]
+        # …and under the onset definition the config carries, which is the
+        # shipped one unless somebody says otherwise.
+        assert (options.dry_min, options.onset_min_mm) == (60, 0.2)
+        stricter = QualityReportTask(
+            _fit_config(tmp_path, dry_min=120, onset_min_mm=0.5),
+        )._fit_options()
+        assert (stricter.dry_min, stricter.onset_min_mm) == (120, 0.5)
 
     def test_an_explicit_out_path_wins(self, tmp_path: Path) -> None:
         config = _fit_config(tmp_path, thresholds_out=tmp_path / "elsewhere.json")

@@ -6,12 +6,12 @@ threshold per horizon and came back with recall near 0.2 at every lead.
 Before that number is read as "the nowcast misses four rain events in
 five", two arithmetic facts have to be taken off the table:
 
-1. **The gauge onset rule is generous.** An onset is the first wet slot
-   after 30 dry minutes, and a slot is wet at 0.1 mm *or* one minute of
-   precipitation. That yields roughly two onsets per station-day — a
-   drizzle burst at 09:10 and another at 09:50 are two separate events to
-   the scorer, and the second one is a "miss" the moment the first is
-   warned about.
+1. **The gauge onset rule was generous.** Under V0 an onset was the first
+   wet slot after 30 dry minutes, and a slot is wet at 0.1 mm *or* one
+   minute of precipitation. That yielded roughly two onsets per
+   station-day — a drizzle burst at 09:10 and another at 09:50 are two
+   separate events to the scorer, and the second one is a "miss" the
+   moment the first is warned about.
 2. **The rule can only warn once an hour.** ``push.engine`` disarms on
    every notification and re-arms only after 60 continuous minutes below
    threshold. A second onset inside that hour was never catchable: no
@@ -30,12 +30,18 @@ The variants
 ======  ==========  ===============================  ==========================
 name    dry spell   onset amount                     what it asks
 ======  ==========  ===============================  ==========================
-V0      30 min      none (the wet rule alone)        today's definition
+V0      30 min      none (the wet rule alone)        the definition until 09-07
 V1      60 min      none                             …with the re-arm's clock
-V2      60 min      ≥ 0.2 mm over two slots          rain, not drizzle
+V2      60 min      ≥ 0.2 mm over two slots          **the shipped rule**
 V3      60 min      ≥ 0.5 mm over two slots          rain worth a notification
 V4      120 min     ≥ 0.2 mm over two slots          a new event, not a shower
 ======  ==========  ===============================  ==========================
+
+This analysis is what chose V2: it became the objective's default on
+2026-09-07 (``warning_score.DEFAULT_DRY_MIN`` / ``DEFAULT_ONSET_MIN_MM``),
+so the script now measures the shipped rule against the alternatives
+either side of it rather than against a rule nobody serves. Every variant
+is still parameterised explicitly, so V0 remains reproducible.
 
 Every variant keeps the shipped WET rule (``≥ 0.1 mm`` or ``≥ 1 min``)
 for deciding which slots are dry, because that is what certifies a dry
@@ -164,20 +170,20 @@ __all__ = [
 class Variant:
     """One onset definition: how long the dry spell, how much the rain.
 
-    ``min_mm_two_slots`` of ``None`` means no amount test at all — the wet
-    rule alone decides, which is what ships today.
+    ``onset_min_mm`` of ``None`` (or 0.0) means no amount test at all —
+    the wet rule alone decides, which is what shipped before 2026-09-07.
     """
 
     name: str
     dry_min: int
-    min_mm_two_slots: float | None
+    onset_min_mm: float | None
     note: str
 
     @property
     def label(self) -> str:
         amount = (
-            "wet rule only" if self.min_mm_two_slots is None
-            else f"≥ {self.min_mm_two_slots:g} mm / 2 slots"
+            "wet rule only" if not self.onset_min_mm
+            else f"≥ {self.onset_min_mm:g} mm / 2 slots"
         )
         return f"dry ≥ {self.dry_min} min, {amount}"
 
@@ -185,19 +191,36 @@ class Variant:
         return {
             "name": self.name,
             "dry_min": int(self.dry_min),
-            "min_mm_two_slots": self.min_mm_two_slots,
+            "onset_min_mm": self.onset_min_mm,
             "label": self.label,
             "note": self.note,
         }
 
 
 VARIANTS: tuple[Variant, ...] = (
-    Variant("V0", 30, None, "the shipped definition the sweep was fitted on"),
+    Variant("V0", 30, None, "the definition the first sweep was fitted on"),
     Variant("V1", 60, None, "same wet rule, dry spell matched to the re-arm"),
-    Variant("V2", 60, 0.2, "an onset must deliver 0.2 mm over two slots"),
+    Variant("V2", 60, 0.2, "the shipped rule: 0.2 mm over two slots"),
     Variant("V3", 60, 0.5, "an onset must deliver 0.5 mm over two slots"),
     Variant("V4", 120, 0.2, "a new rain event rather than the next shower"),
 )
+
+#: The variant the service actually scores under. Everything else on this
+#: page is measured against it, and it is the one whose numbers should
+#: match ``sweep_thresholds`` run over the same rows.
+SHIPPED_VARIANT = "V2"
+
+#: The loosest definition, and therefore the denominator for "how many
+#: onsets does a stricter rule drop".
+BASELINE_VARIANT = "V0"
+
+
+def _variant(name: str) -> Variant:
+    """The named variant. A missing one is a bug in this file, not input."""
+    for variant in VARIANTS:
+        if variant.name == name:
+            return variant
+    raise KeyError(f"no variant named {name!r}")
 
 #: Buckets for "how much rain did this onset actually deliver", in mm over
 #: the onset slot and the one after it. The edges are V2's and V3's
@@ -339,8 +362,9 @@ def variant_onsets(
     KNOWN dry slots must precede a wet one, an unknown slot resets the run
     rather than extending it, and the first slots of a record can never be
     onsets because nothing is known about what came before them. With
-    ``dry_min=30`` and no amount test the result is exactly what the
-    shipped rule produces — asserted in the tests.
+    ``dry_min=30`` and no amount test the result is exactly what
+    ``warning_score.onsets`` produces with those arguments — asserted in
+    the tests.
 
     The amount test then drops the candidates that did not deliver: the
     onset slot's ``mm`` plus the next slot's, an absent value and a trace
@@ -349,7 +373,7 @@ def variant_onsets(
     is not the start of a new event either.
     """
     need = max(1, math.ceil(variant.dry_min / slot_min))
-    floor = variant.min_mm_two_slots
+    floor = variant.onset_min_mm
     step = timedelta(minutes=slot_min)
     out: list[tuple[datetime, float]] = []
     dry_run = 0
@@ -369,7 +393,7 @@ def variant_onsets(
             total = _depth(mm)
             if index + 1 < len(grid):
                 total += _depth(grid[index + 1][1])
-            if floor is None or total >= floor:
+            if not floor or total >= floor:
                 out.append((ts, total))
         dry_run = 0
     return out
@@ -411,7 +435,7 @@ def gauge_truth_variants(
         variant.name: {
             station: dict(pairs)
             for station, pairs in loaded.onsets_for(
-                variant.dry_min, min_mm_two_slots=variant.min_mm_two_slots,
+                variant.dry_min, onset_min_mm=variant.onset_min_mm,
             ).items()
         }
         for variant in variants
@@ -519,6 +543,7 @@ def score_variant_lead(
             "lead_min": int(lead),
             "tolerance_min": shared["tolerance_min"],
             "dry_min": variant.dry_min,
+            "onset_min_mm": variant.onset_min_mm,
             "known_until": known_until.get(station),
             "coverage": coverage.get(station, ()),
             "min_useful_lead_min": shared["min_useful_lead_min"],
@@ -548,7 +573,7 @@ def score_variant_lead(
     return {
         "variant": variant.name,
         "dry_min": variant.dry_min,
-        "min_mm_two_slots": variant.min_mm_two_slots,
+        "onset_min_mm": variant.onset_min_mm,
         "lead_min": int(lead),
         "threshold_pct": int(shared["thresholds"][int(lead)]),
         "n_onsets": pooled["n_onsets"],
@@ -742,7 +767,8 @@ def run(
         known_until=known_until,
         coverage_gap_min=coverage_gap_min,
         tolerance_min=tolerance_min,
-        dry_min=VARIANTS[0].dry_min,
+        dry_min=_variant(BASELINE_VARIANT).dry_min,
+        onset_min_mm=_variant(BASELINE_VARIANT).onset_min_mm or 0.0,
         min_useful_lead_min=min_useful_lead_min,
         persistence_obs=persistence_obs,
         rearm_after_min=rearm_after_min,
@@ -793,7 +819,7 @@ def run(
     _SHARED = None
 
     all_buckets = _empty_buckets()
-    for station_onsets in onsets[VARIANTS[0].name].values():
+    for station_onsets in onsets[BASELINE_VARIANT].values():
         for total in station_onsets.values():
             all_buckets[_bucket_of(total)] += 1
 
@@ -935,7 +961,8 @@ def render_markdown(payload: Mapping[str, Any]) -> str:
     for lead in leads:
         cell = next(
             (c for c in cells
-             if int(c["lead_min"]) == lead and c["variant"] == VARIANTS[0].name),
+             if int(c["lead_min"]) == lead
+             and c["variant"] == BASELINE_VARIANT),
             None,
         )
         if cell:
@@ -994,10 +1021,10 @@ def _headline(cells: Sequence[Mapping[str, Any]]) -> list[str]:
     reader who opens it should not have to derive which one won from five
     tables. Rendered from the cells, so it cannot drift from them.
     """
-    base = [c for c in cells if c["variant"] == VARIANTS[0].name]
+    base = [c for c in cells if c["variant"] == BASELINE_VARIANT]
     if not base:
         return []
-    strict = [c for c in cells if c["variant"] == "V2"]
+    strict = [c for c in cells if c["variant"] == SHIPPED_VARIANT]
     out = ["## What it says\n"]
     out.append(
         "**The re-arm shadow is small; the definition is not.** Across the "
@@ -1046,9 +1073,12 @@ def _lead_paragraph(
 ) -> list[str]:
     """One plain-language paragraph about this lead's table."""
     by_name = {row["variant"]: row for row in rows}
-    base = by_name.get("V0")
+    base = by_name.get(BASELINE_VARIANT)
     if base is None:
-        return ["No V0 row at this lead, so there is nothing to compare against."]
+        return [
+            f"No {BASELINE_VARIANT} row at this lead, so there is nothing to "
+            "compare against.",
+        ]
     lines: list[str] = []
     lines.append(
         f"At {lead} minutes the rule sent {base['n_sent']:,} notifications "
@@ -1065,14 +1095,14 @@ def _lead_paragraph(
         f"{base['shadowed_by_any_warning']:,} "
         f"({_share(base['shadowed_by_any_warning'], base['misses'])})."
     )
-    for name in ("V2", "V4"):
+    for name in (SHIPPED_VARIANT, "V4"):
         row = by_name.get(name)
         if row is None:
             continue
         drop = base["covered_onsets"] - row["covered_onsets"]
         lines.append(
             f"{name} ({row['dry_min']} min dry, ≥ "
-            f"{row['min_mm_two_slots']:g} mm over two slots) removes "
+            f"{row['onset_min_mm']:g} mm over two slots) removes "
             f"{drop:,} of those onsets "
             f"({_share(drop, base['covered_onsets'])} of them), leaving "
             f"{row['onsets_per_station_day']:.2f} per station-day; with the "

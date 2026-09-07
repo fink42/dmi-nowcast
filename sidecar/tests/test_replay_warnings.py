@@ -518,8 +518,9 @@ def test_day_slots_pads_the_day_and_builds_a_contiguous_grid() -> None:
     assert params == (rw.PRECIP_PARAM, rw.PRECIP_DUR_PARAM)
     grid = slots["06180"]
     assert len(grid) == 28 * 6 + 1          # 28 h of 10-min slots, inclusive
-    wet = [ts for ts, w in grid if w]
-    assert wet == [datetime(2026, 9, 5, 6, 20, tzinfo=timezone.utc)]
+    wet = [(ts, mm) for ts, w, mm in grid if w]
+    # The depth rides along with the flag: the onset rule needs it.
+    assert wet == [(datetime(2026, 9, 5, 6, 20, tzinfo=timezone.utc), 1.0)]
 
 
 def test_score_matches_a_replayed_warning_to_a_gauge_onset() -> None:

@@ -83,9 +83,12 @@ The radar set: a self-consistency check, not a second truth
 calibration points*, where the truth is the corpus ``outcome`` — the radar
 observing itself — rather than a gauge. Onsets there are derived from the
 decision rows' own ``observed_mm_h`` (≥ 0.5 mm/h is wet, on 10-minute
-slots at ``radar_ts``) through the same :func:`onsets` rule, and swept
-identically. Its plateau per lead is reported beside the gauge one, with
-``agrees_with_radar`` saying whether the gauge pick falls inside it.
+slots at ``radar_ts``) through the same :func:`onsets` rule, with the
+amount test read off the rate — a slot's rate held across the slot, so
+``--onset-min-mm`` of 0.2 asks the two slots for 1.2 mm/h between them —
+and swept identically. Its plateau per lead is reported beside the gauge
+one, with ``agrees_with_radar`` saying whether the gauge pick falls
+inside it.
 
 **This is not independent evidence.** The radar produced both the forecast
 and its truth, so it shares every bias in the composite — column-max
@@ -159,6 +162,7 @@ from dmi_nowcast_core.push_thresholds import (
 from dmi_nowcast_core.warning_score import (
     DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
+    DEFAULT_ONSET_MIN_MM,
     DEFAULT_PRODUCT_LEADS_MIN,
     DEFAULT_TOLERANCE_MIN,
     SLOT_MIN,
@@ -183,7 +187,7 @@ CURRENT_THRESHOLD_PCT = 40
 RAIN_THRESHOLD_MM_H = 0.5
 
 #: Pad the gauge read either side of the decision window, so an onset at
-#: the very start has its three dry slots behind it and a warning sent at
+#: the very start has its six dry slots behind it and a warning sent at
 #: the very end can still find the rain it promised.
 GAUGE_PAD_MIN = 120
 
@@ -555,6 +559,7 @@ def gauge_truth(
     window: tuple[datetime, datetime],
     *,
     dry_min: int = DEFAULT_DRY_MIN,
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
     log=None,
 ) -> tuple[dict[str, list[datetime]], dict[str, datetime], int]:
     """``(onsets per station, known_until per station, known slot count)``.
@@ -563,15 +568,16 @@ def gauge_truth(
     (``warning_score.gauge_truth_vectorised``): each month partition is
     read once with the station and parameter filters pushed into the
     parquet reader, pivoted into a per-station 10-minute grid with numpy,
-    and reduced to onsets by boolean run length. Ten months of a hundred
-    stations take seconds and tens of megabytes.
+    and reduced to onsets — a wet slot after ``dry_min`` dry that delivers
+    ``onset_min_mm`` over itself and the slot after it — by run length.
+    Ten months of a hundred stations take seconds and tens of megabytes.
 
     It used to read the same months in a Python loop, rescanning each
     month's table once per station — half an hour and gigabytes for the
     same few thousand onsets, which is what got the nightly report killed
     on the VM. The rules are unchanged and the results are identical; the
-    row-at-a-time ``gauge_slots`` / ``onsets`` remain the reference the
-    vectorised path is tested against.
+    row-at-a-time ``gauge_slot_amounts`` / ``onsets`` remain the reference
+    the vectorised path is tested against.
 
     None of this depends on the lead or the threshold, so it is computed
     once and shared by every cell of the sweep.
@@ -582,7 +588,8 @@ def gauge_truth(
     start, end = window
     truth = gauge_truth_vectorised(
         Path(corpus_dir), start - pad, end + pad, list(station_ids),
-        dry_min=dry_min, pad_min=GAUGE_PAD_MIN, log=log,
+        dry_min=dry_min, onset_min_mm=onset_min_mm,
+        pad_min=GAUGE_PAD_MIN, log=log,
     )
     if log:
         log(
@@ -597,6 +604,7 @@ def radar_truth(
     tracks: Mapping[str, Sequence[tuple]],
     *,
     dry_min: int = DEFAULT_DRY_MIN,
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
     slot_min: int = SLOT_MIN,
     threshold_mm_h: float = RAIN_THRESHOLD_MM_H,
 ) -> tuple[dict[str, list[datetime]], dict[str, datetime]]:
@@ -608,6 +616,15 @@ def radar_truth(
     same 10-minute slot grid the gauges report on and pushed through the
     same :func:`onsets` rule, so the two sweeps differ in their truth and
     in nothing else.
+
+    The amount rule needs millimetres, and the radar reports a RATE, so
+    the slot's largest ``observed_mm_h`` is read as sustained across the
+    slot: ``mm = rate * slot_min / 60``. At the 10-minute cadence that
+    puts the gauge's 0.2 mm over two slots at about 1.2 mm/h for one slot,
+    or 0.6 mm/h held across both — drizzle out, showers in, which is the
+    distinction the rule exists to draw. The radar's
+    column-max reflectivity biases the rate HIGH (CLAUDE.md), so this is
+    if anything the more generous of the two sides.
 
     A null ``observed_mm_h`` is off-coverage or nodata: it leaves the slot
     UNKNOWN, exactly as an unreported gauge slot does, and an unknown slot
@@ -621,24 +638,35 @@ def radar_truth(
     is right.
     """
     step = timedelta(minutes=slot_min)
+    hours = slot_min / 60.0
     onsets_by_point: dict[str, list[datetime]] = {}
     known_until: dict[str, datetime] = {}
     for point, track in tracks.items():
-        seen: dict[datetime, bool] = {}
+        seen: dict[datetime, float] = {}
         for record in track:
             observed = record[_OBSERVED]
             if observed is None:
                 continue
             slot = slot_end_of(record[_RADAR_TS], slot_min=slot_min)
-            seen[slot] = seen.get(slot, False) or (observed >= threshold_mm_h)
+            rate = float(observed)
+            previous = seen.get(slot)
+            if previous is None or rate > previous:
+                seen[slot] = rate
         if not seen:
             continue
-        slots: list[tuple[datetime, bool | None]] = []
+        slots: list[tuple[datetime, bool | None, float | None]] = []
         cursor, last = min(seen), max(seen)
         while cursor <= last:
-            slots.append((cursor, seen.get(cursor)))
+            rate = seen.get(cursor)
+            slots.append((
+                cursor,
+                None if rate is None else rate >= threshold_mm_h,
+                None if rate is None else rate * hours,
+            ))
             cursor += step
-        onsets_by_point[point] = gauge_onsets(slots, dry_min, slot_min=slot_min)
+        onsets_by_point[point] = gauge_onsets(
+            slots, dry_min, onset_min_mm=onset_min_mm, slot_min=slot_min,
+        )
         known_until[point] = last
     return onsets_by_point, known_until
 
@@ -737,6 +765,7 @@ def score_cell(shared: dict, lead: int, threshold_pct: int | None) -> dict:
             lead_min=int(lead),
             tolerance_min=shared["tolerance_min"],
             dry_min=shared["dry_min"],
+            onset_min_mm=shared["onset_min_mm"],
             known_until=shared["known_until"].get(station),
             coverage=shared["coverage"][int(lead)].get(station, ()),
             min_useful_lead_min=shared["min_useful_lead_min"],
@@ -801,6 +830,7 @@ def build_shared(
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
     min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN,
     persistence_obs: int = 1,
     rearm_after_min: int = 60,
@@ -846,6 +876,7 @@ def build_shared(
         },
         "tolerance_min": int(tolerance_min),
         "dry_min": int(dry_min),
+        "onset_min_mm": float(onset_min_mm),
         "min_useful_lead_min": float(min_useful_lead_min),
         "persistence_obs": int(persistence_obs),
         "rearm_after_min": int(rearm_after_min),
@@ -1063,6 +1094,7 @@ def radar_sweep(
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
     persistence_obs: int = 1,
     rearm_after_min: int = 60,
     min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN,
@@ -1103,7 +1135,9 @@ def radar_sweep(
     tracks, frames = build_tracks(rows, usable, coverage_gap_min=coverage_gap_min)
     n_rows = len(rows)
     del rows
-    onsets_by_point, known_until = radar_truth(tracks, dry_min=dry_min)
+    onsets_by_point, known_until = radar_truth(
+        tracks, dry_min=dry_min, onset_min_mm=onset_min_mm,
+    )
     points = sorted(p for p in tracks if p in known_until)
     days_by_point = {
         point: {record[_GENERATED].date() for record in tracks[point]}
@@ -1126,6 +1160,7 @@ def radar_sweep(
         coverage_gap_min=coverage_gap_min,
         tolerance_min=tolerance_min,
         dry_min=dry_min,
+        onset_min_mm=onset_min_mm,
         min_useful_lead_min=min_useful_lead_min,
         persistence_obs=persistence_obs,
         rearm_after_min=rearm_after_min,
@@ -1268,6 +1303,7 @@ def run_strata(
                 coverage_gap_min=options.coverage_gap_min,
                 tolerance_min=options.tolerance_min,
                 dry_min=options.dry_min,
+                onset_min_mm=options.onset_min_mm,
                 min_useful_lead_min=options.min_useful_lead_min,
                 persistence_obs=options.persistence_obs,
                 rearm_after_min=options.rearm_after_min,
@@ -1368,6 +1404,7 @@ def build_thresholds_document(
             "persistence_obs": int(settings["persistence_obs"]),
             "tolerance_min": int(settings["tolerance_min"]),
             "dry_min": int(settings["dry_min"]),
+            "onset_min_mm": float(settings["onset_min_mm"]),
         },
         "window": {
             "from": window["from"],
@@ -1443,8 +1480,9 @@ def render_markdown(payload: dict) -> str:
     )
     lines.append(
         f"- Scoring: {settings['tolerance_min']} min tolerance, "
-        f"{settings['dry_min']} min dry run before an onset, coverage gap "
-        f"{settings['coverage_gap_min']} min"
+        f"{settings['dry_min']} min dry run before an onset and "
+        f"≥ {settings['onset_min_mm']:g} mm over the onset slot and the "
+        f"next, coverage gap {settings['coverage_gap_min']} min"
     )
     lines.append(
         f"- Objective: max F1, plateau ≥ "
@@ -1839,7 +1877,8 @@ class SweepOptions:
     the 0.95 plateau, 30 scored warnings of evidence, one observation of
     persistence and a 60-minute re-arm — the live rule's own constants,
     because a replay under different constants would be measuring a
-    different service.
+    different service — over the V2 onset definition (60 dry minutes,
+    ≥ 0.2 mm over the onset slot and the next).
     """
 
     decisions_dirs: Sequence[Path]
@@ -1851,6 +1890,7 @@ class SweepOptions:
     persistence_obs: int = 1
     tolerance_min: int = DEFAULT_TOLERANCE_MIN
     dry_min: int = DEFAULT_DRY_MIN
+    onset_min_mm: float = DEFAULT_ONSET_MIN_MM
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN
     far_cap: float = DEFAULT_FAR_CAP
     min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN
@@ -1930,8 +1970,8 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
     window_from, window_to = min(stamps), max(stamps)
     del stamps
     onsets_by_station, known_until, known_slots = gauge_truth(
-        Path(options.corpus_dir), station_ids,
-        (window_from, window_to), dry_min=options.dry_min, log=log,
+        Path(options.corpus_dir), station_ids, (window_from, window_to),
+        dry_min=options.dry_min, onset_min_mm=options.onset_min_mm, log=log,
     )
     if known_slots == 0:
         raise SweepError("the gauge store has no observations over this window")
@@ -1956,6 +1996,7 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
         coverage_gap_min=options.coverage_gap_min,
         tolerance_min=options.tolerance_min,
         dry_min=options.dry_min,
+        onset_min_mm=options.onset_min_mm,
         min_useful_lead_min=options.min_useful_lead_min,
         persistence_obs=options.persistence_obs,
         rearm_after_min=options.rearm_after_min,
@@ -1989,6 +2030,7 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
             coverage_gap_min=options.coverage_gap_min,
             tolerance_min=options.tolerance_min,
             dry_min=options.dry_min,
+            onset_min_mm=options.onset_min_mm,
             persistence_obs=options.persistence_obs,
             rearm_after_min=options.rearm_after_min,
             min_useful_lead_min=float(options.min_useful_lead_min),
@@ -2027,6 +2069,7 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
             "raining_now_mm_h": RAIN_THRESHOLD_MM_H,
             "tolerance_min": int(options.tolerance_min),
             "dry_min": int(options.dry_min),
+            "onset_min_mm": float(options.onset_min_mm),
             "coverage_gap_min": int(options.coverage_gap_min),
             "far_cap": float(options.far_cap),
             "min_useful_lead_min": float(options.min_useful_lead_min),
