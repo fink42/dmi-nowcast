@@ -46,3 +46,6 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "slow: needs a local DMI archive (DMI_NOWCAST_TEST_CORPUS); skipped in CI",
+]

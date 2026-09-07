@@ -161,13 +161,10 @@ from dmi_nowcast_core.warning_score import (
     DEFAULT_DRY_MIN,
     DEFAULT_PRODUCT_LEADS_MIN,
     DEFAULT_TOLERANCE_MIN,
-    PRECIP_DUR_PARAM,
-    PRECIP_PARAM,
     SLOT_MIN,
     align_decision_table,
     coverage_runs,
     decision_leads_in,
-    gauge_slots,
     p_rain_column,
     pooled_summary,
     score_warnings,
@@ -562,59 +559,38 @@ def gauge_truth(
 ) -> tuple[dict[str, list[datetime]], dict[str, datetime], int]:
     """``(onsets per station, known_until per station, known slot count)``.
 
-    Read month by month with a pad either side, exactly as
-    ``quality_report._gauge_truth`` does, so the full slot grid for a year
-    of a hundred stations is never held at once. Onsets found in the
-    overlap of two padded windows are deduplicated by instant.
+    One vectorised pass over the archive
+    (``warning_score.gauge_truth_vectorised``): each month partition is
+    read once with the station and parameter filters pushed into the
+    parquet reader, pivoted into a per-station 10-minute grid with numpy,
+    and reduced to onsets by boolean run length. Ten months of a hundred
+    stations take seconds and tens of megabytes.
+
+    It used to read the same months in a Python loop, rescanning each
+    month's table once per station — half an hour and gigabytes for the
+    same few thousand onsets, which is what got the nightly report killed
+    on the VM. The rules are unchanged and the results are identical; the
+    row-at-a-time ``gauge_slots`` / ``onsets`` remain the reference the
+    vectorised path is tested against.
 
     None of this depends on the lead or the threshold, so it is computed
     once and shared by every cell of the sweep.
     """
-    from dmi_nowcast_core.station_store import StationObsStore
+    from dmi_nowcast_core.warning_score import gauge_truth_vectorised
 
-    store = StationObsStore(Path(corpus_dir))
     pad = timedelta(minutes=GAUGE_PAD_MIN)
     start, end = window
-    onset_sets: dict[str, set[datetime]] = {}
-    known_until: dict[str, datetime] = {}
-    known_slots = 0
-    for year, month in _months_between(start - pad, end + pad):
-        month_start = datetime(year, month, 1, tzinfo=timezone.utc) - pad
-        if month == 12:
-            month_end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) + pad
-        else:
-            month_end = datetime(year, month + 1, 1, tzinfo=timezone.utc) + pad
-        try:
-            table = store.read(
-                month_start, month_end,
-                [PRECIP_PARAM, PRECIP_DUR_PARAM], list(station_ids),
-            )
-        except Exception as exc:  # noqa: BLE001 — one unreadable month
-            if log:
-                log(f"gauge read failed for {year}-{month:02d}: {exc}")
-            continue
-        for station in station_ids:
-            slots = gauge_slots(
-                table, station, start_utc=month_start, end_utc=month_end,
-            )
-            if not slots:
-                continue
-            onset_sets.setdefault(station, set()).update(
-                gauge_onsets(slots, dry_min)
-            )
-            for stamp, wet in slots:
-                if wet is None:
-                    continue
-                known_slots += 1
-                previous = known_until.get(station)
-                if previous is None or stamp > previous:
-                    known_until[station] = stamp
-        if log:
-            log(f"gauge month {year}-{month:02d}: {known_slots} known slots so far")
-    onsets_by_station = {
-        station: sorted(values) for station, values in onset_sets.items()
-    }
-    return onsets_by_station, known_until, known_slots
+    truth = gauge_truth_vectorised(
+        Path(corpus_dir), start - pad, end + pad, list(station_ids),
+        dry_min=dry_min, pad_min=GAUGE_PAD_MIN, log=log,
+    )
+    if log:
+        log(
+            f"gauge truth: {truth.known_slots} known slot(s), "
+            f"{sum(len(v) for v in truth.onsets.values())} onset(s) over "
+            f"{len(truth.known_until)} reporting station(s)"
+        )
+    return truth.onsets, truth.known_until, truth.known_slots
 
 
 def radar_truth(
@@ -665,15 +641,6 @@ def radar_truth(
         onsets_by_point[point] = gauge_onsets(slots, dry_min, slot_min=slot_min)
         known_until[point] = last
     return onsets_by_point, known_until
-
-
-def _months_between(start: datetime, end: datetime) -> list[tuple[int, int]]:
-    out: list[tuple[int, int]] = []
-    year, month = start.year, start.month
-    while (year, month) <= (end.year, end.month):
-        out.append((year, month))
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-    return out
 
 
 # ---------------------------------------------------------------------------

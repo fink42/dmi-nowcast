@@ -38,6 +38,12 @@ SCHEMA_VERSION = 1
 #: The dedupe key: one reading per station per parameter per instant.
 OBS_KEY = ("station_id", "observed_utc", "parameter_id")
 
+#: Rows per batch when a partition is streamed rather than materialised.
+#: 64k rows of four narrow columns is a couple of megabytes — small enough
+#: that a month never lands in memory whole, large enough that the
+#: per-batch numpy work still amortises.
+STREAM_BATCH_ROWS = 65_536
+
 
 def _pa():
     import pyarrow as pa
@@ -251,6 +257,62 @@ class StationObsStore:
             ("parameter_id", "ascending"),
         ])
 
+    def stream_month(
+        self,
+        year: int,
+        month: int,
+        parameter_ids: Sequence[str] | None = None,
+        station_ids: Sequence[str] | None = None,
+        *,
+        batch_size: int = STREAM_BATCH_ROWS,
+    ):
+        """One month partition as a stream of filtered record batches.
+
+        The bulk path beside :meth:`read`. ``read`` answers "give me this
+        window, tidy": it spans every partition the window touches,
+        concatenates them, sorts the result and hands back one table —
+        which is what a caller reading a day wants, and three things a
+        caller feeding a vectorised pivot pays for and throws away, since
+        the window IS the partition there and the pivot sorts by its own
+        key anyway.
+
+        Two things keep this bounded where ``read`` is not. The station
+        and parameter filters are pushed into the parquet scanner, so the
+        other stations' rows are never decoded into Arrow buffers at all;
+        and the rows arrive a batch at a time, so a month of 1.1M
+        observations costs one batch of resident memory rather than a
+        whole materialised month. Reading the ten-month archive whole cost
+        about 5.5 GB and got the nightly report killed on the VM.
+
+        Yields nothing at all for a partition that does not exist: a
+        window with no archive behind it is not an error, exactly as in
+        :meth:`read`.
+        """
+        import pyarrow.dataset as pds
+
+        path = self.partition_path(int(year), int(month))
+        if not path.exists():
+            return
+        predicate = None
+        if parameter_ids is not None:
+            predicate = pds.field("parameter_id").isin(list(parameter_ids))
+        if station_ids is not None:
+            stations = pds.field("station_id").isin(list(station_ids))
+            predicate = stations if predicate is None else predicate & stations
+        dataset = pds.dataset(path, format="parquet")
+        # Single-threaded with one batch in flight: this runs inside a
+        # worker that has other work to do, and the scanner's default
+        # readahead would keep a dozen batches resident to save time the
+        # pivot does not need saved.
+        yield from dataset.to_batches(
+            columns=list(obs_schema().names),
+            filter=predicate,
+            batch_size=int(batch_size),
+            use_threads=False,
+            batch_readahead=1,
+            fragment_readahead=1,
+        )
+
     # -- catalogue --------------------------------------------------------
 
     def write_catalogue(self, stations: Iterable[Station]) -> int:
@@ -340,6 +402,7 @@ def _months_between(start: datetime, end: datetime) -> list[tuple[int, int]]:
 
 __all__ = [
     "SCHEMA_VERSION",
+    "STREAM_BATCH_ROWS",
     "StationObsStore",
     "obs_schema",
     "catalogue_schema",

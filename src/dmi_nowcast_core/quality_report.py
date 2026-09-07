@@ -105,8 +105,6 @@ from .warning_score import (
     WET_DUR_MIN,
     WET_PRECIP_MM,
     coverage_runs,
-    gauge_slots,
-    onsets,
     pooled_summary,
     raining_now_agreement,
     score_warnings,
@@ -921,60 +919,40 @@ def _gauge_truth(
     *,
     dry_min: int,
 ) -> _GaugeTruth:
-    """Read the gauge store month by month; return onsets and slot flags.
+    """Read the gauge store for the rows' months; onsets and slot flags out.
 
-    Month-sized windows, padded either side, are what keeps this bounded:
-    the full slot grid for ~100 stations over a year would be tens of
-    millions of tuples, and only two things are ever needed from it —
-    the onsets, and the wet flag at each decision's own instant. Onsets
-    found in overlapping windows are deduplicated by instant, exactly as
-    ``replay_warnings.score`` does across its day windows.
+    One vectorised pass (``warning_score.gauge_truth_vectorised``): the
+    months the decision rows span, padded either side because the onset
+    rule needs the dry slots in front of an event, read a partition at a
+    time and pivoted into a per-station 10-minute grid with numpy.
+
+    Only two things are ever taken from that grid — the onsets, and the
+    wet flag at each decision's own instant — but taking them a row at a
+    time, rescanning a month's table once per station, is what ran the
+    nightly report for hours and grew it to 5.5 GB before the VM killed
+    it. The rules are ``gauge_slots``' and ``onsets``' own, unchanged and
+    tested against them; only the loop is gone.
+
+    ``needed`` keeps the wet flags bounded to the decisions that ask for
+    one: the grid holds a slot every ten minutes for every station, and
+    the report wants a few thousand of them.
     """
-    from .station_store import StationObsStore
-    from .warning_score import PRECIP_DUR_PARAM, PRECIP_PARAM
+    from .warning_score import gauge_truth_vectorised
 
-    store = StationObsStore(Path(corpus_dir))
-    truth = _GaugeTruth()
-    onset_sets: dict[str, set[datetime]] = defaultdict(set)
-    last_known: dict[str, datetime] = {}
-    pad = timedelta(minutes=GAUGE_PAD_MIN)
     start, end = window
-    for (year, month) in _months_between(start, end):
-        month_start = datetime(year, month, 1, tzinfo=timezone.utc) - pad
-        if month == 12:
-            month_end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) + pad
-        else:
-            month_end = datetime(year, month + 1, 1, tzinfo=timezone.utc) + pad
-        try:
-            table = store.read(
-                month_start, month_end,
-                [PRECIP_PARAM, PRECIP_DUR_PARAM], list(station_ids),
-            )
-        except Exception:  # noqa: BLE001 — one unreadable month
-            continue
-        for station in station_ids:
-            slots = gauge_slots(
-                table, station, start_utc=month_start, end_utc=month_end,
-            )
-            if not slots:
-                continue
-            onset_sets[station].update(onsets(slots, dry_min))
-            for stamp, wet in slots:
-                if wet is None:
-                    continue
-                truth.known_slots += 1
-                previous = last_known.get(station)
-                if previous is None or stamp > previous:
-                    last_known[station] = stamp
-                key = (station, stamp)
-                if key in needed:
-                    truth.wet_at[key] = wet
-        # Explicitly, because the loop variable would otherwise keep a
-        # month of observations alive while the next month is read — two
-        # months of Arrow buffers live at the peak instead of one.
-        del table
-    truth.onsets = {sid: sorted(values) for sid, values in onset_sets.items()}
-    truth.known_until = last_known
+    loaded = gauge_truth_vectorised(
+        Path(corpus_dir), start, end, list(station_ids),
+        dry_min=dry_min, pad_min=GAUGE_PAD_MIN,
+    )
+    truth = _GaugeTruth(
+        onsets=loaded.onsets,
+        known_until=loaded.known_until,
+        known_slots=loaded.known_slots,
+    )
+    for key in needed:
+        wet = loaded.wet_at(key[0], key[1])
+        if wet is not None:
+            truth.wet_at[key] = wet
     return truth
 
 

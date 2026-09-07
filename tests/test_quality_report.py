@@ -612,8 +612,13 @@ class TestBoundedReads:
 
         The gauge archive is backfilled months deep and carries every
         station DMI publishes. What may be read is the months the decision
-        rows span (padded, because the onset rule needs the dry slots in
-        front of an event) and the stations those rows name.
+        rows span — plus one either side, because the onset rule needs the
+        dry slots in front of an event and the pad reaches into the
+        neighbouring partitions — and the stations those rows name.
+
+        Each partition is read ONCE, which is the other half of the
+        bound: the loop this replaced read three partitions per month and
+        then rescanned the result once per station.
         """
         from dmi_nowcast_core import station_store
 
@@ -621,13 +626,16 @@ class TestBoundedReads:
         real_cls = station_store.StationObsStore
 
         class Recording(real_cls):  # type: ignore[misc, valid-type]
-            def read(self, start_utc, end_utc, parameter_ids=None, station_ids=None):
+            def stream_month(self, year, month, parameter_ids=None,
+                             station_ids=None, **kwargs):
                 calls.append({
-                    "start": start_utc, "end": end_utc,
+                    "month": (int(year), int(month)),
                     "parameters": None if parameter_ids is None else list(parameter_ids),
                     "stations": None if station_ids is None else list(station_ids),
                 })
-                return super().read(start_utc, end_utc, parameter_ids, station_ids)
+                return super().stream_month(
+                    year, month, parameter_ids, station_ids, **kwargs,
+                )
 
         monkeypatch.setattr(station_store, "StationObsStore", Recording)
         report = build_quality_report(full_inputs)
@@ -640,15 +648,18 @@ class TestBoundedReads:
         assert bounds is not None
         window_from, window_to, stations = bounds
         pad = timedelta(minutes=GAUGE_PAD_MIN)
-        # A month partition is read whole and then filtered, so the read
-        # bounds are month edges — but never outside the months the rows
-        # touch, padded.
-        floor = (window_from - pad).replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0,
-        ) - pad
+        floor = (
+            window_from.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0,
+            ) - pad
+        )
+        ceiling = _month_after(window_to) + pad
+        months = [call["month"] for call in calls]
+        assert len(months) == len(set(months)), "a partition was read twice"
         for call in calls:
-            assert call["start"] >= floor
-            assert call["end"] <= _month_after(window_to) + pad
+            year, month = call["month"]
+            assert (year, month) >= (floor.year, floor.month)
+            assert (year, month) <= (ceiling.year, ceiling.month)
             assert call["stations"] is not None, "read every station"
             assert set(call["stations"]) <= set(stations)
             assert call["parameters"] is not None, "read every parameter"

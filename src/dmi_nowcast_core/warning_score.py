@@ -150,6 +150,10 @@ __all__ = [
     "slot_end_of",
     "gauge_slots",
     "onsets",
+    "DEFAULT_GAUGE_PAD_MIN",
+    "StationSlots",
+    "GaugeTruth",
+    "gauge_truth_vectorised",
     "coverage_runs",
     "WarningOutcome",
     "OnsetOutcome",
@@ -566,6 +570,525 @@ def onsets(
         else:
             dry_run += 1
     return out
+
+
+# ---------------------------------------------------------------------------
+# The same rules, vectorised: a month of parquet straight into numpy
+# ---------------------------------------------------------------------------
+#
+# :func:`gauge_slots` and :func:`onsets` above are the reference. They are
+# row-at-a-time Python, which is right for a hand-written test series and
+# ruinous for the real archive: ten months of ~104 stations is ~11 million
+# observation rows, and a caller that rescans a month's table once per
+# station — as all three of this module's consumers did — spends about
+# half an hour and several gigabytes producing a few thousand onsets.
+#
+# What follows is the same three rules over numpy arrays instead:
+#
+# * a slot's value is the LARGEST reading either parameter reported in it,
+#   with DMI's negative "trace" sentinel folded to 0.0 first (identical to
+#   the ``or``-of-fired-arms in :func:`gauge_slots`, since folding is
+#   monotone and both arms threshold a maximum);
+# * a slot nobody reported is UNKNOWN, and unknown is never dry;
+# * an onset is a wet slot preceded by ``ceil(dry_min / slot_min)``
+#   consecutive KNOWN DRY slots, counted by boolean run length rather
+#   than by a running counter.
+#
+# The grid is built ONCE over the whole window rather than per month, and
+# that is not merely faster, it is exactly what the month-by-month callers
+# were approximating: reading month M padded either side and unioning the
+# onsets found in the overlaps recovers precisely the onsets a full-window
+# grid finds, because truncating a window can only SHORTEN a dry run (so a
+# padded read never invents an onset), and every instant is interior to
+# some padded month (so no onset is lost). The union was the workaround
+# for not being able to hold the full grid; a dense array of ~44 000 slots
+# × ~104 stations is 40 MB, so the workaround is no longer needed.
+#
+# numpy and pyarrow are imported inside the functions: this module's
+# scoring half must stay importable with neither, and does.
+
+#: Minutes of context read either side of a month partition. The onset
+#: rule needs the dry slots in FRONT of an event and a warning at the end
+#: of a window needs the slots behind it, so a month is never read alone.
+#: Two hours covers the longest dry spell any caller asks for (120 min).
+DEFAULT_GAUGE_PAD_MIN = 120
+
+
+def _months_between(start: datetime, end: datetime) -> list[tuple[int, int]]:
+    """Every ``(year, month)`` the inclusive window touches."""
+    out: list[tuple[int, int]] = []
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month):
+        out.append((year, month))
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return out
+
+
+def _month_window(
+    year: int, month: int, pad: timedelta,
+) -> tuple[datetime, datetime]:
+    """One month's padded read window, as every caller builds it."""
+    start = datetime(year, month, 1, tzinfo=timezone.utc) - pad
+    if month == 12:
+        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) + pad
+    else:
+        end = datetime(year, month + 1, 1, tzinfo=timezone.utc) + pad
+    return start, end
+
+
+@dataclass(frozen=True)
+class StationSlots:
+    """One station's contiguous slot grid, held as numpy arrays.
+
+    The array form of what :func:`gauge_slots` returns as a list of
+    tuples, with the amounts kept rather than collapsed to a boolean —
+    the variant analyses threshold them at more than one level.
+
+    * ``slot_end`` — int64 epoch SECONDS, ascending, exactly one slot
+      apart. Integers, not datetimes: the whole point is that a run-length
+      pass over 44 000 slots costs microseconds.
+    * ``mm`` / ``dur`` — float32, ``NaN`` where that parameter reported
+      nothing for the slot. Negative readings (DMI's "trace of
+      precipitation" sentinel) are already folded to 0.0.
+    * ``known`` — either parameter reported something usable.
+    * ``wet`` — the shipped rule, ``False`` wherever the slot is unknown.
+      Read it beside ``known``: ``wet=False, known=False`` is *unknown*,
+      which is emphatically not dry.
+    """
+
+    station_id: str
+    slot_end: Any
+    mm: Any
+    dur: Any
+    known: Any
+    wet: Any
+    slot_min: int = SLOT_MIN
+
+    def __len__(self) -> int:
+        return int(self.slot_end.size)
+
+    def slots(self) -> list[tuple[datetime, bool | None]]:
+        """The reference shape: ``[(slot_end, wet|None)]``.
+
+        For tests and for small windows. Materialising this for a hundred
+        stations over a year is exactly the cost this class exists to
+        avoid, so nothing on the hot path calls it.
+        """
+        return [
+            (
+                datetime.fromtimestamp(int(sec), timezone.utc),
+                bool(wet) if known else None,
+            )
+            for sec, wet, known in zip(self.slot_end, self.wet, self.known)
+        ]
+
+    def _index(self, when: datetime) -> int | None:
+        """Grid position of the slot containing ``when``, if it has one."""
+        if self.slot_end.size == 0:
+            return None
+        stamp = slot_end_of(when, slot_min=self.slot_min)
+        step = self.slot_min * 60
+        offset = int(stamp.timestamp()) - int(self.slot_end[0])
+        if offset < 0 or offset % step:
+            return None
+        index = offset // step
+        return int(index) if index < self.slot_end.size else None
+
+    def wet_at(self, when: datetime) -> bool | None:
+        """``True`` / ``False`` / ``None`` for the slot containing ``when``."""
+        index = self._index(when)
+        if index is None or not self.known[index]:
+            return None
+        return bool(self.wet[index])
+
+    def known_until(self) -> datetime | None:
+        """The last slot this station actually reported, or ``None``."""
+        import numpy as np
+
+        found = np.flatnonzero(self.known)
+        if found.size == 0:
+            return None
+        return datetime.fromtimestamp(
+            int(self.slot_end[found[-1]]), timezone.utc,
+        )
+
+    def known_between(self, first: datetime, last: datetime) -> int:
+        """Known slots in ``[first, last]`` — both snapped to slot ends."""
+        import numpy as np
+
+        step = self.slot_min * 60
+        base = int(self.slot_end[0]) if self.slot_end.size else 0
+        lo = (int(slot_end_of(first, slot_min=self.slot_min).timestamp()) - base) // step
+        hi = (int(slot_end_of(last, slot_min=self.slot_min).timestamp()) - base) // step
+        lo = max(0, lo)
+        hi = min(self.slot_end.size - 1, hi)
+        if hi < lo:
+            return 0
+        return int(np.count_nonzero(self.known[lo:hi + 1]))
+
+    def onsets_with_amounts(
+        self,
+        dry_min: int = DEFAULT_DRY_MIN,
+        *,
+        min_mm_two_slots: float | None = None,
+    ) -> list[tuple[datetime, float]]:
+        """``[(onset, mm over the onset slot and the next)]``.
+
+        :func:`onsets`' rule, by boolean run length. ``dry_run`` at slot
+        *i* is the number of consecutive known-dry slots immediately
+        before it — reset by a wet slot and by an unknown one alike — so
+        the counter the reference carries is the run length ending at
+        *i − 1*, and that is a maximum-accumulate away.
+
+        ``min_mm_two_slots`` is the variant analyses' amount test: the
+        onset slot's depth plus the following slot's must reach it, with
+        an unreported depth and a trace sentinel alike contributing zero.
+        A candidate that fails still resets the dry run, which happens for
+        free — every wet slot does, tested or not.
+        """
+        import numpy as np
+
+        n = self.slot_end.size
+        if n == 0:
+            return []
+        need = max(1, math.ceil(dry_min / self.slot_min))
+        dry = self.known & ~self.wet
+        # Run length of consecutive dry slots ENDING at each position:
+        # the last non-dry position at or before i marks where the run
+        # started, and max-accumulate finds it in one pass.
+        position = np.arange(n, dtype=np.int64)
+        started = np.maximum.accumulate(np.where(dry, 0, position + 1))
+        run = np.where(dry, position - started + 1, 0)
+        before = np.zeros(n, dtype=np.int64)
+        before[1:] = run[:-1]
+        candidate = self.wet & (before >= need)
+
+        depth = np.nan_to_num(self.mm, nan=0.0, posinf=0.0, neginf=0.0)
+        two = depth.astype(np.float64)
+        two[:-1] += depth[1:]
+        if min_mm_two_slots is not None:
+            candidate = candidate & (two >= float(min_mm_two_slots))
+        found = np.flatnonzero(candidate)
+        return [
+            (
+                datetime.fromtimestamp(int(self.slot_end[i]), timezone.utc),
+                float(two[i]),
+            )
+            for i in found
+        ]
+
+    def onsets(
+        self,
+        dry_min: int = DEFAULT_DRY_MIN,
+        *,
+        min_mm_two_slots: float | None = None,
+    ) -> list[datetime]:
+        """The onset instants alone — :func:`onsets` over this grid."""
+        return [
+            instant for instant, _mm
+            in self.onsets_with_amounts(dry_min, min_mm_two_slots=min_mm_two_slots)
+        ]
+
+
+@dataclass(frozen=True)
+class GaugeTruth:
+    """What a scoring run needs from the gauge archive, and nothing else.
+
+    ``onsets`` and ``known_until`` are the two things every consumer
+    reads; ``series`` is the grid they were derived from, kept so a second
+    onset definition costs a run-length pass rather than a second read of
+    the archive, and so ``wet_at`` can answer "was it raining at this
+    station at this instant" for the ``raining_now`` comparison.
+    """
+
+    series: dict[str, StationSlots] = field(default_factory=dict)
+    onsets: dict[str, list[datetime]] = field(default_factory=dict)
+    known_until: dict[str, datetime] = field(default_factory=dict)
+    #: Known slots summed over the read windows, month by month. The pad
+    #: makes consecutive windows overlap, so a slot in a pad sliver is
+    #: counted twice — deliberately, because this is the "did the archive
+    #: say anything at all" number the month-by-month readers reported and
+    #: it is quoted in stored reports.
+    known_slots: int = 0
+    slot_min: int = SLOT_MIN
+
+    def wet_at(self, station_id: str, when: datetime) -> bool | None:
+        """The wet flag at one station's slot, or ``None`` if unknown."""
+        series = self.series.get(str(station_id))
+        return None if series is None else series.wet_at(when)
+
+    def onsets_for(
+        self,
+        dry_min: int = DEFAULT_DRY_MIN,
+        *,
+        min_mm_two_slots: float | None = None,
+    ) -> dict[str, list[tuple[datetime, float]]]:
+        """Every station's onsets under one alternative definition.
+
+        The archive is read once; a variant is a run-length pass over the
+        grid already in memory.
+        """
+        return {
+            station: series.onsets_with_amounts(
+                dry_min, min_mm_two_slots=min_mm_two_slots,
+            )
+            for station, series in self.series.items()
+        }
+
+
+def _scatter_max(flat_grid, index, values) -> None:
+    """``grid[i] = max(grid[i], v)`` for every ``(i, v)``, vectorised.
+
+    ``np.maximum.at`` does this directly and is an order of magnitude
+    slower than sorting: the pairs are ordered by (slot, value) so the
+    LAST pair of each slot carries its maximum, and one masked assignment
+    settles the lot. Duplicates are rare in practice — a station reports a
+    parameter once per slot — but two readings inside one 10-minute bin,
+    or a slot straddling two month partitions, both land here.
+    """
+    import numpy as np
+
+    if index.size == 0:
+        return
+    order = np.lexsort((values, index))
+    ordered_index = index[order]
+    ordered_values = values[order]
+    last = np.empty(ordered_index.size, dtype=bool)
+    last[-1] = True
+    np.not_equal(ordered_index[1:], ordered_index[:-1], out=last[:-1])
+    target = ordered_index[last]
+    flat_grid[target] = np.maximum(flat_grid[target], ordered_values[last])
+
+
+def _absorb_batch(
+    batch,
+    station_index,
+    mm_flat,
+    dur_flat,
+    *,
+    first_sec: int,
+    step_sec: int,
+    step_us: int,
+    n_slots: int,
+) -> int:
+    """Fold one record batch of observations into the two value grids.
+
+    Returns the number of readings it used. Everything here is a whole-
+    column operation: the station id becomes a row index by hash lookup,
+    the instant becomes a slot index by integer ceiling division, and the
+    readings are scattered into the grid by maximum.
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if batch.num_rows == 0:
+        return 0
+    row_station = pc.index_in(
+        batch.column("station_id"), value_set=station_index,
+    )
+    value = batch.column("value")
+    keep = pc.and_(pc.is_valid(row_station), pc.is_valid(value))
+    keep = pc.and_(keep, pc.is_valid(batch.column("observed_utc")))
+    keep = pc.and_(keep, pc.is_valid(batch.column("parameter_id")))
+    keep = pc.and_(keep, pc.fill_null(pc.is_finite(value), False))
+    row_station = row_station.filter(keep)
+    batch = batch.filter(keep)
+    if batch.num_rows == 0:
+        return 0
+
+    station_of = np.asarray(row_station, dtype=np.int64)
+    micros = np.asarray(
+        batch.column("observed_utc").cast(pa.int64()), dtype=np.int64,
+    )
+    # DMI's trace sentinel: a negative amount is "below 0.1 mm", never a
+    # negative depth (``_amount_mm``). The fold makes a new array, which
+    # is what lets the rest of this work in place — Arrow's own buffers
+    # come back read-only.
+    readings = np.maximum(
+        np.asarray(batch.column("value"), dtype=np.float32), np.float32(0.0),
+    )
+    is_amount = np.asarray(
+        pc.fill_null(pc.equal(batch.column("parameter_id"), PRECIP_PARAM), False),
+        dtype=bool,
+    )
+
+    # ``slot_end_of`` is a ceiling to the next slot boundary, with an
+    # instant already ON a boundary staying put — which is what integer
+    # ceiling division does, on microseconds so a sub-second stamp rounds
+    # up exactly as the reference's does.
+    slot = -(-micros // step_us) * step_us // 1_000_000
+    position = (slot - first_sec) // step_sec
+    inside = (position >= 0) & (position < n_slots)
+    flat = station_of * n_slots + position
+    amount = inside & is_amount
+    duration = inside & ~is_amount
+    _scatter_max(mm_flat, flat[amount], readings[amount])
+    _scatter_max(dur_flat, flat[duration], readings[duration])
+    return int(batch.num_rows)
+
+
+def gauge_truth_vectorised(
+    store_root: Any,
+    start: datetime,
+    end: datetime,
+    station_ids: Sequence[str] | None = None,
+    *,
+    wet_mm: float = WET_PRECIP_MM,
+    wet_dur_min: float = WET_DUR_MIN,
+    dry_min: int = DEFAULT_DRY_MIN,
+    min_mm_two_slots: float | None = None,
+    slot_min: int = SLOT_MIN,
+    pad_min: int = DEFAULT_GAUGE_PAD_MIN,
+    log=None,
+) -> GaugeTruth:
+    """The whole gauge truth for a window, in one vectorised pass.
+
+    ``store_root`` is the corpus root a
+    :class:`~dmi_nowcast_core.station_store.StationObsStore` takes.
+    ``start`` / ``end`` name the MONTHS to read, exactly as the callers'
+    ``_months_between(start, end)`` did; each month partition is read with
+    ``pad_min`` minutes of context either side, and the grid spans the
+    union of those windows.
+
+    ``station_ids`` restricts the read (and fixes the row order of the
+    grid); ``None`` reads every station the partitions hold. Every
+    requested station gets an entry in ``onsets`` — an empty list where
+    the archive says nothing — while ``known_until`` carries only the
+    stations that actually reported, which is the test the callers use to
+    decide whether a station can verify anything at all.
+
+    Identical in result to ``gauge_slots`` + ``onsets`` per station per
+    month, and about a thousand times faster; the equality is asserted
+    against the reference implementation in the tests, on hand-made series
+    and on a real month of the archive.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    from .station_store import StationObsStore
+
+    if slot_min <= 0:
+        raise ValueError("slot_min must be positive")
+    store = StationObsStore(store_root)
+    pad = timedelta(minutes=int(pad_min))
+    months = _months_between(_as_utc(start, "start"), _as_utc(end, "end"))
+    windows = [_month_window(year, month, pad) for year, month in months]
+    grid_first = slot_end_of(windows[0][0], slot_min=slot_min)
+    grid_last = slot_end_of(windows[-1][1], slot_min=slot_min)
+
+    step_sec = slot_min * 60
+    first_sec = int(grid_first.timestamp())
+    n_slots = (int(grid_last.timestamp()) - first_sec) // step_sec + 1
+    if n_slots <= 0:
+        return GaugeTruth(slot_min=slot_min)
+
+    stations = (
+        None if station_ids is None else [str(s) for s in dict.fromkeys(station_ids)]
+    )
+    if stations is None:
+        stations = _stations_in(store, months)
+    if not stations:
+        return GaugeTruth(slot_min=slot_min)
+    station_index = pa.array(stations, type=pa.string())
+
+    # -1.0 is the "nothing reported" sentinel while the grid is filled: a
+    # folded reading is never negative, so it is a proper identity for the
+    # running maximum. It becomes NaN once the fill is done.
+    shape = (len(stations), int(n_slots))
+    mm = np.full(shape, -1.0, dtype=np.float32)
+    dur = np.full(shape, -1.0, dtype=np.float32)
+    mm_flat = mm.reshape(-1)
+    dur_flat = dur.reshape(-1)
+    step_us = step_sec * 1_000_000
+
+    # The partitions the GRID touches, which is the months asked for plus
+    # whatever sliver of their neighbours the pad reaches into. Each is
+    # streamed a batch at a time and folded straight into the grid, so
+    # the resident cost of a month is one batch and not a month.
+    pool = pa.default_memory_pool()
+    for year, month in _months_between(grid_first, grid_last):
+        rows = 0
+        try:
+            for batch in store.stream_month(
+                year, month, [PRECIP_PARAM, PRECIP_DUR_PARAM], stations,
+            ):
+                rows += _absorb_batch(
+                    batch, station_index, mm_flat, dur_flat,
+                    first_sec=first_sec, step_sec=step_sec,
+                    step_us=step_us, n_slots=n_slots,
+                )
+        except Exception as exc:  # noqa: BLE001 — one unreadable month
+            if log:
+                log(f"gauge read failed for {year}-{month:02d}: {exc}")
+            continue
+        finally:
+            # Arrow's allocator holds freed pages by default, and ten
+            # months of that is the difference between 200 MB and 600.
+            pool.release_unused()
+        if log:
+            log(f"gauge month {year}-{month:02d}: {rows} reading(s)")
+
+    mm[mm < 0.0] = np.nan
+    dur[dur < 0.0] = np.nan
+    slot_ends = first_sec + np.arange(n_slots, dtype=np.int64) * step_sec
+    with np.errstate(invalid="ignore"):
+        known = ~(np.isnan(mm) & np.isnan(dur))
+        wet = (mm >= float(wet_mm)) | (dur >= float(wet_dur_min))
+
+    truth_series: dict[str, StationSlots] = {}
+    onsets_by_station: dict[str, list[datetime]] = {}
+    known_until: dict[str, datetime] = {}
+    for row, station in enumerate(stations):
+        series = StationSlots(
+            station_id=station,
+            slot_end=slot_ends,
+            mm=mm[row],
+            dur=dur[row],
+            known=known[row],
+            wet=wet[row],
+            slot_min=slot_min,
+        )
+        truth_series[station] = series
+        onsets_by_station[station] = series.onsets(
+            dry_min, min_mm_two_slots=min_mm_two_slots,
+        )
+        last = series.known_until()
+        if last is not None:
+            known_until[station] = last
+
+    known_slots = 0
+    for (window_start, window_end) in windows:
+        for series in truth_series.values():
+            known_slots += series.known_between(window_start, window_end)
+
+    return GaugeTruth(
+        series=truth_series,
+        onsets=onsets_by_station,
+        known_until=known_until,
+        known_slots=known_slots,
+        slot_min=slot_min,
+    )
+
+
+def _stations_in(store: Any, months: Sequence[tuple[int, int]]) -> list[str]:
+    """Every station id the requested partitions carry, sorted.
+
+    Only for ``station_ids=None`` — a caller asking about the whole
+    archive. The three consumers all name their stations, because the
+    decision rows decide which stations there is anything to score at.
+    """
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    found: set[str] = set()
+    for year, month in months:
+        path = store.partition_path(int(year), int(month))
+        if not path.exists():
+            continue
+        column = pq.read_table(path, columns=["station_id"]).column("station_id")
+        found.update(pc.unique(column.combine_chunks()).to_pylist())
+    return sorted(str(s) for s in found if s is not None)
 
 
 # ---------------------------------------------------------------------------

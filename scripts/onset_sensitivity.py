@@ -132,14 +132,12 @@ from dmi_nowcast_sidecar.threshold_sweep import (  # noqa: E402
     replay_station,
     write_atomic,
 )
-# Private, and deliberately so: the month walker is the sweep's own, so
-# the gauge window this script reads is the window the fit read, seam for
-# seam; and the two track-record indices are the layout ``build_tracks``
-# writes, which must not be guessed at a second time.
+# Private, and deliberately so: the two track-record indices are the
+# layout ``build_tracks`` writes, which must not be guessed at a second
+# time.
 from dmi_nowcast_sidecar.threshold_sweep import (  # noqa: E402
     _GENERATED,
     _RADAR_TS,
-    _months_between,
 )
 
 __all__ = [
@@ -390,68 +388,45 @@ def gauge_truth_variants(
     Returns ``(onsets[variant][station][instant] -> two-slot mm,
     known_until[station], known slot count)``.
 
-    Read month by month with the sweep's own pad, so a year of a hundred
-    stations is never held at once, and unioned across the overlap exactly
-    as ``threshold_sweep.gauge_truth`` unions its onset instants. The union
-    is the right merge and not merely a convenient one: a padded read that
-    truncates a candidate's context can only *shorten* its dry run and
-    *shrink* its two-slot amount, so a read can never manufacture an onset
-    the fuller read rejects — and the amounts are merged by maximum for
-    the same reason.
-    """
-    from dmi_nowcast_core.station_store import StationObsStore
+    The archive is read once, vectorised
+    (``warning_score.gauge_truth_vectorised``), and each variant is then a
+    boolean run-length pass over the grid already in memory — five onset
+    definitions for the price of one read, where the row-at-a-time version
+    below paid for a month of Python dict work per station per month.
 
-    store = StationObsStore(Path(corpus_dir))
+    ``slot_amounts`` and :func:`variant_onsets` stay as the reference the
+    vectorised derivation is tested against: the amount test, the dry-run
+    reset on a failed candidate and the trace fold are stated there in
+    plain Python and asserted equal to the array version.
+    """
+    from dmi_nowcast_core.warning_score import gauge_truth_vectorised
+
     pad = timedelta(minutes=GAUGE_PAD_MIN)
     start, end = window
+    loaded = gauge_truth_vectorised(
+        Path(corpus_dir), start - pad, end + pad, list(station_ids),
+        pad_min=GAUGE_PAD_MIN, log=log,
+    )
     found: dict[str, dict[str, dict[datetime, float]]] = {
-        variant.name: {} for variant in variants
+        variant.name: {
+            station: dict(pairs)
+            for station, pairs in loaded.onsets_for(
+                variant.dry_min, min_mm_two_slots=variant.min_mm_two_slots,
+            ).items()
+        }
+        for variant in variants
     }
-    known_until: dict[str, datetime] = {}
-    known_slots = 0
-    wanted = list(station_ids)
-    for year, month in _months_between(start - pad, end + pad):
-        month_start = datetime(year, month, 1, tzinfo=timezone.utc) - pad
-        if month == 12:
-            month_end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) + pad
-        else:
-            month_end = datetime(year, month + 1, 1, tzinfo=timezone.utc) + pad
-        try:
-            table = store.read(
-                month_start, month_end,
-                [PRECIP_PARAM, PRECIP_DUR_PARAM], wanted,
+    if log:
+        log(
+            f"gauge truth: {loaded.known_slots} known slot(s) over "
+            f"{len(loaded.known_until)} reporting station(s); "
+            + ", ".join(
+                f"{v.name} {sum(len(s) for s in found[v.name].values())}"
+                for v in variants
             )
-        except Exception as exc:  # noqa: BLE001 — one unreadable month
-            if log:
-                log(f"gauge read failed for {year}-{month:02d}: {exc}")
-            continue
-        by_station: dict[str, list[dict]] = {}
-        for row in table.to_pylist():
-            by_station.setdefault(str(row.get("station_id")), []).append(row)
-        del table
-        for station in wanted:
-            rows = by_station.get(station)
-            if not rows:
-                continue
-            grid = slot_amounts(
-                rows, start_utc=month_start, end_utc=month_end,
-            )
-            for stamp, mm, dur in grid:
-                if mm is None and dur is None:
-                    continue
-                known_slots += 1
-                seen = known_until.get(station)
-                if seen is None or stamp > seen:
-                    known_until[station] = stamp
-            for variant in variants:
-                bucket = found[variant.name].setdefault(station, {})
-                for instant, total in variant_onsets(grid, variant):
-                    previous = bucket.get(instant)
-                    if previous is None or total > previous:
-                        bucket[instant] = total
-        if log:
-            log(f"gauge month {year}-{month:02d}: {known_slots} known slots so far")
-    return found, known_until, known_slots
+            + " onset(s)"
+        )
+    return found, loaded.known_until, loaded.known_slots
 
 
 # ---------------------------------------------------------------------------

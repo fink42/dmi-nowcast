@@ -29,8 +29,11 @@ sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
 import onset_sensitivity as sens  # noqa: E402  (after the sys.path edit)
 
+from dmi_nowcast_core.station_store import StationObsStore  # noqa: E402
+from dmi_nowcast_core.metobs import Observation  # noqa: E402
 from dmi_nowcast_core.warning_score import (  # noqa: E402
     gauge_slots,
+    gauge_truth_vectorised,
     onsets as gauge_onsets,
     score_warnings,
 )
@@ -181,6 +184,65 @@ def test_a_hole_in_the_grid_is_not_a_dry_spell() -> None:
     cells = [(at(i), 0.0, 0.0) for i in range(6)]
     cells.append((at(6) + timedelta(days=1), 1.0, 5.0))
     assert sens.variant_onsets(cells, variant("V0")) == []
+
+
+# ---------------------------------------------------------------------------
+# The vectorised load derives the same variants from the archive
+# ---------------------------------------------------------------------------
+
+
+def stored_series(root: Path) -> None:
+    """``SERIES`` written to a real parquet store, as DMI would deliver it."""
+    rows = []
+    for i, (mm, dur) in enumerate(SERIES):
+        if mm is not None:
+            rows.append(Observation("06180", at(i), "precip_past10min", mm))
+        if dur is not None:
+            rows.append(Observation("06180", at(i), "precip_dur_past10min", dur))
+    StationObsStore(root).append(rows)
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED))
+def test_the_vectorised_load_finds_each_variant_s_own_onsets(
+    name: str, tmp_path: Path,
+) -> None:
+    """The archive path and the hand-worked grid must not drift apart.
+
+    ``gauge_truth_variants`` no longer walks the grid in Python — it reads
+    each month partition into numpy and derives every variant by boolean
+    run length over the same array. The same series, written to a store
+    and read back, has to give the same onsets AND the same two-slot
+    amounts as :func:`variant_onsets` reading the grid directly; the
+    amounts matter because the mm histogram in the report is built from
+    them.
+    """
+    stored_series(tmp_path)
+    spec = variant(name)
+    truth = gauge_truth_vectorised(
+        tmp_path, at(0), at(len(SERIES) - 1), ["06180"],
+        dry_min=spec.dry_min, min_mm_two_slots=spec.min_mm_two_slots,
+    )
+    want = sens.variant_onsets(grid(), spec)
+    assert truth.onsets["06180"] == [ts for ts, _mm in want]
+    found = truth.series["06180"].onsets_with_amounts(
+        spec.dry_min, min_mm_two_slots=spec.min_mm_two_slots,
+    )
+    assert [mm for _ts, mm in found] == [pytest.approx(mm) for _ts, mm in want]
+
+
+def test_one_archive_read_serves_every_variant(tmp_path: Path) -> None:
+    """Five definitions, one load — the whole point of the rewrite."""
+    stored_series(tmp_path)
+    truth = gauge_truth_vectorised(
+        tmp_path, at(0), at(len(SERIES) - 1), ["06180"],
+    )
+    for spec in sens.VARIANTS:
+        derived = truth.onsets_for(
+            spec.dry_min, min_mm_two_slots=spec.min_mm_two_slots,
+        )
+        assert [ts for ts, _mm in derived["06180"]] == [
+            at(i) for i in EXPECTED[spec.name]
+        ]
 
 
 # ---------------------------------------------------------------------------
