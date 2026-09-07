@@ -71,6 +71,14 @@ services:
       # Bind on all interfaces inside the container — the host-side port
       # publishing constrains the network exposure.
       DMI_NOWCAST_SERVER__HOST: 0.0.0.0
+      # Cap glibc's per-thread malloc arenas. The service pins each heavy
+      # blocking job to its own thread (dmi_nowcast_sidecar.workers), which
+      # is what actually fixes the RSS climb; this is the belt-and-braces
+      # underneath it, so a future thread nobody thought about cannot
+      # quietly buy another multi-hundred-megabyte arena that glibc never
+      # gives back. Two, not one: one arena serialises every malloc in the
+      # process behind a single lock.
+      MALLOC_ARENA_MAX: "2"
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8081/healthz"]
       interval: 30s

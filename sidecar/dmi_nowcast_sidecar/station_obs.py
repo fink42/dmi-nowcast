@@ -18,24 +18,28 @@ gauge data is not an input to a nowcast, and a metObs outage must not be
 able to delay a radar cycle.
 
 Async discipline, as everywhere in this service: the HTTP call is async,
-and every Parquet read/rewrite goes to a thread via ``asyncio.to_thread``.
-Nothing touches the filesystem on the event loop.
+and every Parquet read/rewrite goes to a worker thread. Nothing touches
+the filesystem on the event loop.
 
 Memory: the rewrite reads the whole current month, concatenates, dedupes,
 sorts and writes it back, and it does that every ten minutes — by the end
 of a month that is well over a million rows of Arrow buffers, six times a
 day, in the process that also serves the API. Nothing holds on to them
 (``StationObsStore`` keeps a root path and no cached table, and this
-poller keeps neither), but Arrow's pool does not return the high-water
-mark to the kernel on its own, so :func:`release_arrow_pool` asks it to
-after each append. That keeps the poller's contribution to RSS flat
-instead of ratcheting up with the month.
+poller keeps neither), but two things have to be asked for explicitly.
+Arrow's pool does not return the high-water mark to the kernel on its
+own, so :func:`release_arrow_pool` asks it to after each append; and the
+rewrite runs on the dedicated ``"station_obs"`` worker rather than the
+shared executor, so its high-water lives in one allocator arena instead
+of one per thread the shared pool grows (see
+:mod:`dmi_nowcast_sidecar.workers` — this poller being a *second*
+independent ``to_thread`` caller beside the radar cycle is exactly what
+made the shared pool grow in the first place).
 
 Data licence: CC BY 4.0 (DMI Open Data).
 """
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,30 +52,12 @@ from dmi_nowcast_core.metobs import AsyncMetObsClient, is_trace
 from dmi_nowcast_core.station_store import StationObsStore
 
 from .config import Config
+from .workers import release_arrow_pool, run_in_pool
 
 _log = structlog.get_logger(__name__)
 
 #: Spread the poll off the exact minute boundary, as the radar cycle does.
 JITTER_SEC = 30
-
-
-def release_arrow_pool() -> None:
-    """Hand the month rewrite's buffers back to the kernel.
-
-    ``pa.default_memory_pool().release_unused()`` frees pool pages nothing
-    is using any more. Without it the pool keeps the largest partition it
-    ever rewrote, which on the live instance is a permanent step up in RSS
-    every month — and RSS is what the OOM killer scores.
-
-    Never raises: a pyarrow that cannot do this is not a reason to fail a
-    poll that already succeeded.
-    """
-    try:
-        import pyarrow as pa
-
-        pa.default_memory_pool().release_unused()
-    except Exception:  # noqa: BLE001 — best effort, by design
-        pass
 
 
 @dataclass
@@ -170,11 +156,12 @@ class StationObsPoller:
             if not observations:
                 continue
             try:
-                # Parquet rewrite — blocking, so off the loop it goes. The
-                # pool release rides in the same thread: it is a C call of
+                # Parquet rewrite — blocking, so off the loop it goes,
+                # onto this task's own worker (see .workers). The pool
+                # release rides in the same thread: it is a C call of
                 # microseconds, but it belongs where the buffers died.
-                written = await asyncio.to_thread(
-                    self._append_and_release, observations,
+                written = await run_in_pool(
+                    "station_obs", self._append_and_release, observations,
                 )
             except Exception as exc:  # noqa: BLE001
                 result.errors[parameter] = f"{type(exc).__name__}: {exc}"

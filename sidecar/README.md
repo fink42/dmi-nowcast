@@ -15,6 +15,7 @@ images (Alpine) have no wheels for it.
   - `app.py` — FastAPI app + routes
   - `config.py` — pydantic-settings + YAML loader
   - `logging_setup.py` — structlog (pretty in dev, JSON in prod)
+  - `workers.py` — one thread per heavy blocking job (see below)
   - `__main__.py` — uvicorn entrypoint (`python -m dmi_nowcast_sidecar`)
 - `config.example.yaml` — copy to `config.yaml` and edit
 - `deploy/` — Docker Compose + systemd assets
@@ -241,6 +242,51 @@ When the private peer is unreachable the public instance keeps the last
 good copy of each file and logs one line per failure. A stale report is
 honest — it carries its own `generated_at_utc` — where a blanked one
 would not be.
+
+## Where the blocking work runs
+
+Every heavy job in this service is off the event loop. `workers.py` says
+*which thread* it goes to, and that turns out to matter as much.
+
+`asyncio.to_thread` submits to the loop's shared default executor, which
+grows a worker whenever a job arrives and none is idle. glibc gives each
+allocating thread its own malloc arena and never returns an arena's
+high-water mark to the kernel — so a job with a gigabyte-scale transient
+costs that much RSS **for every thread it has ever run on**.
+
+Until Phase F the radar cycle was this process's only `to_thread` caller,
+so STEPS always ran on thread #1 and the service sat flat at ~0.9 GB for
+days. Phase F added two more callers on unrelated cadences — the gauge
+poller (10 min, its own scheduler) and the station scoreboard (after each
+cycle) — which overlap the 5-min cycle often enough that the pool grows,
+and each new worker that takes a turn at the cycle inflates another arena
+to the STEPS high-water. The private instance started climbing ~1 GB an
+hour and needed an hourly restart; the public one, which runs neither new
+task, never moved.
+
+So the three heavy jobs each get a **named single-worker pool** and always
+run there: `cycle` (`CycleEngine._compute_sync`), `station_eval` and
+`station_obs` (the two month-partition rewrites). Small jobs — a file
+copy, a SQLite read, a PNG, a JSON write — stay on `asyncio.to_thread`,
+where the pool's elasticity is worth having and costs nothing.
+
+Measured on `python:3.12-slim`, the live wiring driven 34 cycles:
+
+| | compute ran on | RSS |
+|---|---|---|
+| shared default executor | 3 threads | 2.5 GB, still stepping |
+| per-job pools | 1 thread | 1.19 GB, flat from cycle 13 |
+
+Two things ride along with the same discipline. `release_arrow_pool()`
+is called after each partition rewrite in both tasks, because Arrow's
+pool otherwise keeps the largest month it ever built. And the compose
+files set `MALLOC_ARENA_MAX=2` as the belt-and-braces underneath the
+pools, so a future thread nobody thought about cannot quietly buy another
+arena.
+
+`DMI_NOWCAST_WORKER_DEBUG=1` logs the pool, the worker thread count and
+the process RSS after every pooled job — off by default, and the
+instrument to reach for first if RSS ever climbs again.
 
 ## Deployment
 

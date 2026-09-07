@@ -105,6 +105,38 @@ async def test_cycle_produces_state_with_all_required_fields(engine: CycleEngine
 
 
 @pytest.mark.asyncio
+async def test_every_cycle_computes_on_the_same_dedicated_worker(
+    engine: CycleEngine, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cycle's compute is the process's largest transient by far.
+
+    numpy, STEPS and the national reduction peak in the gigabytes, and on
+    glibc a thread never gives its high-water mark back — so every thread
+    this has ever run on costs that much RSS for ever. On the shared
+    executor it moved around (Phase F put two more independent
+    ``to_thread`` callers beside it, which is what made the pool grow);
+    on its own worker it cannot. See :mod:`dmi_nowcast_sidecar.workers`.
+    """
+    import threading
+
+    seen: list[str] = []
+    original = engine._compute_sync
+
+    def spy(*args, **kwargs):
+        seen.append(threading.current_thread().name)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_compute_sync", spy)
+    for _ in range(3):
+        engine._last_frame_ts = None  # defeat the no-new-frame fast path
+        assert (await engine.run_cycle()).error is None
+
+    assert len(seen) == 3
+    assert len(set(seen)) == 1, f"the compute moved between threads: {set(seen)}"
+    assert seen[0].startswith("dmi-cycle")
+
+
+@pytest.mark.asyncio
 async def test_cycle_writes_state_json_to_disk(engine: CycleEngine) -> None:
     state_path = engine.store.state_path
     assert not state_path.exists()

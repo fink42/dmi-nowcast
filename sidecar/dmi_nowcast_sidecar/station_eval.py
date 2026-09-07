@@ -18,7 +18,11 @@ Design constraints, in the order they bite:
   does can be undone by a failure here.
 - **All I/O off the loop.** ``after_cycle`` is awaited by the scheduler on
   the event loop; the sampling, the parquet rewrite and the state write
-  all happen inside one ``asyncio.to_thread`` call.
+  all happen inside one worker call — on this step's own dedicated
+  thread, not the shared executor, because a month-partition rewrite has
+  a working set worth hundreds of megabytes and glibc charges that to
+  every thread it has ever run on (see
+  :mod:`dmi_nowcast_sidecar.workers`).
 - **One evaluation per radar observation.** The cycle fires every 5 min
   and fullRange composites land every ~10, so half the cycles re-emit the
   previous frame. Evaluating one twice would double-count a persistence
@@ -36,7 +40,6 @@ Design constraints, in the order they bite:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import tempfile
@@ -58,6 +61,7 @@ from dmi_nowcast_core.warning_score import (
 from .config import Config
 from .national_sample import sample_point
 from .push.engine import INITIAL_STATE, Observation, Rules, SubState, evaluate
+from .workers import release_arrow_pool, run_in_pool
 
 _log = structlog.get_logger(__name__)
 
@@ -148,6 +152,12 @@ def _write_atomic(path: Path, write) -> None:
             os.unlink(tmp)
 
 
+#: The idempotency key of a decision row: one evaluation per station per
+#: radar frame. Named once because the merge below joins on it and the
+#: module docstring promises it.
+MERGE_KEY: tuple[str, str] = ("radar_ts", "station_id")
+
+
 def append_rows(path: Path, rows: Sequence[dict], leads_min=None) -> int:
     """Merge ``rows`` into a month partition, keyed on (radar_ts, station_id).
 
@@ -162,11 +172,34 @@ def append_rows(path: Path, rows: Sequence[dict], leads_min=None) -> int:
     the ``p_rain_<lead>`` columns existed — or under a different
     ``national.leads_min`` — keeps every column it had and gains nulls for
     the rest, instead of failing the rewrite on a schema mismatch.
+
+    The drop is an Arrow **left anti join**, not a Python set difference.
+    The obvious spelling — ``existing.to_pylist()``, a set of key tuples,
+    a list comprehension, ``decision_table`` to rebuild — materialises the
+    whole month as row dicts, twelve datetimes and floats each, every ten
+    minutes for the life of the month. Measured on the real partition
+    shape at end-of-month size (430k rows): 3.6 s of blocking work and a
+    449 MB peak of Python objects, against 0.2 s and 9 MB for the join.
+    Same rows, same order, same file — see
+    ``test_append_rows_merges_without_materialising_python_rows``.
+
+    ``release_arrow_pool`` closes the loop the same way the gauge poller
+    does: the pool otherwise keeps the largest month it ever built. It runs
+    once the merge's frame is gone, so the tables it is asked about really
+    are unreachable.
     """
+    try:
+        return _merge_and_write(path, rows, leads_min)
+    finally:
+        release_arrow_pool()
+
+
+def _merge_and_write(path: Path, rows: Sequence[dict], leads_min) -> int:
+    """The read-merge-sort-write half of :func:`append_rows`."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    new = decision_table(rows, leads_min)
+    merged = decision_table(rows, leads_min)
     if path.is_file():
         try:
             existing = pq.read_table(path)
@@ -178,17 +211,24 @@ def append_rows(path: Path, rows: Sequence[dict], leads_min=None) -> int:
         if existing is not None and existing.num_rows:
             existing = align_decision_table(existing, leads_min)
             leads = decision_leads_in(existing)
-            new = align_decision_table(new, leads)
-            keys = {(r["radar_ts"], r["station_id"]) for r in new.to_pylist()}
-            kept = [
-                r for r in existing.to_pylist()
-                if (r["radar_ts"], r["station_id"]) not in keys
-            ]
-            if kept:
-                new = pa.concat_tables([decision_table(kept, leads), new])
-    new = new.sort_by([("radar_ts", "ascending"), ("station_id", "ascending")])
-    _write_atomic(path, lambda tmp: pq.write_table(new, tmp, compression="zstd"))
-    return new.num_rows
+            merged = align_decision_table(merged, leads)
+            kept = existing.join(
+                merged.select(list(MERGE_KEY)),
+                keys=list(MERGE_KEY),
+                join_type="left anti",
+            )
+            if kept.num_rows:
+                # ``join`` is free to reorder columns; select back to the
+                # aligned schema so ``concat_tables`` is never handed two
+                # tables that merely happen to share a column set.
+                merged = pa.concat_tables(
+                    [kept.select(merged.schema.names), merged],
+                )
+    merged = merged.sort_by(
+        [("radar_ts", "ascending"), ("station_id", "ascending")],
+    )
+    _write_atomic(path, lambda tmp: pq.write_table(merged, tmp, compression="zstd"))
+    return merged.num_rows
 
 
 class StationEvalService:
@@ -263,7 +303,8 @@ class StationEvalService:
             getattr(latest, "generated_at_utc", None)
             or datetime.now(timezone.utc)
         )
-        summary = await asyncio.to_thread(
+        summary = await run_in_pool(
+            "station_eval",
             self._evaluate_and_append,
             products,
             geo,
@@ -413,6 +454,7 @@ class StationEvalService:
 
 __all__ = [
     "DECISION_COLUMNS",
+    "MERGE_KEY",
     "STATE_VERSION",
     "StationEvalService",
     "append_rows",

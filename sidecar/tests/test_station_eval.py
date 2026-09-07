@@ -425,6 +425,35 @@ async def test_all_the_blocking_work_runs_off_the_event_loop(
     assert seen == [False], "the blocking work ran on the event loop thread"
 
 
+async def test_every_cycle_evaluates_on_the_same_worker_thread(
+    config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One thread for the life of the process, not one per cycle.
+
+    This step is the second of Phase F's two new blocking callers, and the
+    reason the shared executor started growing workers beside the radar
+    cycle. glibc charges a thread's high-water mark to that thread for
+    ever, so the scoreboard must land on its own worker every time — see
+    :mod:`dmi_nowcast_sidecar.workers`.
+    """
+    service = StationEvalService(config, _engine(_products()))
+    seen: list[int] = []
+    original = service._evaluate_and_append
+
+    def spy(*args, **kwargs):
+        seen.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_evaluate_and_append", spy)
+    for cycle in range(12):
+        radar_ts = RADAR_TS + timedelta(minutes=10 * cycle)
+        service.engine = _engine(_products(), radar_ts=radar_ts)
+        await service.after_cycle(_cycle_result(radar_ts))
+
+    assert len(seen) == 12, "some cycles never reached the blocking step"
+    assert len(set(seen)) == 1
+
+
 # ---------------------------------------------------------------------------
 # The partition merge, on its own
 # ---------------------------------------------------------------------------
@@ -470,6 +499,75 @@ def test_append_rows_writes_atomically(tmp_path: Path) -> None:
     append_rows(path, [_row("06180", RADAR_TS)])
     # No temp files left behind for a reader to trip over.
     assert [p.name for p in tmp_path.iterdir()] == ["09.parquet"]
+
+
+def test_append_rows_merges_without_materialising_python_rows(
+    tmp_path: Path,
+) -> None:
+    """The month must never be turned into row dicts to drop a key.
+
+    The natural spelling of this merge — ``to_pylist``, a set of key
+    tuples, a comprehension, ``decision_table`` to rebuild — costs
+    O(month) Python objects every ten minutes for the life of the month.
+    Measured at end-of-month size (430k rows): 3.6 s of blocking work and
+    a 449 MB peak of Python objects, against 0.2 s and 9 MB for the join;
+    glibc hands neither back.
+
+    Pinned by ``tracemalloc``, which counts exactly the allocations at
+    issue (Python objects, not Arrow's own pool): merging one frame into
+    a 20 000-row partition peaks at ~2 MB the vectorised way and ~16 MB
+    the row-dict way, so a ceiling of 6 MB separates them with room for
+    interpreter noise on either side.
+    """
+    import tracemalloc
+
+    path = tmp_path / "09.parquet"
+    stations = [f"0{6000 + i}" for i in range(100)]
+    append_rows(path, [
+        _row(station, RADAR_TS + timedelta(minutes=10 * frame))
+        for frame in range(200)
+        for station in stations
+    ])
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        merged = append_rows(
+            path, [_row(station, RADAR_TS, action="notify") for station in stations],
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert merged == 20_000  # replaced its keys, did not append them
+    assert peak < 6_000_000, (
+        f"the merge allocated {peak / 1e6:.1f} MB of Python objects; "
+        "the partition is being materialised as row dicts again"
+    )
+
+
+def test_append_rows_grows_by_the_new_keys_only_over_many_cycles(
+    tmp_path: Path,
+) -> None:
+    """The collection on disk stays bounded by (frames × stations), not by cycles.
+
+    Twenty cycles over five stations, each re-emitting the previous frame
+    before writing a new one — the live shape, since fullRange composites
+    land every ~10 min and the cycle fires every 5. A merge that appended
+    instead of replacing would end at 200 rows.
+    """
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "09.parquet"
+    stations = ["06180", "06120", "06031", "06074", "06119"]
+    for cycle in range(20):
+        ts = RADAR_TS + timedelta(minutes=10 * cycle)
+        append_rows(path, [_row(s, ts) for s in stations])
+        append_rows(path, [_row(s, ts, action="notify") for s in stations])
+
+    table = pq.read_table(path)
+    assert table.num_rows == 20 * len(stations)
+    assert set(table.column("action").to_pylist()) == {"notify"}
 
 
 # ---------------------------------------------------------------------------

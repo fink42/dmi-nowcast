@@ -19,7 +19,6 @@ production:
 """
 from __future__ import annotations
 
-import asyncio
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -275,6 +274,36 @@ async def test_parquet_write_runs_off_the_event_loop(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_every_poll_rewrites_on_the_same_worker_thread(tmp_path: Path) -> None:
+    """One thread for the life of the process, not one per overlapping poll.
+
+    The rewrite's working set is a whole month of Arrow buffers. On glibc
+    that high-water is charged to each thread it lands on and never given
+    back, so "which thread" is the difference between a flat RSS and one
+    that climbs with every worker the shared pool happens to grow.
+    """
+    seen: set[int] = set()
+    real_store = StationObsStore(tmp_path / "corpus")
+
+    class RecordingStore(StationObsStore):
+        def append(self, observations):  # type: ignore[override]
+            seen.add(threading.get_ident())
+            return real_store.append(observations)
+
+    client = FakeClient({"precip_past10min": [
+        Observation("06126", NOW, "precip_past10min", 0.2),
+    ]})
+    poller = StationObsPoller(
+        _config(tmp_path, parameters=["precip_past10min"]),
+        client=client,  # type: ignore[arg-type]
+        store=RecordingStore(tmp_path / "corpus"),
+    )
+    for _ in range(12):
+        await poller.poll_once(now=NOW)
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
 async def test_append_failure_is_contained(tmp_path: Path) -> None:
     class BrokenStore(StationObsStore):
         def append(self, observations):  # type: ignore[override]
@@ -381,12 +410,19 @@ def test_station_catalogue_can_be_written_through_the_store(tmp_path: Path) -> N
     assert [s.station_id for s in store.read_catalogue()] == ["06126"]
 
 
-def test_asyncio_import_is_used_for_offloading() -> None:
-    """Guard against someone 'simplifying' the executor call away."""
+def test_the_rewrite_is_offloaded_to_this_task_s_own_worker() -> None:
+    """Guard against someone 'simplifying' the executor call away.
+
+    And against someone putting it back on ``asyncio.to_thread``: the
+    shared executor grows a thread whenever this poller's 10-min cadence
+    overlaps the 5-min radar cycle, and glibc charges the cycle's
+    multi-gigabyte high-water to every thread it has ever run on. That is
+    the leak :mod:`dmi_nowcast_sidecar.workers` exists to stop.
+    """
     import inspect
 
     from dmi_nowcast_sidecar import station_obs
 
     source = inspect.getsource(station_obs.StationObsPoller.poll_once)
-    assert "asyncio.to_thread" in source
-    assert asyncio is not None
+    assert 'run_in_pool(\n                    "station_obs"' in source
+    assert "asyncio.to_thread" not in source

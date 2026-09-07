@@ -135,6 +135,7 @@ from .state_schema import (
     ForecastPointResponse,
 )
 from .storage import StateStore
+from .workers import shutdown_pools
 
 _log = structlog.get_logger(__name__)
 
@@ -279,6 +280,12 @@ def create_app(
                     push_store.close()
                 except Exception as exc:  # noqa: BLE001
                     _log.warning("push_store_close_failed", error=str(exc))
+            # The dedicated worker threads outlive every scheduler above,
+            # by design (they are process-wide, not per-app), so the app
+            # that started them is the thing that stops them. Not waited
+            # on: a teardown must not block on a parquet rewrite nobody
+            # is going to read.
+            shutdown_pools()
 
     app = FastAPI(
         title="dmi-nowcast-sidecar",

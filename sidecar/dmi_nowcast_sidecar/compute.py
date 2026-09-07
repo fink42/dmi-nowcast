@@ -82,6 +82,7 @@ from .state_schema import (
     State,
 )
 from .storage import StateStore
+from .workers import run_in_pool
 
 _log = structlog.get_logger(__name__)
 
@@ -214,7 +215,15 @@ class CycleEngine:
     """Long-lived object that owns cross-cycle state.
 
     One instance per sidecar process. Methods are mostly async-safe (or
-    are explicitly meant to run in a thread via ``asyncio.to_thread``).
+    are explicitly meant to run in a worker thread).
+
+    The cycle's compute is the heaviest transient in the process — parse,
+    dense flow, a STEPS ensemble, the national reduction — so it runs on
+    the dedicated ``"cycle"`` worker rather than the shared default
+    executor. :mod:`dmi_nowcast_sidecar.workers` has the measurements;
+    the short version is that a multi-gigabyte transient costs that much
+    RSS for every thread it has ever run on, and pinning it to one keeps
+    the bill to one.
     """
 
     def __init__(
@@ -501,7 +510,7 @@ class CycleEngine:
                 raise RuntimeError(f"not enough frames available (got {len(paths)})")
 
             t_compute = time.perf_counter()
-            state = await asyncio.to_thread(self._compute_sync, paths, fetch_ms)
+            state = await run_in_pool("cycle", self._compute_sync, paths, fetch_ms)
             compute_ms = (time.perf_counter() - t_compute) * 1000
 
             cycle_ms = (time.perf_counter() - t0) * 1000
@@ -595,7 +604,7 @@ class CycleEngine:
         return paths
 
     def _compute_sync(self, paths: list[Path], fetch_ms: float) -> State:
-        """Blocking compute path — call from inside ``asyncio.to_thread``."""
+        """Blocking compute path — call from inside the ``"cycle"`` worker."""
         t_compute = time.perf_counter()
 
         composites: list[RadarComposite] = [parse_composite(p) for p in paths]
@@ -1104,8 +1113,8 @@ class CycleEngine:
     ) -> EnsembleOutcome | None:
         """Run STEPS and reduce it at home; None means "fall back" (plan §A0).
 
-        Called from ``_compute_sync``, i.e. already inside
-        ``asyncio.to_thread`` — the async-discipline contract holds. Every
+        Called from ``_compute_sync``, i.e. already inside the cycle's
+        worker thread — the async-discipline contract holds. Every
         failure mode (disabled, < 3 frames, ``EnsembleUnavailable``, any
         exception from the vendored pysteps) logs a warning and returns
         None so the cycle emits exactly the deterministic-only state, with

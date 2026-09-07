@@ -67,6 +67,11 @@ services:
       # mounted (private) config.yaml cannot start this container with the
       # private surface exposed.
       DMI_NOWCAST_SERVER__PUBLIC_MODE: "true"
+      # Cap glibc's per-thread malloc arenas — see the private compose for
+      # the full story. This instance has only one heavy blocking caller
+      # (the radar cycle) and has stayed flat, but the ceiling costs
+      # nothing and the two stacks should not drift on it.
+      MALLOC_ARENA_MAX: "2"
     healthcheck:
       # /healthz is part of the public surface, so this works with or
       # without an api_key configured.
