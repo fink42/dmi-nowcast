@@ -1803,3 +1803,93 @@ class TestThresholdsSection:
         assert text.split("## Push thresholds")[1].strip().startswith(
             "Not measured."
         )
+
+
+# ---------------------------------------------------------------------------
+# Union corpus: the radar section filters by point_set
+# ---------------------------------------------------------------------------
+
+
+class TestUnionCorpusPointSet:
+    """One build now serves both point sets, so the radar corpus is a union.
+
+    Its station rows belong to the gauge section (read there through the
+    gauge-joined file). Scoring them here as well would mix two point
+    geometries into one reliability diagram and double-count the events
+    they share.
+    """
+
+    @staticmethod
+    def _union(path: Path) -> Path:
+        """A corpus carrying both point sets, labelled as the builder does."""
+        radar = _corpus_rows(gauge=False, n_events=60)
+        for row in radar:
+            row["point_set"] = "calibration_points_v2"
+        stations = _corpus_rows(gauge=False, n_events=60)
+        for row in stations:
+            # Station rows: distinct ids, and an outcome that is wrong on
+            # purpose so leaking them in would move every number.
+            row["point_id"] = f"st_{row['point_id']}"
+            row["outcome"] = 1 - row["outcome"]
+            row["point_set"] = "station_points"
+        table = _corpus_table(radar + stations, gauge=False)
+        table = table.append_column(
+            "point_set",
+            pa.array([r["point_set"] for r in radar + stations], type=pa.string()),
+        )
+        pq.write_table(table, path)
+        return path
+
+    def test_filter_keeps_only_the_named_set(self, tmp_path: Path) -> None:
+        from dmi_nowcast_core.quality_report import (
+            RADAR_POINT_SET, reliability_from_corpus,
+        )
+
+        path = self._union(tmp_path / "union.parquet")
+        filtered = reliability_from_corpus(
+            path, calibration="cv", point_set=RADAR_POINT_SET,
+        )
+        everything = reliability_from_corpus(path, calibration="cv")
+
+        n_filtered = sum(c["n"] for c in filtered["curves"])
+        n_all = sum(c["n"] for c in everything["curves"])
+        assert n_filtered > 0
+        # Exactly half the rows are radar rows.
+        assert n_filtered * 2 == n_all
+        # And the station rows' inverted outcomes really would have moved it.
+        assert filtered["curves"][0]["brier"] != everything["curves"][0]["brier"]
+
+    def test_filter_is_skipped_on_a_pre_union_corpus(self, tmp_path: Path) -> None:
+        """No point_set column means one point set already — never empty."""
+        from dmi_nowcast_core.quality_report import (
+            RADAR_POINT_SET, reliability_from_corpus,
+        )
+
+        path = write_radar_corpus(tmp_path / "old.parquet")
+        out = reliability_from_corpus(
+            path, calibration="cv", point_set=RADAR_POINT_SET,
+        )
+        assert sum(c["n"] for c in out["curves"]) > 0
+
+    def test_unknown_point_set_empties_the_section(self, tmp_path: Path) -> None:
+        from dmi_nowcast_core.quality_report import reliability_from_corpus
+
+        path = self._union(tmp_path / "union.parquet")
+        out = reliability_from_corpus(path, calibration="cv", point_set="nope")
+        assert out["curves"] == []
+
+    def test_build_report_filters_the_radar_section(self, tmp_path: Path) -> None:
+        """The wiring, not just the helper: the builder must pass the set."""
+        from dmi_nowcast_core.quality_report import (
+            QualityInputs, RADAR_POINT_SET, build_quality_report,
+            reliability_from_corpus,
+        )
+
+        path = self._union(tmp_path / "union.parquet")
+        doc = build_quality_report(QualityInputs(radar_corpus=path))
+        expected = reliability_from_corpus(
+            path, calibration="cv", point_set=RADAR_POINT_SET,
+        )
+        served = doc["reliability"]["radar"]
+        assert served is not None
+        assert [c["n"] for c in served] == [c["n"] for c in expected["curves"]]

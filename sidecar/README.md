@@ -434,22 +434,41 @@ systemd timer already runs it: **1st of the month, 03:00 UTC** (the VM's
 clock is UTC) plus up to 15 minutes of `RandomizedDelaySec`. There is no
 second scheduler to install — one timer, one entry point.
 
-It runs two steps, sequentially, ~3.5 h each (so ~7 h in all, finishing
-around 10:00 UTC):
+**One corpus build serves both point sets.** `--points` is repeatable and
+a single STEPS run per event already feeds every point in the union, so
+the ~120 radar calibration points and the DMI gauge stations come out of
+one ~3.5 h pass rather than two:
 
-| step | what it produces | ~time |
-|---|---|---|
-| 1 national recalibration | isotonic curves (the sidecar is restarted onto them), reliability report, `calibration/latest.parquet` | ~3.5 h |
-| 2 station corpus (`station_corpus.sh`) | `stations/station_corpus_gauge.parquet` — the same corpus over gauge stations, widened with gauge truth | ~3.5 h |
+```
+build   --points src/dmi_nowcast_core/calibration_points_v2.json \
+        --points <corpus>/stations/station_points.json
+fit     --point-set calibration_points_v2      → national_curves.json
+report  --point-set calibration_points_v2      → calibration_reports/<stamp>/
+join    --point-set station_points             → station_corpus_gauge.parquet
+```
 
-Step 2 runs **after** the restart, so the new curves are in service within
-minutes rather than after another 3.5 h, and it is never fatal: the curves
-are the product, the station corpus is a report input. A missing
-`stations/station_points.json` logs one line and is skipped;
-`CALIBRATION_STATIONS=0` skips it deliberately. The job's exit code
-reflects one thing only — whether the sidecar came back serving a newer
-`calibration_fitted_at` — so `systemctl --failed` means "the curves are
-not live", not "the gauge column is stale".
+Every row carries a `point_set` column naming the points file it came
+from, which is what lets one corpus be split back into the two it
+replaces. `calibration/latest.parquet` is the **whole union**; the quality
+report's radar section filters it to `calibration_points_v2` itself
+(`RADAR_POINT_SET` in `src/dmi_nowcast_core/quality_report.py`), because
+the station rows belong to the gauge section and are read there through
+the gauge-joined file.
+
+The gauge join runs **after** the restart, so the new curves are in
+service within minutes, and it is never fatal: the curves are the product,
+the gauge corpus is a report input. A missing
+`stations/station_points.json` logs one line and the run continues with
+radar points only; `CALIBRATION_STATIONS=0` drops the station points and
+the join deliberately; `CALIBRATION_UNION=0` falls back to the old
+two-build path (radar corpus, then `station_corpus.sh`) if a union run
+ever misbehaves. The job's exit code reflects one thing only — whether the
+sidecar came back serving a newer `calibration_fitted_at` — so
+`systemctl --failed` means "the curves are not live", not "the gauge
+column is stale".
+
+Wall time is therefore ~3.5 h plus a join of minutes, finishing around
+06:30 UTC.
 
 The run overlaps the 03:30 UTC nightly quality report, which is harmless:
 the report is a child process of the sidecar, the batch work is in a
@@ -471,8 +490,11 @@ choice but cannot survive a machine that is genuinely out of memory.
 `sidecar/deploy/lib/batch.sh` encodes what works, and every batch script
 sources it:
 
-- **`BATCH_WORKERS=2`.** Not three, not five. It roughly doubles wall time
-  against a job that runs once a month.
+- **`BATCH_WORKERS=2`.** Not five. Three is the next thing to try — peak
+  RSS per worker is ~1.65 GB after the September 2026 STEPS work, so
+  3 × 1.65 GB sits right at the cap — but 2 ships until a real monthly run
+  confirms it, because the measurement that matters is a 3.5 h build
+  beside the live sidecar, not a benchmark.
 - **`BATCH_MEM_CAP=5000m`**, applied with `docker update` to the
   `deploy-sidecar-run-*` container ~25 s after it starts. Under the cap the
   *cgroup's* OOM killer fires first and takes a batch worker (the pool
@@ -492,13 +514,13 @@ container is capped — the report is the reason the cap exists.
 
 ```
 /var/lib/dmi-nowcast-corpus/
-  calibration/national_corpus_<stamp>.parquet   this run's corpus
+  calibration/national_corpus_<stamp>.parquet   this run's UNION corpus (both point sets)
   calibration/latest.parquet                    a COPY of it — quality_report.radar_corpus
-  calibration/latest.md                         which run, which report dir
-  calibration_reports/<stamp>/                  reliability report
-  stations/station_corpus_<stamp>_gauge.parquet this run's gauge corpus
+  calibration/latest.md                         which run, which point sets, which report
+  calibration_reports/<stamp>/                  reliability report (radar point set)
+  stations/station_corpus_<stamp>_gauge.parquet the station rows, joined to gauge truth
   stations/station_corpus_gauge.parquet         a COPY of it — quality_report.station_corpus
-/var/lib/dmi-nowcast/national_curves.json       the served curves
+/var/lib/dmi-nowcast/national_curves.json       the served curves (radar point set)
 ```
 
 `latest.parquet` and `station_corpus_gauge.parquet` are **copies, not
@@ -522,10 +544,18 @@ sidecar/deploy/calibrate.sh 2>&1 \
     | tee ~/dmi-nowcast-logs/calibrate-$(date -u +%Y%m%d_%H%M%S).log
 
 CALIBRATION_STATIONS=0 sidecar/deploy/calibrate.sh        # curves only
+CALIBRATION_UNION=0 sidecar/deploy/calibrate.sh           # two separate builds
 CALIBRATION_INPUT_MONTHS=6 sidecar/deploy/calibrate.sh    # fixed 6-month window
-sidecar/deploy/station_corpus.sh                          # step 2 on its own
-STATION_N_EVENTS=1000 sidecar/deploy/station_corpus.sh    # quick pass
+
+sidecar/deploy/station_corpus.sh                          # redo the gauge half
+STATION_REUSE_CORPUS=0 sidecar/deploy/station_corpus.sh   # force a rebuild
 ```
+
+`station_corpus.sh` is now the *gauge half on its own* — run it after a
+gauge backfill, or when the join failed and the curves did not. It joins
+`calibration/latest.parquet` when that corpus holds `station_points` rows
+(seconds), and only builds a station-only corpus (~3.5 h) when it does
+not.
 
 Every script refuses to start beside a running batch container, so a hand
 run on the 1st cannot collide with the timer's.

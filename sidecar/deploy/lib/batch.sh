@@ -17,6 +17,12 @@
 #
 # What works, and what every batch job here does:
 #   1. TWO workers (BATCH_WORKERS), not three or five.
+#      Three is now plausible and is the next thing to try: the September
+#      2026 STEPS work brought peak RSS per worker to ~1.65 GB, so
+#      3 x 1.65 = 5.0 GB sits right at the cap and a squeeze still costs
+#      a batch worker rather than the service. The shipped default stays
+#      2 until a real monthly run confirms it — the measurement that
+#      matters is a 3.5 h build under the live sidecar, not a benchmark.
 #   2. A HARD memory cap on the batch container, applied ~25 s after it
 #      starts (BATCH_MEM_CAP, default 5000m). Under the cap the cgroup's
 #      own OOM killer fires first and kills a BATCH worker — the pool
@@ -33,7 +39,7 @@
 #
 # Configuration (all overridable by the caller's environment):
 #   BATCH_MEM_CAP       hard cap for the batch container (default 5000m)
-#   BATCH_WORKERS       STEPS/pool workers (default 2)
+#   BATCH_WORKERS       STEPS/pool workers (default 2; try 3, see above)
 #   BATCH_CAP_DELAY_S   seconds to wait for the container (default 25)
 #   BATCH_FORCE         1 to bypass require_no_batch_running
 #   BATCH_PYTHONPATH    PYTHONPATH inside the container (default /repo/src)

@@ -126,6 +126,7 @@ __all__ = [
     "bin_statistics",
     "decision_bounds",
     "CORPUS_COLUMNS",
+    "RADAR_POINT_SET",
     "DECISION_COLUMNS_READ",
 ]
 
@@ -164,6 +165,22 @@ CORPUS_COLUMNS: tuple[str, ...] = (
     "event_time", "point_id", "lead_min", "raw_prob", "sample_weight",
     "frame_age_min", "threshold_mm_h",
 )
+
+#: ``point_set`` of the radar calibration points, i.e. the stem of
+#: ``src/dmi_nowcast_core/calibration_points_v2.json``.
+#:
+#: One corpus build now serves both point sets (one STEPS run per event
+#: feeding the ~120 radar points AND the gauge stations), and the radar
+#: corpus the report is handed — ``calibration/latest.parquet`` — is that
+#: UNION. Its station rows belong to the gauge section, which reads them
+#: through the gauge-joined corpus instead; scoring them here too would
+#: mix two point geometries into one reliability diagram and double-count
+#: the events they share. So the radar section filters to this set.
+#:
+#: A corpus with no ``point_set`` column predates the union build and is
+#: single-set by construction — the filter is skipped rather than
+#: emptying the section.
+RADAR_POINT_SET = "calibration_points_v2"
 
 #: The ONLY decision-row columns this module reads. The written schema is
 #: wider — ``intensity_mm_h``, ``armed_after``, ``streak_after`` and a
@@ -375,7 +392,8 @@ def _kish(weight: "np.ndarray") -> float:
     return (total * total / squares) if squares > 0 else 0.0
 
 
-def _read_corpus_valid(path: Path, outcome_column: str):
+def _read_corpus_valid(path: Path, outcome_column: str,
+                       point_set: str | None = None):
     """Read a corpus Parquet, keeping only the SQL's valid rows.
 
     The filter is ``sql/reliability_pooled.sql``'s ``valid`` CTE exactly:
@@ -383,6 +401,12 @@ def _read_corpus_valid(path: Path, outcome_column: str):
     ``sample_weight``. Applying it in Arrow rather than in Python is what
     keeps a multi-million-row corpus a few seconds rather than a few
     minutes.
+
+    ``point_set`` additionally keeps only the rows built from one
+    ``--points`` file (by that file's stem). A corpus without the column
+    predates the union build and holds exactly one point set already, so
+    the filter is skipped rather than returning nothing — silently
+    emptying the section would be the worse failure.
 
     pyarrow is imported here rather than at module scope: the core package
     lists it as a dev dependency, and this module must stay importable
@@ -394,9 +418,15 @@ def _read_corpus_valid(path: Path, outcome_column: str):
 
     wanted = [*CORPUS_COLUMNS, outcome_column]
     available = set(pq.ParquetFile(path).schema_arrow.names)
+    if point_set is not None and "point_set" in available:
+        wanted.append("point_set")
     table = pq.read_table(path, columns=[c for c in wanted if c in available])
     if outcome_column not in available or "raw_prob" not in available:
         return None
+    if point_set is not None and "point_set" in available:
+        table = table.filter(
+            pc.fill_null(pc.equal(table.column("point_set"), point_set), False)
+        )
     prob = pc.cast(table.column("raw_prob"), "float64")
     weight = pc.cast(table.column("sample_weight"), "float64")
     mask = pc.and_kleene(
@@ -527,6 +557,7 @@ def reliability_from_corpus(
     inputs: QualityInputs | None = None,
     calibration: str = "served",
     per_point: bool = False,
+    point_set: str | None = None,
 ) -> dict:
     """Reliability curves plus the window and totals of one corpus.
 
@@ -552,6 +583,10 @@ def reliability_from_corpus(
     section". Each curve carries ``brier_raw`` alongside ``brier`` — the
     same rows scored without any calibration, so the improvement is a
     paired comparison rather than two numbers over different samples.
+
+    ``point_set`` restricts the corpus to the rows built from one
+    ``--points`` file (that file's stem), which is what a union corpus
+    needs — see :data:`RADAR_POINT_SET`.
     """
     inputs = inputs or QualityInputs()
     curves = dict(curves or {})
@@ -560,7 +595,7 @@ def reliability_from_corpus(
         "threshold_mm_h": None, "per_point_brier": {},
         "mode": "none", "cv_folds": 0, "fold": None,
     }
-    table = _read_corpus_valid(Path(path), outcome_column)
+    table = _read_corpus_valid(Path(path), outcome_column, point_set)
     if table is None or table.num_rows == 0:
         return empty
 
@@ -1549,9 +1584,13 @@ def build_quality_report(inputs: QualityInputs) -> dict:
         # applying them here would draw a perfect diagonal and call it a
         # measurement. Leave-one-month-out CV grades a calibration that
         # never saw the row.
+        # ``radar_corpus`` is the UNION corpus one build now produces;
+        # its station rows are the gauge section's, read there through the
+        # gauge-joined file. See RADAR_POINT_SET.
         radar = reliability_from_corpus(
             Path(inputs.radar_corpus), outcome_column="outcome",
             curves=curves, inputs=inputs, calibration="cv",
+            point_set=RADAR_POINT_SET,
         )
     gauge: dict | None = None
     if inputs.station_corpus is not None and Path(inputs.station_corpus).is_file():

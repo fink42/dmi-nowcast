@@ -256,19 +256,82 @@ def test_stable_names_are_published_atomically(script: str, src_hint: str) -> No
 
 # --- 6. calibrate.sh carries the station step -------------------------
 
-def test_calibrate_runs_the_station_step() -> None:
+def test_calibrate_runs_the_gauge_half() -> None:
     """The systemd timer covers the whole routine without a unit change."""
     text = (DEPLOY_DIR / "calibrate.sh").read_text()
-    assert '"$DEPLOY_DIR/station_corpus.sh"' in text
+    assert "scripts/join_gauge_truth.py" in text
     assert 'CALIBRATION_STATIONS:-1' in text
+    # The CALIBRATION_UNION=0 fallback still delegates to the old path.
+    assert '"$DEPLOY_DIR/station_corpus.sh"' in text
 
 
-def test_calibrate_never_fails_over_the_station_step() -> None:
-    """A missing points file or a failed step 2 must not fail the curves."""
+def test_calibrate_never_fails_over_the_gauge_half() -> None:
+    """A missing points file or a failed join must not fail the curves."""
     text = (DEPLOY_DIR / "calibrate.sh").read_text()
-    tail = text.split("--- step 2: the station corpus")[1]
-    # The step is guarded by an existence check and an if/else, never bare.
-    assert "batch_container_file_exists" in tail
+    tail = text.split("--- the gauge half")[1]
     assert "non-fatal" in tail
     # The only exit condition left is whether the curves are being served.
     assert '[[ "$fit_served" == 1 ]] || exit 1' in tail
+    # A missing points file downgrades the run, it does not abort it.
+    head = text.split("--- the gauge half")[0]
+    assert "batch_container_file_exists \"$station_points\"" in head
+    assert "want_stations=0" in head
+
+
+# --- 7. the union build -----------------------------------------------
+
+def test_calibrate_builds_one_corpus_for_both_point_sets() -> None:
+    text = (DEPLOY_DIR / "calibrate.sh").read_text()
+    # Repeatable --points, assembled before the build.
+    assert 'points_args=(--points "$points_path")' in text
+    assert 'points_args+=(--points "$station_points")' in text
+    assert '"${points_args[@]}"' in text
+    # One builder invocation, not two.
+    assert text.count("scripts/build_calibration_corpus.py") == 1
+
+
+def test_calibrate_names_the_point_set_on_every_consumer() -> None:
+    """fit and report take the radar set; the join takes the station set."""
+    text = (DEPLOY_DIR / "calibrate.sh").read_text()
+    for script, arg in [
+        ("scripts/fit_national_calibration.py", '--point-set "$radar_set"'),
+        ("scripts/national_calibration_report.py", '--point-set "$radar_set"'),
+        ("scripts/join_gauge_truth.py", '--point-set "$station_set"'),
+    ]:
+        block = text.split(script)[1][:400]
+        assert arg in block, f"{script} is missing {arg}"
+
+
+def test_point_set_labels_are_derived_from_the_file_stems() -> None:
+    """points_set_name() in the builder is the file's stem; match it."""
+    text = (DEPLOY_DIR / "calibrate.sh").read_text()
+    assert 'radar_set=$(basename "$points_path" .json)' in text
+    assert 'station_set=$(basename "$station_points" .json)' in text
+    station = (DEPLOY_DIR / "station_corpus.sh").read_text()
+    assert 'point_set=$(basename "$points" .json)' in station
+
+
+def test_station_corpus_prefers_joining_the_union_corpus() -> None:
+    """Rebuilding rows that are already on disk costs 3.5 h for nothing."""
+    text = (DEPLOY_DIR / "station_corpus.sh").read_text()
+    assert "STATION_REUSE_CORPUS" in text
+    assert "STATION_UNION_CORPUS" in text
+    assert 'calibration/latest.parquet' in text
+    # The build is behind the reuse check, and the join is not.
+    reuse_at = text.index("reuse=$(run_in_repo python -")
+    build_at = text.index("scripts/build_calibration_corpus.py")
+    join_at = text.index("scripts/join_gauge_truth.py")
+    assert reuse_at < build_at < join_at
+    assert '--point-set "$point_set"' in text
+
+
+def test_calibration_stations_zero_drops_both_halves() -> None:
+    """CALIBRATION_STATIONS=0 means no station points AND no join."""
+    text = (DEPLOY_DIR / "calibrate.sh").read_text()
+    head = text.split("--- the gauge half")[0]
+    # The union is only assembled when stations are wanted.
+    gate = head.split("want_stations=1")[1]
+    assert 'CALIBRATION_STATIONS:-1' in gate
+    assert "points_args+=" in gate
+    tail = text.split("--- the gauge half")[1]
+    assert '"$want_stations" == 0' in tail

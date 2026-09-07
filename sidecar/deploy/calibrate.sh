@@ -3,19 +3,32 @@
 # dmi-calibrate systemd timer (1st of the month, 03:00 UTC + up to 15 min
 # of randomised delay), and by hand for a re-run.
 #
-# Two steps, sequential, ~3.5 h each:
-#   1. the national recalibration described below — corpus, curves,
-#      reliability report, calibration/latest.parquet
-#   2. station_corpus.sh — the same builder over the DMI gauge stations,
-#      plus the gauge-truth join, published as
-#      stations/station_corpus_gauge.parquet
+ONE corpus build serves BOTH point sets. ``--points`` is repeatable
+# and one STEPS run per event already feeds every point in the union, so
+# the ~120 radar calibration points and the DMI gauge stations come out of
+# a single ~3.5 h pass instead of two:
 #
-# Step 2 lives here rather than in a second scheduled unit deliberately:
+#   build   --points calibration_points_v2.json --points station_points.json
+#   fit     --point-set calibration_points_v2      (the served curves)
+#   report  --point-set calibration_points_v2      (reliability)
+#   join    --point-set station_points             (gauge truth)
+#
+# Every row carries a ``point_set`` column naming the file its point came
+# from, which is what lets one corpus be split back into the two it
+# replaces. ``calibration/latest.parquet`` is the whole union — the
+# quality report's radar section filters it by point_set itself
+# (RADAR_POINT_SET in core/quality_report.py).
+#
+# This lives here rather than in a second scheduled unit deliberately:
 # the timer already exists and changing it needs host root, and two
 # schedulers on one 12 GB VM is how batch jobs end up running on top of
-# each other. It is skipped with CALIBRATION_STATIONS=0, and a missing
-# points file logs one line and is not an error — the calibration must
-# never fail over the station step.
+# each other. CALIBRATION_STATIONS=0 drops the station points AND the
+# join; a missing points file logs one line and is not an error — the
+# calibration must never fail over the station half.
+#
+# CALIBRATION_UNION=0 falls back to the old two-build path (a radar-only
+# corpus, then station_corpus.sh) — the escape hatch if a union run ever
+# misbehaves.
 #
 # Builds a multi-point
 # corpus over the last CALIBRATION_INPUT_MONTHS months (default "all" —
@@ -50,13 +63,22 @@
 #   CALIBRATION_N_EVENTS        events sampled (default 4000)
 #   CALIBRATION_WET_BIAS        oversample wet hours (default 0.15)
 #   CALIBRATION_SEED            random seed (default $(date +%j))
-#   CALIBRATION_STATIONS        0 to skip the station-corpus step (default
-#                               on, when the points file exists)
+#   CALIBRATION_STATIONS        0 to skip the station points and the gauge
+#                               join entirely (default on, when the points
+#                               file exists)
+#   CALIBRATION_UNION           0 to build the two corpora separately
+#                               instead of one union run (default 1)
+#   STATION_POINTS              gauge points JSON (container path; default
+#                               <corpus>/stations/station_points.json)
 #   CALIBRATION_WORKERS         parallel STEPS workers (default 2, from
 #                               BATCH_WORKERS). Each worker is a spawned
 #                               process holding 1.3-2.0 GB of anon RSS at
 #                               16 members / 432x496 — this is THE memory
 #                               knob, and 2 is the number this VM survives.
+#                               3 is now plausible — peak RSS per worker is
+#                               ~1.65 GB after the Sept 2026 STEPS work, so
+#                               3 x 1.65 GB fits under the 5 GB cap — but 2
+#                               ships until a real monthly run confirms it.
 #                               See lib/batch.sh for the full reasoning.
 #   BATCH_MEM_CAP               hard cap put on the batch container ~25 s
 #                               after it starts (default 5000m). Under the
@@ -90,7 +112,7 @@
 #   calibration/latest.parquet                    a COPY of it (see below)
 #   calibration/latest.md                         which run, which report dir
 #   calibration_reports/<stamp>/                  the reliability report
-#   stations/station_corpus_<stamp>_gauge.parquet step 2's gauge corpus
+#   stations/station_corpus_<stamp>_gauge.parquet the gauge-joined rows
 #   stations/station_corpus_gauge.parquet         a COPY of it
 #   /var/lib/dmi-nowcast/national_curves.json     the served curves
 #
@@ -110,6 +132,7 @@
 #   CALIBRATION_INPUT_MONTHS=3 sidecar/deploy/calibrate.sh         # 3-month window
 #   CALIBRATION_INPUT_MONTHS=all sidecar/deploy/calibrate.sh       # explicit default
 #   CALIBRATION_STATIONS=0 sidecar/deploy/calibrate.sh             # curves only
+#   CALIBRATION_UNION=0 sidecar/deploy/calibrate.sh                # two builds
 #
 # By hand, keep a log — the timer's runs go to journald:
 #   sidecar/deploy/calibrate.sh 2>&1 | tee ~/dmi-nowcast-logs/calibrate-$(date -u +%Y%m%d_%H%M%S).log
@@ -189,12 +212,40 @@ stamp=$(date -u +%Y%m%d_%H%M%S)
 corpus_path=/var/lib/dmi-nowcast-corpus/calibration/national_corpus_${stamp}.parquet
 curves_path=/var/lib/dmi-nowcast/national_curves.json
 report_dir=/var/lib/dmi-nowcast-corpus/calibration_reports/${stamp}
-# CALIBRATION_POINTS exists for the merged-point-set hook in monthly.sh:
-# one STEPS run per event already serves every point in the file, so a
-# merged file is a strictly cheaper way to get both point sets.
 points_path=${CALIBRATION_POINTS:-/repo/src/dmi_nowcast_core/calibration_points_v2.json}
+station_points=${STATION_POINTS:-/var/lib/dmi-nowcast-corpus/stations/station_points.json}
 latest_path=/var/lib/dmi-nowcast-corpus/calibration/latest.parquet
 latest_md=/var/lib/dmi-nowcast-corpus/calibration/latest.md
+gauge_path=/var/lib/dmi-nowcast-corpus/stations/station_corpus_${stamp}_gauge.parquet
+gauge_stable=/var/lib/dmi-nowcast-corpus/stations/station_corpus_gauge.parquet
+# point_set labels are the points files' STEMS — the same rule
+# build_calibration_corpus.py's points_set_name() applies. Derived rather
+# than hardcoded so CALIBRATION_POINTS / STATION_POINTS stay honest.
+radar_set=$(basename "$points_path" .json)
+station_set=$(basename "$station_points" .json)
+
+# Decide the shape of the run BEFORE the build: the union needs both
+# points files on the one builder invocation.
+# NB an ``x && y=0`` one-liner here would abort the whole script under
+# ``set -e`` whenever the test is false.
+want_stations=1
+if [[ "${CALIBRATION_STATIONS:-1}" == "0" ]]; then
+    want_stations=0
+fi
+points_args=(--points "$points_path")
+union=0
+if [[ "$want_stations" == 1 ]]; then
+    if batch_container_file_exists "$station_points"; then
+        if [[ "${CALIBRATION_UNION:-1}" != "0" ]]; then
+            union=1
+            points_args+=(--points "$station_points")
+        fi
+    else
+        echo "==> No station points at ${station_points} — radar points only" \
+             "(build them with scripts/build_station_points.py)"
+        want_stations=0
+    fi
+fi
 
 echo "==> National recalibration window: ${window_desc}"
 echo "    settings from live config: ${ensemble_size} members, thr ${threshold} mm/h,"
@@ -203,7 +254,14 @@ echo "    wet-bias refs: ${CALIBRATION_WET_REFS:-<builder default: 5 spread nati
 echo "    n_events: ${n_events}   wet_bias: ${wet_bias}   seed: ${seed}"
 echo "    simulated frame age: ${frame_age_range} min (per-event uniform draw)"
 echo "    workers: ${workers}"
-echo "    points → ${points_path}"
+if [[ "$union" == 1 ]]; then
+    echo "    points → ${points_path} + ${station_points} (ONE union build)"
+    echo "      fit/report point_set: ${radar_set}   gauge join: ${station_set}"
+elif [[ "$want_stations" == 1 ]]; then
+    echo "    points → ${points_path} (CALIBRATION_UNION=0: station corpus built separately)"
+else
+    echo "    points → ${points_path} (no station corpus this run)"
+fi
 echo "    corpus archive (frame source) → ${corpus_dir}"
 echo "    cache → ${cache_dir}"
 echo "    corpus parquet → ${corpus_path}"
@@ -223,7 +281,7 @@ run_in_repo python -c "from pathlib import Path; \
     Path('$report_dir').mkdir(parents=True, exist_ok=True)"
 
 run_in_repo_capped python scripts/build_calibration_corpus.py \
-        --points "$points_path" \
+        "${points_args[@]}" \
         --days-back "$days" \
         --n-events "$n_events" \
         --wet-bias "$wet_bias" \
@@ -242,8 +300,12 @@ run_in_repo_capped python scripts/build_calibration_corpus.py \
         --frame-age-range "$frame_age_range" \
         --output "$corpus_path"
 
+# --point-set even on a single-set corpus: every row the current builder
+# writes carries the column, and naming the set makes the fit's scope
+# explicit in the log rather than implied by what happened to be built.
 run_in_repo_capped python scripts/fit_national_calibration.py \
         --corpus "$corpus_path" \
+        --point-set "$radar_set" \
         --output "$curves_path"
 
 # Reliability report (plan §B3) — non-fatal: duckdb ships in the image
@@ -251,6 +313,7 @@ run_in_repo_capped python scripts/fit_national_calibration.py \
 # whole calibration over a missing report.
 if ! run_in_repo_capped python scripts/national_calibration_report.py \
         --corpus "$corpus_path" \
+        --point-set "$radar_set" \
         --out-dir "$report_dir"; then
     echo "!! reliability report failed (older image without duckdb?)." >&2
     echo "   Curves are still fitted. Generate the report on the dev box:" >&2
@@ -274,23 +337,27 @@ fi
 # A one-screen note beside it: which run, and which report to read. Written
 # through python so the quoting survives the container boundary.
 run_in_repo python - "$latest_md" "$stamp" "$corpus_path" "$curves_path" \
-    "$report_dir" "$window_desc" <<'MD' || echo "!! could not write ${latest_md} (non-fatal)" >&2
+    "$report_dir" "$window_desc" "$radar_set" "$([[ "$union" == 1 ]] && echo "$station_set" || echo "")" \
+    <<'MD' || echo "!! could not write ${latest_md} (non-fatal)" >&2
 import os
 import sys
 from pathlib import Path
 
-out, stamp, corpus, curves, report_dir, window = sys.argv[1:7]
+out, stamp, corpus, curves, report_dir, window, radar_set, station_set = sys.argv[1:9]
+sets = f"{radar_set} + {station_set}" if station_set else radar_set
 tmp = Path(f"{out}.tmp.{os.getpid()}")
 tmp.write_text(
     f"# Latest national calibration\n\n"
     f"- run stamp: `{stamp}` (UTC)\n"
     f"- window: {window}\n"
+    f"- point sets: {sets}\n"
     f"- corpus: `{corpus}`\n"
     f"- `latest.parquet` is a copy of that file\n"
-    f"- curves: `{curves}`\n"
+    f"- curves: fitted on `{radar_set}` → `{curves}`\n"
     f"- reliability report: `{report_dir}`\n\n"
     "Written by sidecar/deploy/calibrate.sh. The nightly quality report\n"
-    "reads `latest.parquet` as `quality_report.radar_corpus`.\n"
+    "reads `latest.parquet` as `quality_report.radar_corpus` and filters\n"
+    "it to the radar point set itself.\n"
 )
 os.replace(tmp, out)
 MD
@@ -334,24 +401,45 @@ if [[ "$fit_served" != 1 ]]; then
     echo "      serving them. Check 'docker compose logs sidecar' for a load error." >&2
 fi
 
-# --- step 2: the station corpus ---------------------------------------
+# --- the gauge half ---------------------------------------------------
 # AFTER the restart, so the new curves are in service within minutes
-# rather than after another 3.5 h. Nothing in step 2 depends on them, so
-# it runs even when the verification above failed; the exit code at the
-# bottom still reports that failure to systemd.
+# rather than after the join. Nothing here depends on them, so it runs
+# even when the verification above failed; the exit code at the bottom
+# still reports that failure to systemd.
 #
-# Never fatal. The station corpus is a *report input*; the curves are the
-# product. A missing points file, a gauge store that has not been
-# backfilled, a join that errors — each costs the gauge column of the
-# quality page for a month and nothing else.
+# Never fatal. The gauge corpus is a *report input*; the curves are the
+# product. A gauge store that has not been backfilled, a join that errors
+# — each costs the gauge column of the quality page for a month and
+# nothing else.
+#
+# With a union corpus this is just the join: the station rows are already
+# built. Without one (CALIBRATION_UNION=0) it is the old separate build,
+# which station_corpus.sh does end to end.
 station_rc="skipped"
-if [[ "${CALIBRATION_STATIONS:-1}" == "0" ]]; then
-    echo "==> Skipping the station corpus (CALIBRATION_STATIONS=0)"
-elif ! batch_container_file_exists "${STATION_POINTS:-/var/lib/dmi-nowcast-corpus/stations/station_points.json}"; then
-    echo "==> Skipping the station corpus: no station points at ${STATION_POINTS:-/var/lib/dmi-nowcast-corpus/stations/station_points.json} (build it with scripts/build_station_points.py)"
+if [[ "$want_stations" == 0 ]]; then
+    echo "==> No gauge corpus this run (CALIBRATION_STATIONS=0 or no points file)"
+elif [[ "$union" == 1 ]]; then
+    echo
+    echo "==> Gauge truth join over the union corpus  $(date -u +%FT%TZ)"
+    echo "    --point-set ${station_set} → ${gauge_path}"
+    if run_in_repo_capped python scripts/join_gauge_truth.py \
+            --corpus "$corpus_path" \
+            --corpus-dir "$corpus_dir" \
+            --point-set "$station_set" \
+            --out "$gauge_path" \
+        && batch_publish_atomic "$gauge_path" "$gauge_stable"; then
+        station_rc=0
+        echo "    ✓ ${gauge_stable}"
+    else
+        station_rc=$?
+        echo "!! gauge join failed (exit ${station_rc}) — non-fatal." >&2
+        echo "   The curves above are unaffected; the quality page's gauge column" >&2
+        echo "   keeps last month's corpus. The union corpus is already built, so" >&2
+        echo "   a re-run only redoes the join: sidecar/deploy/station_corpus.sh" >&2
+    fi
 else
     echo
-    echo "==> Station corpus (step 2 of 2)  $(date -u +%FT%TZ)"
+    echo "==> Station corpus, separate build (CALIBRATION_UNION=0)  $(date -u +%FT%TZ)"
     if "$DEPLOY_DIR/station_corpus.sh"; then
         station_rc=0
     else
@@ -365,7 +453,7 @@ fi
 echo
 echo "==> Monthly routine done $(date -u +%FT%TZ)"
 echo "    curves served:  $([[ "$fit_served" == 1 ]] && echo yes || echo NO)"
-echo "    station corpus: ${station_rc}"
+echo "    gauge corpus:   ${station_rc}"
 echo "    The nightly quality report (03:30 UTC) picks both up by their"
 echo "    stable names — nothing further to run."
 
