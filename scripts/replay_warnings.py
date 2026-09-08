@@ -159,7 +159,7 @@ from dmi_nowcast_core.warning_score import (  # noqa: E402
 MAX_PX_PER_FRAME = 30.0        # compute.py::_MAX_PX_PER_FRAME
 RAIN_THRESHOLD_MM_H = 0.5      # config.py ForecastConfig.rain_threshold_mm_h
 DOWNSAMPLE_FACTOR = 4          # config.py StepsConfig.downsample_factor
-ENSEMBLE_SIZE = 24             # config.py StepsConfig.ensemble_size
+ENSEMBLE_SIZE = 16             # config.py StepsConfig.ensemble_size — what the VM runs (verified 2026-09-08)
 N_CASCADE_LEVELS = 6           # config.py StepsConfig.n_cascade_levels
 HORIZON_MIN = 90               # config.py StepsConfig.horizon_min
 NATIONAL_LEADS = (10, 20, 30, 45, 60)   # config.py NationalConfig.leads_min

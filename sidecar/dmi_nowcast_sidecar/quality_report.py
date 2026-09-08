@@ -208,6 +208,9 @@ class QualityReportTask:
             thresholds_path=self.thresholds_out(),
             live_days=settings.live_days,
             live_days_secondary=settings.live_days_secondary,
+            # Same evidence floor the nightly fit uses, so the page and the
+            # table exclude the same broken buckets.
+            min_known_slots=int(self.settings.fit_thresholds.min_known_slots),
         )
 
     # -- the push-threshold fit (Phase G, G4) -----------------------------
@@ -252,6 +255,7 @@ class QualityReportTask:
             # the thresholds document's ``objective``.
             dry_min=int(settings.dry_min),
             onset_min_mm=float(settings.onset_min_mm),
+            min_known_slots=int(settings.min_known_slots),
             workers=int(settings.workers),
         )
 

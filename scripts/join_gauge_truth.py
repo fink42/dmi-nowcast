@@ -28,7 +28,23 @@ is 0.6 mm/h, just above the 0.5 mm/h radar threshold, so amount alone would
 call genuine light rain dry; the duration channel catches exactly that case.
 
 ``gauge_outcome`` is null only when the **amount** slot is missing —
-a missing duration alone still leaves a usable dry/wet call from the mm.
+a missing duration alone still leaves a usable dry/wet call from the mm —
+or when the station is a **dead gauge**.
+
+Dead gauges
+-----------
+A station that reported at least ``--min-known-slots`` ten-minute slots
+over the corpus window and was never once wet is a bucket stuck at zero,
+not a dry corner of Denmark: every wet radar row there becomes a false
+alarm nothing could have avoided. The 2026-09-08 product study found
+station 06080 doing exactly that — 3 876 known slots on the wettest days
+of the year, zero wet — so its rows leave here with a null
+``gauge_outcome`` (the raw ``gauge_mm`` / ``gauge_dur_min`` readings are
+kept: they are what the station said, and the point is that nobody should
+score against them). The rule is
+``dmi_nowcast_core.warning_score.dead_gauges``, shared with the threshold
+sweep and the nightly quality report so all three exclude the same
+stations. ``--min-known-slots 0`` switches it off.
 
 Traces: DMI encodes "traces of precipitation, less than 0.1 kg/m²" as the
 value ``-0.1``. It is never an amount, so any negative reading is
@@ -74,6 +90,11 @@ from dmi_nowcast_core.metobs import (  # noqa: E402
     normalize_precip_mm,
 )
 from dmi_nowcast_core.station_store import StationObsStore  # noqa: E402
+from dmi_nowcast_core.warning_score import (  # noqa: E402
+    DEFAULT_MIN_KNOWN_SLOTS,
+    dead_gauge_scan,
+    gauge_truth_vectorised,
+)
 
 #: The gauge grid the verification instant is snapped onto.
 GAUGE_SLOT_MIN = 10
@@ -178,6 +199,34 @@ def load_gauge_index(
     return mm, dur
 
 
+def _dead_gauges(
+    corpus_dir: Path,
+    station_ids: list[str],
+    first: datetime,
+    last: datetime,
+    min_known_slots: int,
+) -> set[str]:
+    """Stations excluded by the shared dead-gauge rule, named on stdout.
+
+    One extra vectorised pass over the same months the join already reads
+    — the grid is a few tens of megabytes and the rule has to see EVERY
+    slot, not just the ones a corpus row happens to verify against, or a
+    station's verdict would depend on which events were sampled.
+    """
+    if min_known_slots <= 0 or not station_ids:
+        return set()
+    truth = gauge_truth_vectorised(
+        Path(corpus_dir), first, last, station_ids, log=None,
+    )
+    rows = dead_gauge_scan(truth, min_known_slots=min_known_slots)
+    for row in rows:
+        print(
+            f"dead gauge {row.station_id}: {row.known_slots} known slot(s), "
+            "never wet — gauge_outcome nulled"
+        )
+    return {row.station_id for row in rows}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -193,6 +242,13 @@ def main() -> int:
                          "station_points. Default 'all' keeps every row; "
                          "required to be 'all' for a corpus with no "
                          "point_set column.")
+    ap.add_argument("--min-known-slots", type=int,
+                    default=DEFAULT_MIN_KNOWN_SLOTS,
+                    help="a station reporting at least this many gauge "
+                         "slots over the corpus window and never once wet "
+                         "is a dead bucket: its rows get a null "
+                         "gauge_outcome and are named on stdout. 0 "
+                         f"disables the rule (default {DEFAULT_MIN_KNOWN_SLOTS})")
     ap.add_argument("--wet-mm", type=float, default=DEFAULT_WET_MM,
                     help=f"mm in the 10-min slot that counts as wet (default {DEFAULT_WET_MM})")
     ap.add_argument("--wet-dur-min", type=float, default=DEFAULT_WET_DUR_MIN,
@@ -252,10 +308,15 @@ def main() -> int:
 
     present = [s for s in slots if s is not None]
     store = StationObsStore(args.corpus_dir)
+    dead: set[str] = set()
     if present:
         stations_wanted = sorted({p for p in point_ids if p})
         mm_index, dur_index = load_gauge_index(
             store, min(present), max(present), stations_wanted or None,
+        )
+        dead = _dead_gauges(
+            args.corpus_dir, stations_wanted, min(present), max(present),
+            int(args.min_known_slots),
         )
     else:
         mm_index, dur_index = {}, {}
@@ -285,7 +346,12 @@ def main() -> int:
         if raw_mm is not None and raw_mm < 0.0:
             traces += 1
         mm = normalize_precip_mm(raw_mm)
-        outcome = wet_outcome(raw_mm, dur, args.wet_mm, args.wet_dur_min)
+        # A dead gauge has readings and no truth: keep what it said,
+        # refuse to grade anything against it.
+        outcome = (
+            None if point_id in dead
+            else wet_outcome(raw_mm, dur, args.wet_mm, args.wet_dur_min)
+        )
         gauge_mm.append(mm)
         gauge_dur.append(dur)
         gauge_outcome.append(outcome)
@@ -306,7 +372,8 @@ def main() -> int:
     tmp.replace(args.out)
 
     joined = sum(per_lead_joined.values())
-    print(f"joined={joined} null={n - joined} traces_normalised={traces}")
+    print(f"joined={joined} null={n - joined} traces_normalised={traces} "
+          f"dead_gauges={len(dead)}")
     print(f"{'lead_min':>9} {'rows':>9} {'joined':>9} {'null':>9}")
     for lead in sorted(per_lead_total):
         print(f"{lead:>9} {per_lead_total[lead]:>9} "

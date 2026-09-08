@@ -39,7 +39,7 @@ forecast:
   # flow_confidence_percentile: 40.0
   # flow_texture_percentile: 60.0
   steps:
-    ensemble_size: 24
+    ensemble_size: 16
     n_cascade_levels: 6
     # STEPS horizon in minutes, measured from RADAR-FRAME time — not from
     # now. It must cover the longest lead served above (60) PLUS the frame

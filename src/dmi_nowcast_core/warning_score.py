@@ -141,7 +141,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 __all__ = [
@@ -176,6 +176,10 @@ __all__ = [
     "StationSlots",
     "GaugeTruth",
     "gauge_truth_vectorised",
+    "DEFAULT_MIN_KNOWN_SLOTS",
+    "DeadGauge",
+    "dead_gauge_scan",
+    "dead_gauges",
     "coverage_runs",
     "WarningOutcome",
     "OnsetOutcome",
@@ -1227,6 +1231,147 @@ def _stations_in(store: Any, months: Sequence[tuple[int, int]]) -> list[str]:
         column = pq.read_table(path, columns=["station_id"]).column("station_id")
         found.update(pc.unique(column.combine_chunks()).to_pylist())
     return sorted(str(s) for s in found if s is not None)
+
+
+# ---------------------------------------------------------------------------
+# Dead gauges: a bucket that never moves is not a measurement
+# ---------------------------------------------------------------------------
+
+#: Known slots a station must contribute before "never wet" is evidence
+#: about the GAUGE rather than about the window. 500 ten-minute slots is
+#: about 3.5 days of continuous reporting — long enough that a working
+#: Danish gauge has almost certainly seen rain, short enough that the rule
+#: still fires on a month-long window.
+DEFAULT_MIN_KNOWN_SLOTS = 500
+
+
+@dataclass(frozen=True)
+class DeadGauge:
+    """One excluded station and the counts that convicted it."""
+
+    station_id: str
+    #: Slots the station reported something in, over the evaluated window
+    #: (restricted to ``on_days`` when the caller passed one).
+    known_slots: int
+    #: Wet slots in the same population. Zero, by construction — the field
+    #: exists so a report can state the evidence rather than assert it.
+    wet_slots: int
+
+
+def _epoch_day(value: date | datetime) -> int:
+    """Days since 1970-01-01 for a date, or for a UTC instant's date."""
+    if isinstance(value, datetime):
+        value = _as_utc(value, "on_days entry").date()
+    if not isinstance(value, date):
+        raise TypeError(
+            f"on_days entries must be dates, got {type(value).__name__}"
+        )
+    return value.toordinal() - date(1970, 1, 1).toordinal()
+
+
+def dead_gauge_scan(
+    truth: Any,
+    *,
+    min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS,
+    on_days: Iterable[date | datetime] | None = None,
+) -> list[DeadGauge]:
+    """The stations the dead-gauge rule excludes, with their counts.
+
+    :func:`dead_gauges` is the rule; this is the evidence behind it, kept
+    separate so a report can print "06080: 3 876 known slots, never wet"
+    rather than a bare id.
+
+    ``truth`` is a :class:`GaugeTruth` or any mapping of station id to
+    :class:`StationSlots`. Sorted by station id; empty when nothing
+    qualifies, and empty when ``min_known_slots <= 0``, which switches the
+    rule off.
+    """
+    import numpy as np
+
+    series: Mapping[str, StationSlots] = getattr(truth, "series", truth)
+    floor = int(min_known_slots)
+    day_set = None
+    if on_days is not None:
+        wanted = sorted({_epoch_day(day) for day in on_days})
+        day_set = np.array(wanted, dtype=np.int64)
+
+    rows: list[DeadGauge] = []
+    any_wet = False
+    for station, slots in series.items():
+        known = slots.known
+        # ``wet`` is already False wherever the slot is unknown, but the
+        # conjunction is free and makes the invariant local.
+        wet = slots.wet & known
+        if day_set is not None:
+            on_day = np.isin(slots.slot_end // 86_400, day_set)
+            known = known & on_day
+            wet = wet & on_day
+        n_wet = int(np.count_nonzero(wet))
+        any_wet = any_wet or n_wet > 0
+        rows.append(DeadGauge(str(station), int(np.count_nonzero(known)), n_wet))
+
+    if floor <= 0 or not any_wet:
+        # No station saw rain: the WINDOW was dry, and excluding every
+        # gauge in it would be the rule diagnosing the weather.
+        return []
+    return sorted(
+        (row for row in rows if row.wet_slots == 0 and row.known_slots >= floor),
+        key=lambda row: row.station_id,
+    )
+
+
+def dead_gauges(
+    truth: Any,
+    *,
+    min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS,
+    on_days: Iterable[date | datetime] | None = None,
+    log: Any = None,
+) -> list[str]:
+    """Stations whose gauge reported plenty and never once reported rain.
+
+    A gauge that is wired up but broken is worse for scoring than one that
+    is missing. A missing station has no truth, so every consumer already
+    leaves it out of the pool (``known_until`` carries only the stations
+    that reported). A gauge stuck at zero looks like a station that is
+    working and permanently dry, so every radar-wet slot there becomes a
+    false alarm and every warning a wrong one.
+
+    Found in the 2026-09-08 product study
+    (``archive/product_study_20260908/``): station 06080 reported
+    ``precip_past10min = 0`` and ``precip_dur_past10min = 0`` in all 3 876
+    known slots of the wettest days of the year, including days when its
+    neighbours measured double figures, and contributed 553 false alarms
+    to that study alone. The rule is written as a general property —
+    *known often, wet never* — rather than as an id, because the next
+    gauge to die will have a different number and nobody will notice.
+
+    ``min_known_slots`` is the evidence floor
+    (:data:`DEFAULT_MIN_KNOWN_SLOTS`): below it "never wet" says more
+    about the window than about the station, and a genuinely dry fortnight
+    must not cost a working gauge. ``0`` switches the rule off. As a
+    second guard, a window in which NO station was ever wet excludes
+    nothing at all.
+
+    ``on_days`` restricts the counting to a set of UTC dates — the study's
+    "on the wettest days" reading, which is the strictest form of the
+    test: a gauge that stayed dry while the country was wet is dead beyond
+    argument. A slot belongs to the date its END falls on. ``None``, the
+    default, uses the whole evaluated window.
+
+    ``log`` is an optional ``log(message)`` callable; every exclusion is
+    reported through it with the count behind it, because a station
+    silently dropped from a scoreboard is a station nobody can audit.
+    """
+    found = dead_gauge_scan(
+        truth, min_known_slots=min_known_slots, on_days=on_days,
+    )
+    if log:
+        for row in found:
+            log(
+                f"dead gauge {row.station_id}: {row.known_slots} known slot(s), "
+                "never wet — excluded from scoring"
+            )
+    return [row.station_id for row in found]
 
 
 # ---------------------------------------------------------------------------

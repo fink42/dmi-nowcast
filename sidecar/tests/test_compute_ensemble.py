@@ -694,7 +694,7 @@ def test_dmi_scan_type_locked_to_fullrange() -> None:
 def test_steps_config_defaults_and_bounds() -> None:
     cfg = StepsConfig()
     assert cfg.enabled is True
-    assert cfg.ensemble_size == 24
+    assert cfg.ensemble_size == 16
     assert cfg.n_cascade_levels == 6
     assert cfg.downsample_factor == 4
     # Horizon from radar-frame time: 60 min of served lead + ~30 of frame age.

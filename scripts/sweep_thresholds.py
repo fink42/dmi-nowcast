@@ -57,6 +57,7 @@ from dmi_nowcast_core.push_thresholds import (  # noqa: E402
 from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
+    DEFAULT_MIN_KNOWN_SLOTS,
     DEFAULT_ONSET_MIN_MM,
     DEFAULT_PRODUCT_LEADS_MIN,
     DEFAULT_TOLERANCE_MIN,
@@ -116,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="millimetres an onset must deliver over the onset "
                         "slot and the one after it; 0 scores every wet slot "
                         "after a dry spell, drizzle included")
+    p.add_argument("--min-known-slots", type=int,
+                   default=DEFAULT_MIN_KNOWN_SLOTS,
+                   help="a station that reported at least this many gauge "
+                        "slots over the window and was NEVER wet is a dead "
+                        "bucket, not a dry place: it is excluded from the "
+                        "scored pool and named in the output. 0 disables "
+                        "the rule")
     p.add_argument("--coverage-gap-min", type=int,
                    default=DEFAULT_COVERAGE_GAP_MIN,
                    help="a longer gap between frames ends a coverage run and "
@@ -191,6 +199,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.min_warnings < 0:
         print("error: --min-warnings must not be negative", file=sys.stderr)
         return 2
+    if args.min_known_slots < 0:
+        print("error: --min-known-slots must not be negative", file=sys.stderr)
+        return 2
     if not 0 < args.fallback_threshold_pct < 100:
         print(
             "error: --fallback-threshold-pct must be in (0, 100)",
@@ -214,6 +225,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tolerance_min=int(args.tolerance_min),
         dry_min=int(args.dry_min),
         onset_min_mm=float(args.onset_min_mm),
+        min_known_slots=int(args.min_known_slots),
         coverage_gap_min=int(args.coverage_gap_min),
         far_cap=float(args.far_cap),
         min_useful_lead_min=float(args.min_useful_lead_min),

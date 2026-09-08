@@ -86,7 +86,10 @@ class StepsConfig(BaseModel):
     cost roughly linearly (9 steps instead of 6 at the 10-min cadence).
     """
     enabled: bool = True
-    ensemble_size: Annotated[int, Field(ge=4, le=64)] = 24
+    # 16 is what the VM has run since Phase A (verified 2026-09-08); the code
+    # default now says so, so a replay or corpus launched without an explicit
+    # size scores the ensemble that is actually served.
+    ensemble_size: Annotated[int, Field(ge=4, le=64)] = 16
     n_cascade_levels: Annotated[int, Field(ge=4, le=8)] = 6
     downsample_factor: Annotated[int, Field(ge=1, le=8)] = 4
     horizon_min: Annotated[int, Field(ge=30, le=180)] = 90
@@ -555,6 +558,11 @@ class FitThresholdsConfig(BaseModel):
     #: another fit under the same two.
     dry_min: Annotated[int, Field(ge=0)] = DEFAULT_DRY_MIN
     onset_min_mm: Annotated[float, Field(ge=0.0)] = DEFAULT_ONSET_MIN_MM
+    #: Dead-gauge rule (``warning_score.dead_gauges``): a station known in
+    #: at least this many gauge slots of the window and never once wet is a
+    #: broken bucket and is excluded from the fit AND the quality report.
+    #: Station 06080 (2026-09-08 product study) is why. ``0`` disables.
+    min_known_slots: Annotated[int, Field(ge=0)] = 500
     #: Stability guard (``push_thresholds.apply_stability_guard``): a
     #: lead's served threshold moves only when the new pick is at least
     #: this many points away AND stands on ``min_warnings`` scored

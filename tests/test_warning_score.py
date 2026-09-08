@@ -1164,3 +1164,130 @@ def test_pooled_summary_pools_the_late_column_and_recomputes_the_scores() -> Non
     assert pooled["csi"] == pytest.approx(1 / 3)         # 1 / (1 + 0 + 1 + 1)
     assert pooled["far"] == pytest.approx(1 / 3)         # 1 wrong of 3 sent
     assert pooled["lead_error_min"]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The dead-gauge rule (H0b)
+# ---------------------------------------------------------------------------
+#
+# A gauge stuck at zero is worse for scoring than a missing one: a missing
+# station has no truth and is already left out of every pool, while a
+# stuck one looks like a station that works and is permanently dry, so
+# every radar-wet slot there becomes a false alarm. Station 06080 did
+# exactly that to the 2026-09-08 product study — 3 876 known slots on the
+# wettest days of the year, zero wet — and these cases pin the general
+# rule that catches the next one.
+
+
+#: Seconds in a gauge slot, spelled out so the grids below read as clocks.
+SLOT_MIN_SEC = 600
+
+
+def _station_slots(station_id: str, pattern: str, *, base: datetime = T0):
+    """A ``StationSlots`` from a per-slot pattern: ``.`` dry, ``W`` wet, ``?`` unknown."""
+    numpy = pytest.importorskip("numpy")
+    from dmi_nowcast_core.warning_score import StationSlots
+
+    mm = numpy.array(
+        [
+            {".": 0.0, "W": 0.5, "?": float("nan")}[symbol]
+            for symbol in pattern
+        ],
+        dtype=numpy.float32,
+    )
+    dur = numpy.full(mm.size, numpy.nan, dtype=numpy.float32)
+    known = ~numpy.isnan(mm)
+    wet = numpy.nan_to_num(mm, nan=0.0) >= 0.1
+    slot_end = (
+        int(base.timestamp())
+        + numpy.arange(mm.size, dtype=numpy.int64) * SLOT_MIN_SEC
+    )
+    return StationSlots(
+        station_id=station_id, slot_end=slot_end, mm=mm, dur=dur,
+        known=known, wet=wet,
+    )
+
+
+def _truth(**stations):
+    from dmi_nowcast_core.warning_score import GaugeTruth
+
+    return GaugeTruth(
+        series={sid: _station_slots(sid, pattern) for sid, pattern in stations.items()},
+    )
+
+
+def test_dead_gauges_excludes_a_station_that_reported_plenty_and_never_rained() -> None:
+    from dmi_nowcast_core.warning_score import dead_gauge_scan, dead_gauges
+
+    truth = _truth(
+        alive="." * 599 + "W",      # 600 known slots, one of them wet
+        stuck="." * 600,            # 600 known slots, never once wet
+    )
+    assert dead_gauges(truth, min_known_slots=500) == ["stuck"]
+    [row] = dead_gauge_scan(truth, min_known_slots=500)
+    assert (row.station_id, row.known_slots, row.wet_slots) == ("stuck", 600, 0)
+
+
+def test_dead_gauges_needs_the_evidence_floor_before_it_convicts() -> None:
+    """A short dry window is a fact about the weather, not about the gauge."""
+    from dmi_nowcast_core.warning_score import dead_gauges
+
+    truth = _truth(alive="." * 99 + "W", brief="." * 100)
+    assert dead_gauges(truth, min_known_slots=500) == []
+    # Exactly at the floor it does convict — the boundary is inclusive.
+    assert dead_gauges(truth, min_known_slots=100) == ["brief"]
+
+
+def test_dead_gauges_keeps_a_station_that_was_wet_once() -> None:
+    from dmi_nowcast_core.warning_score import dead_gauges
+
+    truth = _truth(rare="." * 900 + "W" + "." * 99, stuck="." * 1000)
+    assert dead_gauges(truth, min_known_slots=500) == ["stuck"]
+
+
+def test_dead_gauges_counts_only_known_slots_not_unknown_ones() -> None:
+    """Silence is not evidence: a mostly-absent station is not convicted."""
+    from dmi_nowcast_core.warning_score import dead_gauges
+
+    truth = _truth(alive="." * 599 + "W", absent="?" * 900 + "." * 100)
+    assert dead_gauges(truth, min_known_slots=500) == []
+
+
+def test_dead_gauges_excludes_nothing_when_the_whole_window_was_dry() -> None:
+    """Otherwise the rule diagnoses the weather and drops every station."""
+    from dmi_nowcast_core.warning_score import dead_gauges
+
+    truth = _truth(a="." * 600, b="." * 600)
+    assert dead_gauges(truth, min_known_slots=500) == []
+
+
+def test_dead_gauges_can_be_switched_off_and_reports_what_it_excluded() -> None:
+    from dmi_nowcast_core.warning_score import dead_gauges
+
+    truth = _truth(alive="." * 599 + "W", stuck="." * 600)
+    assert dead_gauges(truth, min_known_slots=0) == []
+    lines: list[str] = []
+    assert dead_gauges(truth, min_known_slots=500, log=lines.append) == ["stuck"]
+    assert lines == [
+        "dead gauge stuck: 600 known slot(s), never wet — excluded from scoring",
+    ]
+
+
+def test_dead_gauges_on_days_restricts_the_population_to_named_dates() -> None:
+    """The study's reading: dry while the country was wet is dead beyond argument."""
+    from dmi_nowcast_core.warning_score import dead_gauges
+
+    # 288 slots = two days from T0 (2026-09-05 06:00Z), so day one is
+    # 2026-09-05 and day two runs into 2026-09-06.
+    day_one = 108           # slots up to 2026-09-06 00:00Z
+    truth = _truth(
+        alive="." * (day_one - 1) + "W" + "." * 180,
+        stuck="." * 288,
+    )
+    wet_day = [datetime(2026, 9, 5, tzinfo=timezone.utc).date()]
+    # On the wet day alone the floor of 100 is met by both stations and
+    # only the stuck one was dry through it.
+    assert dead_gauges(truth, min_known_slots=100, on_days=wet_day) == ["stuck"]
+    # A day nobody was wet on convicts nobody, whatever the counts say.
+    dry_day = [datetime(2026, 9, 6, tzinfo=timezone.utc).date()]
+    assert dead_gauges(truth, min_known_slots=100, on_days=dry_day) == []

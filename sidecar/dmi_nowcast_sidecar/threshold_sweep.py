@@ -162,6 +162,7 @@ from dmi_nowcast_core.push_thresholds import (
 from dmi_nowcast_core.warning_score import (
     DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
+    DEFAULT_MIN_KNOWN_SLOTS,
     DEFAULT_ONSET_MIN_MM,
     DEFAULT_PRODUCT_LEADS_MIN,
     DEFAULT_TOLERANCE_MIN,
@@ -512,6 +513,41 @@ def _opt_float(value: Any) -> float | None:
     return None if out != out else out  # NaN is missing, not a probability
 
 
+def _month_filter(
+    months: Iterable[Any],
+) -> tuple[frozenset[int], frozenset[tuple[int, int]]]:
+    """Split a month filter into ``({month numbers}, {(year, month)})``."""
+    plain: set[int] = set()
+    pairs: set[tuple[int, int]] = set()
+    for entry in months:
+        if isinstance(entry, (tuple, list)):
+            year, month = entry
+            pairs.add((int(year), int(month)))
+        else:
+            plain.add(int(entry))
+    return frozenset(plain), frozenset(pairs)
+
+
+def in_months(
+    when: datetime,
+    plain: frozenset[int],
+    pairs: frozenset[tuple[int, int]],
+) -> bool:
+    """Whether an instant falls in a :func:`_month_filter` selection."""
+    return when.month in plain or (when.year, when.month) in pairs
+
+
+def month_filter(months: Iterable[Any]):
+    """A ``predicate(datetime) -> bool`` for a month or (year, month) list.
+
+    The same selection :func:`filter_tracks_by_months` applies to frames,
+    exposed so a caller cutting the ONSETS of the same slice cannot drift
+    from the rule that cut its rows.
+    """
+    plain, pairs = _month_filter(months)
+    return lambda when: in_months(when, plain, pairs)
+
+
 def filter_tracks_by_months(
     tracks: Mapping[str, Sequence[tuple]],
     months: Iterable[int],
@@ -527,8 +563,14 @@ def filter_tracks_by_months(
     arm that no subscription could have held across three months of
     silence. A station left with no frames at all drops out of the slice
     rather than appearing in it empty.
+
+    ``months`` entries are month NUMBERS (1–12), as the season strata use
+    them, or ``(year, month)`` pairs, as a leave-one-month-out fold needs
+    them — an archive longer than a year has two Decembers, and a fold
+    that held out both would be holding out a season. The two forms may be
+    mixed; a frame is kept when it matches either.
     """
-    wanted = frozenset(int(month) for month in months)
+    plain, pairs = _month_filter(months)
     gap = timedelta(minutes=coverage_gap_min)
     out: dict[str, list[tuple]] = {}
     for station, track in tracks.items():
@@ -537,7 +579,7 @@ def filter_tracks_by_months(
         previous: datetime | None = None
         for record in track:
             radar_ts = record[_RADAR_TS]
-            if radar_ts.month not in wanted:
+            if not in_months(radar_ts, plain, pairs):
                 continue
             if previous is not None and radar_ts - previous > gap:
                 run += 1
@@ -560,9 +602,10 @@ def gauge_truth(
     *,
     dry_min: int = DEFAULT_DRY_MIN,
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
+    min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS,
     log=None,
-) -> tuple[dict[str, list[datetime]], dict[str, datetime], int]:
-    """``(onsets per station, known_until per station, known slot count)``.
+) -> tuple[dict[str, list[datetime]], dict[str, datetime], int, list[str]]:
+    """``(onsets, known_until, known slot count, dead gauges)`` per station.
 
     One vectorised pass over the archive
     (``warning_score.gauge_truth_vectorised``): each month partition is
@@ -579,10 +622,20 @@ def gauge_truth(
     row-at-a-time ``gauge_slot_amounts`` / ``onsets`` remain the reference
     the vectorised path is tested against.
 
+    A **dead gauge** — a station that reported at least
+    ``min_known_slots`` slots over the window and was never once wet — is
+    dropped from both maps and returned separately
+    (``warning_score.dead_gauges``). Leaving it in would make every
+    radar-wet slot at that station a false alarm the rule could never
+    avoid, which is what station 06080 did to the 2026-09-08 study. It
+    leaves the pool the same way a station with no gauge at all does:
+    absent from ``known_until``, and therefore absent from
+    ``run_fit``'s ``scored_stations``.
+
     None of this depends on the lead or the threshold, so it is computed
     once and shared by every cell of the sweep.
     """
-    from dmi_nowcast_core.warning_score import gauge_truth_vectorised
+    from dmi_nowcast_core.warning_score import dead_gauges, gauge_truth_vectorised
 
     pad = timedelta(minutes=GAUGE_PAD_MIN)
     start, end = window
@@ -591,13 +644,18 @@ def gauge_truth(
         dry_min=dry_min, onset_min_mm=onset_min_mm,
         pad_min=GAUGE_PAD_MIN, log=log,
     )
+    dead = dead_gauges(truth, min_known_slots=int(min_known_slots), log=log)
+    excluded = set(dead)
+    onsets = {s: v for s, v in truth.onsets.items() if s not in excluded}
+    known_until = {s: v for s, v in truth.known_until.items() if s not in excluded}
     if log:
         log(
             f"gauge truth: {truth.known_slots} known slot(s), "
-            f"{sum(len(v) for v in truth.onsets.values())} onset(s) over "
-            f"{len(truth.known_until)} reporting station(s)"
+            f"{sum(len(v) for v in onsets.values())} onset(s) over "
+            f"{len(known_until)} reporting station(s), "
+            f"{len(dead)} dead gauge(s) excluded"
         )
-    return truth.onsets, truth.known_until, truth.known_slots
+    return onsets, known_until, truth.known_slots, dead
 
 
 def radar_truth(
@@ -1491,6 +1549,15 @@ def render_markdown(payload: dict) -> str:
         f"at least {settings['min_warnings']} scored warnings per lead"
     )
     lines.append(f"- FAR cap for the secondary pick: {_pct(settings['far_cap'])}")
+    if window.get("dead_gauges"):
+        lines.append(
+            "- Dead gauges excluded (reported ≥ "
+            f"{settings.get('min_known_slots', DEFAULT_MIN_KNOWN_SLOTS)} "
+            "slots, never once wet): "
+            + ", ".join(str(s) for s in window["dead_gauges"])
+            + ". A bucket stuck at zero turns every wet slot at that "
+            "station into a false alarm the rule could not have avoided."
+        )
     seasons = (payload.get("strata") or {}).get("season") or {}
     if seasons:
         lines.append(
@@ -1891,6 +1958,10 @@ class SweepOptions:
     tolerance_min: int = DEFAULT_TOLERANCE_MIN
     dry_min: int = DEFAULT_DRY_MIN
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM
+    #: Known slots a station must contribute before "never wet" excludes
+    #: it as a dead gauge (``warning_score.dead_gauges``). 0 switches the
+    #: rule off and puts stuck-at-zero buckets back in the pool.
+    min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN
     far_cap: float = DEFAULT_FAR_CAP
     min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN
@@ -1969,15 +2040,18 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
 
     window_from, window_to = min(stamps), max(stamps)
     del stamps
-    onsets_by_station, known_until, known_slots = gauge_truth(
+    onsets_by_station, known_until, known_slots, dead = gauge_truth(
         Path(options.corpus_dir), station_ids, (window_from, window_to),
-        dry_min=options.dry_min, onset_min_mm=options.onset_min_mm, log=log,
+        dry_min=options.dry_min, onset_min_mm=options.onset_min_mm,
+        min_known_slots=options.min_known_slots, log=log,
     )
     if known_slots == 0:
         raise SweepError("the gauge store has no observations over this window")
     # A station the gauge store says nothing about cannot verify anything:
     # every warning there would be a false alarm by default, which measures
     # the archive's depth rather than the rule. Leave it out of the pool.
+    # ``gauge_truth`` has already taken the dead gauges out of
+    # ``known_until`` for exactly the same reason.
     scored_stations = [s for s in station_ids if s in known_until]
     dropped = len(station_ids) - len(scored_stations)
     if dropped and log:
@@ -2070,6 +2144,7 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
             "tolerance_min": int(options.tolerance_min),
             "dry_min": int(options.dry_min),
             "onset_min_mm": float(options.onset_min_mm),
+            "min_known_slots": int(options.min_known_slots),
             "coverage_gap_min": int(options.coverage_gap_min),
             "far_cap": float(options.far_cap),
             "min_useful_lead_min": float(options.min_useful_lead_min),
@@ -2091,6 +2166,10 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
             "rows": n_rows,
             "station_days": station_days,
             "known_gauge_slots": known_slots,
+            # Stations excluded because their bucket never moved. Named,
+            # not just counted: a scoreboard that silently drops a station
+            # cannot be argued with.
+            "dead_gauges": list(dead),
             "files": counts["files"],
             "duplicate_keys": counts["duplicates"],
         },
@@ -2149,6 +2228,8 @@ __all__ = [
     "decision_parquets",
     "filter_tracks_by_months",
     "gauge_truth",
+    "in_months",
+    "month_filter",
     "load_decisions",
     "parse_leads",
     "parse_strata",

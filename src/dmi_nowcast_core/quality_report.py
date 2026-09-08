@@ -100,6 +100,7 @@ from .warning_score import (
     DEFAULT_COVERAGE_GAP_MIN,
     DEFAULT_DRY_MIN,
     DEFAULT_LEAD_MIN,
+    DEFAULT_MIN_KNOWN_SLOTS,
     DEFAULT_ONSET_MIN_MM,
     DEFAULT_TOLERANCE_MIN,
     SLOT_MIN,
@@ -241,6 +242,10 @@ class QualityInputs:
     dry_min: int = DEFAULT_DRY_MIN
     #: Millimetres an onset must deliver over its own slot and the next.
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM
+    #: Gauge slots a station must have reported over the window before
+    #: "never wet" excludes it as a dead bucket
+    #: (``warning_score.dead_gauges``). 0 switches the rule off.
+    min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS
     raining_now_mm_h: float = 0.5
     #: The longest gap between consecutive decision rows that still counts
     #: as continuous coverage (two radar cycles).
@@ -924,6 +929,10 @@ class _GaugeTruth:
     wet_at: dict[tuple[str, datetime], bool | None] = field(default_factory=dict)
     known_until: dict[str, datetime] = field(default_factory=dict)
     known_slots: int = 0
+    #: Stations excluded by the dead-gauge rule, with their known-slot
+    #: counts — the evidence, so the report can name them rather than
+    #: quietly dropping them.
+    dead: tuple[Any, ...] = ()
 
 
 def decision_bounds(
@@ -957,6 +966,7 @@ def _gauge_truth(
     *,
     dry_min: int,
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
+    min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS,
 ) -> _GaugeTruth:
     """Read the gauge store for the rows' months; onsets and slot flags out.
 
@@ -975,20 +985,37 @@ def _gauge_truth(
     ``needed`` keeps the wet flags bounded to the decisions that ask for
     one: the grid holds a slot every ten minutes for every station, and
     the report wants a few thousand of them.
+
+    A **dead gauge** — reported in at least ``min_known_slots`` slots and
+    never once wet — is dropped from all three maps
+    (``warning_score.dead_gauges``). A bucket stuck at zero is not a dry
+    place: it turns every wet slot at that station into a false alarm and
+    every warning into a wrong one, which is what station 06080 did to the
+    2026-09-08 study. Excluded stations are carried on ``dead`` so the
+    methods block can name them.
     """
-    from .warning_score import gauge_truth_vectorised
+    from .warning_score import dead_gauge_scan, gauge_truth_vectorised
 
     start, end = window
     loaded = gauge_truth_vectorised(
         Path(corpus_dir), start, end, list(station_ids),
         dry_min=dry_min, onset_min_mm=onset_min_mm, pad_min=GAUGE_PAD_MIN,
     )
+    dead = dead_gauge_scan(loaded, min_known_slots=int(min_known_slots))
+    excluded = {row.station_id for row in dead}
     truth = _GaugeTruth(
-        onsets=loaded.onsets,
-        known_until=loaded.known_until,
+        onsets={
+            s: v for s, v in loaded.onsets.items() if s not in excluded
+        },
+        known_until={
+            s: v for s, v in loaded.known_until.items() if s not in excluded
+        },
         known_slots=loaded.known_slots,
+        dead=tuple(dead),
     )
     for key in needed:
+        if key[0] in excluded:
+            continue
         wet = loaded.wet_at(key[0], key[1])
         if wet is not None:
             truth.wet_at[key] = wet
@@ -1009,6 +1036,8 @@ class _Scoreboard:
     per_station: dict[str, dict] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
     window_days: int = 0
+    #: ``warning_score.DeadGauge`` rows for the stations left out.
+    dead_gauges: tuple[Any, ...] = ()
 
 
 def _score_decisions(
@@ -1042,9 +1071,17 @@ def _score_decisions(
     truth = _gauge_truth(
         Path(inputs.corpus_dir), station_ids, (window_from, window_to),
         needed, dry_min=inputs.dry_min, onset_min_mm=inputs.onset_min_mm,
+        min_known_slots=inputs.min_known_slots,
     )
     if truth.known_slots == 0:
         return board
+    board.dead_gauges = tuple(truth.dead)
+    # A dead gauge is out of the pool entirely: its warnings are not false
+    # alarms, its silence is not a miss, and its slots are not evidence
+    # about "raining now" either.
+    excluded_stations = {row.station_id for row in truth.dead}
+    if excluded_stations:
+        station_ids = [s for s in station_ids if s not in excluded_stations]
 
     warnings_by_station: dict[str, list[tuple[datetime, float | None]]] = defaultdict(list)
     frames_by_station: dict[str, list[datetime]] = defaultdict(list)
@@ -1465,6 +1502,7 @@ def _methods_section(
     summary: Mapping[str, Any],
     radar_curves: Sequence[Mapping[str, Any]],
     gauge_curves: Sequence[Mapping[str, Any]],
+    dead_gauges: Sequence[Any] = (),
 ) -> dict | None:
     """The rules the numbers were produced under, in the producer's words.
 
@@ -1544,7 +1582,29 @@ def _methods_section(
             "claimed no onset, is pending: excluded from hits, false "
             "alarms, POD and FAR until the gauge can answer"
         ),
+        # Additive, like the two keys above: the client ignores it, the
+        # archive does not. A station dropped from the scoreboard has to
+        # be named somewhere, or the numbers cannot be reproduced.
+        "dead_gauge_rule": _dead_gauge_sentence(inputs, dead_gauges),
     }
+
+
+def _dead_gauge_sentence(
+    inputs: QualityInputs, dead: Sequence[Any],
+) -> str:
+    """Which stations the dead-gauge rule excluded, and on what evidence."""
+    rule = (
+        f"a station reporting ≥ {inputs.min_known_slots} gauge slots over "
+        "the window and never once wet is a broken bucket, not a dry "
+        "place, and is excluded from every count here"
+    )
+    if not dead:
+        return f"{rule}; none excluded"
+    named = ", ".join(
+        f"{row.station_id} ({row.known_slots} known slots, 0 wet)"
+        for row in dead
+    )
+    return f"{rule}. Excluded: {named}"
 
 
 def _reliability_sentence(
@@ -1679,6 +1739,7 @@ def build_quality_report(inputs: QualityInputs) -> dict:
         "events": events or None,
         "methods": _methods_section(
             inputs, radar, gauge, summary, radar_curves, gauge_curves,
+            dead_gauges=board.dead_gauges,
         ),
         "thresholds": _thresholds_section(inputs),
     }
