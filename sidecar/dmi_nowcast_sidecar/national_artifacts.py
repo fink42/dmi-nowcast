@@ -541,11 +541,17 @@ def write_national_artifacts(
                     "in km/h on the product grid (see \"grid\"), east- and "
                     "north-positive. nodata (255) outside radar coverage, "
                     "and everywhere when the composite has no echo at all. "
-                    "On the echo the vector is the measured optical flow; "
-                    "off it, it is the motion of the nearest cells — a "
-                    "rain-weighted average over a search area that starts "
-                    "small and widens (fill_scales_km) until it reaches "
-                    "echo."
+                    "On the echo the vector is the completed flow the "
+                    "forecast is advected with: the measured optical flow "
+                    "where the estimator had texture to track, blended "
+                    "toward the bulk storm motion where it did not — a "
+                    "featureless echo interior returns near-zero "
+                    "displacement, which is a measurement artefact rather "
+                    "than stationary rain (changed 2026-09-08; it used to "
+                    "be the raw estimate). Off the echo it is the motion "
+                    "of the nearest cells — a rain-weighted average over a "
+                    "search area that starts small and widens "
+                    "(fill_scales_km) until it reaches echo."
                 ),
             }
             if motion_east_kmh is not None else None

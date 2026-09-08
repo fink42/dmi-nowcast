@@ -127,6 +127,35 @@ class ForecastConfig(BaseModel):
     rain_threshold_mm_h: Annotated[float, Field(gt=0, le=50)] = 0.5
     detection_stat: Literal["max", "p90", "mean"] = "p90"
 
+    # H-F hotfix (2026-09-08). How ``dense_flow.complete_flow`` treats the
+    # ON-echo part of the field. ``bulk`` is the pre-hotfix behaviour: the
+    # estimate is kept wherever it rains, and only the dry surroundings are
+    # relaxed toward the rain-weighted bulk vector. ``confidence`` also
+    # relaxes on-echo pixels whose local gradient energy says the estimator
+    # had nothing to track, and relaxes toward a bulk taken from the
+    # high-texture pixels only.
+    #
+    # Why the default is ``confidence``: on the 2026-09-08 17:40Z cycle,
+    # 55 % of the wet pixels in a 160 km box around Odense carried
+    # < 5 km/h under ``bulk`` while the shield moved at 25-28 km/h, and the
+    # rain-weighted bulk was itself dragged to 15-17 km/h. Full evidence
+    # and the variant CSI table: ``archive/flow_stall_20260908/README.md``
+    # (private repo), plan section H-F / DECIDE-9.
+    #
+    # These four values join the calibration corpus's settings hash, so a
+    # corpus built under one policy is refused under another.
+    flow_completion: Literal["bulk", "confidence"] = "confidence"
+    # Box-mean window of the gradient-energy measure, in native pixels.
+    # Matched to Farnebäck's own ``winsize=31``: the question is whether
+    # the ESTIMATOR's window held anything to match.
+    flow_confidence_window_px: Annotated[int, Field(ge=3, le=201)] = 31
+    # Percentile of on-echo energy at which the on-echo weight saturates
+    # at 1 (keep the measured vector); 0 energy takes the bulk outright.
+    flow_confidence_percentile: Annotated[float, Field(ge=0.0, le=100.0)] = 40.0
+    # Percentile of on-echo energy a pixel must reach to vote in the
+    # robust (median) bulk vector.
+    flow_texture_percentile: Annotated[float, Field(ge=0.0, le=100.0)] = 60.0
+
     @field_validator("leads_min")
     @classmethod
     def _leads_sorted(cls, v: list[int]) -> list[int]:

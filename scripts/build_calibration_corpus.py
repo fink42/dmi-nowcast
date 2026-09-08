@@ -196,18 +196,28 @@ appended. The fit (package B3) consumes them as relative weights.
     error          str ("" when clean; per-event diagnostics)
     -- settings columns (B0 parity; identical on every row of a corpus) --
     ensemble_size, n_cascade_levels, downsample_factor, n_timesteps  int32
+    flow_confidence_window_px                                        int32
     threshold_mm_h, disc_radius_m, timestep_min                      float64
-    detection_stat, scan_type, motion_method                         str
+    flow_confidence_percentile, flow_texture_percentile              float64
+    detection_stat, scan_type, motion_method, flow_completion        str
     leads_min_csv, frame_age_range_csv, settings_hash                str
     schema_version                                                   int32 (2)
 
 ``settings_hash`` is a stable hash over the sorted settings dict; the
 builder itself refuses to append to an output whose hash differs, and
 the fit refuses a mixed corpus the same way. ``scan_type``,
-``timestep_min``, ``motion_method`` and ``frame_age_range`` are part of
-the hashed dict, so any pre-fix corpus (mixed-type frames, 5-min
-timestep, uncompleted motion field, zero frame age) hashes differently
-and the fitter refuses it automatically — no manual audit needed.
+``timestep_min``, ``motion_method``, ``frame_age_range`` and the four
+``flow_*`` completion settings are part of the hashed dict, so any
+pre-fix corpus (mixed-type frames, 5-min timestep, uncompleted motion
+field, zero frame age, pre-H-F completion) hashes differently and the
+fitter refuses it automatically — no manual audit needed.
+
+**Operational note (2026-09-08).** Adding the four ``flow_*`` keys
+changed the hash for *every* policy, the legacy ``bulk`` one included.
+Corpora built before this date therefore cannot be extended or mixed
+with new ones; a like-for-like A/B against the legacy flow means
+building a fresh ``--flow-completion bulk`` corpus, not reusing the
+archived one.
 
 Resumable: skips events already present in the output Parquet. Progress
 JSON is written to ``--progress`` after every event for the companion
@@ -262,6 +272,11 @@ from dmi_nowcast_core.corpus import (  # noqa: E402
     ArchiveIndex,
     archive_path_for,
 )
+from dmi_nowcast_core.dense_flow import (  # noqa: E402
+    DEFAULT_CONFIDENCE_PERCENTILE,
+    DEFAULT_CONFIDENCE_WINDOW_PX,
+    DEFAULT_TEXTURE_PERCENTILE,
+)
 from dmi_nowcast_core.geo import CompositeGeo  # noqa: E402
 from dmi_nowcast_core.national import NationalProducts, national_products  # noqa: E402
 from dmi_nowcast_core.parse import parse_composite  # noqa: E402
@@ -292,7 +307,19 @@ STEPS_SEED = 42
 # probability. Corpora built before that fix hash differently and — since
 # they also lack the column entirely — the fitter refuses them structurally.
 # Bump the suffix whenever the motion pipeline changes materially.
+#
+# NOT bumped for the H-F hotfix (2026-09-08): the completion policy and
+# its three numbers are hashed as their own settings keys below, which is
+# both more explicit and more useful — the report can read the policy off
+# the corpus instead of decoding a suffix. Keeping the suffix stable also
+# means the string still says what the ESTIMATOR is (Farnebäck, completed
+# before STEPS), which is unchanged.
 MOTION_METHOD = "farneback_complete_v1"
+# H-F flow-completion policy the corpus is built under (2026-09-08).
+# Mirrors ``ForecastConfig.flow_completion``'s default so an unflagged
+# build matches the deployed sidecar; ``--flow-completion`` overrides it
+# for the A/B against the legacy field.
+DEFAULT_FLOW_COMPLETION = "confidence"
 # Simulated frame age, minutes: [LO, HI] of the uniform draw per event.
 # The live cycle finishes ~12-18 min after its newest frame's radar
 # timestamp (fetch + STEPS + render), and the runtime shifts every lead
@@ -347,6 +374,18 @@ class CorpusSettings:
     #: the hashed settings, so a zero-age corpus can never be mixed with
     #: (or resumed as) a latency-simulating one.
     frame_age_range: tuple[float, float] = DEFAULT_FRAME_AGE_RANGE
+    #: H-F flow-completion policy and its three numbers (2026-09-08), read
+    #: off the runtime's ``forecast.flow_completion`` /
+    #: ``flow_confidence_window_px`` / ``flow_confidence_percentile`` /
+    #: ``flow_texture_percentile``. Hashed exactly like ``scan_type`` and
+    #: ``timestep_min``: the completion changes the velocity STEPS is
+    #: driven with, so it changes every advected probability, and a corpus
+    #: built under one policy must be refused under another rather than
+    #: silently calibrating a forecast nobody serves.
+    flow_completion: str = DEFAULT_FLOW_COMPLETION
+    flow_confidence_window_px: int = DEFAULT_CONFIDENCE_WINDOW_PX
+    flow_confidence_percentile: float = DEFAULT_CONFIDENCE_PERCENTILE
+    flow_texture_percentile: float = DEFAULT_TEXTURE_PERCENTILE
 
     @property
     def n_timesteps(self) -> int:
@@ -369,6 +408,10 @@ class CorpusSettings:
             "detection_stat": str(self.detection_stat),
             "scan_type": str(self.scan_type),
             "motion_method": str(self.motion_method),
+            "flow_completion": str(self.flow_completion),
+            "flow_confidence_window_px": int(self.flow_confidence_window_px),
+            "flow_confidence_percentile": float(self.flow_confidence_percentile),
+            "flow_texture_percentile": float(self.flow_texture_percentile),
             "leads_min": [int(x) for x in self.leads_min],
             "timestep_min": float(self.timestep_min),
             "frame_age_range": [float(x) for x in self.frame_age_range],
@@ -1442,50 +1485,56 @@ def _process_event(
         # Best-effort motion: skimage / opencv from the integration's own
         # dense_flow module. (If unavailable, fall back to FFT phase
         # correlation.)
+        #
+        # Estimate, completion, sanitise and clip all go through
+        # ``estimate_motion`` — the same entry point ``compute.py`` and
+        # ``replay_warnings.py`` call. Corpus/runtime parity is the whole
+        # point of the settings hash, and ``flow_completion`` plus the
+        # three confidence numbers in that hash assert exactly this call.
         from dmi_nowcast_core.dense_flow import (
-            complete_flow,
-            dense_flow,
+            DEFAULT_MAX_PX_PER_FRAME,
             DenseFlowUnavailable,
+            dense_flow,
+            estimate_motion,
         )
         from dmi_nowcast_core.motion import phase_correlation_shift
 
         rain_now = dbz_to_rain_rate(composite_now.reflectivity_dbz)
+        prev_dbz = composites[-2].reflectivity_dbz
+        raw_flow = None
         try:
-            vy, vx = dense_flow(
-                composites[-2].reflectivity_dbz, composite_now.reflectivity_dbz
-            )
+            raw_flow = dense_flow(prev_dbz, composite_now.reflectivity_dbz)
         except DenseFlowUnavailable:
             # Only the fallback needs the PREVIOUS frame's rain rate, and
             # the fallback is never taken with opencv installed — a
             # native-grid array (14 MB) and a Z-R pass held for nothing on
             # every event otherwise.
-            rain_prev = dbz_to_rain_rate(composites[-2].reflectivity_dbz)
+            rain_prev = dbz_to_rain_rate(prev_dbz)
             dy, dx = phase_correlation_shift(rain_prev, rain_now)
-            vy = np.full(rain_now.shape, dy, dtype=np.float32)
-            vx = np.full(rain_now.shape, dx, dtype=np.float32)
-        # Motion completion, in the same place the sidecar does it (before
-        # the clip, so STEPS sees the completed field) — corpus/runtime
-        # parity is the whole point of the settings hash, and
-        # ``motion_method`` in that hash asserts exactly this call.
-        vy, vx = complete_flow(
-            vy, vx, rain_now,
+            del rain_prev
+            raw_flow = (
+                np.full(rain_now.shape, dy, dtype=np.float32),
+                np.full(rain_now.shape, dx, dtype=np.float32),
+            )
+        motion = estimate_motion(
+            prev_dbz, composite_now.reflectivity_dbz, rain_now,
             pixel_km=float(composite_now.xscale_m) / 1000.0,
+            dt_min=float(settings.timestep_min),
             support_threshold_mm_h=settings.threshold_mm_h,
+            completion=settings.flow_completion,
+            confidence_window_px=settings.flow_confidence_window_px,
+            confidence_percentile=settings.flow_confidence_percentile,
+            texture_percentile=settings.flow_texture_percentile,
+            max_px_per_frame=DEFAULT_MAX_PX_PER_FRAME,
+            flow=raw_flow,
         )
-        # Per-pixel clip (NOT zero-everything) — the grid-wide mean-abs
-        # check would trip on every event because skimage's dense flow
-        # fills dry pixels with noisy 50-100 px/frame extrapolations,
-        # making the whole field get zeroed and reducing STEPS to a
-        # persistence forecaster. Mirrors the fix in coordinator.py.
-        MAX_PX = 30.0
-        vy = np.nan_to_num(vy, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        vx = np.nan_to_num(vx, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        vy = np.clip(vy, -MAX_PX, MAX_PX).astype(np.float32)
-        vx = np.clip(vx, -MAX_PX, MAX_PX).astype(np.float32)
-        # Nothing below reads the native-grid rain field; STEPS is the
-        # memory high-water mark of the whole worker, so native arrays
-        # that survive into it are pure headroom lost.
-        del rain_now
+        del raw_flow
+        vy, vx = motion.vy, motion.vx
+        # ``motion`` also holds the raw estimate (two 14 MB native grids)
+        # that only its stall diagnostic needed. STEPS below is the memory
+        # high-water mark of the whole worker, so nothing native survives
+        # into it that is not read there — the rain field included.
+        del motion, rain_now
 
         forecast = run_ensemble(
             dbz_frames, vy, vx,
@@ -1721,6 +1770,35 @@ def main() -> int:
              "(runtime: forecast.detection_stat).",
     )
     ap.add_argument(
+        "--flow-completion", choices=("bulk", "confidence"),
+        default=DEFAULT_FLOW_COMPLETION,
+        help="Motion-completion policy (runtime: "
+             "forecast.flow_completion). 'confidence' also relaxes "
+             "low-texture ON-echo pixels toward a bulk vector taken from "
+             "the high-texture pixels (H-F hotfix, 2026-09-08); 'bulk' is "
+             "the pre-hotfix behaviour. Joins the settings hash with the "
+             "three numbers below, so corpora built under different "
+             "policies never mix.",
+    )
+    ap.add_argument(
+        "--flow-confidence-window-px", type=int,
+        default=DEFAULT_CONFIDENCE_WINDOW_PX,
+        help="Box-mean window of the gradient-energy measure, in native "
+             "pixels (runtime: forecast.flow_confidence_window_px).",
+    )
+    ap.add_argument(
+        "--flow-confidence-percentile", type=float,
+        default=DEFAULT_CONFIDENCE_PERCENTILE,
+        help="On-echo energy percentile at which the on-echo weight "
+             "saturates (runtime: forecast.flow_confidence_percentile).",
+    )
+    ap.add_argument(
+        "--flow-texture-percentile", type=float,
+        default=DEFAULT_TEXTURE_PERCENTILE,
+        help="On-echo energy percentile a pixel must reach to vote in the "
+             "robust bulk vector (runtime: forecast.flow_texture_percentile).",
+    )
+    ap.add_argument(
         "--frame-age-range", type=str,
         default="{:g},{:g}".format(*DEFAULT_FRAME_AGE_RANGE),
         metavar="LO,HI",
@@ -1813,6 +1891,10 @@ def main() -> int:
         # timestep) → 8 for a 60-min horizon at the default 12-18 min age).
         timestep_min=FRAME_SPACING_MIN,
         frame_age_range=frame_age_range,
+        flow_completion=args.flow_completion,
+        flow_confidence_window_px=args.flow_confidence_window_px,
+        flow_confidence_percentile=args.flow_confidence_percentile,
+        flow_texture_percentile=args.flow_texture_percentile,
     )
     settings_cols = settings.settings_columns()
     _LOGGER.info("settings hash: %s  %s", settings.settings_hash, settings.to_dict())

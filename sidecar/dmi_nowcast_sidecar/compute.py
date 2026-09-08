@@ -41,8 +41,8 @@ from dmi_nowcast_core.confidence import (
 from dmi_nowcast_core.corpus import CorpusArchiver
 from dmi_nowcast_core.dense_flow import (
     DenseFlowUnavailable,
-    complete_flow,
     dense_flow,
+    estimate_motion,
 )
 from dmi_nowcast_core.fetch import AsyncDMIClient, RadarFeature
 from dmi_nowcast_core.geo import CompositeGeo
@@ -264,6 +264,13 @@ class CycleEngine:
         # hysteresis (both count radar observations, not poll firings).
         self._last_frame_ts: datetime | None = None
         self._last_state: State | None = None
+        # Motion diagnostics of the last full compute, folded into the
+        # ``cycle_ok`` log line (H-F, 2026-09-08). Scalars only — never a
+        # grid — so a re-emitted state carries no stale array. Empty until
+        # the first full cycle, and deliberately NOT cleared by the
+        # no-new-frame fast path: that path re-emits the same state, so the
+        # same motion numbers still describe it.
+        self._last_motion_diag: dict[str, Any] = {}
         # Geo cached after first composite (projection rarely changes).
         self._geo: CompositeGeo | None = None
         # Calibration curves loaded once. ``_curves`` are the legacy
@@ -532,6 +539,10 @@ class CycleEngine:
                 raining=state.now.raining,
                 rain_incoming=state.forecast.rain_incoming,
                 eta_minutes=state.forecast.eta_minutes,
+                # H-F: which completion ran, how much of the echo the
+                # estimator stalled on, how much of that survived into the
+                # advected field, and the bulk vector it relaxed toward.
+                **self._last_motion_diag,
             )
             return CycleResult(
                 state=state,
@@ -659,10 +670,11 @@ class CycleEngine:
         if dt_min <= 0:
             dt_min = _EXPECTED_FRAME_INTERVAL_MIN
         method_used: str = self.config.forecast.method
+        raw_flow: tuple[np.ndarray, np.ndarray]
         try:
             if self.config.forecast.method == "mean-motion":
                 raise DenseFlowUnavailable("forced via config")
-            vy, vx = dense_flow(
+            raw_flow = dense_flow(
                 composite_prev.reflectivity_dbz,
                 composite_now.reflectivity_dbz,
             )
@@ -670,38 +682,56 @@ class CycleEngine:
             method_used = "mean-motion"
             dy, dx = phase_correlation_shift(rain_prev, rain_now)
             shape = rain_now.shape
-            vy = np.full(shape, dy, dtype=np.float32)
-            vx = np.full(shape, dx, dtype=np.float32)
+            raw_flow = (
+                np.full(shape, dy, dtype=np.float32),
+                np.full(shape, dx, dtype=np.float32),
+            )
 
-        # Sanitised *raw* estimate, kept for the served motion grids (R2)
-        # only. Same nan→0 and clip as the completed field below, so on the
-        # echo the two agree exactly; off it, ``motion_grids_kmh`` runs its
-        # own nearest-cells completion instead of the bulk one (issue #6).
-        # Two extra float32 native grids (~14 MB each) live until the
-        # artifacts are written, then are dropped.
-        vy_raw = np.nan_to_num(vy, nan=0.0).astype(np.float32)
-        vx_raw = np.nan_to_num(vx, nan=0.0).astype(np.float32)
-        np.clip(vy_raw, -_MAX_PX_PER_FRAME, _MAX_PX_PER_FRAME, out=vy_raw)
-        np.clip(vx_raw, -_MAX_PX_PER_FRAME, _MAX_PX_PER_FRAME, out=vx_raw)
-
-        # Motion-field completion (R5). Farnebäck returns exactly zero away
-        # from the echo, which stalls advected rain along a stationary line
-        # ~20-30 km ahead of it; relax the far field toward bulk storm
-        # motion before anything consumes the flow. Deliberately ahead of
-        # the sanitise/clip below so BOTH consumers get the completed field:
-        # the deterministic overlay advection here, and the STEPS velocity
+        # Estimate → complete → sanitise, through the ONE entry point the
+        # corpus builder and the warning replay also call. Completion runs
+        # ahead of the clip so BOTH consumers get the completed field: the
+        # deterministic overlay advection here, and the STEPS velocity
         # (``_run_steps_ensemble`` downsamples this same array).
-        vy, vx = complete_flow(
-            vy, vx, rain_now,
-            pixel_km=float(composite_now.xscale_m) / 1000.0,
+        #
+        # ``flow_completion`` (config, default ``confidence``) is the H-F
+        # hotfix: without it the Farnebäck stall inside broad echo survives
+        # into the advection and into STEPS. See
+        # ``dense_flow.complete_flow`` and
+        # ``archive/flow_stall_20260908/README.md``.
+        pixel_km = float(composite_now.xscale_m) / 1000.0
+        motion = estimate_motion(
+            composite_prev.reflectivity_dbz,
+            composite_now.reflectivity_dbz,
+            rain_now,
+            pixel_km=pixel_km,
+            dt_min=dt_min,
             support_threshold_mm_h=self._rain_threshold,
+            completion=self.config.forecast.flow_completion,
+            confidence_window_px=self.config.forecast.flow_confidence_window_px,
+            confidence_percentile=self.config.forecast.flow_confidence_percentile,
+            texture_percentile=self.config.forecast.flow_texture_percentile,
+            max_px_per_frame=_MAX_PX_PER_FRAME,
+            flow=raw_flow,
         )
-
-        # Sanitize motion.
-        vy = np.nan_to_num(vy, nan=0.0).astype(np.float32)
-        vx = np.nan_to_num(vx, nan=0.0).astype(np.float32)
-        np.clip(vy, -_MAX_PX_PER_FRAME, _MAX_PX_PER_FRAME, out=vy)
-        np.clip(vx, -_MAX_PX_PER_FRAME, _MAX_PX_PER_FRAME, out=vx)
+        del raw_flow
+        vy, vx = motion.vy, motion.vx
+        # Cycle diagnostics, logged with ``cycle_ok`` and (the raw stalled
+        # share) served in ``state.motion``.
+        self._last_motion_diag = {
+            "flow_completion": motion.completion,
+            "stalled_share": round(motion.stalled_share, 3),
+            "stalled_share_completed": round(motion.stalled_share_completed, 3),
+            "bulk_kmh": round(
+                math.hypot(motion.bulk_vy, motion.bulk_vx) * pixel_km * 60.0 / dt_min,
+                1,
+            ),
+        }
+        motion_stalled_share = motion.stalled_share
+        # ``motion`` also holds the two RAW native grids (~14 MB each) that
+        # only the stall diagnostic needed; the served arrows now show the
+        # completed field. Drop them before STEPS, the cycle's memory
+        # high-water mark.
+        del motion
 
         # Disc-area mean motion (rain-weighted in 120 km window around home).
         disc_dy_per_min, disc_dx_per_min = _disc_motion(
@@ -918,18 +948,23 @@ class CycleEngine:
                 generated_at_utc,
             )
             # R2 cell-motion grids: the display product, on the product
-            # grid, in km/h. Fed the *raw* sanitised flow, not the
-            # bulk-completed one the overlays and STEPS ran on — off the
-            # echo it completes toward the nearest cells rather than the
-            # national bulk, which is what the arrow is asked about
-            # (issue #6). The advection's field is untouched. A failure
-            # here costs the click-anywhere arrow, not the cycle.
+            # grid, in km/h. Fed the COMPLETED flow — the same array the
+            # overlays and STEPS ran on — so the arrow the user clicks and
+            # the motion the loop shows are one number. It used to be the
+            # raw estimate, on the argument that "on the echo the vector is
+            # the measured optical flow"; since the H-F hotfix that is no
+            # longer what the forecast advects with, and drawing the
+            # measured-but-stalled vector next to a loop that moves would
+            # be a straight contradiction (2026-09-08). Off the echo,
+            # ``motion_grids_kmh`` still runs its own nearest-cells
+            # completion rather than the national bulk (issue #6). A
+            # failure here costs the click-anywhere arrow, not the cycle.
             motion_east = motion_north = None
             try:
                 motion_east, motion_north = motion_grids_kmh(
-                    vy_raw, vx_raw, rain_now,
+                    vy, vx, rain_now,
                     pixel_km=float(composite_now.xscale_m) / 1000.0,
-                    # ``vy_raw``/``vx_raw`` are pixels per inter-frame interval.
+                    # ``vy``/``vx`` are pixels per inter-frame interval.
                     timestep_min=dt_min,
                     downsample_factor=ensemble.national.downsample_factor,
                     support_threshold_mm_h=self._rain_threshold,
@@ -969,9 +1004,6 @@ class CycleEngine:
             except Exception as exc:  # noqa: BLE001
                 _log.warning("national_artifacts_failed", error=str(exc))
             national_ms += (time.perf_counter() - t_art) * 1000
-
-        # The raw-flow copies exist only for the served motion grids.
-        del vy_raw, vx_raw
 
         # State payload.
         now_utc = datetime.now(timezone.utc)
@@ -1034,6 +1066,7 @@ class CycleEngine:
                 dx_px_per_min=disc_dx_per_min,
                 speed_km_per_h=disc_speed_kmh,
                 bearing_deg_from=bearing_from,
+                stalled_share=round(motion_stalled_share, 3),
             ),
             confidence=float(conf.score),
             calibration=CalibrationBlock(

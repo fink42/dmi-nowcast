@@ -120,6 +120,11 @@ if str(_SIDECAR) not in sys.path:
 
 from dmi_nowcast_core.advect import advect_field_series  # noqa: E402
 from dmi_nowcast_core.calibrate import load_calibration_curves  # noqa: E402
+from dmi_nowcast_core.dense_flow import (  # noqa: E402
+    DEFAULT_CONFIDENCE_PERCENTILE,
+    DEFAULT_CONFIDENCE_WINDOW_PX,
+    DEFAULT_TEXTURE_PERCENTILE,
+)
 from dmi_nowcast_core.geo import CompositeGeo  # noqa: E402
 from dmi_nowcast_core.national import (  # noqa: E402
     national_products,
@@ -158,6 +163,11 @@ ENSEMBLE_SIZE = 24             # config.py StepsConfig.ensemble_size
 N_CASCADE_LEVELS = 6           # config.py StepsConfig.n_cascade_levels
 HORIZON_MIN = 90               # config.py StepsConfig.horizon_min
 NATIONAL_LEADS = (10, 20, 30, 45, 60)   # config.py NationalConfig.leads_min
+# H-F motion completion (2026-09-08). config.py ForecastConfig.
+# flow_completion / flow_confidence_window_px / flow_confidence_percentile
+# / flow_texture_percentile. The three numbers come from dense_flow so the
+# replay cannot drift from the library's own defaults.
+DEFAULT_FLOW_COMPLETION = "confidence"
 FRAME_INTERVAL_MIN = 10        # fullRange cadence (Phase B addendum)
 FRAME_TOLERANCE_S = 60         # a frame is "on the grid" within a minute
 #: The live subscriber row this replay reproduces.
@@ -305,12 +315,29 @@ class FrameSettings:
     leads_min: tuple[int, ...] = NATIONAL_LEADS
     threshold_mm_h: float = RAIN_THRESHOLD_MM_H
     national_curves_path: str | None = None
+    # H-F motion-completion policy and its three numbers (2026-09-08).
+    # Mirror ``ForecastConfig.flow_completion`` and friends; recorded in
+    # the run summary so a replay's decisions can be traced to the flow
+    # they were made on.
+    flow_completion: str = DEFAULT_FLOW_COMPLETION
+    flow_confidence_window_px: int = DEFAULT_CONFIDENCE_WINDOW_PX
+    flow_confidence_percentile: float = DEFAULT_CONFIDENCE_PERCENTILE
+    flow_texture_percentile: float = DEFAULT_TEXTURE_PERCENTILE
 
 
 def production_flow(
-    prev: RadarComposite, now: RadarComposite, rain_now: np.ndarray,
+    prev: RadarComposite,
+    now: RadarComposite,
+    rain_now: np.ndarray,
+    settings: "FrameSettings | None" = None,
+    *,
+    dt_min: float = FRAME_INTERVAL_MIN,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``(vy, vx)`` in px per inter-frame step — compute.py's motion block.
+
+    One call into ``dense_flow.estimate_motion``, the same entry point the
+    runtime and the corpus builder use, so the replay cannot drift from
+    what production serves.
 
     Falls back to a uniform phase-correlation shift when OpenCV is absent,
     exactly as ``build_calibration_corpus._process_event`` does, so the
@@ -318,12 +345,14 @@ def production_flow(
     """
     from dmi_nowcast_core.dense_flow import (
         DenseFlowUnavailable,
-        complete_flow,
         dense_flow,
+        estimate_motion,
     )
 
+    cfg = settings if settings is not None else FrameSettings()
+    raw_flow: tuple[np.ndarray, np.ndarray]
     try:
-        vy, vx = dense_flow(prev.reflectivity_dbz, now.reflectivity_dbz)
+        raw_flow = dense_flow(prev.reflectivity_dbz, now.reflectivity_dbz)
     except DenseFlowUnavailable:
         from dmi_nowcast_core.motion import phase_correlation_shift
 
@@ -331,18 +360,24 @@ def production_flow(
             prev.reflectivity_dbz, zr_a=prev.zr_a, zr_b=prev.zr_b,
         )
         dy, dx = phase_correlation_shift(rain_prev, rain_now)
-        vy = np.full(rain_now.shape, dy, dtype=np.float32)
-        vx = np.full(rain_now.shape, dx, dtype=np.float32)
-    vy, vx = complete_flow(
-        vy, vx, rain_now,
+        raw_flow = (
+            np.full(rain_now.shape, dy, dtype=np.float32),
+            np.full(rain_now.shape, dx, dtype=np.float32),
+        )
+    motion = estimate_motion(
+        prev.reflectivity_dbz, now.reflectivity_dbz, rain_now,
         pixel_km=float(now.xscale_m) / 1000.0,
-        support_threshold_mm_h=RAIN_THRESHOLD_MM_H,
+        dt_min=dt_min,
+        support_threshold_mm_h=cfg.threshold_mm_h,
+        completion=cfg.flow_completion,
+        confidence_window_px=cfg.flow_confidence_window_px,
+        confidence_percentile=cfg.flow_confidence_percentile,
+        texture_percentile=cfg.flow_texture_percentile,
+        max_px_per_frame=MAX_PX_PER_FRAME,
+        flow=raw_flow,
     )
-    vy = np.nan_to_num(vy, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    vx = np.nan_to_num(vx, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    np.clip(vy, -MAX_PX_PER_FRAME, MAX_PX_PER_FRAME, out=vy)
-    np.clip(vx, -MAX_PX_PER_FRAME, MAX_PX_PER_FRAME, out=vx)
-    return vy, vx
+    # The raw grids only fed the stall diagnostic; STEPS runs next.
+    return motion.vy, motion.vx
 
 
 #: One isotonic curve set per process, keyed on the file path — the curves
@@ -390,7 +425,7 @@ def sample_frame(
     dt_min = spacing[-1]
     geo = CompositeGeo(now)
     rain_now = dbz_to_rain_rate(now.reflectivity_dbz, zr_a=now.zr_a, zr_b=now.zr_b)
-    vy, vx = production_flow(composites[-2], now, rain_now)
+    vy, vx = production_flow(composites[-2], now, rain_now, settings, dt_min=dt_min)
 
     n_timesteps = max(1, math.ceil(settings.horizon_min / dt_min - 1e-9))
     forecast = run_ensemble(
@@ -902,6 +937,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--cascade-levels", type=int, default=N_CASCADE_LEVELS)
     p.add_argument("--downsample-factor", type=int, default=DOWNSAMPLE_FACTOR)
     p.add_argument("--horizon-min", type=int, default=HORIZON_MIN)
+    p.add_argument(
+        "--flow-completion", choices=("bulk", "confidence"),
+        default=DEFAULT_FLOW_COMPLETION,
+        help="Motion-completion policy (config.py "
+             "forecast.flow_completion). 'confidence' is the H-F hotfix "
+             "(2026-09-08), 'bulk' the behaviour before it — the two sides "
+             "of the A/B. Recorded in the run summary.",
+    )
     p.add_argument("--no-score", action="store_true",
                    help="replay only; skip the gauge scoring pass")
     args = p.parse_args(argv)
@@ -931,6 +974,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         national_curves_path=(
             str(args.national_curves) if args.national_curves else None
         ),
+        flow_completion=args.flow_completion,
     )
     out_dir = Path(args.out_dir)
     (out_dir / "decisions").mkdir(parents=True, exist_ok=True)
@@ -993,6 +1037,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "horizon_min": settings.horizon_min,
                 "leads_min": list(settings.leads_min),
                 "threshold_mm_h": settings.threshold_mm_h,
+            },
+            # H-F: which motion field these decisions were made on. The
+            # completion changes the STEPS velocity and therefore every
+            # probability in the table, so a replay's numbers mean nothing
+            # without it.
+            "flow": {
+                "completion": settings.flow_completion,
+                "confidence_window_px": settings.flow_confidence_window_px,
+                "confidence_percentile": settings.flow_confidence_percentile,
+                "texture_percentile": settings.flow_texture_percentile,
             },
             "national_curves": settings.national_curves_path,
             "archive_dir": str(args.archive_dir),

@@ -114,6 +114,15 @@ class MotionBlock(BaseModel):
     dx_px_per_min: float
     speed_km_per_h: float
     bearing_deg_from: float
+    # H-F stall diagnostic (additive, 2026-09-08): the share of wet pixels
+    # in the whole composite whose RAW optical-flow estimate is below
+    # 5 km/h. A property of the estimator rather than of the completion
+    # policy — Farnebäck collapses toward zero inside broad, flat echo, and
+    # this says how much of the country it did that on this cycle.
+    # Production read 0.47-0.61 on the 2026-09-08 stratiform shield that
+    # prompted the fix, ~0.11 on a textured convective band. Null on a
+    # state written before the field existed.
+    stalled_share: float | None = None
 
 
 class CalibrationBlock(BaseModel):

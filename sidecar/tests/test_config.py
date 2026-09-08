@@ -19,6 +19,47 @@ def test_load_minimal_yaml(config_yaml: Path) -> None:
     assert cfg.forecast.method == "farneback"
 
 
+def test_flow_completion_defaults_to_the_hotfix(config_yaml: Path) -> None:
+    """H-F (2026-09-08): the gated completion is ON unless turned off.
+
+    It fixes a measured defect — Farnebäck stalling on more than half a
+    stratiform shield — so an unconfigured instance must get the fix and
+    reverting has to be the deliberate act.
+    """
+    cfg = load_config(config_yaml)
+    assert cfg.forecast.flow_completion == "confidence"
+    assert cfg.forecast.flow_confidence_window_px == 31
+    assert cfg.forecast.flow_confidence_percentile == pytest.approx(40.0)
+    assert cfg.forecast.flow_texture_percentile == pytest.approx(60.0)
+
+
+@pytest.mark.parametrize("block", [
+    "forecast:\n  flow_completion: smoothing\n",
+    "forecast:\n  flow_confidence_window_px: 1\n",
+    "forecast:\n  flow_confidence_percentile: 101\n",
+    "forecast:\n  flow_texture_percentile: -1\n",
+])
+def test_flow_completion_values_are_constrained(tmp_path: Path, block: str) -> None:
+    p = tmp_path / "bad.yaml"
+    p.write_text(
+        "home:\n  lat: 55.33\n  lon: 10.32\n"
+        f"storage:\n  data_dir: {tmp_path / 'data'}\n" + block
+    )
+    with pytest.raises(ValueError):
+        load_config(p)
+
+
+def test_flow_completion_can_be_reverted_to_bulk(tmp_path: Path) -> None:
+    """The rollback knob, if the field comparison says H-F regresses."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        "home:\n  lat: 55.33\n  lon: 10.32\n"
+        f"storage:\n  data_dir: {tmp_path / 'data'}\n"
+        "forecast:\n  flow_completion: bulk\n"
+    )
+    assert load_config(p).forecast.flow_completion == "bulk"
+
+
 def test_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="sidecar config not found"):
         load_config(tmp_path / "nope.yaml")
@@ -285,3 +326,17 @@ def test_push_paths_resolve_against_the_data_dir(
     cfg.push.vapid_private_key_file = tmp_path / "elsewhere.pem"
     assert resolved_db_path(cfg) == tmp_path / "elsewhere.sqlite"
     assert resolved_key_path(cfg) == tmp_path / "elsewhere.pem"
+
+
+def test_flow_completion_default_matches_the_variant_registry(config_yaml: Path) -> None:
+    """The harness's ``production`` variant must be the field the sidecar serves.
+
+    ``variants.PRODUCTION_VARIANT`` names the registry entry the Layer A
+    harness scores as "production"; the config default is what the cycle
+    runs. If one moves without the other, a Layer A comparison silently
+    scores a field nobody serves.
+    """
+    from dmi_nowcast_core.variants import PRODUCTION_VARIANT
+
+    cfg = load_config(config_yaml)
+    assert cfg.forecast.flow_completion == PRODUCTION_VARIANT

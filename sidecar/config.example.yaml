@@ -23,6 +23,21 @@ dmi:
 forecast:
   leads_min: [5, 10, 15, 20, 25, 30, 45, 60]
   method: farneback       # farneback (recommended) | tvl1 | mean-motion
+  # How the motion field is completed ON the echo (H-F hotfix,
+  # 2026-09-08). ``confidence`` (the default) relaxes echo pixels whose
+  # local gradient energy says Farnebäck had nothing to track toward a
+  # bulk vector taken from the high-texture pixels only; ``bulk`` is the
+  # behaviour before the fix, which kept the estimate wherever it rained.
+  # The defect it fixes was measured: on the 2026-09-08 17:40Z cycle,
+  # 55 % of the wet pixels around Odense carried < 5 km/h while the
+  # shield moved at 25-28 km/h. The three numbers are the gate's
+  # percentile, the robust bulk's percentile, and the energy window in
+  # native pixels. They also key the calibration corpus, so changing any
+  # of them means rebuilding it.
+  # flow_completion: confidence     # confidence | bulk
+  # flow_confidence_window_px: 31
+  # flow_confidence_percentile: 40.0
+  # flow_texture_percentile: 60.0
   steps:
     ensemble_size: 24
     n_cascade_levels: 6

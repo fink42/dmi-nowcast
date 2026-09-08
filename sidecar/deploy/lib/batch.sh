@@ -200,6 +200,27 @@ print(c.home.radius_km * 1000.0,
 PY
 }
 
+# The live motion-completion policy (H-F, 2026-09-08), on its own line so
+# ``batch_live_settings``' field order stays fixed for every consumer.
+# Prints one space-separated line:
+#   flow_completion confidence_window_px confidence_percentile texture_percentile
+#
+# It has to come from the RUNNING config rather than from a default: the
+# completion decides the velocity STEPS is driven with, so a corpus built
+# under one policy would calibrate a forecast the service does not serve.
+# The four values join the corpus settings hash precisely so that
+# mismatch is refused rather than silently fitted.
+batch_live_flow_settings() {
+    compose exec -T sidecar python - <<'PY'
+from dmi_nowcast_sidecar.config import load_config
+c = load_config()
+print(c.forecast.flow_completion,
+      c.forecast.flow_confidence_window_px,
+      c.forecast.flow_confidence_percentile,
+      c.forecast.flow_texture_percentile)
+PY
+}
+
 # Publish <src> at <dst> atomically, from inside the container.
 #
 # The stable names (calibration/latest.parquet,

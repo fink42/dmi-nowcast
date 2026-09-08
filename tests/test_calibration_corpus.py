@@ -138,9 +138,40 @@ def test_settings_hash_stable_across_construction_routes():
     # latency-simulating one, so the two must never mix.
     {"frame_age_range": (0.0, 0.0)},
     {"frame_age_range": (10.0, 20.0)},
+    # H-F (2026-09-08): the completion policy and each of its three
+    # numbers change the velocity STEPS is driven with, so they change
+    # every advected probability the curves are fitted on.
+    {"flow_completion": "bulk"},
+    {"flow_confidence_window_px": 21},
+    {"flow_confidence_percentile": 30.0},
+    {"flow_texture_percentile": 70.0},
 ])
 def test_settings_hash_changes_when_any_setting_changes(override):
     assert _settings().settings_hash != _settings(**override).settings_hash
+
+
+def test_flow_completion_settings_default_to_the_runtime_policy():
+    """The unflagged corpus build must match the deployed sidecar."""
+    s = _settings()
+    assert s.flow_completion == "confidence"
+    assert s.flow_confidence_window_px == 31
+    assert s.flow_confidence_percentile == pytest.approx(40.0)
+    assert s.flow_texture_percentile == pytest.approx(60.0)
+
+    cols = s.settings_columns()
+    assert cols["flow_completion"] == "confidence"
+    assert cols["flow_confidence_window_px"] == 31
+    assert cols["flow_confidence_percentile"] == pytest.approx(40.0)
+    assert cols["flow_texture_percentile"] == pytest.approx(60.0)
+
+
+def test_flow_completion_matches_the_sidecar_config_default():
+    """One source of truth for the policy: ``dense_flow``'s constants."""
+    from dmi_nowcast_core import dense_flow as df
+
+    assert bcc.DEFAULT_CONFIDENCE_WINDOW_PX == df.DEFAULT_CONFIDENCE_WINDOW_PX
+    assert bcc.DEFAULT_CONFIDENCE_PERCENTILE == df.DEFAULT_CONFIDENCE_PERCENTILE
+    assert bcc.DEFAULT_TEXTURE_PERCENTILE == df.DEFAULT_TEXTURE_PERCENTILE
 
 
 def test_n_timesteps_spans_longest_effective_lead():
@@ -1621,7 +1652,12 @@ def test_settings_hash_ignores_the_sampling_window():
     not re-key a corpus, or a run could never extend one backwards."""
     keys = set(_settings().to_dict())
     assert "days_back" not in keys
-    assert not any("window" in k for k in keys)
+    # ``flow_confidence_window_px`` is a filter window, not a sampling one,
+    # and does belong in the hash (H-F, 2026-09-08) — hence the explicit
+    # exclusion rather than a bare substring test.
+    assert not any(
+        "window" in k for k in keys if k != "flow_confidence_window_px"
+    )
 
 
 # ---------------------------------------------------------------------------

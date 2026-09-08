@@ -38,14 +38,17 @@ from typing import Protocol
 
 import numpy as np
 
-from .dense_flow import complete_flow, dense_flow
+from .dense_flow import complete_flow, dense_flow, estimate_motion
 
 __all__ = [
     "FlowVariant",
     "MAX_PX_PER_FRAME",
+    "PRODUCTION_VARIANT",
     "SUPPORT_THRESHOLD_MM_H",
     "get_variant",
     "list_variants",
+    "bulk_flow",
+    "confidence_flow",
     "persistence_flow",
     "production_flow",
     "register_variant",
@@ -75,14 +78,14 @@ class FlowVariant(Protocol):
         ...
 
 
-def production_flow(
+def bulk_flow(
     prev_dbz: np.ndarray,
     curr_dbz: np.ndarray,
     rain_now_mm_h: np.ndarray,
     *,
     pixel_km: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """The flow the service actually runs — the baseline every candidate beats.
+    """The pre-H-F production field (``flow_completion: bulk``) — the Layer A baseline.
 
     Mirrors ``sidecar/dmi_nowcast_sidecar/compute.py::_compute_sync`` step
     for step, and the order is load-bearing:
@@ -112,6 +115,33 @@ def production_flow(
     return vy, vx
 
 
+def confidence_flow(
+    prev_dbz: np.ndarray,
+    curr_dbz: np.ndarray,
+    rain_now_mm_h: np.ndarray,
+    *,
+    pixel_km: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The H-F hotfix field: robust bulk + confidence-gated completion.
+
+    What the sidecar serves since ``forecast.flow_completion`` defaulted to
+    ``confidence`` (2026-09-08): the same Farnebäck estimate as
+    :func:`bulk_flow`, but ``complete_flow`` relaxes low-texture ON-echo
+    pixels toward a bulk vector taken as the median over high-texture wet
+    pixels — see ``dense_flow.estimate_motion`` and
+    ``archive/flow_stall_20260908`` in the private repo for why. Routed
+    through ``estimate_motion`` so the harness and the runtime cannot
+    drift; ``dt_min`` only feeds the diagnostic, not the field.
+    """
+    motion = estimate_motion(
+        prev_dbz, curr_dbz, rain_now_mm_h,
+        pixel_km=pixel_km, dt_min=10.0,
+        support_threshold_mm_h=SUPPORT_THRESHOLD_MM_H,
+        completion="confidence", max_px_per_frame=MAX_PX_PER_FRAME,
+    )
+    return motion.vy, motion.vx
+
+
 def persistence_flow(
     prev_dbz: np.ndarray,
     curr_dbz: np.ndarray,
@@ -131,7 +161,18 @@ def persistence_flow(
     return zeros, zeros.copy()
 
 
+#: The registry name the sidecar's default ``forecast.flow_completion``
+#: corresponds to. ``production`` is an alias of this entry; a sidecar test
+#: pins the two together so the harness's "production" can never quietly
+#: mean a field the service no longer serves.
+PRODUCTION_VARIANT = "confidence"
+
+#: Kept as a name: the served field, whatever :data:`PRODUCTION_VARIANT` says.
+production_flow = confidence_flow
+
 _VARIANTS: dict[str, FlowVariant] = {
+    "bulk": bulk_flow,
+    "confidence": confidence_flow,
     "production": production_flow,
     "persistence": persistence_flow,
 }

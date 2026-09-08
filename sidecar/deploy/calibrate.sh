@@ -198,6 +198,12 @@ workers=${CALIBRATION_WORKERS:-$BATCH_WORKERS}
 # CALIBRATION_WET_REFS overrides them.
 settings=$(batch_live_settings)
 read -r radius_m ensemble_size cascades downsample threshold stat leads_csv <<< "$settings"
+# The motion-completion policy is corpus-relevant for the same reason the
+# ensemble settings are: it changes the velocity STEPS runs on, so the
+# corpus must be built under whatever the service is serving today
+# (H-F, 2026-09-08). The four values join the settings hash.
+flow_settings=$(batch_live_flow_settings)
+read -r flow_completion flow_window flow_conf_pct flow_texture_pct <<< "$flow_settings"
 
 # Wet/dry references. Empty means "let the builder use its national
 # default set" (five spread points; see build_calibration_corpus.py).
@@ -269,6 +275,7 @@ echo "    curves → ${curves_path}"
 echo "    report → ${report_dir}"
 echo "    stable copy → ${latest_path} (+ ${latest_md})"
 echo "    memory cap → ${BATCH_MEM_CAP} on the batch container"
+echo "    flow completion → ${flow_completion} (window ${flow_window} px, gate p${flow_conf_pct}, texture p${flow_texture_pct})"
 
 # ``run_in_repo`` / ``run_in_repo_capped`` come from lib/batch.sh: they
 # mount the working tree read-only at /repo (scripts/ is not baked into the
@@ -298,6 +305,10 @@ run_in_repo_capped python scripts/build_calibration_corpus.py \
         --disc-radius-m "$radius_m" \
         --leads "$leads_csv" \
         --frame-age-range "$frame_age_range" \
+        --flow-completion "$flow_completion" \
+        --flow-confidence-window-px "$flow_window" \
+        --flow-confidence-percentile "$flow_conf_pct" \
+        --flow-texture-percentile "$flow_texture_pct" \
         --output "$corpus_path"
 
 # --point-set even on a single-set corpus: every row the current builder

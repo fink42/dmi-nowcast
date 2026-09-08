@@ -267,3 +267,111 @@ async def test_cycle_fails_gracefully_with_one_frame(minimal_config: Config) -> 
     assert result.state is None
     assert result.error is not None
     assert "not enough frames" in result.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# H-F: gated flow completion (hotfix, 2026-09-08)
+#
+# Evidence: archive/flow_stall_20260908/README.md (private repo). Farnebäck
+# collapses toward zero inside broad echo; ``complete_flow`` used to keep
+# that stall wherever it rained, so the advection, STEPS and the served
+# motion arrows all inherited it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_state_carries_the_stall_diagnostic(engine: CycleEngine) -> None:
+    result = await engine.run_cycle()
+    assert result.state is not None
+    share = result.state.motion.stalled_share
+    assert share is not None
+    assert 0.0 <= share <= 1.0
+    # ...and the same numbers reach the cycle log line rather than a new one.
+    diag = engine._last_motion_diag
+    assert diag["flow_completion"] == "confidence"
+    assert diag["stalled_share"] == pytest.approx(share)
+    assert "stalled_share_completed" in diag
+    assert diag["bulk_kmh"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_served_motion_grids_get_the_field_the_forecast_advects_with(
+    engine: CycleEngine, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 arrows must show the completed flow, not the raw estimate.
+
+    Before H-F the two were the same on the echo, so feeding the raw
+    estimate was defensible. They are not the same any more: the raw
+    estimate reads near-zero inside broad echo while the loop beside it
+    moves, and drawing that would contradict the picture.
+    """
+    import numpy as np
+
+    from dmi_nowcast_sidecar import compute as compute_mod
+
+    seen: dict[str, np.ndarray] = {}
+    real_estimate = compute_mod.estimate_motion
+    real_grids = compute_mod.motion_grids_kmh
+
+    def spy_estimate(*args, **kwargs):
+        out = real_estimate(*args, **kwargs)
+        seen["vy"] = out.vy.copy()
+        seen["vy_raw"] = out.vy_raw.copy()
+        return out
+
+    def spy_grids(vy, vx, *args, **kwargs):
+        seen["grid_vy"] = np.asarray(vy).copy()
+        return real_grids(vy, vx, *args, **kwargs)
+
+    monkeypatch.setattr(compute_mod, "estimate_motion", spy_estimate)
+    monkeypatch.setattr(compute_mod, "motion_grids_kmh", spy_grids)
+
+    result = await engine.run_cycle()
+    assert result.error is None, f"cycle errored: {result.error}"
+    assert "grid_vy" in seen, "motion_grids_kmh was never called this cycle"
+    assert np.array_equal(seen["grid_vy"], seen["vy"])
+    # The completion actually did something on these frames, so the
+    # assertion above is not trivially true of the raw field as well.
+    assert not np.array_equal(seen["vy_raw"], seen["vy"])
+
+
+@pytest.mark.asyncio
+async def test_bulk_completion_reproduces_the_pre_hotfix_field(
+    minimal_config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rollback path is a real path, not a dead branch."""
+    import numpy as np
+
+    from dmi_nowcast_sidecar import compute as compute_mod
+
+    def _build(policy: str) -> CycleEngine:
+        cfg = minimal_config.model_copy(deep=True)
+        cfg.forecast.leads_min = [5, 10]
+        cfg.forecast.flow_completion = policy  # type: ignore[assignment]
+        eng = CycleEngine(cfg)
+        eng._client.list_latest = AsyncMock(  # type: ignore[method-assign]
+            return_value=[_feature(FRAME_PREV), _feature(FRAME_CURR)],
+        )
+
+        async def _download(feature: RadarFeature, dest_dir: Path) -> Path:
+            return ARCHIVE / feature.filename
+
+        eng._client.download = AsyncMock(side_effect=_download)  # type: ignore[method-assign]
+        return eng
+
+    fields: dict[str, np.ndarray] = {}
+    real_estimate = compute_mod.estimate_motion
+
+    def spy(*args, **kwargs):
+        out = real_estimate(*args, **kwargs)
+        fields[out.completion] = out.vy.copy()
+        return out
+
+    monkeypatch.setattr(compute_mod, "estimate_motion", spy)
+
+    for policy in ("bulk", "confidence"):
+        res = await _build(policy).run_cycle()
+        assert res.error is None, f"{policy} cycle errored: {res.error}"
+
+    assert set(fields) == {"bulk", "confidence"}
+    assert not np.array_equal(fields["bulk"], fields["confidence"])

@@ -363,12 +363,21 @@ def motion_grids_kmh(
     Parameters
     ----------
     vy, vx:
-        Native-grid flow in pixels per frame, **as estimated** — the
-        ``dense_flow`` (or mean-motion fallback) output after the caller's
-        nan→0 / clip sanitise but *before* ``dense_flow.complete_flow``. On
-        the echo that is identical to what the advection consumes; off it,
-        Farnebäck's exact zeros are replaced here by this function's own
-        completion (see below) rather than by ``complete_flow``'s.
+        Native-grid flow in pixels per frame — the field the caller
+        advects with, i.e. ``dense_flow.estimate_motion``'s completed,
+        sanitised, clipped output. On the echo the served arrow is then
+        exactly what the forecast used; off it, this function's own
+        nearest-cells completion (see below) replaces ``complete_flow``'s
+        national-bulk one.
+
+        Changed 2026-09-08: the runtime used to pass the RAW estimate
+        here, on the argument that the arrow should show what was
+        *measured*. Since the H-F hotfix the raw estimate is no longer
+        what the forecast advects with inside broad echo — it is
+        near-zero there, which is a property of the estimator, not of the
+        rain — so drawing it would contradict the loop beside it. Passing
+        the raw field still works and still means "as measured"; the
+        docstring simply no longer claims that is what the caller does.
     rain_mm_h:
         Native-grid rain rate for the same frame (NaN outside the radar
         composite). Defines the echo support and the coverage mask.

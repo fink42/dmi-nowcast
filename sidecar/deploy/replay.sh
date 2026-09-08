@@ -78,6 +78,12 @@ echo "    workers: ${BATCH_WORKERS}   memory cap: ${BATCH_MEM_CAP}"
 settings=$(batch_live_settings)
 read -r _radius_m ensemble_size cascades downsample _threshold _stat _leads <<< "$settings"
 echo "    ensemble ${ensemble_size} members, ${cascades} cascade levels, ds ${downsample}"
+# Motion completion too (H-F, 2026-09-08): it decides the velocity STEPS
+# runs on, so a replay under the other policy is scoring a different
+# forecast. The choice is echoed into the run summary's "flow" block.
+flow_settings=$(batch_live_flow_settings)
+read -r flow_completion _flow_window _flow_conf_pct _flow_texture_pct <<< "$flow_settings"
+echo "    flow completion ${flow_completion}"
 
 BATCH_RUN_ARGS=(-v "$days_file:/tmp/replay_days.txt:ro")
 
@@ -92,6 +98,7 @@ run_in_repo_capped python scripts/replay_warnings.py \
         --cascade-levels "$cascades" \
         --downsample-factor "$downsample" \
         --horizon-min "$horizon" \
+        --flow-completion "$flow_completion" \
         --national-curves "$curves" \
         --out-dir "$out_dir" \
         --progress "$out_dir/progress.json"

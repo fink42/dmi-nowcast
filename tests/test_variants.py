@@ -1,6 +1,6 @@
 """The flow-variant registry, pinned against the live pipeline.
 
-``variants.production_flow`` is the baseline every Phase H candidate is
+``variants.bulk_flow`` (the pre-H-F field) is the Layer A baseline every Phase H candidate is
 measured against, so it has to be ``compute.py::_compute_sync`` and not an
 approximation of it. These tests re-run the inline sequence from that
 function on a synthetic pair and demand bit-for-bit equality, and then
@@ -21,6 +21,9 @@ from dmi_nowcast_core.variants import (
     get_variant,
     list_variants,
     persistence_flow,
+    PRODUCTION_VARIANT,
+    bulk_flow,
+    confidence_flow,
     production_flow,
     register_variant,
 )
@@ -48,7 +51,7 @@ def _moving_blob_pair(shift: int = 4, size: int = 96):
     return prev, curr, rain
 
 
-def test_production_variant_matches_the_inline_compute_sequence():
+def test_bulk_variant_matches_the_inline_compute_sequence():
     prev, curr, rain = _moving_blob_pair()
 
     # compute.py::_compute_sync, lines ~660-705, verbatim.
@@ -63,22 +66,22 @@ def test_production_variant_matches_the_inline_compute_sequence():
     np.clip(vy, -MAX_PX_PER_FRAME, MAX_PX_PER_FRAME, out=vy)
     np.clip(vx, -MAX_PX_PER_FRAME, MAX_PX_PER_FRAME, out=vx)
 
-    got_vy, got_vx = production_flow(prev, curr, rain, pixel_km=PIXEL_KM)
+    got_vy, got_vx = bulk_flow(prev, curr, rain, pixel_km=PIXEL_KM)
     assert np.array_equal(got_vy, vy)
     assert np.array_equal(got_vx, vx)
     assert got_vy.dtype == np.float32 and got_vx.dtype == np.float32
 
 
-def test_production_variant_recovers_the_synthetic_displacement():
+def test_bulk_variant_recovers_the_synthetic_displacement():
     """A sanity check that the pair is trackable at all, not just equal."""
     prev, curr, rain = _moving_blob_pair(shift=4)
-    vy, vx = production_flow(prev, curr, rain, pixel_km=PIXEL_KM)
+    vy, vx = bulk_flow(prev, curr, rain, pixel_km=PIXEL_KM)
     echo = rain >= SUPPORT_THRESHOLD_MM_H
     assert float(np.mean(vx[echo])) == pytest.approx(4.0, abs=1.5)
     assert abs(float(np.mean(vy[echo]))) < 1.0
 
 
-def test_production_completes_before_filling_nan():
+def test_bulk_completes_before_filling_nan():
     """A NaN next to the echo must take the BULK vector, not zero.
 
     ``complete_flow`` gives a non-finite pixel weight 0, so it inherits
@@ -99,7 +102,7 @@ def test_production_completes_before_filling_nan():
     original = variants.dense_flow
     variants.dense_flow = fake_dense_flow
     try:
-        vy, vx = production_flow(
+        vy, vx = bulk_flow(
             np.zeros((size, size), dtype=np.float32),
             np.zeros((size, size), dtype=np.float32),
             rain, pixel_km=PIXEL_KM,
@@ -112,7 +115,7 @@ def test_production_completes_before_filling_nan():
     assert vy[10, 13] == pytest.approx(0.0)
 
 
-def test_production_clips_last_and_leaves_no_nan():
+def test_bulk_clips_last_and_leaves_no_nan():
     """With no echo at all, completion is a no-op — the guards still apply."""
     size = 12
     flow = np.full((size, size), 1.0e6, dtype=np.float32)
@@ -124,7 +127,7 @@ def test_production_clips_last_and_leaves_no_nan():
     original = variants.dense_flow
     variants.dense_flow = fake_dense_flow
     try:
-        vy, vx = production_flow(
+        vy, vx = bulk_flow(
             np.zeros((size, size), dtype=np.float32),
             np.zeros((size, size), dtype=np.float32),
             np.zeros((size, size), dtype=np.float32),  # nothing above 0.5 mm/h
@@ -152,7 +155,7 @@ def test_persistence_variant_is_exactly_zero():
 
 
 def test_registry_lookup_and_listing():
-    assert list_variants() == ("persistence", "production")
+    assert list_variants() == ("bulk", "confidence", "persistence", "production")
     assert get_variant("production") is production_flow
     assert get_variant("persistence") is persistence_flow
     with pytest.raises(KeyError) as excinfo:
@@ -183,3 +186,25 @@ def test_register_variant_adds_and_is_callable():
         assert not np.any(vy)
     finally:
         variants._VARIANTS.pop(name, None)
+
+
+def test_production_is_the_confidence_field_the_sidecar_serves():
+    assert PRODUCTION_VARIANT == "confidence"
+    assert get_variant("production") is confidence_flow
+    assert production_flow is confidence_flow
+    assert get_variant("bulk") is bulk_flow
+    assert set(list_variants()) >= {"bulk", "confidence", "production", "persistence"}
+
+
+def test_confidence_variant_routes_through_estimate_motion():
+    from dmi_nowcast_core.dense_flow import estimate_motion
+
+    prev, curr, rain = _moving_blob_pair()
+    vy, vx = confidence_flow(prev, curr, rain, pixel_km=PIXEL_KM)
+    ref = estimate_motion(
+        prev, curr, rain, pixel_km=PIXEL_KM, dt_min=10.0,
+        support_threshold_mm_h=0.5, completion="confidence", max_px_per_frame=30.0,
+    )
+    np.testing.assert_array_equal(vy, ref.vy)
+    np.testing.assert_array_equal(vx, ref.vx)
+    assert np.isfinite(vy).all() and np.abs(vy).max() <= 30.0
