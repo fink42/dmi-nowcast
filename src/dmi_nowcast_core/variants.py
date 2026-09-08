@@ -1,0 +1,163 @@
+"""Registry of motion-field variants for the Phase H Layer A harness.
+
+Why a registry rather than a flag in the harness: Phase H queues several
+independent candidates that all change exactly one thing — the completed
+flow field the deterministic advection and STEPS both consume (H-c's
+Farnebäck parameter grid, H-F's confidence-gated completion, H-b's
+multi-frame median, and ``dense_lucaskanade`` as the literature's
+reference method). If each of those edited the harness, two candidates
+could never be scored on identical cases, which is the one thing the
+plan's protocol insists on. Instead every candidate adds an entry here
+and the harness keeps a single ``--variant`` switch.
+
+**The interface.** A variant is a callable::
+
+    make_flow(prev_dbz, curr_dbz, rain_now_mm_h, *, pixel_km) -> (vy, vx)
+
+* ``prev_dbz`` / ``curr_dbz`` — reflectivity (dBZ) on the native grid, in
+  time order, exactly the arrays ``compute.py`` hands to ``dense_flow``.
+  NaN (nodata) and −inf (undetect) are the caller's, not cleaned first.
+* ``rain_now_mm_h`` — rain rate for ``curr_dbz``, the echo support that
+  motion completion needs.
+* ``pixel_km`` — grid spacing, 0.5 on the DMI 500 m composite.
+* returns ``(vy, vx)`` float32 in **pixels per frame**, already
+  completed, sanitised and clipped: the field a consumer can advect with
+  directly, with no NaN and no silent unit change. Positive ``vy`` is
+  southward, positive ``vx`` eastward, as in ``dense_flow``.
+
+A variant must be a module-level function (or otherwise picklable): the
+harness runs one process per day under ``ProcessPoolExecutor``.
+
+New entries go through :func:`register_variant` at import time of the
+module that defines them, or straight into ``_VARIANTS`` here when they
+belong to the core library.
+"""
+from __future__ import annotations
+
+from typing import Protocol
+
+import numpy as np
+
+from .dense_flow import complete_flow, dense_flow
+
+__all__ = [
+    "FlowVariant",
+    "MAX_PX_PER_FRAME",
+    "SUPPORT_THRESHOLD_MM_H",
+    "get_variant",
+    "list_variants",
+    "persistence_flow",
+    "production_flow",
+    "register_variant",
+]
+
+#: Displacement clip, copied from ``compute.py::_MAX_PX_PER_FRAME``. 30 px
+#: per 10-min frame on the 500 m grid is 90 km/h — beyond any Danish storm
+#: motion, so anything above it is an optical-flow artefact.
+MAX_PX_PER_FRAME = 30.0
+
+#: Echo support for ``complete_flow``, copied from the live
+#: ``ForecastConfig.rain_threshold_mm_h``.
+SUPPORT_THRESHOLD_MM_H = 0.5
+
+
+class FlowVariant(Protocol):
+    """Callable signature every registered variant satisfies."""
+
+    def __call__(
+        self,
+        prev_dbz: np.ndarray,
+        curr_dbz: np.ndarray,
+        rain_now_mm_h: np.ndarray,
+        *,
+        pixel_km: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        ...
+
+
+def production_flow(
+    prev_dbz: np.ndarray,
+    curr_dbz: np.ndarray,
+    rain_now_mm_h: np.ndarray,
+    *,
+    pixel_km: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The flow the service actually runs — the baseline every candidate beats.
+
+    Mirrors ``sidecar/dmi_nowcast_sidecar/compute.py::_compute_sync`` step
+    for step, and the order is load-bearing:
+
+    1. ``dense_flow`` (OpenCV Farnebäck, stock ``winsize=31, levels=3,
+       poly_n=7``) on **dBZ**, not rain rate.
+    2. ``complete_flow`` on the *raw* estimate — before the ``nan_to_num``,
+       because completion gives a non-finite pixel the bulk vector
+       (weight 0) rather than the 0 px/frame that ``nan_to_num`` would
+       freeze in.
+    3. only then ``nan_to_num`` and the ±``MAX_PX_PER_FRAME`` clip.
+
+    Production applies completion ahead of the sanitise for the same
+    reason, so that both consumers — the deterministic overlay advection
+    and the STEPS velocity — see the identical completed field.
+    """
+    vy, vx = dense_flow(prev_dbz, curr_dbz)
+    vy, vx = complete_flow(
+        vy, vx, rain_now_mm_h,
+        pixel_km=pixel_km,
+        support_threshold_mm_h=SUPPORT_THRESHOLD_MM_H,
+    )
+    vy = np.nan_to_num(vy, nan=0.0).astype(np.float32)
+    vx = np.nan_to_num(vx, nan=0.0).astype(np.float32)
+    np.clip(vy, -MAX_PX_PER_FRAME, MAX_PX_PER_FRAME, out=vy)
+    np.clip(vx, -MAX_PX_PER_FRAME, MAX_PX_PER_FRAME, out=vx)
+    return vy, vx
+
+
+def persistence_flow(
+    prev_dbz: np.ndarray,
+    curr_dbz: np.ndarray,
+    rain_now_mm_h: np.ndarray,
+    *,
+    pixel_km: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Zero motion: advecting with it reproduces the current observation.
+
+    A variant rather than a special case in the harness, so the Eulerian
+    persistence baseline goes through the same advection, the same ×4
+    reduction and the same masking as every candidate. If it did not, a
+    difference between persistence and a candidate could be an artefact
+    of two code paths rather than of the physics.
+    """
+    zeros = np.zeros(np.asarray(curr_dbz).shape, dtype=np.float32)
+    return zeros, zeros.copy()
+
+
+_VARIANTS: dict[str, FlowVariant] = {
+    "production": production_flow,
+    "persistence": persistence_flow,
+}
+
+
+def register_variant(name: str, make_flow: FlowVariant) -> None:
+    """Add a variant. Refuses to shadow an existing name.
+
+    Silent replacement is the one failure mode that would be invisible in
+    a report: a run labelled ``production`` scoring something else.
+    """
+    if name in _VARIANTS:
+        raise ValueError(f"variant {name!r} is already registered")
+    _VARIANTS[name] = make_flow
+
+
+def get_variant(name: str) -> FlowVariant:
+    """Look up a variant by name, with the available names in the error."""
+    try:
+        return _VARIANTS[name]
+    except KeyError:
+        raise KeyError(
+            f"unknown flow variant {name!r}; known: {', '.join(list_variants())}"
+        ) from None
+
+
+def list_variants() -> tuple[str, ...]:
+    """Registered variant names, sorted, for CLI help and reports."""
+    return tuple(sorted(_VARIANTS))

@@ -148,6 +148,36 @@ def fss(
     prediction against any non-zero observation), and approaches the random
     base rate as the prediction is decorrelated.
     """
+    mse, mse_ref = fss_components(
+        predicted, actual,
+        threshold=threshold, neighborhood_px=neighborhood_px,
+    )
+    if mse_ref == 0:
+        return float("nan")
+    return 1.0 - mse / mse_ref
+
+
+def fss_components(
+    predicted: np.ndarray,
+    actual: np.ndarray,
+    *,
+    threshold: float,
+    neighborhood_px: int,
+) -> tuple[float, float]:
+    """``(mse, mse_ref)`` behind :func:`fss`, so scores can be POOLED.
+
+    FSS is a ratio of two means, and the mean of per-case FSS values is not
+    the FSS of the pooled cases: a nearly dry frame with a tiny denominator
+    would carry the same weight as a frontal one. A harness that scores
+    thousands of frames therefore accumulates these two terms across cases
+    and forms ``1 − Σmse / Σmse_ref`` at the end — the same reason
+    ``benchmark.contingency_sum`` exists for the categorical scores. Both
+    terms are means over the identical pixel count, so summing them over
+    equal-sized grids gives the pixel-pooled answer.
+
+    Exposed rather than inlined so there is exactly one definition of the
+    fractions: :func:`fss` is this function plus the division.
+    """
     from scipy.ndimage import uniform_filter
 
     if predicted.shape != actual.shape:
@@ -161,6 +191,4 @@ def fss(
 
     mse = float(np.mean((pred_frac - actual_frac) ** 2))
     mse_ref = float(np.mean(pred_frac ** 2 + actual_frac ** 2))
-    if mse_ref == 0:
-        return float("nan")
-    return 1.0 - mse / mse_ref
+    return mse, mse_ref

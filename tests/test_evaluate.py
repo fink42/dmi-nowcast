@@ -16,6 +16,7 @@ from dmi_nowcast_core.evaluate import (
     far,
     frequency_bias,
     fss,
+    fss_components,
     hss,
     pod,
 )
@@ -166,3 +167,37 @@ def test_fss_handles_nan_pixels():
 def test_fss_shape_mismatch_raises():
     with pytest.raises(ValueError):
         fss(np.zeros((10, 10)), np.zeros((10, 11)), threshold=0.5, neighborhood_px=1)
+
+
+def test_fss_components_reproduce_fss_exactly():
+    """``fss`` is ``fss_components`` plus the division — pin that.
+
+    The harness pools thousands of cases by summing these two terms, so a
+    drift between them would silently make every pooled FSS wrong while
+    every per-case FSS stayed right.
+    """
+    rng = np.random.default_rng(5)
+    pred = (rng.standard_normal((48, 48)) > 0.7).astype(np.float32) * 3.0
+    actual = np.roll(pred, shift=(2, 1), axis=(0, 1))
+    for px in (1, 3, 8):
+        mse, mse_ref = fss_components(
+            pred, actual, threshold=1.0, neighborhood_px=px,
+        )
+        assert mse_ref > 0
+        assert fss(pred, actual, threshold=1.0, neighborhood_px=px) == \
+            pytest.approx(1.0 - mse / mse_ref)
+
+
+def test_fss_components_on_two_dry_fields_have_no_denominator():
+    dry = np.zeros((8, 8), dtype=np.float32)
+    mse, mse_ref = fss_components(dry, dry, threshold=1.0, neighborhood_px=1)
+    assert (mse, mse_ref) == (0.0, 0.0)
+    # ...which is exactly the case ``fss`` reports as undefined.
+    assert math.isnan(fss(dry, dry, threshold=1.0, neighborhood_px=1))
+
+
+def test_fss_components_shape_mismatch_raises():
+    with pytest.raises(ValueError):
+        fss_components(
+            np.zeros((4, 4)), np.zeros((4, 5)), threshold=0.5, neighborhood_px=1,
+        )
