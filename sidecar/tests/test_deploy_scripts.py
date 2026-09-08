@@ -25,7 +25,7 @@ LIB = DEPLOY_DIR / "lib" / "batch.sh"
 
 # The scripts that source the library and therefore must honour its rules.
 BATCH_SCRIPTS = ["calibrate.sh", "station_corpus.sh", "replay.sh",
-                 "radar_replay.sh"]
+                 "radar_replay.sh", "gauge_agreement.sh"]
 
 FAKE_DOCKER = """#!/usr/bin/env bash
 # Stub docker: log the argv, answer ``ps`` from the environment.
