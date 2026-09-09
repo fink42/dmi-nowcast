@@ -77,11 +77,13 @@ export const da = {
 		expand: 'Vis prognose',
 		loading: 'Henter prognose …',
 		headlineRainingNow: 'Det regner her nu',
-		headlineEta: (min: number) => `Regn om ca. ${min} min`,
+		headlineEta: (min: number, at?: string | null) =>
+			at ? `Regn om ca. ${min} min (kl. ${at})` : `Regn om ca. ${min} min`,
 		headlineNoRain: 'Ingen regn forventet den næste time',
 		headlineUnknown: 'Ingen prognose for dette punkt',
 		etaLabel: 'Forventet ankomst',
-		etaValue: (min: number) => `om ca. ${min} min`,
+		etaValue: (min: number, at?: string | null) =>
+			at ? `om ca. ${min} min, kl. ${at}` : `om ca. ${min} min`,
 		etaNow: 'nu',
 		etaNone: 'ingen regn inden for horisonten',
 		intensityLabel: 'Intensitet',

@@ -209,12 +209,26 @@ export function headlineDecision(
 	return next === null ? { kind: 'no-rain', etaMin: null } : { kind: 'eta', etaMin: next };
 }
 
-export function headline(t: Catalog, decision: HeadlineDecision): string {
+/**
+ * The clock time an ETA points at, in the viewer's local time.
+ *
+ * "Rain in about 24 min" is only useful next to a watch; the panel counts
+ * the minutes down every 15 s, so the arrival time is stable while the
+ * countdown moves — which is exactly why people ask for it. Derived from
+ * the same counted-down ETA the headline uses, never from the cycle's own
+ * clock, so the sentence and the time cannot disagree.
+ */
+export function arrivalClock(etaMin: number | null, nowMs: number, locale: Locale): string | null {
+	if (etaMin === null || !Number.isFinite(etaMin) || !Number.isFinite(nowMs)) return null;
+	return clockTime(new Date(nowMs + Math.round(etaMin) * 60_000).toISOString(), locale);
+}
+
+export function headline(t: Catalog, decision: HeadlineDecision, at: string | null = null): string {
 	switch (decision.kind) {
 		case 'raining-now':
 			return t.panel.headlineRainingNow;
 		case 'eta':
-			return t.panel.headlineEta(Math.round(decision.etaMin ?? 0));
+			return t.panel.headlineEta(Math.round(decision.etaMin ?? 0), at);
 		default:
 			return t.panel.headlineNoRain;
 	}

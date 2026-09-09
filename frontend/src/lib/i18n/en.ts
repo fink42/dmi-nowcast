@@ -75,11 +75,13 @@ export const en: Catalog = {
 		expand: 'Show forecast',
 		loading: 'Fetching forecast …',
 		headlineRainingNow: 'It is raining here now',
-		headlineEta: (min: number) => `Rain in about ${min} min`,
+		headlineEta: (min: number, at?: string | null) =>
+			at ? `Rain in about ${min} min (${at})` : `Rain in about ${min} min`,
 		headlineNoRain: 'No rain expected within the hour',
 		headlineUnknown: 'No forecast for this point',
 		etaLabel: 'Expected arrival',
-		etaValue: (min: number) => `in about ${min} min`,
+		etaValue: (min: number, at?: string | null) =>
+			at ? `in about ${min} min, at ${at}` : `in about ${min} min`,
 		etaNow: 'now',
 		etaNone: 'no rain within the horizon',
 		intensityLabel: 'Intensity',

@@ -16,15 +16,7 @@
  *     instant, so the sentence and the picture cannot disagree.
  */
 import { describe, expect, it } from 'vitest';
-import {
-	countdownEtaMin,
-	headline,
-	headlineDecision,
-	nextWetMinutes,
-	rainNowMmH,
-	RAINING_NOW_MIN,
-	RAINING_NOW_MM_H
-} from './format';
+import { RAINING_NOW_MIN, RAINING_NOW_MM_H, arrivalClock, clockTime, countdownEtaMin, headline, headlineDecision, nextWetMinutes, rainNowMmH } from './format';
 import type { RainSample } from './nowcast/sampler';
 import { da } from './i18n/da';
 import { en } from './i18n/en';
@@ -272,7 +264,29 @@ describe('headlineDecision', () => {
 	});
 });
 
+describe('arrivalClock', () => {
+	it('names the local clock time the counted-down minutes point at', () => {
+		const now = Date.UTC(2026, 8, 9, 16, 5, 0);
+		const expected = clockTime(new Date(now + 24 * 60_000).toISOString(), 'en');
+		expect(arrivalClock(24, now, 'en')).toBe(expected);
+		expect(arrivalClock(24.4, now, 'da')).toBe(clockTime(new Date(now + 24 * 60_000).toISOString(), 'da'));
+		expect(arrivalClock(null, now, 'en')).toBeNull();
+		expect(arrivalClock(Number.NaN, now, 'en')).toBeNull();
+	});
+});
+
 describe('headline', () => {
+	it('adds the arrival time when it is given, in both languages', () => {
+		const eta = headlineDecision(24, [], after(0));
+		expect(headline(en, eta, '18:29')).toBe('Rain in about 24 min (18:29)');
+		expect(headline(da, eta, '18.29')).toBe('Regn om ca. 24 min (kl. 18.29)');
+		expect(headline(en, eta)).toBe('Rain in about 24 min');
+		expect(en.panel.etaValue(24, '18:29')).toBe('in about 24 min, at 18:29');
+		expect(da.panel.etaValue(24, '18.29')).toBe('om ca. 24 min, kl. 18.29');
+		// Never on the other two headlines, whatever is passed.
+		expect(headline(en, { kind: 'raining-now', etaMin: null }, '18:29')).toBe(en.panel.headlineRainingNow);
+	});
+
 	it('says the counted-down minutes, not the ones the cycle computed', () => {
 		const etaNow = countdownEtaMin(12, GENERATED, after(7));
 		expect(headline(da, headlineDecision(etaNow, [], after(7)))).toBe('Regn om ca. 5 min');

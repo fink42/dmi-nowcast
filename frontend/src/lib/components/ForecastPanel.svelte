@@ -13,6 +13,7 @@
 	import { base } from '$app/paths';
 	import { t, locale } from '$lib/i18n';
 	import {
+		arrivalClock,
 		clockTime,
 		confidenceWord,
 		countdownEtaMin,
@@ -69,6 +70,10 @@
 	 */
 	const decision = $derived(headlineDecision(etaNow, forecast?.rainSeries ?? [], nowcast.now));
 	const kind = $derived(decision.kind);
+	/** The wall-clock time the headline's minutes point at — null unless it is an ETA. */
+	const arrival = $derived(
+		kind === 'eta' ? arrivalClock(decision.etaMin, nowcast.now, locale()) : null
+	);
 	const confidence = $derived(forecast?.confidence ?? nowcast.confidence);
 	const ageMin = $derived(nowcast.radarAgeMin);
 	const highlight = $derived(forecast ? probabilityWithin(forecast, 20) : null);
@@ -149,7 +154,7 @@
 			<p class="muted peek">{t().panel.error}</p>
 		{:else if forecast}
 			<p class="headline peek" class:rain={kind !== 'no-rain'}>
-				{headline(t(), decision)}
+				{headline(t(), decision, arrival)}
 			</p>
 		{/if}
 
@@ -203,7 +208,7 @@
 									? t().panel.etaNow
 									: decision.etaMin === null
 										? t().panel.etaNone
-										: t().panel.etaValue(Math.round(decision.etaMin))}
+										: t().panel.etaValue(Math.round(decision.etaMin), arrival)}
 							</dd>
 						</div>
 						<div>
