@@ -8,7 +8,8 @@
 	import { t } from '$lib/i18n';
 	import { nowcast } from '$lib/nowcast/store.svelte';
 	import { inCoverage } from '$lib/nowcast/sampler';
-	import { pointFromUrl } from '$lib/push/notification';
+	import { initialPoint } from '$lib/nowcast/initial';
+	import { loadStored } from '$lib/push/prefs';
 	import { push } from '$lib/push/store.svelte';
 
 	/** Matches the breakpoint where the sheet becomes a side panel (see below). */
@@ -40,13 +41,16 @@
 		const stopNowcast = nowcast.start();
 		void push.init();
 
-		const initial = pointFromUrl(location.search);
+		// A deep link, else the point this browser is subscribed to (see
+		// `$lib/nowcast/initial`): the place the pushes are for is the place
+		// to open on.
+		const initial = initialPoint(location.search, loadStored());
 		if (initial) {
 			// `selectPoint` works without grids — it falls back to /forecast —
 			// so the panel fills in straight away and is re-sampled below once
 			// the cycle's grids arrive.
 			openPoint(initial.lat, initial.lon);
-			if (!nowcast.manifest) deepLink = initial;
+			if (!nowcast.manifest) deepLink = { lat: initial.lat, lon: initial.lon };
 		}
 
 		const onMessage = (event: MessageEvent) => {
