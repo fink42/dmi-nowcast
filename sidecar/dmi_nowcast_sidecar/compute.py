@@ -49,6 +49,7 @@ from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.motion import phase_correlation_shift
 from dmi_nowcast_core.national import (
     NationalProducts,
+    enforce_lead_monotonic,
     motion_grids_kmh,
     national_products,
     observed_rain_grid,
@@ -1313,6 +1314,11 @@ class CycleEngine:
                 if curve is not None:
                     p_by_lead[lead] = float(curve.predict(p_by_lead[lead]))
                     done.append(lead)
+            # Same guard as the grids: "rain within L" must never be less
+            # likely than "rain within a shorter L" (see _calibrate_national).
+            p_by_lead.update(
+                enforce_lead_monotonic({lead: p_by_lead[lead] for lead in done})
+            )
             calibrated_leads = tuple(done)
         _log.info(
             "ensemble_ok",
@@ -1338,14 +1344,29 @@ class CycleEngine:
         passes through). Leads with no curve keep their RAW grid — never
         interpolated between leads' curves. No-op (same object back) when no
         national curves are loaded or ``products`` is None.
+
+        The calibrated grids then go through
+        :func:`~dmi_nowcast_core.national.enforce_lead_monotonic`, because
+        the curves are fitted per lead with nothing tying them together and
+        the served claim "rain within L" must never be less likely than the
+        window it contains. Uncalibrated leads are deliberately left out of
+        that pass: their raw grids are not on the calibrated scale, so
+        lifting one against the other would compare two different things.
         """
         if products is None or not self._national_curves:
             return products
         p_rain: dict[int, np.ndarray] = {}
+        calibrated: dict[int, np.ndarray] = {}
         for lead in products.leads_min:
             grid = products.p_rain[int(lead)]
             curve = self._national_curves.get(int(lead))
-            p_rain[int(lead)] = grid if curve is None else curve.predict(grid)
+            if curve is None:
+                p_rain[int(lead)] = grid
+            else:
+                p_rain[int(lead)] = calibrated[int(lead)] = curve.predict(grid)
+        # ``p_rain[L]`` is P(rain WITHIN L), so longer leads contain shorter
+        # ones; per-lead curves are fitted independently and can invert that.
+        p_rain.update(enforce_lead_monotonic(calibrated))
         return replace(products, p_rain=p_rain)
 
     def _national_calibration_manifest(self, products: NationalProducts) -> dict | None:

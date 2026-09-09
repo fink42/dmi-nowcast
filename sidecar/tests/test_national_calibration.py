@@ -560,3 +560,118 @@ def test_legacy_values_identical_with_and_without_national_file(
     # invariance above isn't vacuous).
     assert state_with.forecast.per_lead[0].p_ensemble != \
         state_without.forecast.per_lead[0].p_ensemble
+
+
+# ---------------------------------------------------------------------------
+# Lead monotonicity — "rain within L" is nested, so P must never fall
+# ---------------------------------------------------------------------------
+
+
+def _flat_curve(value: float) -> dict:
+    """A curve that maps every raw probability to one fixed value — the
+    cleanest way to pin what a lead serves regardless of the ensemble."""
+    return {"raw_breakpoints": [0.0, 1.0], "calibrated_values": [value, value]}
+
+
+#: Curves that fall with the lead — 0.6 / 0.5 / 0.4 at 20 / 30 / 45 — the
+#: shape the 2026-09-09 national fit actually had (a unanimous ensemble
+#: mapped to 0.728 at 10 min but only 0.440 at 60), because each lead's
+#: isotonic curve is fitted on its own rows with nothing tying them
+#: together. Served as-is it claims that rain in the next 45 minutes is
+#: less likely than rain in the next 20 — impossible for nested events.
+DECREASING_CURVES = {
+    "20": _flat_curve(0.6), "30": _flat_curve(0.5), "45": _flat_curve(0.4),
+}
+
+
+def _products(p_rain: dict[int, np.ndarray]) -> NationalProducts:
+    shape = next(iter(p_rain.values())).shape
+    return NationalProducts(
+        p_rain=p_rain,
+        eta_min=np.full(shape, 6.0, dtype=np.float32),
+        intensity_mm_h=np.full(shape, 2.5, dtype=np.float32),
+        leads_min=tuple(sorted(p_rain)),
+        threshold_mm_h=0.5,
+        timestep_min=10.0,
+        frame_age_min=15.0,
+        downsample_factor=4,
+        n_members=8,
+    )
+
+
+def test_calibrated_grids_never_fall_with_the_lead(
+    minimal_config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0.6 / 0.5 / 0.4 out of the curves must be served as 0.6 / 0.6 / 0.6."""
+    _write_curves_file(
+        minimal_config.calibration.national_curves_path, DECREASING_CURVES
+    )
+    engine = _make_engine(minimal_config, monkeypatch)
+
+    raw = np.full((8, 8), 0.75, dtype=np.float32)
+    raw[0, 0] = np.nan  # outside radar coverage at every lead
+    out = engine._calibrate_national(
+        _products({20: raw.copy(), 30: raw.copy(), 45: raw.copy()})
+    )
+
+    for lead in (20, 30, 45):
+        assert float(out.p_rain[lead][4, 4]) == pytest.approx(0.6)
+        assert np.isnan(out.p_rain[lead][0, 0])  # nodata stays nodata
+    # The shortest lead is untouched — the guard only ever lifts.
+    np.testing.assert_array_equal(
+        out.p_rain[20][1:, 1:], _interp32(raw, _flat_curve(0.6))[1:, 1:]
+    )
+
+
+def test_monotone_guard_skips_leads_with_no_curve(
+    minimal_config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uncalibrated leads keep their RAW grid object: the guard runs over
+    the calibrated leads only, so a raw grid is never silently lifted by a
+    calibrated neighbour it is not comparable with."""
+    _write_curves_file(
+        minimal_config.calibration.national_curves_path,
+        {"20": _flat_curve(0.6), "45": _flat_curve(0.4)},
+    )
+    engine = _make_engine(minimal_config, monkeypatch)
+
+    raw30 = np.full((4, 4), 0.05, dtype=np.float32)
+    out = engine._calibrate_national(
+        _products({
+            20: np.full((4, 4), 0.75, dtype=np.float32),
+            30: raw30,
+            45: np.full((4, 4), 0.75, dtype=np.float32),
+        })
+    )
+
+    assert out.p_rain[30] is raw30
+    assert float(out.p_rain[20][0, 0]) == pytest.approx(0.6)
+    assert float(out.p_rain[45][0, 0]) == pytest.approx(0.6)  # lifted from 0.4
+
+
+def test_home_p_by_lead_never_falls_with_the_lead(
+    minimal_config: Config,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same guard on the home point's ``p_ensemble``: one curve set, one
+    claim. Leads 10/20/30 get falling curves; the served series must not."""
+    _write_curves_file(
+        minimal_config.calibration.national_curves_path,
+        {
+            "5": _flat_curve(0.2), "10": _flat_curve(0.6),
+            "20": _flat_curve(0.5), "30": _flat_curve(0.4),
+            "60": _flat_curve(0.7),
+        },
+    )
+    engine = _make_engine(minimal_config, monkeypatch)
+    state = engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+
+    by_lead = {e.lead_min: e.p_ensemble for e in state.forecast.per_lead}
+    assert by_lead[5] == pytest.approx(0.2)
+    assert by_lead[10] == pytest.approx(0.6)
+    assert by_lead[20] == pytest.approx(0.6)
+    assert by_lead[30] == pytest.approx(0.6)
+    assert by_lead[60] == pytest.approx(0.7)
+    # Every lead still counts as calibrated — the guard is not a fallback.
+    assert state.probabilistic.calibrated_leads == HOME_LEADS

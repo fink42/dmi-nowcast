@@ -21,6 +21,12 @@ answer "is it raining here right now" — the ensemble's first timestep is
 already minutes into the future — so anything that must not say "rain
 incoming" into falling rain needs this grid as well.
 
+:func:`enforce_lead_monotonic` is the serving-side guard on ``p_rain``:
+because the event is CUMULATIVE ("rain within L"), longer leads contain
+shorter ones and the raw fractions are non-decreasing in the lead — but
+independently-fitted per-lead calibration curves can break that, so the
+running max is re-imposed after the curves are applied.
+
 This module is pure core: numpy only, no sidecar / FastAPI / homeassistant
 imports (and none of the heavier core deps like pyproj — geolocation stays
 with the caller).
@@ -42,7 +48,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping, TypeVar, Union
 
 import numpy as np
 
@@ -241,6 +247,57 @@ def national_products(
         downsample_factor=int(downsample_factor),
         n_members=int(n_members),
     )
+
+
+#: A per-lead probability: one number (the home point) or a whole grid.
+_P = TypeVar("_P", bound=Union[float, np.ndarray])
+
+
+def enforce_lead_monotonic(
+    p_by_lead: Mapping[int, _P],
+) -> dict[int, _P]:
+    """Make ``{lead: P(rain within lead)}`` non-decreasing in the lead.
+
+    Returns a new dict in which each lead's probability is the elementwise
+    maximum of itself and every shorter lead's — a running max in ascending
+    lead order.
+
+    *Why this can be needed at all.* ``p_rain[L]`` is the fraction of
+    members whose CUMULATIVE exceedance has crossed the threshold by ``L``
+    (see :func:`national_products`), so the raw ensemble fractions are
+    monotone in ``L`` by construction: "rain within 60 min" is a superset
+    of "rain within 45 min". The per-lead isotonic curves, however, are
+    fitted independently — each lead gets its own monotone map from raw to
+    calibrated — and nothing ties the five maps to each other. A lead whose
+    curve happens to sit lower than the previous lead's therefore serves
+    the impossible claim that the longer window is LESS likely than the
+    window it contains. This guard restores the ordering the quantity
+    guarantees, at the cost of nothing when the curves already agree.
+
+    NaN handling: nodata pixels (outside radar coverage) are NaN in every
+    lead's grid, so the running max leaves them NaN. Where the masks
+    disagree the pixel's own lead wins — ``np.fmax`` would otherwise let a
+    shorter lead's number leak into a nodata pixel and invent coverage.
+
+    All values must be of one kind: either every lead is a float, or every
+    lead is an array of one shape.
+    """
+    out: dict[int, _P] = {}
+    prev: _P | None = None
+    for lead in sorted(p_by_lead):
+        current = p_by_lead[lead]
+        if prev is None:
+            merged = current
+        elif isinstance(current, np.ndarray):
+            merged = np.fmax(prev, current)
+            merged[np.isnan(current)] = np.nan
+        else:
+            # np.fmax, not max(): a NaN at the previous lead must not
+            # poison this one (Python's max propagates it order-dependently).
+            merged = current if math.isnan(current) else float(np.fmax(prev, current))
+        out[int(lead)] = merged
+        prev = merged
+    return out
 
 
 def observed_rain_grid(

@@ -17,6 +17,7 @@ from dmi_nowcast_core.national import (
     DEFAULT_LEADS_MIN,
     NationalProducts,
     _steps_in_lead,
+    enforce_lead_monotonic,
     motion_grids_kmh,
     national_products,
     observed_rain_grid,
@@ -610,3 +611,93 @@ def test_observed_grid_rejects_bad_inputs():
         observed_rain_grid(np.zeros((4, 4, 4), np.float32))
     with pytest.raises(ValueError, match="downsample_factor"):
         observed_rain_grid(np.zeros((8, 8), np.float32), downsample_factor=0)
+
+
+# ---------------------------------------------------------------------------
+# enforce_lead_monotonic — "rain within L" is nested, so P must not fall
+# ---------------------------------------------------------------------------
+
+
+def test_monotone_guard_lifts_a_dip_in_a_float_series():
+    """The bug this exists for: independently-fitted per-lead curves served
+    0.50 / 0.52 / 0.49 / 0.49 / 0.44 at one point on 2026-09-09, i.e.
+    "rain within 60 min" less likely than "rain within 20 min"."""
+    served = {10: 0.50, 20: 0.52, 30: 0.49, 45: 0.49, 60: 0.44}
+    out = enforce_lead_monotonic(served)
+    assert out == {10: 0.50, 20: 0.52, 30: 0.52, 45: 0.52, 60: 0.52}
+    assert served[60] == 0.44, "the caller's mapping must not be mutated"
+
+
+def test_monotone_guard_walks_leads_in_ascending_order_not_dict_order():
+    """Curve dicts come out of JSON, whose key order is whatever was
+    written — the running max must follow the LEAD, not the insertion."""
+    out = enforce_lead_monotonic({60: 0.4, 10: 0.6, 30: 0.5})
+    assert out == {10: 0.6, 30: 0.6, 60: 0.6}
+    assert list(out) == [10, 30, 60]
+
+
+def test_monotone_guard_leaves_an_already_monotone_series_alone():
+    served = {10: 0.1, 20: 0.3, 30: 0.3, 60: 0.9}
+    assert enforce_lead_monotonic(served) == served
+
+
+def test_monotone_guard_passes_a_single_lead_and_an_empty_map_through():
+    grid = np.full((3, 3), 0.25, dtype=np.float32)
+    assert enforce_lead_monotonic({}) == {}
+    only = enforce_lead_monotonic({30: grid})
+    assert only[30] is grid  # nothing to compare against, nothing copied
+
+
+def test_monotone_guard_is_elementwise_on_grids():
+    a = np.array([[0.2, 0.9], [0.5, 0.0]], dtype=np.float32)
+    b = np.array([[0.1, 0.9], [0.7, 0.0]], dtype=np.float32)
+    c = np.array([[0.0, 0.4], [0.6, 0.3]], dtype=np.float32)
+
+    out = enforce_lead_monotonic({20: a, 30: b, 45: c})
+
+    assert out[20] is a  # the shortest lead is authoritative
+    f32 = lambda rows: np.array(rows, dtype=np.float32)  # noqa: E731
+    np.testing.assert_array_equal(out[30], f32([[0.2, 0.9], [0.7, 0.0]]))
+    np.testing.assert_array_equal(out[45], f32([[0.2, 0.9], [0.7, 0.3]]))
+    assert out[30].dtype == np.float32 and out[45].dtype == np.float32
+    # Inputs untouched.
+    np.testing.assert_array_equal(b, f32([[0.1, 0.9], [0.7, 0.0]]))
+    np.testing.assert_array_equal(c, f32([[0.0, 0.4], [0.6, 0.3]]))
+
+
+def test_monotone_guard_keeps_nodata_pixels_nodata():
+    """A pixel outside radar coverage is NaN at every lead and must stay
+    NaN — the guard must never let a shorter lead's number invent coverage
+    the longer lead does not have."""
+    nan = np.float32(np.nan)
+    short = np.array([[0.8, 0.8], [nan, 0.2]], dtype=np.float32)
+    long_ = np.array([[nan, 0.9], [nan, 0.1]], dtype=np.float32)
+
+    out = enforce_lead_monotonic({20: short, 60: long_})
+
+    assert np.isnan(out[60][0, 0])   # NaN here, number at lead 20 → stays NaN
+    assert np.isnan(out[60][1, 0])   # NaN at both leads
+    assert out[60][0, 1] == pytest.approx(0.9)
+    assert out[60][1, 1] == pytest.approx(0.2)  # lifted past the dip
+
+
+def test_monotone_guard_handles_a_nan_float():
+    out = enforce_lead_monotonic({10: float("nan"), 20: 0.3, 30: float("nan")})
+    assert np.isnan(out[10])
+    assert out[20] == pytest.approx(0.3)  # not poisoned by the NaN before it
+    assert np.isnan(out[30])
+
+
+def test_monotone_guard_matches_the_cumulative_ensemble_by_construction():
+    """Raw ``p_rain`` is already monotone in the lead (the per-member
+    exceedance is cumulative), so the guard is a no-op on uncalibrated
+    grids — it only ever repairs what the curves broke."""
+    rng = np.random.default_rng(11)
+    ensemble = rng.gamma(1.0, 1.5, size=(8, 6, 12, 10)).astype(np.float32)
+    products = national_products(
+        ensemble, leads_min=(10, 20, 30, 45, 60), threshold_mm_h=2.0,
+        timestep_min=10.0, frame_age_min=0.0,
+    )
+    guarded = enforce_lead_monotonic(products.p_rain)
+    for lead in products.leads_min:
+        np.testing.assert_array_equal(guarded[lead], products.p_rain[lead])

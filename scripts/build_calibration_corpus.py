@@ -93,6 +93,42 @@ live service does. The usual ±4 min match tolerance applies around the
 *snapped* target; when no frame lands inside tolerance the lead's
 outcome stays null.
 
+**Truth is CUMULATIVE — "rain within L", not "rain at T+L"
+(``--outcome-rule``, default ``within``; bug found 2026-09-09).**
+
+The served quantity is
+:attr:`dmi_nowcast_core.national.NationalProducts.p_rain`: the fraction
+of ensemble members whose **cumulative** max rain rate crosses the
+threshold by lead ``L`` — ``P(rain at ANY time within L minutes)``. Until
+2026-09-09 this builder scored the truth from the SINGLE verification
+frame at the lead's snapped instant, i.e. ``P(rain AT T+L)``. Those are
+different events, and the gap grows with the lead: a cell that crosses
+the point at +35 min is a hit for "within 60" and a miss for "at 60", so
+the fit saw systematically fewer positives the longer the lead.
+
+The damage was visible in the fit of 2026-09-09 04:35Z: a UNANIMOUS
+ensemble (raw fraction 1.0) mapped to only 0.728 / 0.634 / 0.559 / 0.493
+/ 0.440 at 10 / 20 / 30 / 45 / 60 min, and served probabilities at one
+point could DECREASE with lead (Fasterholt 2026-09-09 05:34Z: 0.50, 0.52,
+0.49, 0.49, 0.44) — impossible for nested events, since "rain within 60"
+contains "rain within 45".
+
+So a lead's truth now reads EVERY timestep instant its window covers —
+``T + j·step`` for ``j = 1 .. snapped[lead]/step`` — and the outcome is 1
+if the point's disc is wet at ANY of them, 0 if wet at none. The final
+frame (the lead's own snapped instant) is the one the lead is defined by:
+if it is missing or unparseable the outcome stays **null**, exactly as
+before. A missing INTERMEDIATE frame is skipped and the remaining
+instants still score — a null there would throw away a whole lead over a
+10-min hole — but it can only ever turn a 1 into a 0 (a fast cell passing
+through the gap goes unseen), so the gaps are counted and warned about
+per event rather than swallowed.
+
+``--outcome-rule instant`` restores the pre-fix single-frame scoring
+bit-for-bit. It exists only to reproduce an older fit; it hashes
+differently (``outcome_rule`` is in the settings dict), so ``within`` and
+``instant`` rows can never be mixed in one corpus or one fit.
+
 **Wet/dry index cache re-key** — the index cache filename incorporates
 both the scan type and the wet-reference set
 (``wet_dry_index_fullRange_<refs-hash>.json``): wet/dry counts change
@@ -189,7 +225,10 @@ appended. The fit (package B3) consumes them as relative weights.
     region         str
     lead_min       int32
     raw_prob       float32 (NaN when the forecast failed / out of grid)
-    outcome        int8, nullable (null = verification frame missing)
+    outcome        int8, nullable — 1 = the disc was wet at some instant
+                   inside the lead's window (``--outcome-rule within``) or
+                   at the snapped instant itself (``instant``); null = the
+                   lead's FINAL verification frame was missing/unreadable
     sample_weight  float64
     frame_age_min  float32 (this event's simulated frame age, minutes —
                    constant across the event's rows)
@@ -253,7 +292,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Literal, Optional, Sequence, Union
 
 import numpy as np
 
@@ -320,6 +359,16 @@ MOTION_METHOD = "farneback_complete_v1"
 # build matches the deployed sidecar; ``--flow-completion`` overrides it
 # for the A/B against the legacy field.
 DEFAULT_FLOW_COMPLETION = "confidence"
+# How a lead's verification truth is scored (module docstring, "Truth is
+# CUMULATIVE"). ``within`` matches the served quantity — rain at ANY
+# verification instant up to and including the lead's snapped frame.
+# ``instant`` is the pre-2026-09-09 behaviour, kept only to reproduce an
+# older fit. Part of the settings hash: the two rules score different
+# EVENTS, so their rows must never share a corpus.
+OUTCOME_RULE_WITHIN = "within"
+OUTCOME_RULE_INSTANT = "instant"
+OUTCOME_RULES = (OUTCOME_RULE_WITHIN, OUTCOME_RULE_INSTANT)
+DEFAULT_OUTCOME_RULE = OUTCOME_RULE_WITHIN
 # Simulated frame age, minutes: [LO, HI] of the uniform draw per event.
 # The live cycle finishes ~12-18 min after its newest frame's radar
 # timestamp (fetch + STEPS + render), and the runtime shifts every lead
@@ -386,6 +435,15 @@ class CorpusSettings:
     flow_confidence_window_px: int = DEFAULT_CONFIDENCE_WINDOW_PX
     flow_confidence_percentile: float = DEFAULT_CONFIDENCE_PERCENTILE
     flow_texture_percentile: float = DEFAULT_TEXTURE_PERCENTILE
+    #: Truth definition for a lead (2026-09-09 fix; module docstring,
+    #: "Truth is CUMULATIVE"). ``within`` scores rain at ANY verification
+    #: instant inside the lead's window — the event ``p_rain`` actually
+    #: describes; ``instant`` scores the single snapped frame, which is
+    #: what the pre-fix corpora used. Hashed exactly like ``scan_type``
+    #: and ``flow_completion``: the rules label DIFFERENT events, so a
+    #: corpus built under one must be refused under the other rather than
+    #: silently fitting a curve to a quantity nobody serves.
+    outcome_rule: Literal["within", "instant"] = DEFAULT_OUTCOME_RULE
 
     @property
     def n_timesteps(self) -> int:
@@ -406,6 +464,7 @@ class CorpusSettings:
             "threshold_mm_h": float(self.threshold_mm_h),
             "disc_radius_m": float(self.disc_radius_m),
             "detection_stat": str(self.detection_stat),
+            "outcome_rule": str(self.outcome_rule),
             "scan_type": str(self.scan_type),
             "motion_method": str(self.motion_method),
             "flow_completion": str(self.flow_completion),
@@ -1286,8 +1345,8 @@ def _gather_event_frames(
     settings: CorpusSettings,
     frame_age_min: float = 0.0,
     archive: Optional[ArchiveIndex] = None,
-) -> tuple[list[Frame], dict[int, Frame]]:
-    """Return (input_features[3], {lead: verification_feature}).
+) -> tuple[list[Frame], dict[int, list[Frame]]]:
+    """Return (input_features[3], {lead: [verification_features, ascending]}).
 
     Lists ONE window covering every frame the event needs, archive first
     and DMI second (:func:`_list_frames_in_window`), filtered to
@@ -1297,13 +1356,29 @@ def _gather_event_frames(
     frame into a fullRange corpus (or vice versa).
 
     Inputs are spaced at the frame cadence (``timestep_min``): T-20,
-    T-10, T on the 10-min grid. Verification targets are the snapped
-    EFFECTIVE leads — ``snap_lead_min(lead + frame_age_min, timestep)``,
-    the module-docstring snapping rule — so the fetch window stretches
-    with the simulated age (out to T+80 at the defaults, from T+60 at
-    zero age); a lead whose snapped target has no frame within
-    ``FRAME_TOLERANCE_MIN`` is simply absent from the truth dict, so its
-    outcome stays null.
+    T-10, T on the 10-min grid. The window a lead is verified over ends at
+    its snapped EFFECTIVE lead — ``snap_lead_min(lead + frame_age_min,
+    timestep)``, the module-docstring snapping rule — so the fetch window
+    stretches with the simulated age (out to T+80 at the defaults, from
+    T+60 at zero age).
+
+    *Which* frames inside that window are returned is
+    ``settings.outcome_rule`` (module docstring, "Truth is CUMULATIVE"):
+
+    - ``within`` (default, and the served quantity): every timestep
+      instant the window covers, ``T + j·step`` for
+      ``j = 1 .. snapped[lead]/step``, in ascending order. Instants with
+      no frame within ``FRAME_TOLERANCE_MIN`` are dropped from the list —
+      the remaining ones still score the lead — and counted for the
+      warning below.
+    - ``instant``: the single frame at the snapped target, i.e. a
+      one-element list holding exactly what the pre-2026-09-09 builder
+      returned.
+
+    Under both rules the lead is absent from the dict entirely when its
+    FINAL (snapped) frame is missing, so :func:`_score_outcomes` leaves
+    that lead's outcome null exactly as before. A lead is defined by that
+    instant; the earlier ones only add to it.
 
     Every frame this returns is resolved by :func:`_resolve_frame`, which
     short-circuits on an archived frame — so an event whose window the
@@ -1336,55 +1411,103 @@ def _gather_event_frames(
             )
         inputs.append(f)
 
-    truth: dict[int, Frame] = {}
+    # One resolution per distinct instant, shared across the leads whose
+    # windows contain it — with 8 leads on a 10-min grid the same handful
+    # of instants is asked for over and over.
+    resolved: dict[int, Optional[Frame]] = {}
+
+    def _at(offset_min: int) -> Optional[Frame]:
+        if offset_min not in resolved:
+            resolved[offset_min] = _find_nearest_feature(
+                feats, event_time + timedelta(minutes=offset_min)
+            )
+        return resolved[offset_min]
+
+    truth: dict[int, list[Frame]] = {}
     for lead in settings.leads_min:
-        f = _find_nearest_feature(
-            feats, event_time + timedelta(minutes=snapped[lead])
+        target = snapped[lead]
+        if settings.outcome_rule == OUTCOME_RULE_INSTANT:
+            offsets: tuple[int, ...] = (target,)
+        else:
+            # Every timestep instant in (0, target]. Written as "the whole
+            # steps, then the target" rather than range(step, target + 1,
+            # step) so the DEFINING instant is in the list even if a
+            # non-integer timestep ever made ``target`` a non-multiple of
+            # ``step``; on the 10-min grid the two are the same tuple.
+            offsets = tuple(range(step, target, step)) + (target,)
+        window = [f for f in (_at(off) for off in offsets) if f is not None]
+        # The lead is DEFINED by its final instant: no frame there and the
+        # outcome must stay null, exactly as before the cumulative fix.
+        if _at(target) is None:
+            continue
+        truth[lead] = window
+
+    n_missing = sum(1 for f in resolved.values() if f is None)
+    if n_missing:
+        # Bounded and visible rather than swallowed: a gap can only hide a
+        # cell that passed through it, i.e. turn a 1 into a 0.
+        _LOGGER.warning(
+            "event %s: %d of %d verification instant(s) had no %s frame "
+            "within %d min — those instants are skipped",
+            _ts_str(event_time), n_missing, len(resolved),
+            settings.scan_type or "radar", FRAME_TOLERANCE_MIN,
         )
-        if f is not None:  # missing verification just leaves the lead's outcome null
-            truth[lead] = f
     return inputs, truth
 
 
 def _score_outcomes(
-    truth: dict[int, Frame],
+    truth: dict[int, list[Frame]],
     points: tuple[CalibrationPoint, ...],
     settings: CorpusSettings,
     cache_dir: Path,
     corpus_dir: Optional[Path],
 ) -> dict[str, dict[int, Optional[int]]]:
-    """Outcomes per (point, lead): parse each verification frame ONCE, then
-    sample every point's disc from it. Missing frame / parse failure / empty
-    disc → None (null in Parquet, filtered at fit time).
+    """Outcomes per (point, lead) from the lead's verification window.
 
-    Leads are grouped by the frame they verify against BEFORE anything is
-    parsed. Several nominal leads routinely snap to one radar instant —
-    at the live 12-18 min frame age the eight served leads
-    (5,10,15,20,25,30,45,60) resolve to only six distinct frames — and
-    parsing the same HDF5 twice to sample the same discs from it is pure
-    waste. The per-(point, lead) result is identical either way: the
-    outcome depends only on the frame, the point and the settings.
+    ``truth`` is what :func:`_gather_event_frames` returned: per lead, the
+    ordered frames its window covers (one frame under
+    ``--outcome-rule instant``, up to ``snapped/step`` of them under
+    ``within``). The lead's outcome is the CUMULATIVE event the service
+    serves — 1 if the point's disc is wet at ANY frame in the list, 0 if
+    at none (module docstring, "Truth is CUMULATIVE").
+
+    **Missing-data policy.** ``None`` (null in Parquet, filtered at fit
+    time) when the lead's FINAL frame — the snapped instant the lead is
+    defined by — is absent from ``truth`` or fails to parse, or when the
+    disc holds no valid data there. An INTERMEDIATE frame that is missing
+    or unparseable is skipped and the rest of the window still scores:
+    nulling a lead over one 10-min hole would throw away a good final
+    observation, while the skip can only lose a positive (a cell that
+    crossed the point inside the gap), never invent one. The gaps are
+    counted — listing gaps by :func:`_gather_event_frames`, parse
+    failures here — so a decaying archive shows up in the log.
+
+    Each DISTINCT frame is resolved, parsed and disc-sampled exactly ONCE
+    however many leads' windows contain it, and only one parsed composite
+    is alive at a time (the per-frame wet flags are all that survives the
+    loop). The windows nest — lead 60's contains every shorter lead's — so
+    at the live 12-18 min age the eight served leads cover ~35 (lead,
+    instant) pairs over only 8 distinct frames, up from the 6 the
+    single-instant rule needed. Parsing per lead instead of per frame
+    would mean reading those 8 files ~35 times.
     """
     outcomes: dict[str, dict[int, Optional[int]]] = {
         p.id: {int(lead): None for lead in settings.leads_min} for p in points
     }
-    # frame identity → the leads that verify against it, in lead order.
-    by_frame: dict[tuple, list[int]] = {}
+    # Distinct frames across every lead's window, in time order.
+    frames_by_key: dict[tuple, Frame] = {}
     for lead in settings.leads_min:
-        feature = truth.get(lead)
-        if feature is None:
-            continue
-        key = (feature.datetime_utc, feature.filename)
-        by_frame.setdefault(key, []).append(int(lead))
+        for feature in truth.get(int(lead), ()):
+            frames_by_key.setdefault(
+                (feature.datetime_utc, feature.filename), feature
+            )
 
-    for lead in settings.leads_min:
-        feature = truth.get(lead)
-        if feature is None:
-            continue
-        key = (feature.datetime_utc, feature.filename)
-        leads_here = by_frame.pop(key, None)
-        if leads_here is None:  # already handled with an earlier lead
-            continue
+    # key → {point_id: 0/1/None}. One parsed composite alive at a time:
+    # the per-frame wet flags are all that outlives the loop body.
+    wet_by_key: dict[tuple, dict[str, Optional[int]]] = {}
+    n_unparseable = 0
+    for key in sorted(frames_by_key):
+        feature = frames_by_key[key]
         try:
             path = _resolve_frame(feature, cache_dir, corpus_dir)
             composite = parse_composite(path)
@@ -1392,20 +1515,41 @@ def _score_outcomes(
             rain = dbz_to_rain_rate(
                 composite.reflectivity_dbz, zr_a=composite.zr_a, zr_b=composite.zr_b
             )
-        except Exception:  # noqa: BLE001 — frame-level failure nulls these leads
+        except Exception:  # noqa: BLE001 — frame-level failure: no flags at all
+            n_unparseable += 1
             continue
+        flags: dict[str, Optional[int]] = {}
         for point in points:
             try:
                 stats = sample_disc(
                     rain, geo, point.lon, point.lat, radius_m=settings.disc_radius_m
                 )
-                value = outcome_from_stats(
+                flags[point.id] = outcome_from_stats(
                     stats, settings.detection_stat, settings.threshold_mm_h
                 )
             except Exception:  # noqa: BLE001 — point-level failure stays None
-                continue
-            for lead_here in leads_here:
-                outcomes[point.id][lead_here] = value
+                flags[point.id] = None
+        wet_by_key[key] = flags
+
+    if n_unparseable:
+        _LOGGER.warning(
+            "%d verification frame(s) could not be read; leads whose FINAL "
+            "frame is among them stay null, the rest score without them",
+            n_unparseable,
+        )
+
+    for lead in settings.leads_min:
+        window = truth.get(int(lead))
+        if not window:
+            continue
+        keys = [(f.datetime_utc, f.filename) for f in window]
+        final = wet_by_key.get(keys[-1], {})
+        for point in points:
+            if final.get(point.id) is None:
+                continue  # the defining instant is unusable → stays None
+            outcomes[point.id][int(lead)] = int(
+                any(wet_by_key.get(k, {}).get(point.id) == 1 for k in keys)
+            )
     return outcomes
 
 
@@ -1770,6 +1914,18 @@ def main() -> int:
              "(runtime: forecast.detection_stat).",
     )
     ap.add_argument(
+        "--outcome-rule", choices=OUTCOME_RULES, default=DEFAULT_OUTCOME_RULE,
+        help="How a lead's truth is scored. 'within' (default) matches the "
+             "quantity the service serves — p_rain[L] is P(rain at ANY time "
+             "within L min), so the outcome is 1 if the disc is wet at any "
+             "verification instant up to the lead's snapped frame. 'instant' "
+             "is the pre-2026-09-09 behaviour (rain AT that one frame), "
+             "which under-counted positives more and more with lead and let "
+             "served probabilities fall as the lead grew; keep it only to "
+             "reproduce an older fit. Joins the settings hash, so the two "
+             "rules never mix in one corpus.",
+    )
+    ap.add_argument(
         "--flow-completion", choices=("bulk", "confidence"),
         default=DEFAULT_FLOW_COMPLETION,
         help="Motion-completion policy (runtime: "
@@ -1883,6 +2039,7 @@ def main() -> int:
         threshold_mm_h=args.threshold_mm_h,
         disc_radius_m=args.disc_radius_m,
         detection_stat=args.detection_stat,
+        outcome_rule=args.outcome_rule,
         leads_min=leads,
         scan_type=args.scan_type,
         # The STEPS timestep follows the single-type frame spacing (10

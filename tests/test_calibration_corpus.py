@@ -10,6 +10,7 @@ exactly as ``tests/test_corpus_manifest.py`` does for the manifest builder.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -145,6 +146,9 @@ def test_settings_hash_stable_across_construction_routes():
     {"flow_confidence_window_px": 21},
     {"flow_confidence_percentile": 30.0},
     {"flow_texture_percentile": 70.0},
+    # 2026-09-09: 'within' and 'instant' score DIFFERENT events, so a
+    # curve fitted on one must never be fed rows scored under the other.
+    {"outcome_rule": "instant"},
 ])
 def test_settings_hash_changes_when_any_setting_changes(override):
     assert _settings().settings_hash != _settings(**override).settings_hash
@@ -199,6 +203,7 @@ def test_settings_columns_carry_hash_and_schema_version():
     assert cols["leads_min_csv"] == "5,10,15,20,25,30,45,60"
     assert cols["n_timesteps"] == 8
     assert cols["scan_type"] == "fullRange"
+    assert cols["outcome_rule"] == "within"
     assert cols["motion_method"] == "farneback_complete_v1"
     assert cols["timestep_min"] == pytest.approx(10.0)
     # The list-valued setting is flattened to a scalar Parquet column.
@@ -654,12 +659,20 @@ def test_gather_event_frames_fullrange_inputs_and_snapped_truth(monkeypatch):
         event,
     ]
     # Verification snapped up: 5 → T+10, 15 → T+20; on-grid leads stay put.
-    assert truth[5].datetime_utc == event + timedelta(minutes=10)
-    assert truth[10].datetime_utc == event + timedelta(minutes=10)
-    assert truth[15].datetime_utc == event + timedelta(minutes=20)
-    assert truth[30].datetime_utc == event + timedelta(minutes=30)
+    # Under the default "within" rule each lead carries its WHOLE window,
+    # ascending, ending at that snapped instant.
+    def offsets(lead: int) -> list[int]:
+        return [
+            round((f.datetime_utc - event).total_seconds() / 60)
+            for f in truth[lead]
+        ]
+
+    assert offsets(5) == [10]
+    assert offsets(10) == [10]
+    assert offsets(15) == [10, 20]
+    assert offsets(30) == [10, 20, 30]
     # Nothing off-grid leaked anywhere.
-    for f in list(inputs) + list(truth.values()):
+    for f in list(inputs) + [f for w in truth.values() for f in w]:
         assert f.datetime_utc.minute % 10 == 0
 
 
@@ -683,7 +696,9 @@ def test_gather_event_frames_missing_snapped_frame_leaves_outcome_null(monkeypat
     inputs, truth = bcc._gather_event_frames(event, settings)
     assert len(inputs) == 3
     assert 5 not in truth
-    assert truth[20].datetime_utc == event + timedelta(minutes=20)
+    # Lead 20's window is T+10, T+20; the T+10 hole is skipped, and the
+    # FINAL (defining) instant is there, so the lead still scores.
+    assert [f.datetime_utc for f in truth[20]] == [event + timedelta(minutes=20)]
 
     # Downstream: the missing lead yields a null outcome row.
     outcomes = {"p": {5: None, 20: 1}}
@@ -841,18 +856,22 @@ def test_gather_event_frames_verifies_at_the_frame_aged_instant(monkeypatch):
         event - timedelta(minutes=10),
         event,
     ]
-    # ceil((30 + 15) / 10) * 10 = 50; ceil((60 + 15) / 10) * 10 = 80.
-    assert truth[30].datetime_utc == event + timedelta(minutes=50)
-    assert truth[60].datetime_utc == event + timedelta(minutes=80)
-    assert truth[5].datetime_utc == event + timedelta(minutes=20)
+    # ceil((30 + 15) / 10) * 10 = 50; ceil((60 + 15) / 10) * 10 = 80. The
+    # aged instant is where each lead's window ENDS.
+    assert truth[30][-1].datetime_utc == event + timedelta(minutes=50)
+    assert truth[60][-1].datetime_utc == event + timedelta(minutes=80)
+    assert truth[5][-1].datetime_utc == event + timedelta(minutes=20)
+    # …and the window runs from the first timestep to it.
+    assert truth[30][0].datetime_utc == event + timedelta(minutes=10)
+    assert len(truth[30]) == 5 and len(truth[60]) == 8
     # The prefetch window must reach the latest instant (+ tolerance).
     assert window["end"] >= event + timedelta(minutes=80)
     assert window["start"] <= event - timedelta(minutes=20)
 
     # Zero age is the old behaviour, unchanged.
     _, truth0 = bcc._gather_event_frames(event, settings, 0.0)
-    assert truth0[30].datetime_utc == event + timedelta(minutes=30)
-    assert truth0[60].datetime_utc == event + timedelta(minutes=60)
+    assert truth0[30][-1].datetime_utc == event + timedelta(minutes=30)
+    assert truth0[60][-1].datetime_utc == event + timedelta(minutes=60)
 
 
 def test_frame_age_is_recorded_on_every_row(tmp_path: Path):
@@ -1506,15 +1525,16 @@ def test_gather_event_frames_resolves_inputs_and_truth_from_the_archive(
         event - timedelta(minutes=20), event - timedelta(minutes=10), event,
     ]
     # Snapped effective leads, exactly as with an API listing: 30+15 → T+50.
-    assert truth[5].datetime_utc == event + timedelta(minutes=20)
-    assert truth[30].datetime_utc == event + timedelta(minutes=50)
-    assert truth[60].datetime_utc == event + timedelta(minutes=80)
+    assert truth[5][-1].datetime_utc == event + timedelta(minutes=20)
+    assert truth[30][-1].datetime_utc == event + timedelta(minutes=50)
+    assert truth[60][-1].datetime_utc == event + timedelta(minutes=80)
+    verification = [f for w in truth.values() for f in w]
     # The interleaved doppler frames on disk never leak in.
-    for f in list(inputs) + list(truth.values()):
+    for f in list(inputs) + verification:
         assert f.datetime_utc.minute % 10 == 0
         assert f.scan_type == "fullRange"
     # And every one of them resolves to a real file with no network.
-    for f in list(inputs) + list(truth.values()):
+    for f in list(inputs) + verification:
         assert bcc._resolve_frame(f, tmp_path / "cache", corpus).is_file()
 
 
@@ -1542,7 +1562,7 @@ def test_gather_event_frames_falls_back_to_dmi_for_an_unarchived_window(
     assert [f.datetime_utc for f in inputs] == [
         event - timedelta(minutes=20), event - timedelta(minutes=10), event,
     ]
-    assert truth[30].datetime_utc == event + timedelta(minutes=50)
+    assert truth[30][-1].datetime_utc == event + timedelta(minutes=50)
 
 
 def test_gather_event_frames_names_the_listing_source_when_inputs_are_missing(
@@ -1842,17 +1862,17 @@ def test_point_set_is_not_part_of_the_settings_hash(tmp_path: Path):
 def test_score_outcomes_parses_each_verification_frame_once(
     tmp_path: Path, monkeypatch
 ):
-    """Several nominal leads snap onto one radar instant — at the live
-    12-18 min frame age the eight served leads resolve to six distinct
-    frames — and re-parsing the same HDF5 to sample the same discs from it
-    is pure waste. The per-(point, lead) outcome must be unchanged."""
+    """Leads' windows overlap almost completely under the cumulative rule —
+    lead 20's contains lead 15's — and re-parsing the same HDF5 to sample
+    the same discs from it is pure waste. The per-(point, lead) outcome
+    must be unchanged."""
     points = bcc.load_points(_write_points(tmp_path, POINTS_V2))
     settings = _settings(leads_min=(5, 10, 15, 20))
 
     shared = _feature(datetime(2026, 8, 1, 12, 30, tzinfo=timezone.utc))
     other = _feature(datetime(2026, 8, 1, 12, 40, tzinfo=timezone.utc))
-    # Leads 5/10/15 all verify against the same frame; lead 20 against another.
-    truth = {5: shared, 10: shared, 15: shared, 20: other}
+    # Leads 5/10/15 verify against one frame; lead 20's window covers both.
+    truth = {5: [shared], 10: [shared], 15: [shared], 20: [shared, other]}
 
     parsed: list[str] = []
     monkeypatch.setattr(bcc, "_resolve_frame", lambda f, *a: Path(f.filename))
@@ -1882,3 +1902,182 @@ def test_score_outcomes_parses_each_verification_frame_once(
     # Every (point, lead) still gets its outcome.
     for point in points:
         assert outcomes[point.id] == {5: 1, 10: 1, 15: 1, 20: 1}
+
+
+# ---------------------------------------------------------------------------
+# Cumulative truth — "rain within L", not "rain at T+L" (bug, 2026-09-09)
+# ---------------------------------------------------------------------------
+
+
+#: One point, planted where ``_fake_frames_wet_at``'s geo puts every disc.
+WET_POINT = bcc.CalibrationPoint(id="p", lat=55.0, lon=10.0, region="r")
+
+
+def _fake_frames_wet_at(
+    monkeypatch, event: datetime, wet_offsets: set[int]
+) -> None:
+    """Stub the HDF5 read so a planted zero-byte frame stands in for a
+    composite that is WET exactly at the given minute offsets from
+    ``event``, and dry at every other one.
+
+    ``dbz_to_rain_rate`` is handed the reflectivity field and nothing else,
+    so the frame's offset rides along inside that (constant) field — the
+    only channel the real call signature leaves open.
+    """
+
+    class _Composite:
+        zr_a, zr_b, xscale_m, yscale_m = 200.0, 1.6, 500.0, 500.0
+
+        def __init__(self, offset_min: int) -> None:
+            self.reflectivity_dbz = np.full((8, 8), float(offset_min), np.float32)
+
+    class _Geo:
+        composite = _Composite(0)
+
+        def lonlat_to_grid(self, lon, lat):
+            return GridIndex(row=4.0, col=4.0)
+
+    def _parse(path):
+        stamp = datetime.strptime(
+            Path(path).name.split(".")[2], "%Y%m%d%H%M"
+        ).replace(tzinfo=timezone.utc)
+        return _Composite(round((stamp - event).total_seconds() / 60))
+
+    monkeypatch.setattr(bcc, "parse_composite", _parse)
+    monkeypatch.setattr(bcc, "CompositeGeo", lambda c: _Geo())
+    monkeypatch.setattr(
+        bcc, "dbz_to_rain_rate",
+        lambda dbz, **k: np.full(
+            dbz.shape, 5.0 if int(dbz.flat[0]) in wet_offsets else 0.0, np.float32
+        ),
+    )
+
+
+def _offsets(window: list, event: datetime) -> list[int]:
+    return [
+        round((f.datetime_utc - event).total_seconds() / 60) for f in window
+    ]
+
+
+def test_outcome_rule_defaults_to_the_served_quantity():
+    """``p_rain[L]`` is P(rain WITHIN L), so ``within`` is the default and
+    ``instant`` has to be asked for by name."""
+    s = _settings()
+    assert s.outcome_rule == bcc.OUTCOME_RULE_WITHIN == "within"
+    assert s.to_dict()["outcome_rule"] == "within"
+    assert bcc.DEFAULT_OUTCOME_RULE == "within"
+
+
+def test_check_existing_corpus_refuses_an_instant_corpus_under_within(
+    tmp_path: Path,
+):
+    """The two rules label DIFFERENT events (rain within L vs rain at T+L),
+    so a resumed build must never concatenate them."""
+    out = _write_corpus(tmp_path, _settings(outcome_rule="instant"))
+    with pytest.raises(ValueError, match="mixed corpus"):
+        bcc.check_existing_corpus(out, _settings().settings_hash)
+    # …while the matching rule still resumes it.
+    assert bcc.check_existing_corpus(
+        out, _settings(outcome_rule="instant").settings_hash
+    ) == {"2026-08-01T12:00:00+00:00"}
+
+
+@pytest.mark.parametrize("rule, expected, window_lengths", [
+    # Wet ONLY at T+20. "within" is the served event: every lead whose
+    # window reaches T+20 is a hit.
+    ("within", {10: 0, 20: 1, 30: 1, 60: 1}, [1, 2, 3, 6]),
+    # "instant" scores the single snapped frame — the pre-fix behaviour,
+    # which called the 30- and 60-min windows misses.
+    ("instant", {10: 0, 20: 1, 30: 0, 60: 0}, [1, 1, 1, 1]),
+])
+def test_outcome_rule_scores_within_versus_instant(
+    tmp_path: Path, monkeypatch, rule: str, expected: dict, window_lengths: list,
+):
+    _no_network(monkeypatch)
+    corpus = tmp_path / "corpus"
+    event = datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc)
+    index = _plant_every_5_min(
+        corpus, event - timedelta(minutes=30), event + timedelta(minutes=90)
+    )
+    _fake_frames_wet_at(monkeypatch, event, {20})
+
+    settings = _settings(
+        leads_min=(10, 20, 30, 60),
+        frame_age_range=(0.0, 0.0),
+        outcome_rule=rule,
+    )
+    _, truth = bcc._gather_event_frames(event, settings, 0.0, archive=index)
+    assert [len(truth[lead]) for lead in (10, 20, 30, 60)] == window_lengths
+    # Whatever the rule, the lead's LAST frame is its snapped instant.
+    assert _offsets([truth[lead][-1] for lead in (10, 20, 30, 60)], event) == [
+        10, 20, 30, 60,
+    ]
+
+    outcomes = bcc._score_outcomes(
+        truth, (WET_POINT,), settings, tmp_path / "cache", corpus
+    )
+    assert outcomes[WET_POINT.id] == expected
+
+
+def test_within_rule_nulls_a_lead_whose_final_frame_is_missing(
+    tmp_path: Path, monkeypatch,
+):
+    """The lead is DEFINED by its snapped instant: no frame there and the
+    outcome stays null rather than being guessed from the window."""
+    _no_network(monkeypatch)
+    corpus = tmp_path / "corpus"
+    event = datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc)
+    _plant_every_5_min(
+        corpus, event - timedelta(minutes=30), event + timedelta(minutes=90)
+    )
+    bcc.archive_path_for(
+        corpus, f"dk.com.{event + timedelta(minutes=30):%Y%m%d%H%M}.500_max.h5"
+    ).unlink()
+    index = ArchiveIndex(corpus)
+    _fake_frames_wet_at(monkeypatch, event, {20})
+
+    settings = _settings(leads_min=(20, 30, 60), frame_age_range=(0.0, 0.0))
+    _, truth = bcc._gather_event_frames(event, settings, 0.0, archive=index)
+    assert 30 not in truth
+
+    outcomes = bcc._score_outcomes(
+        truth, (WET_POINT,), settings, tmp_path / "cache", corpus
+    )
+    assert outcomes[WET_POINT.id][30] is None
+    # The same hole is only an INTERMEDIATE instant for lead 60, which
+    # still sees the T+20 hit and scores.
+    assert outcomes[WET_POINT.id][20] == 1
+    assert outcomes[WET_POINT.id][60] == 1
+
+
+def test_within_rule_scores_through_a_missing_intermediate_frame(
+    tmp_path: Path, monkeypatch, caplog,
+):
+    """A hole inside the window is skipped, not fatal — but it can silently
+    turn a 1 into a 0 (the cell crossed while nobody was looking), so it is
+    counted and warned about per event."""
+    _no_network(monkeypatch)
+    corpus = tmp_path / "corpus"
+    event = datetime(2025, 12, 20, 3, 0, tzinfo=timezone.utc)
+    _plant_every_5_min(
+        corpus, event - timedelta(minutes=30), event + timedelta(minutes=90)
+    )
+    bcc.archive_path_for(
+        corpus, f"dk.com.{event + timedelta(minutes=20):%Y%m%d%H%M}.500_max.h5"
+    ).unlink()
+    index = ArchiveIndex(corpus)
+    _fake_frames_wet_at(monkeypatch, event, {20, 40})
+
+    settings = _settings(leads_min=(30, 60), frame_age_range=(0.0, 0.0))
+    with caplog.at_level(logging.WARNING, logger="calib"):
+        _, truth = bcc._gather_event_frames(event, settings, 0.0, archive=index)
+    assert _offsets(truth[30], event) == [10, 30]  # the hole is simply absent
+    assert "1 of 6 verification instant(s)" in caplog.text
+
+    outcomes = bcc._score_outcomes(
+        truth, (WET_POINT,), settings, tmp_path / "cache", corpus
+    )
+    # Lead 30's only wet instant fell in the hole → a lost positive, never
+    # an invented one. Lead 60 still reaches the T+40 hit.
+    assert outcomes[WET_POINT.id][30] == 0
+    assert outcomes[WET_POINT.id][60] == 1
