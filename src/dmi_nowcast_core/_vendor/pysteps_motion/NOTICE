@@ -1,0 +1,106 @@
+Vendored subset of pysteps — the Lucas-Kanade motion estimator
+==============================================================
+
+This directory contains a redistribution of code from the pysteps project
+(https://github.com/pySTEPS/pysteps), licensed under the BSD 3-Clause
+License — see LICENSE-pysteps in this directory.
+
+Vendored version
+----------------
+pysteps 1.21.1 (see `_VENDORED_FROM` in __init__.py), taken from the PyPI
+source distribution `pysteps-1.21.1.tar.gz`.
+
+Why vendored
+------------
+Two reasons, and the second is the one that decided it:
+
+1. pysteps is not installable on Home Assistant OS (no wheels for
+   `musllinux_*_cp314`, and the source build wants an OpenMP toolchain
+   HA OS does not ship at runtime) — the same wall that produced the
+   sibling `_vendor/pysteps_steps` tree.
+2. Neither the sidecar image nor the algorithm library depends on
+   pysteps, and Phase H needs exactly ONE pysteps function: `dense_
+   lucaskanade`, as the literature's reference motion estimator, so that
+   the Farnebäck field the service serves can be scored against it on
+   identical Layer A cases (`forecast_skill_plan.md` §3, H-c and H-F).
+   Adding pysteps and its dependency tree to a memory-capped VM image to
+   call one function that will probably never be served is a bad trade;
+   six source files are not.
+
+Separate from `_vendor/pysteps_steps` on purpose
+------------------------------------------------
+That tree is the strict subset `pysteps.nowcasts.steps.forecast`
+executes, identified by an `sys.settrace` audit, and it carries seven
+modifications made for peak memory because STEPS runs those functions
+sixteen times per timestep. None of that is true of this tree, which is
+essentially unmodified. Merging them would make it impossible to say
+which statement applies to a given file.
+
+Files vendored
+--------------
+Six upstream source files, mirroring the upstream layout, plus package
+`__init__.py` files:
+
+    decorators.py              from pysteps/decorators.py
+    exceptions.py              from pysteps/exceptions.py
+    motion/lucaskanade.py      from pysteps/motion/lucaskanade.py
+    tracking/lucaskanade.py    from pysteps/tracking/lucaskanade.py
+    feature/shitomasi.py       from pysteps/feature/shitomasi.py
+    utils/cleansing.py         from pysteps/utils/cleansing.py
+    utils/images.py            from pysteps/utils/images.py
+    utils/interpolate.py       from pysteps/utils/interpolate.py
+
+All upstream docstrings are kept verbatim, including the references
+(Bouguet 2001; Lucas and Kanade 1981; Shi and Tomasi 1994).
+
+Modifications from upstream
+---------------------------
+1. All `from pysteps.X import Y` rewritten to the equivalent relative
+   import (`from ..utils.cleansing import ...`). Mechanical; no logic
+   changes.
+2. `motion/lucaskanade.py` — the two runtime dispatchers,
+   `pysteps.feature.get_method(fd_method)` and
+   `pysteps.utils.get_method(interp_method)`, are replaced by the
+   `_FEATURE_METHODS` / `_INTERP_METHODS` dicts and their two lookup
+   helpers. Upstream's dispatchers import every detector and utility in
+   the package (`blob` → scikit-image, `tstorm` → pandas, and the
+   `motion` interface → the `_vet` / `_proesmans` Cython extensions),
+   which is the whole of what vendoring is meant to avoid. Only the two
+   DEFAULT methods are vendored — `fd_method="shitomasi"` and
+   `interp_method="idwinterp2d"` — and any other name now raises a
+   `ValueError` naming what is available instead of an ImportError from
+   three files away. The call sites and the arguments are unchanged.
+3. `decorators.py` — `postprocess_import` and `deprecate_args` dropped
+   (importer-only helpers; nothing on the LK path calls them). The three
+   that are used — `check_input_frames`, `prepare_interpolator`,
+   `memoize` — and their shared `_add_extra_kwrds_to_docstrings` are
+   verbatim.
+4. `utils/interpolate.py` — `rbfinterp2d` and its `_Rbf_cached` companion
+   dropped, with the now-unused `scipy.interpolate.Rbf` and `warnings`
+   imports. `idwinterp2d` (the default, and the only one this repo asks
+   for) and `_cKDTree_cached` are verbatim.
+5. `exceptions.py` — kept whole; it is four exception classes and no
+   code, and a copy is cheaper than a cross-tree import into
+   `pysteps_steps`, which would couple two vendored trees that document
+   different provenance guarantees.
+
+No numerical behaviour is changed by any of the above: with the default
+arguments this tree runs the identical code path as an installed pysteps
+1.21.1. `tests/test_flow_variants.py` pins the two properties that
+matter — that a known synthetic displacement comes back within 15 %, and
+that the axis/sign convention of the returned field matches
+`dense_flow`'s `(vy, vx)`.
+
+Convention note for callers
+---------------------------
+`dense_lucaskanade` returns `(2, m, n)` with `out[0]` the x- (column,
+eastward) component and `out[1]` the y- (row, southward) component, in
+pixels per timestep. `dmi_nowcast_core.dense_flow.dense_flow` returns
+`(vy, vx)` — row component first. `flow_variants.lucaskanade_flow` does
+that swap, and a test pins it.
+
+License
+-------
+BSD 3-Clause — same as upstream. See LICENSE-pysteps.
+Original copyright (c) 2019, PySteps developers.
+Vendoring changes are made available under the same license.

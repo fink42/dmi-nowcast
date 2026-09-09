@@ -27,12 +27,15 @@ dev = [
     "pyarrow>=17.0",
     "duckdb>=1.5.5",
 ]
-# NOTE: upstream ``pysteps`` is deliberately NOT a dependency. The STEPS
-# subset this project needs is vendored under
-# ``src/dmi_nowcast_core/_vendor/pysteps_steps/`` (BSD-3, notices kept):
+# NOTE: upstream ``pysteps`` is deliberately NOT a dependency. The two
+# subsets this project needs are vendored under
+# ``src/dmi_nowcast_core/_vendor/`` (BSD-3, notices kept):
+#   pysteps_steps/   the STEPS ensemble forecast
+#   pysteps_motion/  ``dense_lucaskanade``, the Phase H reference motion
+#                    estimator scored against Farnebaeck on Layer A
 # pysteps has no wheels for musl targets and its source build wants an
 # OpenMP-capable compiler, which made it unusable in the environments
-# this code has to run in. See that directory's NOTICE.
+# this code has to run in. See each directory's NOTICE.
 
 [build-system]
 requires = ["hatchling"]

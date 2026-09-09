@@ -25,7 +25,7 @@ LIB = DEPLOY_DIR / "lib" / "batch.sh"
 
 # The scripts that source the library and therefore must honour its rules.
 BATCH_SCRIPTS = ["calibrate.sh", "station_corpus.sh", "replay.sh",
-                 "radar_replay.sh", "gauge_agreement.sh"]
+                 "radar_replay.sh", "gauge_agreement.sh", "layer_a.sh"]
 
 FAKE_DOCKER = """#!/usr/bin/env bash
 # Stub docker: log the argv, answer ``ps`` from the environment.
@@ -86,6 +86,54 @@ def test_batch_scripts_use_the_library(script: str) -> None:
     assert "require_no_batch_running" in text
     # No script may define its own run_in_repo — that is how the cap gets lost.
     assert "\nrun_in_repo() {" not in text
+
+
+def test_layer_a_runs_its_variants_one_at_a_time() -> None:
+    """The list form is a sequential loop, never two containers at once.
+
+    Two batch containers beside the live sidecar is the memory shape
+    lib/batch.sh exists to prevent, and the hand-run 2026-09-08
+    comparison did exactly that with two `docker run`s. A 27-variant
+    screen must not industrialise it.
+    """
+    text = (DEPLOY_DIR / "layer_a.sh").read_text()
+    assert 'for variant in "${variants[@]}"; do' in text
+    # Each iteration goes through the capped helper, exactly once.
+    assert text.count("run_in_repo_capped") == 1
+    assert "run_in_repo_capped python scripts/persistence_vs_advection.py" in text
+    # Nothing is backgrounded: no command line ends in ``&``. (Line
+    # continuations are joined first so a trailing ``\`` cannot hide one.)
+    joined = text.replace("\\\n", " ")
+    assert not any(
+        line.rstrip().endswith("&") and not line.rstrip().endswith("&&")
+        for line in joined.splitlines()
+    )
+
+
+def test_layer_a_checks_variant_names_before_the_first_container() -> None:
+    """A typo four hours in has cost four hours."""
+    text = (DEPLOY_DIR / "layer_a.sh").read_text()
+    check_at = text.index("--variant-list")
+    run_at = text.index("run_in_repo_capped python")
+    assert check_at < run_at
+    assert "FATAL: unknown flow variant" in text
+
+
+def test_layer_a_output_names_carry_the_variant_and_stride() -> None:
+    """Two runs in one directory must not collide, and must be readable."""
+    text = (DEPLOY_DIR / "layer_a.sh").read_text()
+    assert '${out_dir}/${variant}_stride${stride}_${stamp}' in text
+    assert '--out-json "${base}.json"' in text
+    assert '--out-md "${base}.md"' in text
+    # The harness writes with Path.write_text, which makes no parents.
+    assert 'run_in_repo mkdir -p "$out_dir"' in text
+
+
+def test_layer_a_binds_the_days_file_read_only() -> None:
+    """Same contract as replay.sh: an operator's list, from the host."""
+    text = (DEPLOY_DIR / "layer_a.sh").read_text()
+    assert 'BATCH_RUN_ARGS=(-v "$days_file:/tmp/layer_a_days.txt:ro")' in text
+    assert "--days-file /tmp/layer_a_days.txt" in text
 
 
 # --- 2. the memory cap ------------------------------------------------

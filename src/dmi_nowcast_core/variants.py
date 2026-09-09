@@ -28,13 +28,39 @@ and the harness keeps a single ``--variant`` switch.
 A variant must be a module-level function (or otherwise picklable): the
 harness runs one process per day under ``ProcessPoolExecutor``.
 
+**Extra frames (added for H4).** Two Phase H candidates cannot be
+expressed on a two-frame signature: ``median3`` combines three pair
+estimates and ``oracle`` reads the frame after ``curr``. Rather than
+widen the signature for all thirty-odd entries — which would make every
+caller fetch frames that no entry it uses will look at — a variant
+*declares* what it needs, as attributes on the callable::
+
+    make_flow.needs_history = 2      # extra OLDER frames, beyond ``prev``
+    make_flow.needs_future = True    # the frame AFTER ``curr``
+
+and the harness then passes, **as keyword arguments and only to the
+entries that declared them**::
+
+    history_dbz=[oldest, ..., the frame before prev]   # len == needs_history
+    future_dbz=<the frame after curr>
+
+Both default to "not needed" (:func:`variant_requirements` reads them
+with ``getattr``), so every entry written before this existed keeps
+working untouched, and a caller that does not implement the extension
+can still run any variant that declares nothing. A variant that declares
+a need must raise a clear ``ValueError`` when the frames are absent
+rather than silently degrade — a Layer A run that quietly scored
+``oracle`` as ``confidence`` would be worse than one that crashed.
+
 New entries go through :func:`register_variant` at import time of the
 module that defines them, or straight into ``_VARIANTS`` here when they
-belong to the core library.
+belong to the core library. The Phase H candidates live in
+:mod:`dmi_nowcast_core.flow_variants`, imported at the bottom of this
+file so ``list_variants()`` is complete however the registry was reached.
 """
 from __future__ import annotations
 
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import numpy as np
 
@@ -43,8 +69,11 @@ from .dense_flow import complete_flow, dense_flow, estimate_motion
 __all__ = [
     "FlowVariant",
     "MAX_PX_PER_FRAME",
+    "NEEDS_FUTURE_ATTR",
+    "NEEDS_HISTORY_ATTR",
     "PRODUCTION_VARIANT",
     "SUPPORT_THRESHOLD_MM_H",
+    "VariantRequirements",
     "get_variant",
     "list_variants",
     "bulk_flow",
@@ -52,6 +81,7 @@ __all__ = [
     "persistence_flow",
     "production_flow",
     "register_variant",
+    "variant_requirements",
 ]
 
 #: Displacement clip, copied from ``compute.py::_MAX_PX_PER_FRAME``. 30 px
@@ -64,8 +94,21 @@ MAX_PX_PER_FRAME = 30.0
 SUPPORT_THRESHOLD_MM_H = 0.5
 
 
+#: Attribute a variant sets to ask for extra OLDER frames (an int, 0 = none).
+NEEDS_HISTORY_ATTR = "needs_history"
+
+#: Attribute a variant sets to ask for the frame after ``curr`` (a bool).
+NEEDS_FUTURE_ATTR = "needs_future"
+
+
 class FlowVariant(Protocol):
-    """Callable signature every registered variant satisfies."""
+    """Callable signature every registered variant satisfies.
+
+    The two extra-frame keywords are part of the protocol but optional on
+    both sides: a variant that does not declare a need never receives
+    them, so it need not accept them, and every entry written before the
+    declaration existed still type-checks against this.
+    """
 
     def __call__(
         self,
@@ -76,6 +119,48 @@ class FlowVariant(Protocol):
         pixel_km: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         ...
+
+
+class VariantRequirements(NamedTuple):
+    """What extra frames one variant asked for.
+
+    ``history`` counts frames OLDER than ``prev``; ``future`` is the one
+    frame after ``curr``. A caller reads this once per run and fetches
+    accordingly — the point of a declaration rather than a try/except is
+    that the harness can decide a case is unscoreable *before* parsing
+    anything, and count the skip.
+    """
+
+    history: int
+    future: bool
+
+
+def variant_requirements(make_flow: FlowVariant) -> VariantRequirements:
+    """Read a variant's extra-frame declaration, with the defaults applied.
+
+    Deliberately forgiving on the way in and strict on the way out: any
+    entry lacking the attributes (which is most of them) reads as
+    ``(0, False)``, but a declared ``needs_history`` that is negative or
+    not an integer is a bug in the entry, not a shrug, so it raises here
+    where the name is still in hand rather than as an IndexError inside
+    a worker three hours into a run.
+    """
+    raw_history = getattr(make_flow, NEEDS_HISTORY_ATTR, 0)
+    try:
+        history = int(raw_history)
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"{make_flow!r}.{NEEDS_HISTORY_ATTR} must be an int, got "
+            f"{raw_history!r}"
+        ) from None
+    if history < 0:
+        raise ValueError(
+            f"{make_flow!r}.{NEEDS_HISTORY_ATTR} must be >= 0, got {history}"
+        )
+    return VariantRequirements(
+        history=history,
+        future=bool(getattr(make_flow, NEEDS_FUTURE_ATTR, False)),
+    )
 
 
 def bulk_flow(
@@ -202,3 +287,11 @@ def get_variant(name: str) -> FlowVariant:
 def list_variants() -> tuple[str, ...]:
     """Registered variant names, sorted, for CLI help and reports."""
     return tuple(sorted(_VARIANTS))
+
+
+# The Phase H candidates register themselves on import. This sits at the
+# bottom because ``flow_variants`` imports ``register_variant`` and the
+# two shared constants from here, so the names have to exist first; the
+# circular pair resolves either way round because neither module touches
+# the other at import time beyond that.
+from . import flow_variants as _flow_variants  # noqa: E402,F401

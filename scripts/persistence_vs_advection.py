@@ -76,6 +76,21 @@ harness, so it gained four switches:
   summed counts, never averaged per case.
 * every pair also reports the H-F flow-stall diagnostic on the completed
   flow.
+* ``--variant-list`` prints the registry and exits, so a wrapper script
+  can check a name before starting a four-hour container.
+
+**Variants that need more than two frames** (H4). ``median3`` wants two
+frames older than ``prev``, ``oracle`` the frame after ``curr``. A
+variant declares that on itself (``needs_history`` / ``needs_future``,
+see ``dmi_nowcast_core.variants``) and this script reads the declaration
+once per run: it widens the frame window each candidate ``t`` must have,
+fetches the extra frames through the same ``CompositeCache``, and passes
+them as ``history_dbz=`` / ``future_dbz=`` **only** to the entries that
+asked. Every other entry is called exactly as before. A candidate whose
+extra frames are missing or off-cadence is skipped and counted, per
+reason, in the JSON ``meta`` and the markdown header — a variant that
+silently scored 1,700 of the baseline's 1,925 cases would not be a
+paired comparison, so the count has to be visible next to the result.
 
 The JSON grows a ``days`` block: per day, per stratum, per horizon and
 threshold, the summed contingency table and FSS components. That is what
@@ -136,7 +151,9 @@ from dmi_nowcast_core.geo import CompositeGeo  # noqa: E402
 from dmi_nowcast_core.national import observed_rain_grid  # noqa: E402
 from dmi_nowcast_core.parse import RadarComposite, parse_composite  # noqa: E402
 from dmi_nowcast_core.transform import dbz_to_rain_rate  # noqa: E402
-from dmi_nowcast_core.variants import get_variant, list_variants  # noqa: E402
+from dmi_nowcast_core.variants import (  # noqa: E402
+    get_variant, list_variants, variant_requirements,
+)
 
 # --- production constants, copied so the study does not import the sidecar ---
 RAIN_THRESHOLD_MM_H = 0.5        # config.py ForecastConfig.rain_threshold_mm_h
@@ -201,6 +218,11 @@ class CaseSpec:
     #: Filled in by __post_init__ from the horizons; passing it directly
     #: is for tests that want an offset the snapper would not choose.
     offsets_min: tuple[int, ...] = ()
+    #: Another registry name whose frame needs are ADDED to this run's, so a
+    #: baseline can be scored on exactly the case list a history- or
+    #: future-hungry candidate will get (``--align-with median3``): the
+    #: paired day-block bootstrap assumes both runs saw the same cases.
+    align_with: str | None = None
 
     def __post_init__(self) -> None:
         if not self.horizons_min:
@@ -216,9 +238,38 @@ class CaseSpec:
             )
 
     @property
+    def requirements(self) -> Any:
+        """The variant's extra-frame declaration (history count, future flag).
+
+        Read through the registry rather than stored on the spec, so a
+        ``CaseSpec`` stays a plain pickled tuple of configuration and the
+        worker process resolves the callable itself — the same reason
+        ``variant`` is a name and not a function.
+        """
+        own = variant_requirements(get_variant(self.variant))
+        if not self.align_with:
+            return own
+        other = variant_requirements(get_variant(self.align_with))
+        return type(own)(
+            history=max(own.history, other.history),
+            future=bool(own.future or other.future),
+        )
+
+    @property
+    def frames_before(self) -> int:
+        """Frames before ``t`` a case needs: ``prev``, plus any history."""
+        return 1 + self.requirements.history
+
+    @property
     def frames_ahead(self) -> int:
-        """Frames after ``t`` a case needs, from the furthest truth offset."""
-        return max(self.offsets_min) // FRAME_INTERVAL_MIN
+        """Frames after ``t`` a case needs, from the furthest truth offset.
+
+        Floored at one when the variant reads the next frame: ``oracle``
+        parses ``t+10``, so ``t+10`` has to be inside the window whose
+        presence and cadence were checked, even if no horizon reaches it.
+        """
+        reach = max(self.offsets_min) // FRAME_INTERVAL_MIN
+        return max(reach, 1) if self.requirements.future else reach
 
     @property
     def fss_scales_px(self) -> tuple[int, ...]:
@@ -265,10 +316,37 @@ def full_range_frames(archive_dir: Path, day: datetime) -> list[datetime]:
     return out
 
 
+#: FIFO depth of :class:`CompositeCache` for a two-frame variant. Six is
+#: what the pre-H4 harness used and is kept as the floor so a
+#: ``--variant production`` run parses exactly the frames it always did.
+BASE_CACHE_FRAMES = 6
+
+
+def cache_maxsize(spec: "CaseSpec") -> int:
+    """Cache depth for one run: the historical six plus the extra frames.
+
+    A case's window is ``prev`` … the furthest truth offset, which the
+    default horizons already stretch to seven frames — the FIFO is
+    deliberately a little short of that, because with ``--stride 1`` the
+    next case reuses the newest end of the window and the oldest frame is
+    the one that will never be wanted again.
+
+    A variant that declares extra frames widens the window at BOTH ends,
+    so the cache gets one slot per declared frame and no more. Each slot
+    is one parsed composite — 13.7 MB of float32 on the native
+    1728x1984 grid — so ``median3``'s two history slots cost 27 MB per
+    worker, and the future slot usually costs nothing at all because
+    ``t+10`` is already the +10 truth frame. Frames are still parsed one
+    at a time on demand; nothing here loads a window up front.
+    """
+    req = spec.requirements
+    return BASE_CACHE_FRAMES + req.history + (1 if req.future else 0)
+
+
 class CompositeCache:
     """Tiny FIFO cache so a day's frames are parsed once, not four times."""
 
-    def __init__(self, archive_dir: Path, maxsize: int = 6) -> None:
+    def __init__(self, archive_dir: Path, maxsize: int = BASE_CACHE_FRAMES) -> None:
         self.archive_dir = archive_dir
         self.maxsize = maxsize
         self._store: dict[datetime, RadarComposite] = {}
@@ -299,6 +377,8 @@ def rain_of(comp: RadarComposite) -> np.ndarray:
 def variant_flow(
     prev: RadarComposite, now: RadarComposite, rain_now: np.ndarray,
     variant: str = "production",
+    history: Sequence[RadarComposite] = (),
+    future: RadarComposite | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``(vy, vx)`` in px per inter-frame step, from the variant registry.
 
@@ -306,10 +386,35 @@ def variant_flow(
     candidate can be scored on identical cases without touching this
     script; ``production`` there is ``compute.py::_compute_sync`` step for
     step, which is what this function used to inline.
+
+    ``history`` (oldest first, ending with the frame before ``prev``) and
+    ``future`` (the frame after ``now``) are forwarded **only** to a
+    variant that declared it wants them. Passing them unconditionally
+    would break every entry whose signature is the original four
+    arguments, which is all but two of them; passing them to a variant
+    that did not ask would also hide the case where a caller fetched the
+    wrong frames, because nothing would read them.
     """
-    return get_variant(variant)(
+    make_flow = get_variant(variant)
+    req = variant_requirements(make_flow)
+    extra: dict[str, Any] = {}
+    if req.history:
+        if len(history) < req.history:
+            raise ValueError(
+                f"variant {variant!r} needs {req.history} history frames, "
+                f"got {len(history)}"
+            )
+        extra["history_dbz"] = [
+            c.reflectivity_dbz for c in history[-req.history:]
+        ]
+    if req.future:
+        if future is None:
+            raise ValueError(f"variant {variant!r} needs the frame after now")
+        extra["future_dbz"] = future.reflectivity_dbz
+    return make_flow(
         prev.reflectivity_dbz, now.reflectivity_dbz, rain_now,
         pixel_km=float(now.xscale_m) / 1000.0,
+        **extra,
     )
 
 
@@ -419,8 +524,25 @@ def horizon_metrics(
     }
 
 
+#: The skip reasons ``run_day`` tallies, in report order. ``window`` is
+#: the pre-H4 silent ``continue`` (the t-10..t+max run of frames is not on
+#: disk at cadence), now counted; the other two are the frames a variant
+#: declared it needs and did not get.
+SKIP_REASONS = ("window", "history", "future")
+
+
+def empty_skips() -> dict[str, int]:
+    return {reason: 0 for reason in SKIP_REASONS}
+
+
+def _count_skip(skips: dict[str, int] | None, reason: str) -> None:
+    if skips is not None:
+        skips[reason] = skips.get(reason, 0) + 1
+
+
 def run_case(
     cache: CompositeCache, t: datetime, spec: CaseSpec | None = None,
+    skips: dict[str, int] | None = None,
 ) -> dict[str, Any] | None:
     """Counts for one case, or ``None`` when the case is skipped.
 
@@ -428,14 +550,53 @@ def run_case(
     ``spec`` with exactly the fullRange spacing, plus at least
     ``MIN_WET_FRACTION`` of the product grid wet at t. With the default
     ``spec`` (horizons 10, 20) that is the pre-Phase-H rule verbatim.
+
+    A variant that declared ``needs_history`` / ``needs_future`` extends
+    that requirement backwards and forwards, and those frames are held to
+    the same cadence rule: a file whose *content* timestamp is off the
+    10-minute grid is a skip, not a case scored against the wrong lead.
+    ``skips``, when given, is incremented in place with the reason — the
+    caller reports the tally, because a run's case count only means
+    something next to the number of candidates it declined.
     """
     spec = spec or CaseSpec(horizons_min=(10, 20))
+    req = spec.requirements
     step = timedelta(minutes=FRAME_INTERVAL_MIN)
     prev = cache.get(t - step)
     now = cache.get(t)
     dt_min = (now.timestamp_utc - prev.timestamp_utc).total_seconds() / 60.0
     if not (FRAME_INTERVAL_MIN - 1 <= dt_min <= FRAME_INTERVAL_MIN + 1):
+        _count_skip(skips, "window")
         return None
+
+    # The extra frames, before anything expensive: parsing four composites
+    # to discover the oldest is off-cadence wastes the case's whole cost.
+    # Oldest first, so ``history[-1]`` is always the frame before ``prev``.
+    history: list[RadarComposite] = []
+    for back in range(req.history, 0, -1):
+        offset = FRAME_INTERVAL_MIN * (back + 1)
+        try:
+            comp = cache.get(t - timedelta(minutes=offset))
+        except (OSError, KeyError):
+            _count_skip(skips, "history")
+            return None
+        gap = (now.timestamp_utc - comp.timestamp_utc).total_seconds() / 60.0
+        if abs(gap - offset) > 1.0:
+            _count_skip(skips, "history")
+            return None
+        history.append(comp)
+
+    future: RadarComposite | None = None
+    if req.future:
+        try:
+            future = cache.get(t + step)
+        except (OSError, KeyError):
+            _count_skip(skips, "future")
+            return None
+        gap = (future.timestamp_utc - now.timestamp_utc).total_seconds() / 60.0
+        if abs(gap - FRAME_INTERVAL_MIN) > 1.0:
+            _count_skip(skips, "future")
+            return None
 
     rain_now = rain_of(now)
     obs_grid = reduce_grid(rain_now)
@@ -454,7 +615,7 @@ def run_case(
             return None
         truths[h] = reduce_grid(rain_of(tc))
 
-    vy, vx = variant_flow(prev, now, rain_now, spec.variant)
+    vy, vx = variant_flow(prev, now, rain_now, spec.variant, history, future)
     speed = bulk_speed_kmh(
         vy, vx, rain_now, pixel_m=float(now.xscale_m), dt_min=dt_min,
     )
@@ -497,52 +658,75 @@ def run_case(
     return out
 
 
+def contiguous(frames: Sequence[datetime]) -> bool:
+    """True when every neighbouring pair is one fullRange interval apart."""
+    return all(
+        abs((b - a).total_seconds() / 60.0 - FRAME_INTERVAL_MIN) <= 0.5
+        for a, b in zip(frames, frames[1:])
+    )
+
+
 def run_day(
     archive_dir_s: str, day_s: str, stride: int, spec: CaseSpec | None = None,
-) -> tuple[str, list[dict[str, Any]], dict[str, Any], str | None]:
+) -> tuple[str, list[dict[str, Any]], dict[str, Any], str | None, dict[str, int]]:
     """Worker entry point: every case of one day, plus its day blocks.
 
     A candidate ``t`` needs an unbroken 10-minute run of frames from
     ``t-10`` to the furthest truth offset — the pre-Phase-H rule, only
     extended as far as the horizons reach, so ``--horizons 10,20`` selects
-    exactly the cases the archived baseline selected.
+    exactly the cases the archived baseline selected. A variant that
+    declared ``needs_history`` extends the run backwards; the candidate
+    list itself is NOT re-phased (the loop still starts at ``i = 1`` and
+    strides identically), so a history-hungry variant scores the same
+    ``t`` values as every other one minus the few at the day's leading
+    edge, which are counted as skips rather than quietly renumbering the
+    stride and scoring a different case list.
 
-    Returns ``(day, cases, day_blocks, error)``. ``day_blocks`` is the
-    per-stratum sum over the day's cases — the unit the day-block
+    Returns ``(day, cases, day_blocks, error, skips)``. ``day_blocks`` is
+    the per-stratum sum over the day's cases — the unit the day-block
     bootstrap resamples, and the only place the threshold and FSS detail
     is kept. The per-case dicts are stripped of that detail before they
     travel back: with four horizons, three thresholds and five FSS scales
     it is ~100 numbers per case per horizon, which turns a 3,800-case run
-    into tens of megabytes of JSON nobody reads.
+    into tens of megabytes of JSON nobody reads. ``skips`` counts the
+    candidates declined for want of frames, by reason.
     """
     spec = spec or CaseSpec()
     archive_dir = Path(archive_dir_s)
     day = datetime.strptime(day_s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    skips = empty_skips()
     try:
         frames = full_range_frames(archive_dir, day)
-        cache = CompositeCache(archive_dir)
+        cache = CompositeCache(archive_dir, maxsize=cache_maxsize(spec))
         cases: list[dict[str, Any]] = []
         day_blocks: dict[str, Any] = {}
         ahead = spec.frames_ahead
+        back = spec.frames_before
         for i in range(1, len(frames) - ahead, stride):
             t = frames[i]
-            need = frames[i - 1: i + ahead + 1]
-            spacing = [
-                (b - a).total_seconds() / 60.0 for a, b in zip(need, need[1:])
-            ]
-            if any(abs(s - FRAME_INTERVAL_MIN) > 0.5 for s in spacing):
+            if not contiguous(frames[i - 1: i + ahead + 1]):
+                skips["window"] += 1
+                continue
+            # The extra history is checked separately so its absence is
+            # attributed to the variant and not to a hole in the archive:
+            # a day's first frames have no t-30 by construction, and that
+            # is a property of median3, not of the data.
+            if back > 1 and (
+                i - back < 0 or not contiguous(frames[i - back: i])
+            ):
+                skips["history"] += 1
                 continue
             try:
-                res = run_case(cache, t, spec)
+                res = run_case(cache, t, spec, skips)
             except Exception as exc:  # one bad frame must not kill the day
                 cases.append({"t": t.strftime("%Y%m%d%H%M"), "error": repr(exc)})
                 continue
             if res is not None:
                 accumulate_day_blocks(day_blocks, res)
                 cases.append(strip_detail(res))
-        return day_s, cases, day_blocks, None
+        return day_s, cases, day_blocks, None, skips
     except Exception as exc:
-        return day_s, [], {}, repr(exc)
+        return day_s, [], {}, repr(exc), skips
 
 
 # --------------------------------------------------------------------------
@@ -916,10 +1100,26 @@ def case_study(
     leads: Sequence[float], window: Sequence[int],
     variant: str = "production",
 ) -> dict[str, Any]:
-    """Point read-out around one frame: observations, advection, truth."""
+    """Point read-out around one frame: observations, advection, truth.
+
+    Uses the same ``variant_flow`` as the batch path, extra frames
+    included, so a case study of a candidate reads the field that
+    candidate would actually have produced. A missing extra frame is an
+    error here rather than a skip: a case study names one frame on
+    purpose, and silently studying it under a different flow would be
+    the wrong kind of helpful.
+    """
     step = timedelta(minutes=FRAME_INTERVAL_MIN)
     now = parse_composite(frame_path(archive_dir, ts))
     prev = parse_composite(frame_path(archive_dir, ts - step))
+    req = variant_requirements(get_variant(variant))
+    history = [
+        parse_composite(frame_path(archive_dir, ts - timedelta(
+            minutes=FRAME_INTERVAL_MIN * (back + 1))))
+        for back in range(req.history, 0, -1)
+    ]
+    future = parse_composite(frame_path(archive_dir, ts + step)) \
+        if req.future else None
     geo = CompositeGeo(now)
     row, col = point_pixel(geo, lat, lon)
 
@@ -934,7 +1134,7 @@ def case_study(
 
     rain_now = rain_of(now)
     dt_min = (now.timestamp_utc - prev.timestamp_utc).total_seconds() / 60.0
-    vy, vx = variant_flow(prev, now, rain_now, variant)
+    vy, vx = variant_flow(prev, now, rain_now, variant, history, future)
     order = sorted(float(x) for x in leads)
     adv = {
         f"+{h:g}": (
@@ -1167,6 +1367,22 @@ def _split(arg: str | None) -> list[str]:
     return [x.strip() for x in arg.split(",") if x.strip()] if arg else []
 
 
+class _PrintVariants(argparse.Action):
+    """``--variant-list``: print the registry, one name per line, and exit.
+
+    An ``argparse.Action`` rather than a flag checked after parsing so it
+    works WITHOUT ``--archive-dir``, which is otherwise required: the
+    caller asking what the names are is a wrapper script deciding whether
+    to start a container, and it has no archive path to offer. Actions
+    run while arguments are consumed, and ``parser.exit()`` returns before
+    argparse gets to its required-argument check.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):  # noqa: D102
+        print("\n".join(list_variants()))
+        parser.exit()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--archive-dir", required=True, type=Path,
@@ -1187,10 +1403,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="advection horizons in minutes for --case")
     p.add_argument("--case-window", default="-20,-10,0,10,20,30",
                    help="observed offsets in minutes for --case")
+    p.add_argument("--align-with", default=None, metavar="NAME",
+                   help="also require the frames this other registry variant "
+                        "needs, so the case list matches a later run of it "
+                        "(e.g. a baseline aligned with median3 or oracle)")
     p.add_argument("--variant", default="production",
-                   choices=list(list_variants()),
+                   choices=list(list_variants()), metavar="NAME",
                    help="flow variant from dmi_nowcast_core.variants "
-                        "(default production = the live pipeline)")
+                        "(default production = the live pipeline); "
+                        "--variant-list prints them all")
+    p.add_argument("--variant-list", nargs=0, action=_PrintVariants,
+                   help="print the registered flow variants and exit")
     p.add_argument("--horizons",
                    default=",".join(str(h) for h in DEFAULT_HORIZONS_MIN),
                    help="comma-separated forecast horizons in minutes "
@@ -1258,6 +1481,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # collapse onto one JSON key.
     spec = CaseSpec(
         variant=args.variant,
+        align_with=args.align_with,
         horizons_min=tuple(sorted({int(x) for x in _split(args.horizons)})),
         thresholds_mm_h=tuple(sorted({float(x) for x in _split(args.thresholds)})),
         fss_scales_km=tuple(sorted({int(x) for x in _split(args.fss_scales_km)})),
@@ -1266,13 +1490,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     cases: list[dict[str, Any]] = []
     errors: list[str] = []
     day_blocks: dict[str, Any] = {}
+    skips = empty_skips()
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = [
             pool.submit(run_day, str(args.archive_dir), d, args.stride, spec)
             for d in days
         ]
         for i, fut in enumerate(as_completed(futures), 1):
-            day_s, day_cases, blocks, err = fut.result()
+            day_s, day_cases, blocks, err, day_skips = fut.result()
             if err:
                 errors.append(f"{day_s}: {err}")
             cases += [c for c in day_cases if "error" not in c]
@@ -1281,25 +1506,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             errors += [
                 f"{day_s} {c['t']}: {c['error']}" for c in day_cases if "error" in c
             ]
+            for reason, n in day_skips.items():
+                skips[reason] = skips.get(reason, 0) + n
             print(f"[{i}/{len(days)}] {day_s}: {len(day_cases)} cases",
                   file=sys.stderr, flush=True)
 
     agg = aggregate(cases)
     blocks_agg = aggregate_blocks(day_blocks)
     stall_agg = aggregate_stall(cases)
+    req = spec.requirements
     meta = {
         "days": len(days),
         "cases (frames)": len([c for c in cases if "horizons" in c]),
         "stride": args.stride,
         "errors": len(errors),
         "variant": spec.variant,
+        "align_with": spec.align_with,
+        # Two numbers, not one: the total is what makes a case count
+        # comparable between variants, and the breakdown says whether the
+        # gap is the archive's holes (``window``, the same for every
+        # variant on the same days) or the price of THIS variant's extra
+        # frames (``history`` / ``future``).
+        "skipped cases": sum(skips.values()),
+        "skipped by reason": ", ".join(
+            f"{reason}={skips.get(reason, 0)}" for reason in SKIP_REASONS
+        ),
+        "extra frames needed": (
+            f"history={req.history}, future={'yes' if req.future else 'no'}"
+        ),
         "horizons (min)": ",".join(str(h) for h in spec.horizons_min),
         "truth offsets (min)": ",".join(str(o) for o in spec.offsets_min),
         "thresholds (mm/h)": ",".join(f"{t:g}" for t in spec.thresholds_mm_h),
         "FSS scales (km)": ",".join(str(s) for s in spec.fss_scales_km),
     }
     payload = {
-        "meta": {**meta, "day_list": days, "error_list": errors[:50]},
+        "meta": {
+            **meta, "day_list": days, "error_list": errors[:50],
+            "skips": skips,
+        },
         "aggregate": agg,
         "blocks": blocks_agg,
         "stall": stall_agg,

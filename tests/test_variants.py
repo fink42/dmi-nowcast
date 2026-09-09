@@ -17,7 +17,10 @@ from dmi_nowcast_core import variants
 from dmi_nowcast_core.dense_flow import complete_flow, dense_flow
 from dmi_nowcast_core.variants import (
     MAX_PX_PER_FRAME,
+    NEEDS_FUTURE_ATTR,
+    NEEDS_HISTORY_ATTR,
     SUPPORT_THRESHOLD_MM_H,
+    VariantRequirements,
     get_variant,
     list_variants,
     persistence_flow,
@@ -26,6 +29,7 @@ from dmi_nowcast_core.variants import (
     confidence_flow,
     production_flow,
     register_variant,
+    variant_requirements,
 )
 
 PIXEL_KM = 0.5
@@ -154,13 +158,43 @@ def test_persistence_variant_is_exactly_zero():
     assert vx[0, 0] == 0.0
 
 
+#: The four entries that describe the SERVICE. Everything else in the
+#: registry is a Phase H candidate registered by ``flow_variants``.
+SERVICE_VARIANTS = ("bulk", "confidence", "persistence", "production")
+
+
 def test_registry_lookup_and_listing():
-    assert list_variants() == ("bulk", "confidence", "persistence", "production")
+    """Sorted, complete, and the service entries are still all there.
+
+    An equality against the whole list would now be a list of 31 names
+    that has to be edited every time a candidate is added — which is the
+    kind of test that gets updated without being read. The invariants
+    worth holding are that the service four are present and resolve to
+    the right callables, and that the listing is sorted and unique.
+    """
+    names = list_variants()
+    assert set(names) >= set(SERVICE_VARIANTS)
+    assert list(names) == sorted(names)
+    assert len(set(names)) == len(names)
     assert get_variant("production") is production_flow
     assert get_variant("persistence") is persistence_flow
     with pytest.raises(KeyError) as excinfo:
         get_variant("nope")
     assert "production" in str(excinfo.value)
+
+
+def test_the_phase_h_candidates_are_registered_by_importing_variants():
+    """``import variants`` alone must be enough to see the whole registry.
+
+    ``flow_variants`` registers on import and ``variants`` imports it at
+    the bottom, so a caller that only ever touches ``variants`` — which
+    is every caller — gets the complete list. If that import were ever
+    dropped, ``--variant lucaskanade`` would fail with "unknown flow
+    variant" on the VM and nowhere else.
+    """
+    names = list_variants()
+    assert {"lucaskanade", "median3", "oracle"} <= set(names)
+    assert sum(n.startswith("farneback_w") for n in names) == 24
 
 
 def test_register_variant_refuses_to_shadow():
@@ -208,3 +242,71 @@ def test_confidence_variant_routes_through_estimate_motion():
     np.testing.assert_array_equal(vy, ref.vy)
     np.testing.assert_array_equal(vx, ref.vx)
     assert np.isfinite(vy).all() and np.abs(vy).max() <= 30.0
+
+
+# ---------------------------------------------------------------------------
+# the extra-frame declaration (H4)
+# ---------------------------------------------------------------------------
+def test_a_variant_that_declares_nothing_needs_nothing():
+    """The default, and the reason every pre-H4 entry still works.
+
+    ``variant_requirements`` reads two attributes that almost no entry
+    sets. If the default were anything but "needs nothing", the harness
+    would start fetching frames for ``production`` and skipping cases at
+    the edges of every day — silently changing the baseline the whole
+    phase is measured against.
+    """
+    assert variant_requirements(production_flow) == VariantRequirements(0, False)
+    assert variant_requirements(persistence_flow) == VariantRequirements(0, False)
+    for name in SERVICE_VARIANTS:
+        assert variant_requirements(get_variant(name)) == (0, False)
+
+
+def test_requirements_read_the_declared_attributes():
+    def needy(prev_dbz, curr_dbz, rain_now_mm_h, *, pixel_km, **kwargs):
+        return persistence_flow(prev_dbz, curr_dbz, rain_now_mm_h, pixel_km=pixel_km)
+
+    setattr(needy, NEEDS_HISTORY_ATTR, 3)
+    setattr(needy, NEEDS_FUTURE_ATTR, True)
+    req = variant_requirements(needy)
+    assert req == VariantRequirements(history=3, future=True)
+    # A NamedTuple, so both spellings work for a caller.
+    assert req.history == 3 and req[0] == 3
+
+
+def test_requirements_reject_a_nonsense_declaration():
+    """A bad declaration is a bug in the entry, caught before the run.
+
+    Not a shrug-and-default: the harness sizes its frame window from
+    this number, so a negative or non-integer one would either skip
+    every case or index a list backwards, three hours into a worker.
+    """
+    def entry(prev_dbz, curr_dbz, rain_now_mm_h, *, pixel_km):
+        return persistence_flow(prev_dbz, curr_dbz, rain_now_mm_h, pixel_km=pixel_km)
+
+    setattr(entry, NEEDS_HISTORY_ATTR, -1)
+    with pytest.raises(ValueError, match="must be >= 0"):
+        variant_requirements(entry)
+
+    setattr(entry, NEEDS_HISTORY_ATTR, "two")
+    with pytest.raises(TypeError, match="must be an int"):
+        variant_requirements(entry)
+
+
+def test_the_two_h4_entries_that_need_frames_declare_it():
+    assert variant_requirements(get_variant("median3")) == (2, False)
+    assert variant_requirements(get_variant("oracle")) == (0, True)
+
+
+def test_every_registered_variant_declares_something_readable():
+    """No entry may carry a declaration the harness cannot act on.
+
+    Cheap, and it is the one place a new candidate with a typo'd
+    attribute (``needs_histroy = 2``) would be noticed — such an entry
+    would read as "needs nothing", be handed no frames, and raise inside
+    a worker on the first case.
+    """
+    for name in list_variants():
+        req = variant_requirements(get_variant(name))
+        assert isinstance(req.history, int) and req.history >= 0
+        assert isinstance(req.future, bool)

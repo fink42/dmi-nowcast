@@ -536,3 +536,318 @@ def test_run_case_skips_when_a_truth_frame_is_off_cadence():
             return comp
 
     assert pva.run_case(_SkewedCache(), T0, pva.CaseSpec(horizons_min=(10,))) is None
+
+
+# ---------------------------------------------------------------------------
+# H4: variants that need more than two frames
+# ---------------------------------------------------------------------------
+from dmi_nowcast_core import variants as variants_mod  # noqa: E402
+
+
+class _RecordingVariant:
+    """A variant that records the keywords it was called with.
+
+    Declares its needs through the same attributes a real entry uses, so
+    what is under test is the harness's reading of the declaration and
+    not a special case for the two shipped candidates.
+    """
+
+    def __init__(self, needs_history: int = 0, needs_future: bool = False):
+        self.needs_history = needs_history
+        self.needs_future = needs_future
+        self.calls: list[dict] = []
+
+    def __call__(self, prev_dbz, curr_dbz, rain_now_mm_h, *, pixel_km, **kwargs):
+        self.calls.append({"pixel_km": pixel_km, **kwargs})
+        zeros = np.zeros(np.asarray(curr_dbz).shape, dtype=np.float32)
+        return zeros, zeros.copy()
+
+
+@pytest.fixture
+def registered():
+    """Register throwaway variants and always remove them again.
+
+    The registry is process-global and ``register_variant`` refuses to
+    shadow, so a test that leaked a name would break the next run of the
+    suite rather than itself — the worst kind of flake.
+    """
+    added: list[str] = []
+
+    def _add(name: str, variant) -> str:
+        variants_mod.register_variant(name, variant)
+        added.append(name)
+        return name
+
+    yield _add
+    for name in added:
+        variants_mod._VARIANTS.pop(name, None)
+
+
+def test_a_plain_variant_is_called_without_the_extra_keywords(registered):
+    """The contract that keeps every pre-H4 entry working.
+
+    ``bulk``'s signature has no ``history_dbz``; passing one would be a
+    TypeError on every case. So the harness must pass nothing at all,
+    not ``history_dbz=[]``.
+    """
+    spy = _RecordingVariant()
+    name = registered("h4-plain", spy)
+    spec = pva.CaseSpec(variant=name, horizons_min=(10,), thresholds_mm_h=(0.5,),
+                        fss_scales_km=(2,))
+
+    assert pva.run_case(_FakeCache(), T0, spec) is not None
+    assert spy.calls == [{"pixel_km": 0.5}]
+
+
+def test_a_history_variant_gets_the_older_frames_oldest_first(registered):
+    """``history_dbz=[t-30, t-20]`` for ``needs_history=2``.
+
+    The order is load-bearing: ``median3`` pairs them as (h0, h1),
+    (h1, prev), so a reversed list would build the median out of three
+    backwards estimates and produce a field pointing upwind — which no
+    aggregate score would identify as an ordering bug.
+    """
+    spy = _RecordingVariant(needs_history=2)
+    name = registered("h4-history", spy)
+    spec = pva.CaseSpec(variant=name, horizons_min=(10,), thresholds_mm_h=(0.5,),
+                        fss_scales_km=(2,))
+    cache = _FakeCache()
+
+    assert pva.run_case(cache, T0, spec) is not None
+    (call,) = spy.calls
+    assert set(call) == {"pixel_km", "history_dbz"}
+    history = call["history_dbz"]
+    assert len(history) == 2
+    # The band translates east at 8 px/frame, so an older frame's echo
+    # sits further west. Compare the centre of mass, oldest first.
+    centres = [
+        float((np.arange(SIZE) * np.maximum(f + 32.0, 0.0).sum(axis=0)).sum()
+              / np.maximum(f + 32.0, 0.0).sum())
+        for f in history
+    ]
+    assert centres[0] < centres[1]
+    prev_frame = cache.get(T0 - timedelta(minutes=10)).reflectivity_dbz
+    prev_centre = float(
+        (np.arange(SIZE) * np.maximum(prev_frame + 32.0, 0.0).sum(axis=0)).sum()
+        / np.maximum(prev_frame + 32.0, 0.0).sum()
+    )
+    assert centres[1] < prev_centre
+
+
+def test_a_future_variant_gets_the_next_frame(registered):
+    spy = _RecordingVariant(needs_future=True)
+    name = registered("h4-future", spy)
+    spec = pva.CaseSpec(variant=name, horizons_min=(10,), thresholds_mm_h=(0.5,),
+                        fss_scales_km=(2,))
+    cache = _FakeCache()
+
+    assert pva.run_case(cache, T0, spec) is not None
+    (call,) = spy.calls
+    assert set(call) == {"pixel_km", "future_dbz"}
+    np.testing.assert_array_equal(
+        call["future_dbz"],
+        cache.get(T0 + timedelta(minutes=10)).reflectivity_dbz,
+    )
+
+
+def test_case_spec_widens_the_window_for_a_declaring_variant(registered):
+    plain = registered("h4-reach-plain", _RecordingVariant())
+    hist = registered("h4-reach-hist", _RecordingVariant(needs_history=2))
+    fut = registered("h4-reach-fut", _RecordingVariant(needs_future=True))
+
+    assert pva.CaseSpec(variant=plain).frames_before == 1
+    assert pva.CaseSpec(variant=hist).frames_before == 3
+    # The future frame is t+10, which every default horizon already
+    # reaches — but a spec whose furthest offset is shorter must still
+    # cover it, or run_case would parse a frame nobody checked.
+    short = pva.CaseSpec(variant=fut, horizons_min=(10,), offsets_min=(5,))
+    assert short.frames_ahead == 1
+    assert pva.CaseSpec(
+        variant=plain, horizons_min=(10,), offsets_min=(5,)).frames_ahead == 0
+
+
+def test_cache_grows_by_one_slot_per_declared_frame(registered):
+    """One extra parsed composite per declared frame, and no more."""
+    plain = registered("h4-cache-plain", _RecordingVariant())
+    both = registered("h4-cache-both", _RecordingVariant(2, True))
+
+    assert pva.cache_maxsize(pva.CaseSpec(variant=plain)) == pva.BASE_CACHE_FRAMES
+    assert pva.cache_maxsize(pva.CaseSpec(variant=both)) == \
+        pva.BASE_CACHE_FRAMES + 3
+
+
+def test_run_case_counts_a_history_frame_that_is_off_cadence(registered):
+    """A file that exists but whose timestamp is wrong is a skip, not a case."""
+    spy = _RecordingVariant(needs_history=2)
+    name = registered("h4-skew", spy)
+    spec = pva.CaseSpec(variant=name, horizons_min=(10,), thresholds_mm_h=(0.5,),
+                        fss_scales_km=(2,))
+
+    class _SkewedHistory(_FakeCache):
+        def get(self, ts: datetime):
+            comp = super().get(ts)
+            if ts < T0 - timedelta(minutes=10):
+                return _composite(ts + timedelta(minutes=3), 20.0)
+            return comp
+
+    skips = pva.empty_skips()
+    assert pva.run_case(_SkewedHistory(), T0, spec, skips) is None
+    assert skips["history"] == 1
+    assert skips["window"] == 0 and skips["future"] == 0
+    assert spy.calls == []
+
+
+def test_run_case_counts_a_missing_history_frame(registered):
+    """An absent file is a skip too, and it is counted the same way."""
+    spy = _RecordingVariant(needs_history=2)
+    name = registered("h4-missing", spy)
+    spec = pva.CaseSpec(variant=name, horizons_min=(10,), thresholds_mm_h=(0.5,),
+                        fss_scales_km=(2,))
+
+    class _HoleyCache(_FakeCache):
+        def get(self, ts: datetime):
+            if ts <= T0 - timedelta(minutes=20):
+                raise OSError("no such frame")
+            return super().get(ts)
+
+    skips = pva.empty_skips()
+    assert pva.run_case(_HoleyCache(), T0, spec, skips) is None
+    assert skips["history"] == 1
+
+
+def test_run_case_counts_the_prev_frame_gap_as_a_window_skip():
+    """The pre-H4 silent ``continue`` is now a counted ``window`` skip."""
+    class _BadPrev:
+        def get(self, ts: datetime):
+            # prev lands 4 minutes before t instead of 10.
+            if ts < T0:
+                return _composite(T0 - timedelta(minutes=4), 20.0)
+            return _composite(ts, 20.0)
+
+    skips = pva.empty_skips()
+    assert pva.run_case(_BadPrev(), T0, pva.CaseSpec(horizons_min=(10,)),
+                        skips) is None
+    assert skips["window"] == 1
+
+
+def test_run_case_without_a_skip_dict_still_just_returns_none():
+    """The counter is optional; the old two-argument call still works."""
+    assert pva.run_case(_FakeCache(), T0, pva.CaseSpec(horizons_min=(10,))) \
+        is not None
+
+
+def test_contiguous_accepts_the_cadence_and_rejects_a_hole():
+    step = timedelta(minutes=pva.FRAME_INTERVAL_MIN)
+    run = [T0 + i * step for i in range(4)]
+    assert pva.contiguous(run)
+    assert pva.contiguous([])
+    holed = run[:2] + [t + timedelta(minutes=10) for t in run[2:]]
+    assert not pva.contiguous(holed)
+
+
+def test_variant_flow_refuses_to_run_a_needy_variant_without_frames(registered):
+    """A caller that forgot the frames gets told, not a wrong field."""
+    name = registered("h4-strict", _RecordingVariant(needs_history=2))
+    comp = _composite(T0, 20.0)
+    rain = np.ones((SIZE, SIZE), dtype=np.float32)
+    with pytest.raises(ValueError, match="needs 2 history frames"):
+        pva.variant_flow(comp, comp, rain, name)
+
+    fut = registered("h4-strict-future", _RecordingVariant(needs_future=True))
+    with pytest.raises(ValueError, match="needs the frame after now"):
+        pva.variant_flow(comp, comp, rain, fut)
+
+
+def test_variant_flow_passes_only_the_newest_history_frames(registered):
+    """Given more history than declared, the newest ``needs_history`` win."""
+    spy = _RecordingVariant(needs_history=1)
+    name = registered("h4-trim", spy)
+    old = _composite(T0 - timedelta(minutes=30), 4.0)
+    mid = _composite(T0 - timedelta(minutes=20), 12.0)
+    comp = _composite(T0, 20.0)
+    rain = np.ones((SIZE, SIZE), dtype=np.float32)
+
+    pva.variant_flow(comp, comp, rain, name, [old, mid])
+    (call,) = spy.calls
+    assert len(call["history_dbz"]) == 1
+    np.testing.assert_array_equal(call["history_dbz"][0], mid.reflectivity_dbz)
+
+
+# --- the skip tally reaches the report --------------------------------
+def test_run_day_reports_its_skips(tmp_path: Path):
+    """No archive on disk, so every candidate is a window skip of zero cases."""
+    day, cases, blocks, err, skips = pva.run_day(
+        str(tmp_path), "2026-09-02", 1, pva.CaseSpec(horizons_min=(10,)),
+    )
+    assert day == "2026-09-02" and err is None
+    assert cases == [] and blocks == {}
+    assert set(skips) == set(pva.SKIP_REASONS)
+    assert sum(skips.values()) == 0  # no frames at all means no candidates
+
+
+def test_empty_skips_has_every_reason_at_zero():
+    assert pva.empty_skips() == {"window": 0, "history": 0, "future": 0}
+    assert pva.SKIP_REASONS == ("window", "history", "future")
+
+
+def test_markdown_header_carries_the_skip_tally():
+    """The count has to be readable next to the case count, not only in JSON.
+
+    A candidate that scored 1,700 of the baseline's 1,925 cases is not a
+    paired comparison, and the person reading the markdown is the one who
+    has to notice.
+    """
+    meta = {
+        "variant": "median3",
+        "cases (frames)": 1700,
+        "skipped cases": 225,
+        "skipped by reason": "window=15, history=210, future=0",
+        "extra frames needed": "history=2, future=no",
+    }
+    report = pva.markdown_report({"pooled": {}}, meta)
+    assert "**skipped cases**: 225" in report
+    assert "window=15, history=210, future=0" in report
+    assert "**extra frames needed**: history=2, future=no" in report
+
+
+# --- the CLI switch ---------------------------------------------------
+def test_variant_list_prints_every_name_and_exits():
+    """``--variant-list`` must work WITHOUT --archive-dir.
+
+    The caller is ``sidecar/deploy/layer_a.sh`` checking a name before it
+    starts a four-hour container; it has no archive path to offer.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        pva.main(["--variant-list"])
+    assert excinfo.value.code == 0
+
+
+def test_variant_list_output_is_the_registry(capsys):
+    from dmi_nowcast_core.variants import list_variants as _names
+
+    with pytest.raises(SystemExit):
+        pva.main(["--variant-list"])
+    printed = capsys.readouterr().out.split()
+    assert tuple(printed) == _names()
+    assert "oracle" in printed and "lucaskanade" in printed
+
+
+def test_variant_choices_do_not_swamp_the_usage_line(capsys):
+    """31 names inline would make ``--help`` unreadable; metavar keeps it short."""
+    with pytest.raises(SystemExit):
+        pva.main(["--help"])
+    usage = capsys.readouterr().out
+    assert "[--variant NAME]" in usage
+    assert "farneback_w21_l3_p5" not in usage.split("options:")[0]
+
+
+def test_align_with_unions_the_frame_requirements():
+    """A baseline aligned with a hungry candidate skips the same cases."""
+    from persistence_vs_advection import CaseSpec
+
+    plain = CaseSpec(variant="confidence", horizons_min=(10, 20))
+    aligned = CaseSpec(variant="confidence", horizons_min=(10, 20), align_with="median3")
+    assert plain.requirements.history == 0 and aligned.requirements.history == 2
+    assert aligned.frames_before == plain.frames_before + 2
+    future = CaseSpec(variant="confidence", horizons_min=(10,), align_with="oracle")
+    assert future.requirements.future is True and future.frames_ahead >= 1
