@@ -143,7 +143,34 @@ def _write_decisions(directory: Path) -> Path:
     return directory
 
 
-def _write_summary(directory: Path, *, ensemble_size: int = 16) -> None:
+def _anchor_block(
+    policy: str = "fullRange", *, harmonisation_sha: str | None = None,
+) -> dict:
+    """The replay's L3 provenance block, as ``summary.json`` carries it."""
+    return {
+        "policy": policy,
+        "lag_min": {"fullRange": 13.1, "doppler": 8.1, "flat": None},
+        "poll_interval_min": 5.0,
+        "frame_age_override_min": None,
+        "max_anchor_age_min": 60.0,
+        "history_mode": "same-type",
+        "harmonisation": (
+            {"path": None} if harmonisation_sha is None
+            else {"path": "/x/doppler_harmonisation.json",
+                  "sha256": harmonisation_sha, "schema_version": 1,
+                  "fitted_at": "2026-09-08T18:44:53+00:00"}
+        ),
+        "counts": {"instants": 10, "doppler_anchored": 0,
+                   "fullrange_anchored": 10, "degraded": 0,
+                   "history_fallback": 0, "no_anchor": 0, "no_history": 0},
+        "frame_age_min": {"n": 10, "mean": 15.0, "p50": 15.0,
+                          "min": 15.0, "max": 15.0},
+    }
+
+
+def _write_summary(
+    directory: Path, *, ensemble_size: int = 16, anchor: dict | None = None,
+) -> None:
     (directory / "summary.json").write_text(json.dumps({
         "run": {
             "n_days": len(DAYS),
@@ -151,6 +178,7 @@ def _write_summary(directory: Path, *, ensemble_size: int = 16) -> None:
             "n_stations": len(STATIONS),
             "n_decision_rows": FRAMES_PER_DAY * len(STATIONS) * len(DAYS),
             "frame_age_min": 0,
+            "anchor": anchor if anchor is not None else _anchor_block(),
             "steps": {
                 "ensemble_size": ensemble_size,
                 "n_cascade_levels": 6,
@@ -514,6 +542,78 @@ class TestProvenance:
         ]
         markdown = (tmp_path / "out" / "benchmark.md").read_text()
         assert "The two runs are not at parity" in markdown
+
+    def test_a_different_anchor_policy_fails_parity_unless_it_is_allowed(
+        self, tmp_path: Path,
+    ) -> None:
+        """L3's whole point is a different anchor — say so, or it is a bug.
+
+        A fresher frame changes every probability in the table. Left
+        unnamed it is an unexplained difference; named with
+        ``--allow-differing anchor`` it is the experiment.
+        """
+        _write_gauge(tmp_path / "corpus")
+        _write_summary(_write_decisions(tmp_path / "replay"))
+        _write_summary(
+            _write_decisions(tmp_path / "other"),
+            anchor=_anchor_block(
+                "freshest", harmonisation_sha="deadbeefcafe0001",
+            ),
+        )
+        payload = _run(
+            tmp_path, "--layers", "b", "--candidate", str(tmp_path / "other"),
+        )
+        assert payload["parity_problems"] == [
+            "anchor.policy: baseline 'fullRange' vs candidate 'freshest'",
+            "anchor.harmonisation: baseline None vs candidate "
+            "'deadbeefcafe0001'",
+        ]
+        assert "The two runs are not at parity" in (
+            tmp_path / "out" / "benchmark.md"
+        ).read_text()
+
+        allowed = _run(
+            tmp_path, "--layers", "b", "--candidate", str(tmp_path / "other"),
+            "--allow-differing", "anchor",
+        )
+        assert allowed["parity_problems"] == []
+        assert allowed["deliberate_differences"] == [
+            "anchor.policy: baseline 'fullRange' vs candidate 'freshest'",
+            "anchor.harmonisation: baseline None vs candidate "
+            "'deadbeefcafe0001'",
+        ]
+        markdown = (tmp_path / "out" / "benchmark.md").read_text()
+        assert "The candidate difference under test" in markdown
+        assert "The two runs are not at parity" not in markdown
+        # The runs table names the policy each side stood on.
+        assert "| fullRange |" in markdown
+        assert "| freshest |" in markdown
+
+    def test_allowing_the_anchor_does_not_excuse_anything_else(
+        self, tmp_path: Path,
+    ) -> None:
+        _write_gauge(tmp_path / "corpus")
+        _write_summary(_write_decisions(tmp_path / "replay"), ensemble_size=16)
+        _write_summary(
+            _write_decisions(tmp_path / "other"), ensemble_size=24,
+            anchor=_anchor_block("freshest"),
+        )
+        payload = _run(
+            tmp_path, "--layers", "b", "--candidate", str(tmp_path / "other"),
+            "--allow-differing", "anchor",
+        )
+        assert payload["parity_problems"] == [
+            "ensemble_size: baseline 16 vs candidate 24",
+        ]
+
+    def test_an_unknown_allow_differing_name_is_refused(
+        self, tmp_path: Path,
+    ) -> None:
+        """A typo must not silently disable the parity check."""
+        with pytest.raises(ValueError, match="unknown"):
+            report_module.parse_allow_differing("anchr")
+        assert report_module.parse_allow_differing("") == ()
+        assert report_module.parse_allow_differing("anchor") == ("anchor",)
 
     def test_rows_with_no_summary_beside_them_are_not_assumed_at_parity(
         self, tmp_path: Path,

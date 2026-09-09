@@ -272,6 +272,19 @@ PARITY_KEYS: tuple[str, ...] = (
     "threshold_mm_h", "frame_age_min",
 )
 
+#: Fields of the replay's ``anchor`` block that make two runs different
+#: experiments rather than two samples of one. The observed frame-age
+#: statistics are deliberately NOT here: they are an *outcome* of the
+#: policy and the lags, and they vary with the archive's gaps.
+ANCHOR_PARITY_KEYS: tuple[str, ...] = (
+    "policy", "lag_min", "poll_interval_min", "frame_age_override_min",
+    "history_mode",
+)
+
+#: Differences ``--allow-differing`` will accept as the candidate's whole
+#: point rather than as a broken comparison.
+ALLOWED_DIFFERENCES: tuple[str, ...] = ("anchor",)
+
 
 def find_summary(directory: Path) -> Path | None:
     """The replay's ``summary.json`` for a decisions directory, if any.
@@ -319,14 +332,69 @@ def run_settings(directories: Sequence[Path]) -> dict:
             "threshold_mm_h": steps.get("threshold_mm_h"),
             "leads_min": steps.get("leads_min"),
             "flow": run.get("flow"),
+            # L3 (2026-09-09): which frame each cycle stood on. Absent from
+            # runs made before the anchor policy existed, which is itself
+            # informative — those are fullRange runs at a flat frame age.
+            "anchor": run.get("anchor"),
             "rules": run.get("rules"),
             "national_curves": run.get("national_curves"),
         }
     return {"available": False, "error": "no summary.json beside the rows"}
 
 
-def parity_problems(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> list[str]:
-    """Settings the two runs disagree about, in the report's words."""
+def _harmonisation_id(anchor: Mapping[str, Any] | None) -> Any:
+    """The harmonisation map's identity: its digest, not its path.
+
+    Two runs on two machines name the same file differently; a run that
+    applied a re-fitted table is a different experiment even under the
+    same name. The digest is what decides.
+    """
+    stamp = (anchor or {}).get("harmonisation") or {}
+    return stamp.get("sha256") or stamp.get("path")
+
+
+def anchor_differences(
+    baseline: Mapping[str, Any], candidate: Mapping[str, Any],
+) -> list[str]:
+    """How the two runs' anchor policies differ, in the report's words."""
+    a = baseline.get("anchor") or {}
+    b = candidate.get("anchor") or {}
+    if not a and not b:
+        return []
+    out = []
+    if bool(a) != bool(b):
+        out.append(
+            "anchor: one run records an anchor policy and the other does "
+            "not (a run made before 2026-09-09 is fullRange at a flat "
+            "frame age)"
+        )
+        return out
+    for key in ANCHOR_PARITY_KEYS:
+        if a.get(key) != b.get(key):
+            out.append(
+                f"anchor.{key}: baseline {a.get(key)!r} vs "
+                f"candidate {b.get(key)!r}"
+            )
+    if _harmonisation_id(a) != _harmonisation_id(b):
+        out.append(
+            f"anchor.harmonisation: baseline {_harmonisation_id(a)!r} vs "
+            f"candidate {_harmonisation_id(b)!r}"
+        )
+    return out
+
+
+def parity_problems(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    allow: Sequence[str] = (),
+) -> list[str]:
+    """Settings the two runs disagree about, in the report's words.
+
+    ``allow`` names differences that are the candidate's whole point —
+    ``"anchor"`` for an L3 run, where the fresher frame IS the change
+    under test. Anything not named is still a parity failure: a
+    difference measured across two changes is attributable to neither.
+    """
     if not baseline.get("available") or not candidate.get("available"):
         return [
             "one of the two runs has no summary.json, so parity could not "
@@ -342,6 +410,8 @@ def parity_problems(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -
             f"flow: baseline {baseline.get('flow')!r} vs "
             f"candidate {candidate.get('flow')!r}"
         )
+    if "anchor" not in allow:
+        problems += anchor_differences(baseline, candidate)
     return problems
 
 
@@ -1220,6 +1290,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.append(_runs_table(report))
     lines.append("")
     problems = report.get("parity_problems") or []
+    deliberate = report.get("deliberate_differences") or []
     if report.get("candidate") is None:
         lines.append("Baseline only — no candidate given, so no differences below.")
     elif problems:
@@ -1233,6 +1304,29 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         lines.append(
             "The two runs agree on every parity setting "
             f"({', '.join(PARITY_KEYS)}) and on the flow configuration."
+        )
+    if deliberate:
+        lines.append("")
+        lines.append(
+            "**The candidate difference under test** (accepted via "
+            "`--allow-differing "
+            + ",".join(settings.get("allow_differing") or ())
+            + "`): "
+            + "; ".join(deliberate)
+            + ". Everything below is the effect of that change and of "
+            "nothing else the parity check can see."
+        )
+    elif (
+        report.get("candidate") is not None
+        and not problems
+        and (settings.get("allow_differing") or ())
+    ):
+        lines.append("")
+        lines.append(
+            "`--allow-differing "
+            + ",".join(settings.get("allow_differing") or ())
+            + "` was passed, but the two runs do not differ there — the "
+            "candidate is a repeat of the baseline, not a variant."
         )
     lines.append("")
     dead = report.get("dead_gauges") or []
@@ -1297,20 +1391,38 @@ def _runs_table(report: Mapping[str, Any]) -> str:
         rows.append(("candidate", report["candidate"]))
     header = (
         "| run | rows | days | stations | ensemble | cascade | downsample "
-        "| frame age | flow completion |"
+        "| frame age | flow completion | anchor | lags (fR/dop) | history "
+        "| harmonisation |"
     )
-    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---|"
+    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|"
     lines = [header, sep]
     for name, block in rows:
         settings = block["settings"]
         flow = (settings.get("flow") or {}).get("completion")
+        anchor = settings.get("anchor") or {}
+        lag = anchor.get("lag_min") or {}
+        observed = (anchor.get("frame_age_min") or {}).get("p50")
+        age = settings.get("frame_age_min")
+        # The flat override when a run used one; otherwise the age the run
+        # actually got, which is the number the policy is judged on.
+        age_cell = (
+            f"{age} (flat)" if age is not None
+            else (f"{observed} (p50)" if observed is not None else "–")
+        )
+        lags = (
+            f"{lag.get('fullRange', '–')}/{lag.get('doppler', '–')}"
+            if lag else "–"
+        )
+        stamp = (anchor.get("harmonisation") or {}).get("sha256")
         lines.append(
             f"| {name} | {block.get('rows', '–')} | "
             f"{block.get('days', '–')} | {block.get('stations', '–')} | "
             f"{settings.get('ensemble_size', '–')} | "
             f"{settings.get('n_cascade_levels', '–')} | "
             f"{settings.get('downsample_factor', '–')} | "
-            f"{settings.get('frame_age_min', '–')} | {flow or '–'} |"
+            f"{age_cell} | {flow or '–'} | "
+            f"{anchor.get('policy', '–')} | {lags} | "
+            f"{anchor.get('history_mode', '–')} | {stamp or '–'} |"
         )
     return "\n".join(lines)
 
@@ -1492,6 +1604,23 @@ def load_points(path: Path | None) -> list[str] | None:
     return ids
 
 
+def parse_allow_differing(spec: str | None) -> tuple[str, ...]:
+    """``--allow-differing`` as a validated tuple; unknown names are an error.
+
+    Deliberately not a free-form list: silently accepting a typo would
+    turn a parity failure into no warning at all, which is the one
+    outcome this whole block exists to prevent.
+    """
+    names = tuple(x.strip() for x in (spec or "").split(",") if x.strip())
+    unknown = [n for n in names if n not in ALLOWED_DIFFERENCES]
+    if unknown:
+        raise ValueError(
+            f"--allow-differing: unknown {', '.join(unknown)}; "
+            f"known: {', '.join(ALLOWED_DIFFERENCES)}"
+        )
+    return names
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Layer B / Layer C benchmark over replay decision rows.",
@@ -1542,6 +1671,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--workers", type=int, default=1,
                    help="processes over (lead, threshold) cells in Layer C")
+    p.add_argument(
+        "--allow-differing", default="", dest="allow_differing",
+        help="comma-separated settings the candidate is ALLOWED to differ "
+             f"on, from {{{', '.join(ALLOWED_DIFFERENCES)}}}. 'anchor' is "
+             "the L3 case: the candidate stands on a fresher frame, and "
+             "that difference is the experiment rather than a parity "
+             "failure. Everything not named here still fails parity.",
+    )
     return p
 
 
@@ -1554,6 +1691,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         leads = parse_leads(args.leads)
         thresholds = parse_thresholds(args.thresholds)
         stations = load_points(args.points)
+        allow_differing = parse_allow_differing(args.allow_differing)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1598,6 +1736,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if candidate_dirs is None else [str(d) for d in candidate_dirs]
             ),
             "corpus_dir": str(args.corpus_dir),
+            "allow_differing": list(allow_differing),
         },
         "baseline": {"settings": run_settings(baseline_dirs)},
         "candidate": (
@@ -1608,6 +1747,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if candidate_dirs is not None:
         report["parity_problems"] = parity_problems(
             report["baseline"]["settings"], report["candidate"]["settings"],
+            allow=allow_differing,
+        )
+        report["deliberate_differences"] = (
+            anchor_differences(
+                report["baseline"]["settings"], report["candidate"]["settings"],
+            ) if "anchor" in allow_differing else []
         )
 
     try:

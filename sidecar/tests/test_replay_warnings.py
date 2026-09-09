@@ -116,11 +116,23 @@ def _textured_dbz(shift: int) -> np.ndarray:
     return np.clip(dbz, -30.0, 60.0).astype(np.float32)
 
 
-def _write_composite(path: Path, ts: datetime, dbz: np.ndarray) -> None:
+def _write_composite(
+    path: Path,
+    ts: datetime,
+    dbz: np.ndarray,
+    coverage: np.ndarray | None = None,
+) -> None:
+    """Write one ODIM composite; ``coverage=False`` pixels become ``nodata``.
+
+    The coverage mask is how the doppler product is modelled: same grid,
+    same scaling, but blank beyond its 120 km range.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = np.clip(
         np.round((dbz - OFFSET) / GAIN), UNDETECT + 1, NODATA - 1,
     ).astype(np.uint8)
+    if coverage is not None:
+        raw[~coverage] = NODATA
     with h5py.File(path, "w") as h5:
         what = h5.create_group("what")
         what.attrs["gain"] = GAIN
@@ -618,3 +630,290 @@ def test_read_decisions_tolerates_a_file_without_the_per_lead_columns(
     rows = rw.read_decisions(path)
     assert rows[0]["p_rain"] == pytest.approx(0.8)   # the old column survives
     assert rows[0]["p_rain_30"] is None              # the new one reads unknown
+
+
+# ---------------------------------------------------------------------------
+# The anchor policy (Phase H, H-L / L3)
+# ---------------------------------------------------------------------------
+
+#: doppler's 120 km edge in miniature: a disc around the grid centre.
+DOPPLER_RADIUS_PX = 90.0
+#: A day of both products around the module's anchor instant.
+DUAL_START = T_ANCHOR - timedelta(minutes=40)
+
+
+def _doppler_coverage() -> np.ndarray:
+    rows, cols = np.indices((GRID_PX, GRID_PX))
+    centre = (GRID_PX - 1) / 2.0
+    return (
+        (rows - centre) ** 2 + (cols - centre) ** 2
+    ) <= DOPPLER_RADIUS_PX ** 2
+
+
+def _harmonisation_payload(shift_db: float = 2.0) -> dict:
+    """A constant ``+shift_db`` map, in every band and season.
+
+    The real table is fitted per distance band and season (L2,
+    2026-09-08); ``tests/test_doppler_harmonisation.py`` pins the fit. All
+    this one has to do is be a real, applicable table.
+    """
+    from dmi_nowcast_core import product_pairs as pp
+
+    edges = pp.mapped_edges()
+    entry = {
+        "mapped_dbz": [float(e + shift_db) for e in edges],
+        "n_doppler_px": 1_000_000,
+        "n_fullrange_px": 1_000_000,
+    }
+    return {
+        "schema_version": pp.HARMONISATION_SCHEMA_VERSION,
+        "meta": {"generated": "2026-09-08T18:44:53+00:00", "n_fit_triples": 1417},
+        "bin_edges_dbz": [float(e) for e in edges],
+        "tables": {
+            pp.table_key(season, band): dict(entry)
+            for season in pp.SEASON_ORDER
+            for band in pp.DOPPLER_BANDS
+        },
+    }
+
+
+@pytest.fixture(scope="module")
+def dual_archive(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Both products on the 5-minute grid, 05:40 → 06:25.
+
+    fullRange on ``:x0`` over the whole grid; doppler on ``:x5`` inside a
+    disc and ``nodata`` outside it, so the fill really is doing something.
+    """
+    root = tmp_path_factory.mktemp("dual-archive")
+    coverage = _doppler_coverage()
+    for i in range(10):
+        ts = DUAL_START + timedelta(minutes=5 * i)
+        full = ts.minute % 10 == 0
+        _write_composite(
+            rw.frame_path(root, ts), ts,
+            _textured_dbz(shift=2 * i),
+            None if full else coverage,
+        )
+    return root
+
+
+@pytest.fixture(scope="module")
+def harmonisation_file(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("harm") / "doppler_harmonisation.json"
+    path.write_text(json.dumps(_harmonisation_payload()))
+    return path
+
+
+def _anchor_settings(**over) -> "rw.AnchorSettings":
+    base = {"frame_age_override_min": None}
+    base.update(over)
+    return rw.AnchorSettings(**base)
+
+
+def test_plan_day_puts_both_policies_on_the_same_instants(
+    dual_archive: Path, harmonisation_file: Path,
+) -> None:
+    """The candidate decides when the baseline does, five minutes fresher."""
+    day = datetime(2026, 9, 5).date()
+    base = rw.plan_day(
+        dual_archive, day,
+        rw.dc_replace(TINY, anchor=_anchor_settings()),
+    )
+    fresh = rw.plan_day(
+        dual_archive, day,
+        rw.dc_replace(TINY, anchor=_anchor_settings(
+            policy="freshest", harmonisation_path=str(harmonisation_file),
+        )),
+    )
+    assert [s.now for s, _h in base] == [s.now for s, _h in fresh]
+    assert [s.timestamp.strftime("%H:%M") for s, _h in base] == [
+        "05:40", "05:50", "06:00", "06:10", "06:20",
+    ]
+    assert [s.timestamp.strftime("%H:%M") for s, _h in fresh] == [
+        "05:45", "05:55", "06:05", "06:15", "06:25",
+    ]
+    assert all(s.frame_age_min == pytest.approx(15.0) for s, _h in base)
+    assert all(s.frame_age_min == pytest.approx(10.0) for s, _h in fresh)
+    # Only the last two of each have a complete triple behind them.
+    assert [h is not None for _s, h in base] == [False, False, True, True, True]
+
+
+def test_plan_day_clips_on_the_anchor_frame(dual_archive: Path) -> None:
+    day = datetime(2026, 9, 5).date()
+    plan = rw.plan_day(
+        dual_archive, day, rw.dc_replace(TINY, anchor=_anchor_settings()),
+        start_min=6 * 60 + 20, end_min=6 * 60 + 20,
+    )
+    assert [s.timestamp for s, _h in plan] == [T_ANCHOR]
+    # The decision itself runs 15 minutes after the frame, not at it.
+    assert plan[0][0].now == T_ANCHOR + timedelta(minutes=15)
+
+
+def _cli(archive: Path, out_dir: Path, points_file: Path, *extra: str) -> list[str]:
+    return [
+        "--archive-dir", str(archive),
+        "--corpus-dir", str(out_dir / "corpus"),
+        "--points", str(points_file),
+        "--days", DAY,
+        "--out-dir", str(out_dir),
+        "--ensemble-size", "3", "--cascade-levels", "4",
+        "--downsample-factor", "2", "--horizon-min", "30",
+        "--no-score",
+        *extra,
+    ]
+
+
+def test_the_default_run_records_a_fullrange_anchor(
+    dual_archive: Path, points_file: Path, tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "base"
+    assert rw.main(_cli(
+        dual_archive, out_dir, points_file,
+        "--start-utc", "06:20", "--end-utc", "06:20",
+    )) == 0
+    summary = json.loads((out_dir / "summary.json").read_text())
+    anchor = summary["run"]["anchor"]
+    assert anchor["policy"] == "fullRange"
+    assert anchor["harmonisation"] == {"path": None}
+    assert anchor["counts"]["fullrange_anchored"] == 1
+    assert anchor["counts"]["doppler_anchored"] == 0
+    assert anchor["counts"]["degraded"] == 0
+    assert anchor["frame_age_min"]["p50"] == pytest.approx(15.0)
+    # The flat model is off, so the parity key is null rather than a lie.
+    assert summary["run"]["frame_age_min"] is None
+
+    rows = rw.read_decisions(out_dir / "decisions" / f"{DAY}.parquet")
+    assert {r["radar_ts"] for r in rows} == {T_ANCHOR}
+    assert all(
+        r["generated_at"] - r["radar_ts"] == timedelta(minutes=15) for r in rows
+    )
+
+
+def test_the_freshest_anchor_stands_on_the_doppler_frame(
+    dual_archive: Path, points_file: Path, harmonisation_file: Path,
+    tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "fresh"
+    assert rw.main(_cli(
+        dual_archive, out_dir, points_file,
+        "--anchor", "freshest",
+        "--harmonisation", str(harmonisation_file),
+        "--start-utc", "06:15", "--end-utc", "06:15",
+    )) == 0
+    summary = json.loads((out_dir / "summary.json").read_text())
+    anchor = summary["run"]["anchor"]
+    assert anchor["policy"] == "freshest"
+    assert anchor["history_mode"] == "same-type"
+    assert anchor["lag_min"] == {"fullRange": 13.1, "doppler": 8.1, "flat": None}
+    assert anchor["counts"]["doppler_anchored"] == 1
+    assert anchor["counts"]["fullrange_anchored"] == 0
+    assert anchor["counts"]["history_fallback"] == 0
+    assert anchor["frame_age_min"]["p50"] == pytest.approx(10.0)
+    stamp = anchor["harmonisation"]
+    assert stamp["schema_version"] == 1
+    assert stamp["fitted_at"] == "2026-09-08T18:44:53+00:00"
+    assert len(stamp["sha256"]) == 16
+
+    rows = rw.read_decisions(out_dir / "decisions" / f"{DAY}.parquet")
+    # The anchor is the :x5 frame — a minute the fullRange arm never
+    # stamps, so a baseline and a candidate can share one directory
+    # without their rows deduplicating each other away.
+    assert {r["radar_ts"] for r in rows} == {
+        T_ANCHOR - timedelta(minutes=5),
+    }
+    assert all(
+        r["generated_at"] - r["radar_ts"] == timedelta(minutes=10) for r in rows
+    )
+    # The stations sit at the grid centre, inside doppler's disc, and the
+    # fixture is soaked: the anchor field reads rain there.
+    assert all(r["observed_mm_h"] is not None for r in rows)
+
+
+def test_the_filled_history_keeps_the_grid_outside_doppler_coverage(
+    dual_archive: Path, points_file: Path, harmonisation_file: Path,
+    tmp_path: Path,
+) -> None:
+    """``--anchor-history filled`` is the variant that keeps national cover.
+
+    Under ``same-type`` the cascade only ever sees doppler's disc, so
+    ``p_rain`` is undefined outside it; under ``filled`` every history
+    frame is itself a per-pixel freshest composite and the ensemble spans
+    the fullRange domain again.
+    """
+    out_dir = tmp_path / "filled"
+    assert rw.main(_cli(
+        dual_archive, out_dir, points_file,
+        "--anchor", "freshest",
+        "--harmonisation", str(harmonisation_file),
+        "--anchor-history", "filled",
+        "--start-utc", "06:15", "--end-utc", "06:15",
+    )) == 0
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["run"]["anchor"]["history_mode"] == "filled"
+    assert summary["run"]["anchor"]["counts"]["doppler_anchored"] == 1
+    rows = rw.read_decisions(out_dir / "decisions" / f"{DAY}.parquet")
+    assert rows and all(r["p_rain"] is not None for r in rows)
+
+
+def test_september_has_no_doppler_and_the_candidate_degrades(
+    archive_dir: Path, points_file: Path, harmonisation_file: Path,
+    tmp_path: Path,
+) -> None:
+    """The 2026-09 archive is fullRange only; the run must cope and say so."""
+    out_dir = tmp_path / "sept"
+    assert rw.main(_cli(
+        archive_dir, out_dir, points_file,
+        "--anchor", "freshest",
+        "--harmonisation", str(harmonisation_file),
+        "--start-utc", "06:20", "--end-utc", "06:20",
+    )) == 0
+    summary = json.loads((out_dir / "summary.json").read_text())
+    counts = summary["run"]["anchor"]["counts"]
+    assert counts["doppler_anchored"] == 0
+    assert counts["fullrange_anchored"] == 1
+    assert counts["degraded"] == 1          # the candidate ran as the baseline
+    rows = rw.read_decisions(out_dir / "decisions" / f"{DAY}.parquet")
+    assert {r["radar_ts"] for r in rows} == {T_ANCHOR}
+
+
+def test_the_flat_frame_age_reproduces_a_pre_l3_run(
+    dual_archive: Path, points_file: Path, tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "flat"
+    assert rw.main(_cli(
+        dual_archive, out_dir, points_file,
+        "--frame-age-min", "14",
+        "--start-utc", "06:20", "--end-utc", "06:20",
+    )) == 0
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["run"]["frame_age_min"] == 14.0
+    assert summary["run"]["anchor"]["frame_age_override_min"] == 14.0
+    assert summary["run"]["anchor"]["poll_interval_min"] == 0.0
+    rows = rw.read_decisions(out_dir / "decisions" / f"{DAY}.parquet")
+    assert all(
+        r["generated_at"] - r["radar_ts"] == timedelta(minutes=14) for r in rows
+    )
+
+
+def test_freshest_without_a_map_is_refused(
+    dual_archive: Path, points_file: Path, tmp_path: Path,
+) -> None:
+    """Raw doppler carries 20-30 %% less echo at 20 dBZ. Never unmapped."""
+    with pytest.raises(SystemExit) as excinfo:
+        rw.main(_cli(
+            dual_archive, tmp_path / "nope", points_file, "--anchor", "freshest",
+        ))
+    assert excinfo.value.code == 2
+
+
+def test_an_unreadable_map_fails_before_the_first_frame(
+    dual_archive: Path, points_file: Path, tmp_path: Path,
+) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"schema_version": 99, "tables": {"a": {}}}))
+    with pytest.raises(SystemExit) as excinfo:
+        rw.main(_cli(
+            dual_archive, tmp_path / "nope", points_file,
+            "--anchor", "freshest", "--harmonisation", str(bad),
+        ))
+    assert excinfo.value.code == 2

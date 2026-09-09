@@ -38,6 +38,41 @@ the archive: live, it is ``now - radar_ts`` at compute time (median 14
 min). It moves the products' lead bookkeeping AND the wall clock the
 decision runs on, so ``generated_at = radar_ts + frame_age_min``.
 
+The anchor policy (Phase H, H-L / L3)
+-------------------------------------
+``--anchor`` decides WHICH frame a cycle stands on;
+:mod:`dmi_nowcast_core.anchor` holds the policy itself and the reasoning.
+
+``fullRange`` (default)
+    Today's product, ``:x0``, 240 km range, published
+    ``--lag-fullrange-min`` (13.1) minutes after its nominal time.
+``freshest``
+    The per-pixel freshest covering frame: the ``:x5`` doppler composite,
+    harmonised onto fullRange's distribution through the L2 table
+    (``--harmonisation``, required) and filled from the newest fullRange
+    frame outside its 120 km range. The flow and the STEPS cascade still
+    run on a **same-type** triple 10 minutes apart (DECIDE-3, DECIDE-4).
+
+Two consequences worth knowing before reading a run:
+
+1. **The decision cadence does not change.** The measured lags are
+   ``:x0 + 13.1`` and ``:x5 + 8.1`` — the same wall instant: DMI
+   publishes both products in one event every ten minutes. So
+   ``freshest`` does not add decisions; it makes each of the same
+   decisions five minutes fresher (anchor age 10 min instead of 15).
+   That also keeps ``radar_ts`` unique per decision, which every
+   downstream consumer depends on: decision rows are deduplicated on
+   ``(radar_ts, station_id)``, so two instants sharing one anchor would
+   silently collapse into one row.
+2. **The frame age is no longer flat.** ``--frame-age-min`` was one
+   simulated latency for every frame; it is now derived per instant from
+   the product's publication lag plus the wait for the next 5-minute
+   poll, so a default ``fullRange`` run sits at 15 min where the old runs
+   sat at 14. Pass ``--frame-age-min 14`` to reproduce a run made before
+   this existed — it restores the flat model exactly, for both products
+   and with no poll grid. Scoring a new candidate against an OLD baseline
+   folds that one-minute step into the difference: re-run the baseline.
+
 Parallelism and the state simplification
 ----------------------------------------
 The per-frame pipeline is state-free; only ``evaluate`` carries state,
@@ -80,6 +115,15 @@ Then the real thing::
         --out-dir /var/lib/dmi-nowcast-corpus/stations/replay \\
         --progress /var/lib/dmi-nowcast-corpus/stations/replay/progress.json
 
+The L3 candidate — same days, same everything, freshest anchor
+(``CORPUS=/var/lib/dmi-nowcast-corpus``)::
+
+    python scripts/replay_warnings.py \\
+        ... as above ... \\
+        --anchor freshest \\
+        --harmonisation "$CORPUS"/stations/product_study/doppler_harmonisation.json \\
+        --out-dir /var/lib/dmi-nowcast-corpus/stations/replay_freshest
+
 Outputs under ``--out-dir``:
 
 ``decisions/YYYY-MM-DD.parquet``
@@ -103,7 +147,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -118,8 +162,13 @@ _SIDECAR = _REPO_ROOT / "sidecar"
 if str(_SIDECAR) not in sys.path:
     sys.path.insert(0, str(_SIDECAR))
 
+from dmi_nowcast_core import anchor as anchor_policy  # noqa: E402
 from dmi_nowcast_core.advect import advect_field_series  # noqa: E402
 from dmi_nowcast_core.calibrate import load_calibration_curves  # noqa: E402
+from dmi_nowcast_core.corpus import (  # noqa: E402
+    SCAN_TYPE_DOPPLER,
+    SCAN_TYPE_FULL_RANGE,
+)
 from dmi_nowcast_core.dense_flow import (  # noqa: E402
     DEFAULT_CONFIDENCE_PERCENTILE,
     DEFAULT_CONFIDENCE_WINDOW_PX,
@@ -277,6 +326,40 @@ def full_range_frames(archive_dir: Path, day: date) -> list[datetime]:
     return out
 
 
+def archive_frames(
+    archive_dir: Path, start: datetime, end: datetime,
+) -> dict[str, dict[datetime, Path]]:
+    """``{scan_type: {timestamp: path}}`` for ``[start, end]``, by probing.
+
+    Deliberately a directory probe on the 5-minute grid rather than an
+    :class:`dmi_nowcast_core.corpus.ArchiveIndex`: the index scans all
+    ~78,000 archived filenames, and this runs once per day worker. A day
+    plus its lookback is ~300 ``exists()`` calls, which is nothing beside
+    one STEPS run.
+
+    The minute IS the product marker (``corpus.scan_type_from_filename``),
+    so only ``:x0`` and ``:x5`` slots are probed and anything else in the
+    tree is ignored — an off-grid frame must never be mistaken for either
+    product.
+    """
+    out: dict[str, dict[datetime, Path]] = {
+        SCAN_TYPE_FULL_RANGE: {}, SCAN_TYPE_DOPPLER: {},
+    }
+    step = timedelta(minutes=FRAME_INTERVAL_MIN / 2)
+    ts = start.replace(second=0, microsecond=0)
+    ts -= timedelta(minutes=ts.minute % 5)
+    while ts <= end:
+        path = frame_path(archive_dir, ts)
+        if path.exists():
+            scan = (
+                SCAN_TYPE_FULL_RANGE if ts.minute % FRAME_INTERVAL_MIN == 0
+                else SCAN_TYPE_DOPPLER
+            )
+            out[scan][ts] = path
+        ts += step
+    return out
+
+
 class CompositeCache:
     """FIFO cache so a day's frames are parsed once, not three times."""
 
@@ -304,6 +387,61 @@ class CompositeCache:
 
 
 @dataclass(frozen=True)
+class AnchorSettings:
+    """Which frame each cycle stands on — Phase H, L3.
+
+    The default is the pre-L3 model, so a ``FrameSettings()`` built in a
+    test or another script keeps behaving exactly as it did: the
+    ``fullRange`` policy with a flat simulated frame age. The CLI's
+    default is the *new* one (``frame_age_override_min=None``, so the age
+    comes from the publication lag and the poll grid); ``--frame-age-min``
+    puts the flat model back.
+    """
+
+    policy: str = anchor_policy.POLICY_FULLRANGE
+    lag_fullrange_min: float = anchor_policy.DEFAULT_LAG_FULLRANGE_MIN
+    lag_doppler_min: float = anchor_policy.DEFAULT_LAG_DOPPLER_MIN
+    poll_interval_min: float = anchor_policy.DEFAULT_POLL_INTERVAL_MIN
+    max_age_min: float = anchor_policy.DEFAULT_MAX_ANCHOR_AGE_MIN
+    frame_age_override_min: float | None = DEFAULT_FRAME_AGE_MIN
+    harmonisation_path: str | None = None
+    history_mode: str = anchor_policy.HISTORY_SAME_TYPE
+
+    @property
+    def lag(self) -> anchor_policy.ProductLag:
+        return anchor_policy.ProductLag(
+            fullrange_min=self.lag_fullrange_min,
+            doppler_min=self.lag_doppler_min,
+            flat=self.frame_age_override_min,
+        )
+
+    @property
+    def poll_min(self) -> float:
+        """0 with a flat override: instants are the publication instants.
+
+        The flat model has no poll grid — a frame is seen exactly
+        ``frame_age_override_min`` after its nominal time — and snapping
+        it to a 5-minute grid would move every old run by a minute.
+        """
+        if self.frame_age_override_min is not None:
+            return 0.0
+        return self.poll_interval_min
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "policy": self.policy,
+            "lag_min": self.lag.as_dict(),
+            "poll_interval_min": self.poll_min,
+            "frame_age_override_min": self.frame_age_override_min,
+            "max_anchor_age_min": self.max_age_min,
+            "history_mode": self.history_mode,
+            "harmonisation": anchor_policy.harmonisation_stamp(
+                self.harmonisation_path,
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class FrameSettings:
     """STEPS / product settings for a replay. Defaults mirror production."""
 
@@ -323,6 +461,8 @@ class FrameSettings:
     flow_confidence_window_px: int = DEFAULT_CONFIDENCE_WINDOW_PX
     flow_confidence_percentile: float = DEFAULT_CONFIDENCE_PERCENTILE
     flow_texture_percentile: float = DEFAULT_TEXTURE_PERCENTILE
+    # L3 (2026-09-09): which frame each cycle stands on. See AnchorSettings.
+    anchor: AnchorSettings = field(default_factory=AnchorSettings)
 
 
 def production_flow(
@@ -395,13 +535,116 @@ def _curves(path: str | None) -> dict[int, Any]:
     return cached
 
 
+def legacy_history(
+    archive_dir: Path, radar_ts: datetime, settings: FrameSettings,
+) -> anchor_policy.HistorySelection:
+    """The pre-L3 input triple: fullRange at ``T-20`` / ``T-10`` / ``T``.
+
+    Built from paths without touching the disk, so a missing predecessor
+    still surfaces as the ``OSError`` from the parser rather than as a
+    silently shorter history — the day worker records it as a frame error
+    either way, and the difference matters when debugging one frame.
+    """
+    step = timedelta(minutes=FRAME_INTERVAL_MIN)
+    stamps = tuple(radar_ts - i * step for i in (2, 1, 0))
+    age = settings.frame_age_min
+    selection = anchor_policy.AnchorSelection(
+        now=radar_ts + timedelta(minutes=age),
+        policy=anchor_policy.POLICY_FULLRANGE,
+        scan_type=SCAN_TYPE_FULL_RANGE,
+        timestamp=radar_ts,
+        path=frame_path(archive_dir, radar_ts),
+        frame_age_min=age,
+        fullrange_ts=radar_ts,
+        fullrange_path=frame_path(archive_dir, radar_ts),
+    )
+    return anchor_policy.HistorySelection(
+        scan_type=SCAN_TYPE_FULL_RANGE,
+        timestamps=stamps,
+        paths=tuple(frame_path(archive_dir, ts) for ts in stamps),
+        fill_timestamps=(None, None, None),
+        fill_paths=(None, None, None),
+        selection=selection,
+    )
+
+
+def anchor_inputs(
+    cache: CompositeCache,
+    history: anchor_policy.HistorySelection,
+    settings: FrameSettings,
+) -> tuple[list[RadarComposite], np.ndarray, np.ndarray]:
+    """``(history composites, anchor dBZ, flow support dBZ)`` for one cycle.
+
+    Under the ``fullRange`` policy all three are the archive's own frames
+    and nothing is computed — the anchor IS the newest history frame.
+
+    Under a doppler anchor the history triple is harmonised frame by frame
+    (never raw: plan §0.3) and the anchor field additionally takes its
+    outside-coverage pixels from the newest fullRange frame. The flow's
+    echo support then has to be the *same-type* field, not the filled one:
+    the flow was estimated from a doppler pair, so beyond 120 km it has no
+    observation behind it and the completion step must be allowed to fill
+    it from the bulk motion instead of being told there is echo there.
+
+    ``history_mode="filled"`` fills every history frame the same way, so
+    each pixel's series is still one product at 10-minute spacing while
+    the cascade — and therefore ``p_rain`` — keeps fullRange's coverage.
+    """
+    composites = [cache.get(ts) for ts in history.timestamps]
+    if history.selection.scan_type != SCAN_TYPE_DOPPLER:
+        newest = composites[-1].reflectivity_dbz
+        return composites, newest, newest
+
+    table = anchor_policy.load_harmonisation(settings.anchor.harmonisation_path)
+    distance = anchor_policy.distance_km_grid(composites[-1])
+    fields = [
+        anchor_policy.anchor_field(
+            comp.reflectivity_dbz,
+            scan_type=SCAN_TYPE_DOPPLER,
+            anchor_ts=comp.timestamp_utc,
+            harmonisation=table,
+            distance_km=distance,
+        )
+        for comp in composites
+    ]
+
+    def _filled(index: int) -> Any:
+        fill_ts = history.fill_timestamps[index]
+        if fill_ts is None:
+            return fields[index]
+        return anchor_policy.fill_uncovered(
+            fields[index], cache.get(fill_ts).reflectivity_dbz, fill_ts,
+        )
+
+    anchor = _filled(len(fields) - 1)
+    if settings.anchor.history_mode == anchor_policy.HISTORY_FILLED:
+        used = [_filled(i) for i in range(len(fields) - 1)] + [anchor]
+    else:
+        used = fields
+    out = [
+        dc_replace(comp, reflectivity_dbz=field.dbz)
+        for comp, field in zip(composites, used)
+    ]
+    # Under "filled" the unfilled harmonised grids are now unreferenced;
+    # they are ~14 MB each on the national grid and this runs two to a
+    # 5 GB cgroup cap.
+    del fields
+    return out, anchor.dbz, out[-1].reflectivity_dbz
+
+
 def sample_frame(
     cache: CompositeCache,
     radar_ts: datetime,
     points: Sequence[StationPoint],
     settings: FrameSettings,
+    *,
+    history: anchor_policy.HistorySelection | None = None,
 ) -> list[dict[str, Any]]:
-    """Run one frame end-to-end; return one sample dict per station.
+    """Run one cycle end-to-end; return one sample dict per station.
+
+    ``history`` is the planned cycle (:func:`plan_day`). Without one the
+    pre-L3 fullRange triple at ``radar_ts`` is used, which is what a
+    direct caller and the older tests expect.
 
     Raises on a missing input frame or a STEPS failure — the day worker
     catches it and records the frame as an error rather than pretending
@@ -409,12 +652,9 @@ def sample_frame(
     """
     from dmi_nowcast_sidecar.national_sample import sample_point
 
-    step = timedelta(minutes=FRAME_INTERVAL_MIN)
-    composites = [
-        cache.get(radar_ts - 2 * step),
-        cache.get(radar_ts - step),
-        cache.get(radar_ts),
-    ]
+    if history is None:
+        history = legacy_history(cache.archive_dir, radar_ts, settings)
+    composites, anchor_dbz, support_dbz = anchor_inputs(cache, history, settings)
     spacing = [
         (b.timestamp_utc - a.timestamp_utc).total_seconds() / 60.0
         for a, b in zip(composites, composites[1:])
@@ -423,9 +663,16 @@ def sample_frame(
         raise RuntimeError(f"input frames are not on the {FRAME_INTERVAL_MIN}-min grid")
     now = composites[-1]
     dt_min = spacing[-1]
+    frame_age_min = history.selection.frame_age_min
     geo = CompositeGeo(now)
-    rain_now = dbz_to_rain_rate(now.reflectivity_dbz, zr_a=now.zr_a, zr_b=now.zr_b)
-    vy, vx = production_flow(composites[-2], now, rain_now, settings, dt_min=dt_min)
+    rain_now = dbz_to_rain_rate(anchor_dbz, zr_a=now.zr_a, zr_b=now.zr_b)
+    rain_support = (
+        rain_now if support_dbz is anchor_dbz
+        else dbz_to_rain_rate(support_dbz, zr_a=now.zr_a, zr_b=now.zr_b)
+    )
+    vy, vx = production_flow(
+        composites[-2], now, rain_support, settings, dt_min=dt_min,
+    )
 
     n_timesteps = max(1, math.ceil(settings.horizon_min / dt_min - 1e-9))
     forecast = run_ensemble(
@@ -445,7 +692,7 @@ def sample_frame(
         leads_min=settings.leads_min,
         threshold_mm_h=settings.threshold_mm_h,
         timestep_min=dt_min,
-        frame_age_min=settings.frame_age_min,
+        frame_age_min=frame_age_min,
         downsample_factor=settings.downsample_factor,
     )
     del forecast
@@ -473,7 +720,7 @@ def sample_frame(
     # overlays; a point decision only ever reads lead 0.
     forecast_now_field = next(iter(advect_field_series(
         rain_now, vy, vx,
-        horizons_minutes=[settings.frame_age_min],
+        horizons_minutes=[frame_age_min],
         dt_minutes=dt_min,
     )))
     forecast_grids = {
@@ -488,7 +735,7 @@ def sample_frame(
     stamped_ts = now.timestamp_utc
     if stamped_ts.tzinfo is None:
         stamped_ts = stamped_ts.replace(tzinfo=timezone.utc)
-    generated_at = stamped_ts + timedelta(minutes=settings.frame_age_min)
+    generated_at = stamped_ts + timedelta(minutes=frame_age_min)
     out: list[dict[str, Any]] = []
     for point in points:
         sample = sample_point(
@@ -507,6 +754,67 @@ def sample_frame(
             "observed_mm_h": sample.observed_mm_h if sample else None,
             "forecast_now_mm_h": series.get(0) if series else None,
         })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Planning a day: which cycles run, on which frame
+# ---------------------------------------------------------------------------
+
+
+def plan_day(
+    archive_dir: Path,
+    day: date,
+    settings: FrameSettings,
+    *,
+    start_min: int = 0,
+    end_min: int = 24 * 60,
+) -> list[tuple[Any, Any]]:
+    """``[(selection, history | None)]`` — the cycles to replay for ``day``.
+
+    A cycle belongs to the day of its **anchor frame**, not of the instant
+    it runs at, so a 23:50 anchor decided at 00:05 still lands in the
+    23:50 day's parquet — the same convention the flat model had, where a
+    23:50 frame produced a 00:04 ``generated_at``. ``--start-utc`` /
+    ``--end-utc`` likewise clip on the anchor frame.
+
+    ``history is None`` means the anchor has no input triple behind it
+    (the first frames of a day whose predecessors are outside the
+    archive, or a gap). The caller records those as frame errors; that is
+    what the pre-L3 loop did when the parser raised on a missing file.
+    """
+    cfg = settings.anchor
+    day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    day_end = day_start + timedelta(days=1) - timedelta(seconds=1)
+    # Back far enough for the oldest frame an anchor at 00:00 could need
+    # (its triple) and for a stale-but-eligible frame; forward far enough
+    # that the last frame of the day is still seen by a poll.
+    lookback = timedelta(minutes=cfg.max_age_min + 2 * FRAME_INTERVAL_MIN)
+    lags = [cfg.lag.fullrange_min, cfg.lag.doppler_min]
+    if cfg.frame_age_override_min is not None:
+        lags.append(cfg.frame_age_override_min)
+    tail = timedelta(minutes=max(lags) + max(cfg.poll_min, 0.0) + 1.0)
+
+    frames = archive_frames(archive_dir, day_start - lookback, day_end)
+    selections = anchor_policy.decision_instants(
+        day_start, day_end + tail, frames,
+        policy=cfg.policy,
+        lag=cfg.lag,
+        poll_interval_min=cfg.poll_min,
+        max_age_min=cfg.max_age_min,
+    )
+    out: list[tuple[Any, Any]] = []
+    for selection in selections:
+        stamp = selection.timestamp
+        if stamp.date() != day:
+            continue
+        if not start_min <= stamp.hour * 60 + stamp.minute <= end_min:
+            continue
+        out.append((selection, anchor_policy.anchor_history(
+            selection, frames,
+            step_min=FRAME_INTERVAL_MIN,
+            tolerance_s=FRAME_TOLERANCE_S,
+        )))
     return out
 
 
@@ -579,25 +887,39 @@ def run_day(args: tuple) -> dict:
     result: dict[str, Any] = {
         "day": day_s, "rows": 0, "frames": 0, "errors": [],
         "state": {}, "elapsed_s": 0.0, "frame_ms": [], "failed": False,
+        "anchor": anchor_policy.counts_template(), "frame_age_min": [],
     }
     try:
         archive_dir = Path(archive_dir_s)
-        frames = [
-            ts for ts in full_range_frames(archive_dir, day)
-            if start_min <= ts.hour * 60 + ts.minute <= end_min
-        ]
+        plan = plan_day(
+            archive_dir, day, settings, start_min=start_min, end_min=end_min,
+        )
         cache = CompositeCache(archive_dir)
         states = {p.id: eng.INITIAL_STATE for p in points}
         rows: list[dict[str, Any]] = []
-        for radar_ts in frames:
+        for selection, history in plan:
             t0 = time.time()
+            if history is None:
+                result["anchor"]["no_history"] += 1
+                result["errors"].append(
+                    f"{selection.timestamp:%Y-%m-%dT%H:%MZ}: no "
+                    f"{selection.scan_type} input triple behind the anchor"
+                )
+                continue
+            radar_ts = history.selection.timestamp
             try:
-                samples = sample_frame(cache, radar_ts, points, settings)
+                samples = sample_frame(
+                    cache, radar_ts, points, settings, history=history,
+                )
             except Exception as exc:  # noqa: BLE001 — one frame, not the day
                 result["errors"].append(
                     f"{radar_ts:%Y-%m-%dT%H:%MZ}: {type(exc).__name__}: {exc}"
                 )
                 continue
+            anchor_policy.count_selection(result["anchor"], history)
+            result["frame_age_min"].append(
+                round(history.selection.frame_age_min, 2)
+            )
             for sample in samples:
                 station = sample["station_id"]
                 obs = eng.Observation(
@@ -918,7 +1240,58 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--days", help="comma-separated YYYY-MM-DD")
     p.add_argument("--days-file", type=Path, help="one YYYY-MM-DD per line")
     p.add_argument("--workers", type=int, default=1)
-    p.add_argument("--frame-age-min", type=float, default=DEFAULT_FRAME_AGE_MIN)
+    p.add_argument(
+        "--frame-age-min", type=float, default=None,
+        help="Flat simulated frame age for EVERY frame, the pre-L3 model. "
+             "Given, it overrides the per-product publication lag and the "
+             "poll grid, reproducing an older run exactly (the runs before "
+             "2026-09-09 used 14). Omitted, the age comes from "
+             "--lag-fullrange-min / --lag-doppler-min plus the wait for the "
+             "next poll, so a fullRange cycle sits at 15 min.",
+    )
+    p.add_argument(
+        "--anchor", choices=anchor_policy.POLICIES,
+        default=anchor_policy.POLICY_FULLRANGE,
+        help="Which frame each cycle stands on (Phase H, L3). 'fullRange' "
+             "is today's product; 'freshest' anchors on the :x5 doppler "
+             "composite, harmonised through --harmonisation and filled from "
+             "the newest fullRange frame outside its 120 km range.",
+    )
+    p.add_argument(
+        "--harmonisation", type=Path, default=None,
+        help="L2 doppler->fullRange quantile map (doppler_harmonisation.json). "
+             "Required by --anchor freshest: raw doppler carries 20-30 %% "
+             "less echo at 20 dBZ and must never enter the chain unmapped.",
+    )
+    p.add_argument(
+        "--lag-fullrange-min", type=float,
+        default=anchor_policy.DEFAULT_LAG_FULLRANGE_MIN,
+        help="Publication lag of the :x0 composite (measured 2026-09-06/07).",
+    )
+    p.add_argument(
+        "--lag-doppler-min", type=float,
+        default=anchor_policy.DEFAULT_LAG_DOPPLER_MIN,
+        help="Publication lag of the :x5 composite (measured 2026-09-06/07).",
+    )
+    p.add_argument(
+        "--poll-interval-min", type=float,
+        default=anchor_policy.DEFAULT_POLL_INTERVAL_MIN,
+        help="The cycle's poll cadence. A frame is first seen at the first "
+             "poll at or after it is published; a poll that finds no new "
+             "frame is not a decision instant (the runtime's no-new-frame "
+             "fast path), which also keeps radar_ts unique per decision.",
+    )
+    p.add_argument(
+        "--anchor-history", choices=anchor_policy.HISTORY_MODES,
+        default=anchor_policy.HISTORY_SAME_TYPE,
+        help="What the flow and the cascade eat under a doppler anchor. "
+             "'same-type' is DECIDE-3 as written: three doppler frames, so "
+             "p_rain exists only inside doppler's 120 km range and six "
+             "gauges go dark. 'filled' makes every history frame a "
+             "per-pixel freshest composite instead — each pixel's series "
+             "is still one product at 10-min spacing, and the national "
+             "grid keeps fullRange's coverage.",
+    )
     p.add_argument("--out-dir", required=True, type=Path)
     p.add_argument("--rules", help="k=v,... over the live subscriber row")
     p.add_argument("--progress", type=Path,
@@ -963,8 +1336,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     start_min = _hhmm_to_min(args.start_utc, 0)
     end_min = _hhmm_to_min(args.end_utc, 24 * 60)
 
+    anchor_settings = AnchorSettings(
+        policy=args.anchor,
+        lag_fullrange_min=float(args.lag_fullrange_min),
+        lag_doppler_min=float(args.lag_doppler_min),
+        poll_interval_min=float(args.poll_interval_min),
+        frame_age_override_min=(
+            None if args.frame_age_min is None else float(args.frame_age_min)
+        ),
+        harmonisation_path=(
+            str(args.harmonisation) if args.harmonisation else None
+        ),
+        history_mode=args.anchor_history,
+    )
+    if anchor_settings.policy == anchor_policy.POLICY_FRESHEST:
+        if not anchor_settings.harmonisation_path:
+            p.error("--anchor freshest requires --harmonisation")
+        try:
+            # Fail here, not 4,000 frames in: an unreadable or
+            # wrong-schema table cannot be applied to a single frame.
+            anchor_policy.load_harmonisation(anchor_settings.harmonisation_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            p.error(f"--harmonisation: {exc}")
+
     settings = FrameSettings(
-        frame_age_min=float(args.frame_age_min),
+        frame_age_min=(
+            DEFAULT_FRAME_AGE_MIN if args.frame_age_min is None
+            else float(args.frame_age_min)
+        ),
+        anchor=anchor_settings,
         ensemble_size=int(args.ensemble_size),
         n_cascade_levels=int(args.cascade_levels),
         downsample_factor=int(args.downsample_factor),
@@ -997,17 +1397,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
     errors: list[str] = []
     frame_ms: list[float] = []
+    anchor_counts = anchor_policy.counts_template()
+    frame_ages: list[float] = []
     if args.workers <= 1:
         results = (run_day(t) for t in tasks)
         for i, res in enumerate(results, 1):
-            _absorb(res, progress, args.progress, errors, frame_ms, i, len(tasks))
+            _absorb(res, progress, args.progress, errors, frame_ms, i,
+                    len(tasks), anchor_counts, frame_ages)
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = [pool.submit(run_day, t) for t in tasks]
             for i, fut in enumerate(as_completed(futures), 1):
                 _absorb(
                     fut.result(), progress, args.progress, errors, frame_ms,
-                    i, len(tasks),
+                    i, len(tasks), anchor_counts, frame_ages,
                 )
 
     decisions: list[dict] = []
@@ -1020,6 +1423,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         decisions += rows
         n_frames += len({r["radar_ts"] for r in rows})
 
+    # Anchor totals over every requested day, not only the ones this
+    # invocation replayed: a resumed run would otherwise report the
+    # candidate as having anchored on almost nothing.
+    all_anchor_counts = anchor_policy.counts_template()
+    all_frame_ages: list[float] = []
+    for d in days:
+        entry = progress["days"].get(d) or {}
+        if d in done:
+            anchor_policy.sum_counts(all_anchor_counts, entry.get("anchor"))
+            all_frame_ages.extend(entry.get("frame_age_min") or ())
+    anchor_policy.sum_counts(all_anchor_counts, anchor_counts)
+    all_frame_ages.extend(frame_ages)
+
     summary: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "run": {
@@ -1028,7 +1444,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "n_frames": n_frames,
             "n_stations": len(points),
             "n_decision_rows": len(decisions),
-            "frame_age_min": settings.frame_age_min,
+            # The flat simulated age, or null when the age came from the
+            # publication lags. A parity key in benchmark_report: two runs
+            # that disagree here are not measuring the same thing.
+            "frame_age_min": settings.anchor.frame_age_override_min,
+            # L3: which frame each cycle stood on, what it cost in
+            # freshness, and how often the candidate fell back to the
+            # baseline. Everything needed to read the run's numbers.
+            "anchor": {
+                **settings.anchor.as_dict(),
+                "counts": all_anchor_counts,
+                "frame_age_min": anchor_policy.frame_age_stats(all_frame_ages),
+            },
             "rules": rules,
             "steps": {
                 "ensemble_size": settings.ensemble_size,
@@ -1082,10 +1509,16 @@ def _absorb(
     frame_ms: list[float],
     index: int,
     total: int,
+    anchor_counts: dict[str, int] | None = None,
+    frame_ages: list[float] | None = None,
 ) -> None:
     """Fold one finished day into the run state and persist progress."""
     errors.extend(res["errors"])
     frame_ms.extend(res["frame_ms"])
+    if anchor_counts is not None:
+        anchor_policy.sum_counts(anchor_counts, res.get("anchor"))
+    if frame_ages is not None:
+        frame_ages.extend(res.get("frame_age_min") or ())
     progress["days"][res["day"]] = {
         "status": "failed" if res.get("failed") else "done",
         "rows": res["rows"],
@@ -1093,6 +1526,10 @@ def _absorb(
         "elapsed_s": res["elapsed_s"],
         "state": res["state"],
         "n_errors": len(res["errors"]),
+        # Which product each of the day's cycles stood on, so a resumed
+        # run can still report the anchor totals for days it skipped.
+        "anchor": res.get("anchor"),
+        "frame_age_min": res.get("frame_age_min"),
     }
     if progress_path is not None:
         _write_json_atomic(progress_path, progress)
