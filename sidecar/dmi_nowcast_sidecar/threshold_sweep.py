@@ -152,7 +152,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from dmi_nowcast_core.push_thresholds import (
     DEFAULT_FALLBACK_THRESHOLD_PCT,
@@ -375,6 +375,7 @@ def load_decisions(
     directories: Sequence[Path],
     *,
     leads_min: Iterable[int] | None = None,
+    extra_columns: Sequence[str] = (),
     log=None,
 ) -> tuple[list[dict], tuple[int, ...], dict[str, int]]:
     """Read every decision parquet under ``directories`` into one row list.
@@ -386,9 +387,19 @@ def load_decisions(
     All files are aligned to the union of the requested leads and every
     lead any file carries, so a day written before ``p_rain_45`` existed
     reads back with a null there instead of a missing key.
+
+    ``extra_columns`` names columns to carry along BESIDE the shared
+    schema, which alignment would otherwise drop. It exists for one case:
+    scoring a run whose probability lives in a column the schema does not
+    know about — ``p_post_<lead>`` from the H-P post-processor. A file
+    without one of them contributes ``None`` for it, exactly as an absent
+    lead does. Everything else about the read is unchanged, so the default
+    call reads precisely what it always read.
     """
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
+    extras = [str(name) for name in dict.fromkeys(extra_columns)]
     counts: dict[str, int] = {"files": 0, "skipped": 0, "rows": 0, "duplicates": 0}
     paths_by_dir: list[list[Path]] = []
     leads: set[int] = set(int(lead) for lead in (leads_min or ()))
@@ -416,7 +427,15 @@ def load_decisions(
     for paths in paths_by_dir:
         for path in paths:
             try:
-                table = align_decision_table(pq.read_table(path), union)
+                raw = pq.read_table(path)
+                table = align_decision_table(raw, union)
+                for name in extras:
+                    table = table.append_column(name, (
+                        raw.column(name).cast(pa.float64())
+                        if name in raw.schema.names
+                        else pa.nulls(raw.num_rows, pa.float64())
+                    ))
+                del raw
             except Exception as exc:  # noqa: BLE001 — one unreadable file
                 counts["skipped"] += 1
                 if log:
@@ -456,6 +475,7 @@ def build_tracks(
     leads: Sequence[int],
     *,
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
+    column_for: Callable[[int], str] = p_rain_column,
 ) -> tuple[dict[str, list[tuple]], dict[str, list[datetime]]]:
     """Per-station tracks in ``radar_ts`` order, plus the raw frame stamps.
 
@@ -463,6 +483,10 @@ def build_tracks(
     every lead in the sweep splits its state at exactly the same instants
     the coverage runs do — even at a lead whose probability column is
     mostly null.
+
+    ``column_for`` names the probability column of each lead. The default
+    is the served ``p_rain_<lead>``; the benchmark points it at
+    ``p_post_<lead>`` to replay the same rule on a post-processed run.
     """
     by_station: dict[str, list[dict]] = {}
     for row in rows:
@@ -472,7 +496,7 @@ def build_tracks(
         by_station.setdefault(str(row.get("station_id")), []).append(row)
 
     gap = timedelta(minutes=coverage_gap_min)
-    columns = [p_rain_column(lead) for lead in leads]
+    columns = [column_for(lead) for lead in leads]
     tracks: dict[str, list[tuple]] = {}
     frames: dict[str, list[datetime]] = {}
     for station, station_rows in by_station.items():

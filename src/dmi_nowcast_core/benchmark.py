@@ -16,7 +16,7 @@ The three layers of the Phase H suite consume different parts:
   :func:`crps_ensemble` and :func:`rank_histogram` on the STEPS members,
   plus :func:`stall_diagnostic` on the completed flow.
 * **Layer B** (probability skill, gauge truth): :func:`brier_decomposition`,
-  :func:`roc_auc`, :func:`pr_auc`.
+  :func:`reliability_bins`, :func:`roc_auc`, :func:`pr_auc`.
 * **Both**: :func:`block_bootstrap` / :func:`paired_block_bootstrap` for the
   day-block confidence intervals the acceptance gate is written in terms
   of, and :func:`contingency_sum` so a pooled CSI over resampled days is
@@ -46,6 +46,7 @@ from .evaluate import ContingencyTable
 
 __all__ = [
     "brier_decomposition",
+    "reliability_bins",
     "roc_auc",
     "pr_auc",
     "crps_ensemble",
@@ -158,6 +159,48 @@ def brier_decomposition(
         "base_rate": base,
         "n": n,
     }
+
+
+def reliability_bins(
+    p: np.ndarray | Sequence[float],
+    y: np.ndarray | Sequence[float],
+    n_bins: int = 10,
+) -> list[dict[str, float | int]]:
+    """Reliability curve with counts, one entry per **occupied** bin.
+
+    Bin *k* covers ``[k/K, (k+1)/K)`` with ``p == 1`` folded into the last
+    one — :func:`brier_decomposition`'s binning, ``quality_report``'s and
+    ``sql/reliability_pooled.sql``'s, so a number here, a number from the
+    nightly report and a number from DuckDB agree. Empty bins are omitted
+    rather than reported as zeroes: an unoccupied bin has no observed
+    frequency, and 0.0 is a value.
+
+    Pairs where either input is non-finite are dropped, as everywhere else
+    in this module. Returns ``[]`` for an empty sample.
+    """
+    prob, outcome = _paired_finite(p, y, "p", "y")
+    if prob.size == 0:
+        return []
+    _check_binary(outcome)
+    prob = _check_probability(prob)
+    index = np.clip(np.floor(prob * n_bins).astype(np.int64), 0, n_bins - 1)
+    counts = np.bincount(index, minlength=n_bins)
+    sum_p = np.bincount(index, weights=prob, minlength=n_bins)
+    sum_y = np.bincount(index, weights=outcome, minlength=n_bins)
+    out: list[dict[str, float | int]] = []
+    for k in range(n_bins):
+        total = int(counts[k])
+        if total == 0:
+            continue
+        out.append({
+            "bin": k,
+            "p_lo": k / n_bins,
+            "p_hi": (k + 1) / n_bins,
+            "n": total,
+            "mean_p": float(sum_p[k] / total),
+            "observed": float(sum_y[k] / total),
+        })
+    return out
 
 
 def roc_auc(

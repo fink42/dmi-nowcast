@@ -917,3 +917,171 @@ def test_an_unreadable_map_fails_before_the_first_frame(
             "--anchor", "freshest", "--harmonisation", str(bad),
         ))
     assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# H-P feature columns (Phase H)
+# ---------------------------------------------------------------------------
+
+
+def _feature_table(out_dir: Path):
+    import pyarrow.parquet as pq
+
+    return pq.read_table(out_dir / "decisions" / f"{DAY}.parquet")
+
+
+@pytest.fixture(scope="module")
+def featured_day(archive_dir: Path, tmp_path_factory: pytest.TempPathFactory):
+    """One replayed day with --features on (the default). STEPS is not free."""
+    out_dir = tmp_path_factory.mktemp("features")
+    result = rw.run_day(_day_args(archive_dir, out_dir))
+    assert result["failed"] is False
+    return _feature_table(out_dir), out_dir
+
+
+class TestFeatureColumns:
+    """The H-P predictors, written beside the decision they were taken on."""
+
+    def test_every_documented_column_is_written(self, featured_day) -> None:
+        table, _out_dir = featured_day
+        expected = list(rw.feature_schema(TINY.leads_min).names)
+        assert set(expected) <= set(table.schema.names)
+        # The shared schema comes first and is untouched.
+        shared = list(rw.decision_schema(TINY.leads_min).names)
+        assert table.schema.names[:len(shared)] == shared
+
+    def test_the_documentation_covers_exactly_those_columns(self) -> None:
+        docs = rw.feature_documentation(TINY.leads_min)
+        assert set(docs) == set(rw.feature_schema(TINY.leads_min).names)
+        assert all(text.strip() for text in docs.values())
+
+    def test_the_values_are_in_range(self, featured_day) -> None:
+        table, _out_dir = featured_day
+        for row in table.to_pylist():
+            for lead in TINY.leads_min:
+                raw = row[f"raw_frac_{lead}"]
+                assert raw is None or 0.0 <= raw <= 1.0
+            assert row["obs_max_5km_mm_h"] >= 0.0
+            # The disc maximum cannot be below the block p90 at its centre.
+            assert row["obs_max_5km_mm_h"] >= row["observed_mm_h"] - 1e-3
+            assert row["stalled_share"] is None or 0.0 <= row["stalled_share"] <= 1.0
+            assert row["bulk_kmh"] >= 0.0
+            assert row["local_speed_kmh"] >= 0.0
+            bearing = row["bulk_dir_deg"]
+            assert bearing is None or 0.0 <= bearing < 360.0
+            wet = row["up_wet_frac_40km"]
+            assert wet is None or 0.0 <= wet <= 1.0
+            distance = row["up_dist_km"]
+            assert distance is None or 0.0 <= distance <= 40.0
+
+    def test_the_calendar_columns_come_off_the_decision_instant(
+        self, featured_day,
+    ) -> None:
+        table, _out_dir = featured_day
+        for row in table.to_pylist():
+            stamp = row["generated_at"]
+            assert row["season"] == "summer"          # 2026-09-05
+            assert row["hour_utc"] == stamp.hour
+            assert row["frame_age_min"] == pytest.approx(14.0)
+
+    def test_the_radar_distance_is_the_stations_own(self, featured_day) -> None:
+        from dmi_nowcast_core.product_pairs import nearest_radar_km
+
+        table, _out_dir = featured_day
+        expected = {
+            point["id"]: nearest_radar_km(point["lat"], point["lon"])
+            for point in POINTS["points"]
+        }
+        for row in table.to_pylist():
+            assert row["station_radar_km"] == pytest.approx(
+                expected[row["station_id"]], abs=1e-3,
+            )
+
+    def test_the_raw_fraction_is_the_uncalibrated_one(
+        self, archive_dir: Path,
+    ) -> None:
+        """With no curves the two agree; the curve is what separates them."""
+        samples = rw.sample_frame(
+            rw.CompositeCache(archive_dir), T_ANCHOR,
+            [rw.StationPoint(**p) for p in POINTS["points"]], TINY,
+        )
+        for sample in samples:
+            for lead, value in sample["p_rain"].items():
+                raw = sample["features"][f"raw_frac_{lead}"]
+                assert raw == pytest.approx(value)
+
+    def test_no_features_reproduces_the_shared_schema(
+        self, archive_dir: Path, tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        settings = replace(TINY, features=False)
+        result = rw.run_day(
+            _day_args(archive_dir, tmp_path, settings=settings)
+        )
+        assert result["failed"] is False
+        table = _feature_table(tmp_path)
+        assert table.schema.names == list(
+            rw.decision_schema(TINY.leads_min).names
+        )
+
+
+class TestFeaturesAreIgnoredDownstream:
+    """The additive columns must be invisible to everything that scores."""
+
+    def test_the_sweeps_reader_conforms_them_away(self, featured_day) -> None:
+        from dmi_nowcast_sidecar.threshold_sweep import load_decisions
+
+        _table, out_dir = featured_day
+        rows, leads, _counts = load_decisions([out_dir], leads_min=TINY.leads_min)
+        assert rows
+        assert set(rows[0]) == set(rw.decision_schema(leads).names)
+
+    def test_the_benchmark_loader_reads_the_probabilities_unchanged(
+        self, featured_day,
+    ) -> None:
+        import sys as _sys
+
+        _sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+        import benchmark_report as bench
+
+        table, out_dir = featured_day
+        loaded = bench.load_probabilities([out_dir], [30])
+        assert loaded["rows"] == table.num_rows
+        assert set(loaded["p"]) == {30}
+
+    def test_the_replays_own_reader_drops_them(self, featured_day) -> None:
+        _table, out_dir = featured_day
+        rows = rw.read_decisions(
+            out_dir / "decisions" / f"{DAY}.parquet", TINY.leads_min,
+        )
+        assert set(rows[0]) == set(rw.decision_schema(TINY.leads_min).names)
+
+
+def test_the_summary_documents_the_feature_columns(
+    archive_dir: Path, points_file: Path, tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "documented"
+    assert rw.main(_cli(
+        archive_dir, out_dir, points_file,
+        "--start-utc", "06:20", "--end-utc", "06:20",
+    )) == 0
+    block = json.loads((out_dir / "summary.json").read_text())["run"]["features"]
+    assert block["enabled"] is True
+    assert "raw_frac_30" in block["columns"]
+    assert block["upstream_corridor"]["far_km"] == 40.0
+    assert block["wet_mm_h"] == 0.5
+
+
+def test_no_features_is_recorded_as_such(
+    archive_dir: Path, points_file: Path, tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "bare"
+    assert rw.main(_cli(
+        archive_dir, out_dir, points_file, "--no-features",
+        "--start-utc", "06:20", "--end-utc", "06:20",
+    )) == 0
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["run"]["features"]["enabled"] is False
+    # Documented anyway, so a reader of an old run can see what is missing.
+    assert summary["run"]["features"]["columns"]

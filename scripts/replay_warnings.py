@@ -124,11 +124,58 @@ The L3 candidate — same days, same everything, freshest anchor
         --harmonisation "$CORPUS"/stations/product_study/doppler_harmonisation.json \\
         --out-dir /var/lib/dmi-nowcast-corpus/stations/replay_freshest
 
+Post-processing features (Phase H, H-P)
+--------------------------------------
+``--features`` (ON by default) writes, beside each decision, the
+predictors the gauge-trained post-processor is fitted on
+(``scripts/fit_postprocess.py``). They come off the SAME anchor field, the
+SAME completed flow and the SAME national grids the cycle already
+computed — no second STEPS run, no second motion estimate — and they are
+computed for the whole station list in one vectorised pass rather than a
+Python loop per pixel.
+
+The columns are **additive**. They are not part of
+``warning_score.decision_schema``, and every existing consumer
+(``threshold_sweep.load_decisions``, both benchmark layers, the nightly
+fit) conforms a file to that schema before reading it, so a run with
+features scores identically to one without. ``--no-features`` reproduces
+the pre-2026-09-09 file byte for byte.
+
+Definitions, also written to ``summary.json`` under ``run.features``:
+
+``raw_frac_<lead>``
+    The UNcalibrated ensemble fraction at that lead, read at the same
+    product pixel the calibrated ``p_rain_<lead>`` was. The calibrated
+    column is untouched — it is the baseline the post-processor has to
+    beat.
+``obs_max_5km_mm_h``
+    Max observed rain rate within 5 km of the station on the native grid.
+    (The block-p90 observation at the station's own product pixel is
+    already the schema's ``observed_mm_h``, and is not duplicated.)
+``up_max_20km_mm_h`` / ``up_max_40km_mm_h`` / ``up_dist_km`` /
+``up_wet_frac_40km``
+    The upwind corridor: 6 km wide, laid along the LOCAL completed flow at
+    the station, out to 20 and 40 km. Maximum rain rate in it, distance to
+    the nearest pixel at or above 0.5 mm/h (NaN — "no echo upwind" — when
+    there is none), and the share of its in-composite pixels that are wet.
+``bulk_kmh`` / ``bulk_dir_deg`` / ``local_speed_kmh`` / ``stalled_share``
+    The cycle's motion: bulk speed and the compass bearing it heads
+    toward, the completed flow's speed at the station, and the share of
+    wet pixels whose raw estimate is stalled (the H-F health signal).
+``season`` / ``hour_utc`` / ``frame_age_min`` / ``station_radar_km``
+    The decision instant's season (the project-wide May-Sep / Dec-Mar /
+    shoulder split) and UTC hour, the cycle's own simulated latency, and
+    the station's great-circle distance to the nearest DMI radar.
+
+``eta_min`` and ``intensity_mm_h`` are features too, and are already
+decision columns; they are read from there rather than written twice.
+
 Outputs under ``--out-dir``:
 
 ``decisions/YYYY-MM-DD.parquet``
     One row per (frame, station): the sampled forecast and the action the
-    engine took. :data:`dmi_nowcast_core.warning_score.DECISION_COLUMNS`.
+    engine took. :data:`dmi_nowcast_core.warning_score.DECISION_COLUMNS`,
+    plus the H-P feature columns above when ``--features`` is on.
 ``events.parquet``
     Every warning the replay sent, with its outcome, matched onset and
     lead error.
@@ -180,7 +227,9 @@ from dmi_nowcast_core.national import (  # noqa: E402
     observed_rain_grid,
 )
 from dmi_nowcast_core.parse import RadarComposite, parse_composite  # noqa: E402
+from dmi_nowcast_core import postprocess  # noqa: E402
 from dmi_nowcast_core.probabilistic import run_ensemble  # noqa: E402
+from dmi_nowcast_core.product_pairs import nearest_radar_km  # noqa: E402
 from dmi_nowcast_core.transform import dbz_to_rain_rate  # noqa: E402
 from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_DRY_MIN,
@@ -463,21 +512,33 @@ class FrameSettings:
     flow_texture_percentile: float = DEFAULT_TEXTURE_PERCENTILE
     # L3 (2026-09-09): which frame each cycle stands on. See AnchorSettings.
     anchor: AnchorSettings = field(default_factory=AnchorSettings)
+    # H-P (2026-09-09): write the per-station post-processing features
+    # beside the decision. Additive columns; every consumer of the decision
+    # schema ignores them (``align_decision_table`` conforms a file to the
+    # schema and drops what is not in it), so a run WITH features scores
+    # identically to one without.
+    features: bool = True
 
 
-def production_flow(
+def production_motion(
     prev: RadarComposite,
     now: RadarComposite,
     rain_now: np.ndarray,
     settings: "FrameSettings | None" = None,
     *,
     dt_min: float = FRAME_INTERVAL_MIN,
-) -> tuple[np.ndarray, np.ndarray]:
-    """``(vy, vx)`` in px per inter-frame step — compute.py's motion block.
+) -> Any:
+    """The cycle's :class:`~dmi_nowcast_core.dense_flow.MotionEstimate`.
 
     One call into ``dense_flow.estimate_motion``, the same entry point the
     runtime and the corpus builder use, so the replay cannot drift from
     what production serves.
+
+    The whole estimate is returned, not just ``(vy, vx)``: the H-P feature
+    block needs the bulk motion and the stall share beside the completed
+    field. The caller drops it before STEPS runs — it carries two more
+    native-grid float32 grids (~14 MB each on the DMI composite) that
+    nothing downstream of the features reads.
 
     Falls back to a uniform phase-correlation shift when OpenCV is absent,
     exactly as ``build_calibration_corpus._process_event`` does, so the
@@ -516,8 +577,7 @@ def production_flow(
         max_px_per_frame=MAX_PX_PER_FRAME,
         flow=raw_flow,
     )
-    # The raw grids only fed the stall diagnostic; STEPS runs next.
-    return motion.vy, motion.vx
+    return motion
 
 
 #: One isotonic curve set per process, keyed on the file path — the curves
@@ -670,9 +730,29 @@ def sample_frame(
         rain_now if support_dbz is anchor_dbz
         else dbz_to_rain_rate(support_dbz, zr_a=now.zr_a, zr_b=now.zr_b)
     )
-    vy, vx = production_flow(
+    motion = production_motion(
         composites[-2], now, rain_support, settings, dt_min=dt_min,
     )
+    vy, vx = motion.vy, motion.vx
+    # The H-P features come off the SAME anchor field and the SAME
+    # completed flow the ensemble is about to run on — no second estimate,
+    # no second STEPS. Computed here, before the cascade, so the
+    # MotionEstimate (which carries two more native-grid grids) can be
+    # dropped before the memory-hungry part of the cycle.
+    grid_features = None
+    if settings.features:
+        native = [geo.lonlat_to_grid(point.lon, point.lat) for point in points]
+        grid_features = postprocess.station_features(
+            rain_now, vy, vx,
+            np.array([idx.row for idx in native], dtype=np.float64),
+            np.array([idx.col for idx in native], dtype=np.float64),
+            pixel_km=float(now.xscale_m) / 1000.0,
+            dt_min=dt_min,
+            bulk_vy=motion.bulk_vy,
+            bulk_vx=motion.bulk_vx,
+            stalled_share=motion.stalled_share,
+        )
+    del motion
 
     n_timesteps = max(1, math.ceil(settings.horizon_min / dt_min - 1e-9))
     forecast = run_ensemble(
@@ -696,6 +776,12 @@ def sample_frame(
         downsample_factor=settings.downsample_factor,
     )
     del forecast
+
+    # The UNcalibrated fractions, kept by reference before the curves
+    # replace them: ``raw_frac_<lead>`` is the H-P model's main predictor
+    # and the calibrated ``p_rain_<lead>`` is the baseline it has to beat,
+    # so both have to survive the next block.
+    raw_p_rain = dict(products.p_rain)
 
     # §B4: the calibrated grid REPLACES the raw one, exactly as the cycle
     # does it — a decision taken on a raw ensemble fraction is not the
@@ -736,15 +822,16 @@ def sample_frame(
     if stamped_ts.tzinfo is None:
         stamped_ts = stamped_ts.replace(tzinfo=timezone.utc)
     generated_at = stamped_ts + timedelta(minutes=frame_age_min)
+    season = postprocess.season_of_month(generated_at.month)
     out: list[dict[str, Any]] = []
-    for point in points:
+    for index, point in enumerate(points):
         sample = sample_point(
             products, geo, point.lat, point.lon,
             observed_mm_h=observed_grid,
             forecast_mm_h=forecast_grids,
         )
         series = sample.forecast_mm_h if sample else None
-        out.append({
+        row: dict[str, Any] = {
             "radar_ts": stamped_ts,
             "generated_at": generated_at,
             "station_id": point.id,
@@ -753,8 +840,82 @@ def sample_frame(
             "intensity_mm_h": sample.intensity_mm_h if sample else None,
             "observed_mm_h": sample.observed_mm_h if sample else None,
             "forecast_now_mm_h": series.get(0) if series else None,
-        })
+        }
+        if grid_features is not None:
+            row["features"] = _feature_row(
+                grid_features, index, point,
+                raw_p_rain=raw_p_rain,
+                pixel=None if sample is None else (sample.row, sample.col),
+                leads_min=products.leads_min,
+                season=season,
+                hour_utc=generated_at.hour,
+                frame_age_min=frame_age_min,
+            )
+        out.append(row)
     return out
+
+
+#: ``(lat, lon)`` → km to the nearest radar, memoised per process. The
+#: distance is a property of the station, not of the cycle, and the replay
+#: asks for it once per station per frame.
+_RADAR_KM_CACHE: dict[tuple[float, float], float] = {}
+
+
+def station_radar_km(lat: float, lon: float) -> float:
+    key = (round(float(lat), 6), round(float(lon), 6))
+    hit = _RADAR_KM_CACHE.get(key)
+    if hit is None:
+        hit = float(nearest_radar_km(float(lat), float(lon)))
+        _RADAR_KM_CACHE[key] = hit
+    return hit
+
+
+def _finite(value: Any) -> float | None:
+    """A feature value for parquet: non-finite becomes a null, never a 0."""
+    if value is None:
+        return None
+    out = float(value)
+    return out if math.isfinite(out) else None
+
+
+def _feature_row(
+    grid_features: dict[str, np.ndarray],
+    index: int,
+    point: StationPoint,
+    *,
+    raw_p_rain: dict[int, np.ndarray],
+    pixel: tuple[int, int] | None,
+    leads_min: Sequence[int],
+    season: str,
+    hour_utc: int,
+    frame_age_min: float,
+) -> dict[str, Any]:
+    """One station's H-P feature columns for one cycle.
+
+    ``pixel`` is the PRODUCT-grid pixel ``sample_point`` read, so the raw
+    ensemble fraction comes off exactly the pixel the calibrated one did;
+    ``None`` means the station is off coverage and every ensemble feature
+    is unknown. The grid-derived features are read from ``grid_features``
+    by position — they were computed for the whole station list in one
+    pass, on the native grid, and a station off the native grid already
+    carries NaN there.
+    """
+    row: dict[str, Any] = {}
+    for lead in leads_min:
+        grid = raw_p_rain.get(int(lead))
+        row[postprocess.raw_fraction_column(lead)] = (
+            None if pixel is None or grid is None
+            else _finite(grid[pixel[0], pixel[1]])
+        )
+    for name, _definition in postprocess.SCALAR_FEATURE_COLUMNS:
+        values = grid_features.get(name)
+        if values is not None:
+            row[name] = _finite(values[index])
+    row["season"] = season
+    row["hour_utc"] = int(hour_utc)
+    row["frame_age_min"] = float(frame_age_min)
+    row["station_radar_km"] = station_radar_km(point.lat, point.lon)
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -955,11 +1116,15 @@ def run_day(args: tuple) -> dict:
                     "action": decision.action,
                     "armed_after": decision.state.armed,
                     "streak_after": decision.state.streak,
+                    # H-P: additive, and only when --features is on.
+                    **(sample.get("features") or {}),
                 })
             result["frames"] += 1
             result["frame_ms"].append(round((time.time() - t0) * 1000.0, 1))
         out_path = Path(out_dir_s) / "decisions" / f"{day_s}.parquet"
-        write_decisions(out_path, rows, settings.leads_min)
+        write_decisions(
+            out_path, rows, settings.leads_min, features=settings.features,
+        )
         result["rows"] = len(rows)
         result["state"] = {sid: state_to_json(s) for sid, s in states.items()}
     except Exception as exc:  # noqa: BLE001 — a dead day must not kill the run
@@ -990,9 +1155,60 @@ def _write_table_atomic(table, path: Path) -> None:
             os.unlink(tmp)
 
 
-def write_decisions(path: Path, rows: Sequence[dict], leads_min=None) -> None:
-    """Write one day's decision rows, atomically, in the shared schema."""
-    _write_table_atomic(decision_table(rows, leads_min), path)
+def feature_schema(leads_min=None):
+    """Arrow fields for the H-P feature columns, in write order.
+
+    Additive to :func:`dmi_nowcast_core.warning_score.decision_schema` and
+    deliberately NOT part of it: the live decision step writes the shared
+    schema and has no features, and ``align_decision_table`` conforms any
+    file to that schema — so every existing consumer (the threshold sweep,
+    both benchmark layers, the nightly fit) reads a run with features
+    exactly as it reads one without, and simply never sees these columns.
+
+    Types mirror the decision schema's rules. Every numeric feature is
+    nullable float32 and a null means "not computable at this station this
+    cycle", never zero — a station off the composite has no upstream
+    corridor, and 0 mm/h would be a claim that it is dry there.
+    """
+    import pyarrow as pa
+
+    fields = []
+    for name, _definition in postprocess.feature_columns(
+        NATIONAL_LEADS if leads_min is None else leads_min,
+    ):
+        if name == "season":
+            fields.append((name, pa.string()))
+        elif name == "hour_utc":
+            fields.append((name, pa.int8()))
+        else:
+            fields.append((name, pa.float32()))
+    return pa.schema(fields)
+
+
+def feature_documentation(leads_min=None) -> dict[str, str]:
+    """``{column: definition}`` — what goes in ``summary.json``."""
+    return dict(postprocess.feature_columns(
+        NATIONAL_LEADS if leads_min is None else leads_min,
+    ))
+
+
+def write_decisions(
+    path: Path, rows: Sequence[dict], leads_min=None, *, features: bool = False,
+) -> None:
+    """Write one day's decision rows, atomically, in the shared schema.
+
+    ``features`` appends the H-P columns after the shared ones. A row
+    missing one contributes a null, exactly as in the base schema.
+    """
+    table = decision_table(rows, leads_min)
+    if features:
+        import pyarrow as pa
+
+        for field_ in feature_schema(leads_min):
+            table = table.append_column(field_, pa.array(
+                [row.get(field_.name) for row in rows], type=field_.type,
+            ))
+    _write_table_atomic(table, path)
 
 
 def read_decisions(path: Path, leads_min=None) -> list[dict]:
@@ -1318,6 +1534,15 @@ def main(argv: Sequence[str] | None = None) -> int:
              "(2026-09-08), 'bulk' the behaviour before it — the two sides "
              "of the A/B. Recorded in the run summary.",
     )
+    p.add_argument(
+        "--features", action=argparse.BooleanOptionalAction, default=True,
+        help="write the H-P post-processing features beside each decision "
+             "(scripts/fit_postprocess.py trains on them). Additive "
+             "columns: every existing consumer conforms the file to the "
+             "shared decision schema and ignores them, so a run with "
+             "features scores identically to one without. --no-features "
+             "reproduces the pre-2026-09-09 file exactly.",
+    )
     p.add_argument("--no-score", action="store_true",
                    help="replay only; skip the gauge scoring pass")
     args = p.parse_args(argv)
@@ -1375,6 +1600,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(args.national_curves) if args.national_curves else None
         ),
         flow_completion=args.flow_completion,
+        features=bool(args.features),
     )
     out_dir = Path(args.out_dir)
     (out_dir / "decisions").mkdir(parents=True, exist_ok=True)
@@ -1476,6 +1702,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "texture_percentile": settings.flow_texture_percentile,
             },
             "national_curves": settings.national_curves_path,
+            # H-P: what the extra columns in decisions/*.parquet mean.
+            # Written whether or not this run produced them, so a reader
+            # of an old run can see what it is missing.
+            "features": {
+                "enabled": settings.features,
+                "columns": feature_documentation(settings.leads_min),
+                "wet_mm_h": postprocess.WET_MM_H,
+                "obs_disc_km": postprocess.OBS_DISC_KM,
+                "upstream_corridor": {
+                    "half_width_km": postprocess.UPSTREAM_HALF_WIDTH_KM,
+                    "near_km": postprocess.UPSTREAM_NEAR_KM,
+                    "far_km": postprocess.UPSTREAM_FAR_KM,
+                    "step_km": postprocess.UPSTREAM_STEP_KM,
+                },
+            },
             "archive_dir": str(args.archive_dir),
             "corpus_dir": str(args.corpus_dir),
             "points_file": str(args.points),

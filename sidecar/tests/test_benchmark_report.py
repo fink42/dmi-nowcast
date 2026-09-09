@@ -391,6 +391,42 @@ class TestLayerB:
             # which is exactly right for a run against itself.
             assert difference["bss_excludes_zero"] is False
 
+    def test_the_candidate_arm_can_score_its_own_probability_column(
+        self, corpus: Path,
+    ) -> None:
+        """A post-processed copy (p_post) against the original's p_rain, in one A/B.
+
+        ``--probability-column`` applies to both arms, so scoring a
+        written-back copy through it would compare the copy with itself.
+        ``--candidate-probability-column`` names the candidate's column
+        alone; the baseline keeps reading ``p_rain_{lead}``.
+        """
+        import shutil
+
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+
+        post = corpus / "replay_post"
+        shutil.copytree(corpus / "replay", post)
+        for path in sorted((post / "decisions").glob("*.parquet")):
+            table = pq.read_table(path)
+            for lead in ("20", "30"):
+                shifted = pc.min_element_wise(
+                    pc.add(table.column(f"p_rain_{lead}"), 0.3), 1.0,
+                )
+                table = table.append_column(f"p_post_{lead}", shifted)
+            pq.write_table(table, path)
+
+        payload = _run(
+            corpus, "--layers", "b", "--candidate", str(post),
+            "--candidate-probability-column", "p_post_{lead}",
+        )
+        assert payload["settings"]["probability_column"] == "p_rain_{lead}"
+        assert payload["settings"]["candidate_probability_column"] == "p_post_{lead}"
+        entry = payload["layer_b"]["leads"]["20"]["all"]
+        assert entry["candidate"]["brier"] != entry["baseline"]["brier"]
+
     def test_a_dead_gauge_leaves_the_pool_and_is_named(self, corpus: Path) -> None:
         """06120 reports 75 slots and is never wet — the 06080 pattern."""
         payload = _run(corpus, "--layers", "b", "--min-known-slots", "40")

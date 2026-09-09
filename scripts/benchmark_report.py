@@ -129,6 +129,7 @@ from dmi_nowcast_core.benchmark import (  # noqa: E402
     brier_decomposition,
     paired_block_bootstrap,
     pr_auc,
+    reliability_bins,
     roc_auc,
 )
 from dmi_nowcast_core.push_thresholds import (  # noqa: E402
@@ -420,11 +421,42 @@ def parity_problems(
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_PROBABILITY_TEMPLATE = "p_rain_{lead}"
+
+
+def column_template(template: str) -> Callable[[int], str]:
+    """``"p_post_{lead}"`` → a function naming that run's probability column.
+
+    The template is how a post-processed run is scored by the same report:
+    ``scripts/fit_postprocess.py`` writes its out-of-fold probabilities into
+    a COPY of the run as ``p_post_<lead>``, leaving ``p_rain_<lead>``
+    untouched beside it, and ``--probability-column p_post_{lead}`` points
+    both layers at the new column. Everything else — the outcome window,
+    the dead-gauge rule, the strata, the bootstrap — is unchanged, which is
+    the whole point of doing it this way instead of writing a second
+    report.
+    """
+    if "{lead}" not in template:
+        raise ValueError(
+            f"--probability-column must contain '{{lead}}', got {template!r}"
+        )
+    probe = template.format(lead=30)
+    if not probe or probe != probe.strip():
+        raise ValueError(f"--probability-column is not a column name: {template!r}")
+
+    def name(lead: int) -> str:
+        return template.format(lead=int(lead))
+
+    return name
+
+
 def load_probabilities(
     directories: Sequence[Path],
     leads: Sequence[int],
     *,
     stations: Sequence[str] | None = None,
+    column_for: Callable[[int], str] = p_rain_column,
+    extra_columns: Sequence[str] = (),
     log=None,
 ) -> dict:
     """Decision rows as columns: ``t``, station code, and one p per lead.
@@ -441,15 +473,31 @@ def load_probabilities(
     the order given — so a pooled replay-plus-live read scores the same
     rows both layers replay.
 
-    Returns ``{"t": int64 epoch seconds, "station": int32 codes,
-    "stations": [id], "p": {lead: float64 with NaN for null}, "files": n,
-    "rows": n, "duplicates": n}``.
+    ``column_for`` names the probability column per lead (default
+    ``p_rain_<lead>``; see :func:`column_template`). ``extra_columns`` are
+    additional NUMERIC columns carried along as float64 — the H-P feature
+    columns, for ``scripts/fit_postprocess.py``, which needs them
+    deduplicated exactly the way the scored probabilities are. A column no
+    file carries comes back all-NaN rather than missing, so a model can be
+    fitted against a run that predates a feature.
+
+    Returns ``{"t": int64 epoch seconds of the decision instant,
+    "radar_ts": int64 epoch seconds of the anchor frame, "station": int32
+    codes, "stations": [id], "p": {lead: float64 with NaN for null},
+    "extra": {name: float64}, "files": n, "rows": n, "duplicates": n}``.
     """
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
     wanted = [int(lead) for lead in leads]
+    p_columns = {lead: column_for(lead) for lead in wanted}
+    extras = [str(name) for name in dict.fromkeys(extra_columns)]
+    if len(set(p_columns.values())) != len(p_columns):
+        raise SweepError("the probability column template collides across leads")
+    #: The columns asked of every file, in one order: the scored
+    #: probabilities first, then whatever extras the caller wants.
+    asked = list(dict.fromkeys(list(p_columns.values()) + extras))
     tables: list[Any] = []
     counts = {"files": 0, "skipped": 0, "rows": 0}
     for directory in directories:
@@ -467,10 +515,7 @@ def load_probabilities(
                 if log:
                     log(f"skipping {path.name}: not a decision table")
                 continue
-            present = [
-                p_rain_column(lead) for lead in wanted
-                if p_rain_column(lead) in names
-            ]
+            present = [name for name in asked if name in names]
             columns = ["radar_ts", "generated_at", "station_id"] + present
             try:
                 table = pq.read_table(path, columns=columns)
@@ -479,15 +524,13 @@ def load_probabilities(
                 if log:
                     log(f"skipping {path.name}: {type(exc).__name__}: {exc}")
                 continue
-            for lead in wanted:
-                column = p_rain_column(lead)
-                if column not in names:
+            for name in asked:
+                if name not in names:
                     table = table.append_column(
-                        column, pa.nulls(table.num_rows, pa.float32()),
+                        name, pa.nulls(table.num_rows, pa.float64()),
                     )
             table = table.select(
-                ["radar_ts", "generated_at", "station_id"]
-                + [p_rain_column(lead) for lead in wanted]
+                ["radar_ts", "generated_at", "station_id"] + asked
             )
             counts["files"] += 1
             counts["rows"] += table.num_rows
@@ -495,7 +538,7 @@ def load_probabilities(
                 ("radar_ts", pa.timestamp("us", tz="UTC")),
                 ("generated_at", pa.timestamp("us", tz="UTC")),
                 ("station_id", pa.string()),
-                *[(p_rain_column(lead), pa.float32()) for lead in wanted],
+                *[(name, pa.float64()) for name in asked],
             ])))
     if not tables:
         raise SweepError("no decision rows found")
@@ -542,19 +585,25 @@ def load_probabilities(
         stamp.cast(pa.int64()).to_numpy(zero_copy_only=False), dtype=np.int64,
     ) // 1_000_000
 
-    probabilities = {
-        lead: np.asarray(
-            merged.column(p_rain_column(lead)).combine_chunks()
+    def _numeric(name: str) -> np.ndarray:
+        return np.asarray(
+            merged.column(name).combine_chunks()
             .cast(pa.float64()).to_numpy(zero_copy_only=False),
             dtype=np.float64,
         )
-        for lead in wanted
-    }
+
+    radar_ts = np.asarray(
+        merged.column("radar_ts").combine_chunks()
+        .cast(pa.int64()).to_numpy(zero_copy_only=False), dtype=np.int64,
+    ) // 1_000_000
+    probabilities = {lead: _numeric(p_columns[lead]) for lead in wanted}
     out = {
         "t": t,
+        "radar_ts": radar_ts,
         "station": codes,
         "stations": station_ids,
         "p": probabilities,
+        "extra": {name: _numeric(name) for name in extras},
         "files": counts["files"],
         "skipped": counts["skipped"],
         "rows": int(merged.num_rows),
@@ -657,31 +706,17 @@ class GaugeGrid:
 def reliability_table(p: np.ndarray, y: np.ndarray, n_bins: int = N_BINS) -> list[dict]:
     """Ten-bin reliability curve with counts, one row per occupied bin.
 
-    Bin *k* is ``[k/K, (k+1)/K)`` with ``p == 1`` folded into the last —
-    ``quality_report._bin_index``' convention and ``brier_decomposition``'s,
-    so a number here, a number from the nightly report and a number from
-    DuckDB all agree.
+    ``benchmark.reliability_bins`` does the binning — bin *k* is
+    ``[k/K, (k+1)/K)`` with ``p == 1`` folded into the last, which is
+    ``quality_report._bin_index``' convention and
+    ``brier_decomposition``'s, so a number here, a number from the nightly
+    report and a number from DuckDB all agree. This wrapper only rounds
+    for JSON.
     """
-    if p.size == 0:
-        return []
-    index = np.clip(np.floor(p * n_bins).astype(np.int64), 0, n_bins - 1)
-    counts = np.bincount(index, minlength=n_bins)
-    sum_p = np.bincount(index, weights=p, minlength=n_bins)
-    sum_y = np.bincount(index, weights=y, minlength=n_bins)
-    out = []
-    for k in range(n_bins):
-        n = int(counts[k])
-        if n == 0:
-            continue
-        out.append({
-            "bin": k,
-            "p_lo": k / n_bins,
-            "p_hi": (k + 1) / n_bins,
-            "n": n,
-            "mean_p": _round(sum_p[k] / n),
-            "observed": _round(sum_y[k] / n),
-        })
-    return out
+    return [
+        {**row, "mean_p": _round(row["mean_p"]), "observed": _round(row["observed"])}
+        for row in reliability_bins(p, y, n_bins=n_bins)
+    ]
 
 
 def probability_scores(p: np.ndarray, y: np.ndarray) -> dict:
@@ -879,9 +914,18 @@ class FoldSet:
         onset_min_mm: float,
         min_known_slots: int,
         coverage_gap_min: int,
+        column_for: Callable[[int], str] = p_rain_column,
         log=None,
     ) -> None:
-        rows, file_leads, counts = load_decisions(directories, leads_min=(), log=log)
+        # A non-default probability column is not in the decision schema,
+        # so the aligning read would drop it; it is asked for explicitly.
+        extra = [
+            column_for(lead) for lead in leads
+            if column_for(lead) != p_rain_column(lead)
+        ]
+        rows, file_leads, counts = load_decisions(
+            directories, leads_min=(), extra_columns=extra, log=log,
+        )
         if not rows:
             raise SweepError("no decision rows found")
         usable = [lead for lead in leads if lead in file_leads]
@@ -892,6 +936,7 @@ class FoldSet:
             rows = [r for r in rows if str(r.get("station_id")) in allowed]
         tracks, frames = build_tracks(
             rows, usable, coverage_gap_min=coverage_gap_min,
+            column_for=column_for,
         )
         self.n_rows = len(rows)
         del rows
@@ -1285,6 +1330,16 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "Neither runs STEPS: both replay rows the nowcast already wrote."
     )
     lines.append("")
+    if settings.get("probability_column", DEFAULT_PROBABILITY_TEMPLATE) != (
+        DEFAULT_PROBABILITY_TEMPLATE
+    ):
+        lines.append(
+            "**Scored column: "
+            f"`{settings['probability_column']}`**, not the served "
+            f"`{DEFAULT_PROBABILITY_TEMPLATE}`. Every number below is "
+            "about that column."
+        )
+        lines.append("")
     lines.append("## Runs compared")
     lines.append("")
     lines.append(_runs_table(report))
@@ -1646,6 +1701,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma-separated lead times")
     p.add_argument("--layers", default="bc", choices=("b", "c", "bc"),
                    help="which layers to run; Layer C is the expensive one")
+    p.add_argument(
+        "--probability-column", default=DEFAULT_PROBABILITY_TEMPLATE,
+        help="template naming the probability column to score, with "
+             "'{lead}' standing for the lead in minutes. The default is "
+             "the served p_rain_<lead>; 'p_post_{lead}' scores a run "
+             "written back by scripts/fit_postprocess.py through this "
+             "same report, so the two are comparable line for line.",
+    )
+    p.add_argument(
+        "--candidate-probability-column", default=None, metavar="TEMPLATE",
+        help="probability column template for the CANDIDATE arm only "
+             "(default: the same as --probability-column). Lets a "
+             "post-processed copy (p_post_{lead}) be scored against the "
+             "original run's p_rain_{lead} in one A/B.",
+    )
     p.add_argument("--thresholds", default="20:80:5",
                    help="Layer C refit grid: lo:hi[:step] or a list")
     p.add_argument("--min-known-slots", type=int, default=DEFAULT_MIN_KNOWN_SLOTS,
@@ -1692,6 +1762,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         thresholds = parse_thresholds(args.thresholds)
         stations = load_points(args.points)
         allow_differing = parse_allow_differing(args.allow_differing)
+        column_template(args.probability_column)
+        if args.candidate_probability_column:
+            column_template(args.candidate_probability_column)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1711,6 +1784,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "settings": {
             "leads": list(leads),
             "layers": args.layers,
+            "probability_column": args.probability_column,
+            "candidate_probability_column": (
+                args.candidate_probability_column or args.probability_column
+            ),
             "thresholds": list(thresholds),
             "min_known_slots": int(args.min_known_slots),
             "dry_min": int(args.dry_min),
@@ -1778,36 +1855,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _run_layer_b(
-    report: dict, args: Any, leads: Sequence[int], stations: Sequence[str] | None,
-    baseline_dirs: Sequence[Path], candidate_dirs: Sequence[Path] | None, log,
-) -> None:
-    baseline = load_probabilities(baseline_dirs, leads, stations=stations, log=log)
-    candidate = (
-        None if candidate_dirs is None
-        else load_probabilities(candidate_dirs, leads, stations=stations, log=log)
-    )
-    ids = sorted(set(baseline["stations"]) | set(
-        candidate["stations"] if candidate else []
-    ))
-    t_all = baseline["t"]
-    window = (
-        datetime.fromtimestamp(int(t_all.min()), timezone.utc),
-        datetime.fromtimestamp(int(t_all.max()), timezone.utc),
-    )
+def build_gauge_grid(
+    corpus_dir: Path,
+    station_ids: Sequence[str],
+    window: tuple[datetime, datetime],
+    *,
+    dry_min: int,
+    onset_min_mm: float,
+    min_known_slots: int,
+    log=None,
+) -> tuple["GaugeGrid", list[dict], list[str]]:
+    """``(grid, dead-gauge rows, scored stations)`` for a decision window.
+
+    Layer B's truth, in one function so that anything else scoring against
+    the gauges — ``scripts/fit_postprocess.py`` fits on exactly this
+    outcome — uses the same window pad, the same wet rule and the same
+    dead-gauge exclusions rather than a second opinion about any of them.
+    """
     pad = timedelta(minutes=GAUGE_PAD_MIN)
     truth = gauge_truth_vectorised(
-        Path(args.corpus_dir), window[0] - pad, window[1] + pad, ids,
-        dry_min=int(args.dry_min), onset_min_mm=float(args.onset_min_mm),
+        Path(corpus_dir), window[0] - pad, window[1] + pad, list(station_ids),
+        dry_min=int(dry_min), onset_min_mm=float(onset_min_mm),
         pad_min=GAUGE_PAD_MIN, log=log,
     )
-    dead = dead_gauge_scan(truth, min_known_slots=int(args.min_known_slots))
-    for row in dead:
-        log(
-            f"dead gauge {row.station_id}: {row.known_slots} known slot(s), "
-            "never wet — excluded from Layer B"
-        )
-    report["dead_gauges"] = [
+    dead = dead_gauge_scan(truth, min_known_slots=int(min_known_slots))
+    if log:
+        for row in dead:
+            log(
+                f"dead gauge {row.station_id}: {row.known_slots} known "
+                "slot(s), never wet — excluded"
+            )
+    rows = [
         {
             "station_id": row.station_id,
             "known_slots": row.known_slots,
@@ -1816,9 +1894,49 @@ def _run_layer_b(
         for row in dead
     ]
     excluded = {row.station_id for row in dead}
-    scored = [s for s in ids if s not in excluded]
+    scored = [s for s in station_ids if s not in excluded]
     grid = GaugeGrid(truth, scored)
     del truth
+    return grid, rows, scored
+
+
+def decision_window(t: np.ndarray) -> tuple[datetime, datetime]:
+    """First and last decision instant, as aware UTC datetimes."""
+    return (
+        datetime.fromtimestamp(int(t.min()), timezone.utc),
+        datetime.fromtimestamp(int(t.max()), timezone.utc),
+    )
+
+
+def _candidate_column_for(args: Any) -> Callable[[int], str]:
+    """The candidate arm's probability column: its own template, else the baseline's."""
+    return column_template(args.candidate_probability_column or args.probability_column)
+
+
+def _run_layer_b(
+    report: dict, args: Any, leads: Sequence[int], stations: Sequence[str] | None,
+    baseline_dirs: Sequence[Path], candidate_dirs: Sequence[Path] | None, log,
+) -> None:
+    column_for = column_template(args.probability_column)
+    baseline = load_probabilities(
+        baseline_dirs, leads, stations=stations, column_for=column_for, log=log,
+    )
+    candidate = (
+        None if candidate_dirs is None
+        else load_probabilities(
+            candidate_dirs, leads, stations=stations,
+            column_for=_candidate_column_for(args), log=log,
+        )
+    )
+    ids = sorted(set(baseline["stations"]) | set(
+        candidate["stations"] if candidate else []
+    ))
+    grid, dead_rows, scored = build_gauge_grid(
+        Path(args.corpus_dir), ids, decision_window(baseline["t"]),
+        dry_min=int(args.dry_min), onset_min_mm=float(args.onset_min_mm),
+        min_known_slots=int(args.min_known_slots), log=log,
+    )
+    report["dead_gauges"] = dead_rows
 
     # Re-code the station column against the scored set; a row at an
     # excluded station gets code -1 and is dropped with the rest.
@@ -1859,6 +1977,10 @@ def _recode_stations(rows: dict, scored: Sequence[str]) -> None:
     mapped = codes[rows["station"]]
     missing = mapped < 0
     rows["station"] = np.where(missing, 0, mapped)
+    # Kept so a caller that scores something other than ``p`` — the H-P fit
+    # scores its own predictions on the same rows — can drop exactly the
+    # rows this function silenced.
+    rows["dropped"] = missing
     if np.any(missing):
         # A new array rather than an in-place write: Arrow's own buffers
         # come back read-only, and a zero-copy column is one of them.
@@ -1873,6 +1995,7 @@ def _run_layer_c(
     stations: Sequence[str] | None, baseline_dirs: Sequence[Path],
     candidate_dirs: Sequence[Path] | None, log,
 ) -> None:
+    column_for = column_template(args.probability_column)
     common = dict(
         far_cap=float(args.far_cap),
         plateau_frac=float(args.plateau_frac),
@@ -1893,7 +2016,8 @@ def _run_layer_c(
         stations=stations,
         dry_min=int(args.dry_min), onset_min_mm=float(args.onset_min_mm),
         min_known_slots=int(args.min_known_slots),
-        coverage_gap_min=int(args.coverage_gap_min), log=log,
+        coverage_gap_min=int(args.coverage_gap_min),
+        column_for=column_for, log=log,
     )
     if "dead_gauges" not in report:
         report["dead_gauges"] = [{"station_id": s} for s in base_folds.dead]
@@ -1912,7 +2036,8 @@ def _run_layer_c(
         stations=stations,
         dry_min=int(args.dry_min), onset_min_mm=float(args.onset_min_mm),
         min_known_slots=int(args.min_known_slots),
-        coverage_gap_min=int(args.coverage_gap_min), log=log,
+        coverage_gap_min=int(args.coverage_gap_min),
+        column_for=_candidate_column_for(args), log=log,
     )
     report["candidate"].setdefault("rows", cand_folds.n_rows)
     report["candidate"].setdefault("stations", len(cand_folds.stations))
