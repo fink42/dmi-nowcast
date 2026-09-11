@@ -693,3 +693,15 @@ def test_f1_of_pools_the_day_counts_instead_of_averaging_them() -> None:
         2 * precision * recall / (precision + recall)
     )
     assert pooled != pytest.approx((1.0 + report_module._f1_of([busy])) / 2)
+
+
+def test_layer_c_day_blocks_count_a_missed_onset(corpus: Path) -> None:
+    """A missed onset lands in its day's `misses` (the 2026-09-11 KeyError).
+
+    Every onset the sweep leaves unwarned is bumped with the outcome name
+    `miss`, which the block map translates to the `misses` count; passing
+    the count name instead raised KeyError on the first real fold.
+    """
+    payload = _run(corpus, "--layers", "c", "--thresholds", "90:90:10")
+    pooled = payload["layer_c"]["leads"]["20"]["out_of_fold"]
+    assert pooled["misses"] > 0

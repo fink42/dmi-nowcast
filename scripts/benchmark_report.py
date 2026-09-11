@@ -1076,7 +1076,7 @@ def score_fold(
                 bump(warning.sent_utc.date(), warning.outcome)
         for onset in result.onsets:
             if onset.outcome == "miss":
-                bump(onset.onset_utc.date(), "misses")
+                bump(onset.onset_utc.date(), "miss")
     return results, per_day, n_sent
 
 
