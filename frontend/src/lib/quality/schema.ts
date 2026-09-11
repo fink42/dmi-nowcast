@@ -276,7 +276,19 @@ export interface QualityThresholds {
 
 export interface QualityReport {
 	schema_version: number;
+	/** When this document was written — of either kind of build. */
 	generated_at_utc: string;
+	/**
+	 * When the full build behind the reliability diagrams ran. An hourly live
+	 * refresh rebuilds the scoreboard, the map and the recent warnings and
+	 * carries the corpus-based sections over from this build, so the two
+	 * halves of the page can be hours apart and the page says so.
+	 *
+	 * Null on a document written before the live refresh existed.
+	 */
+	built_at_utc: string | null;
+	/** When the live sections were last rebuilt. Null on an older document. */
+	live_refreshed_at_utc: string | null;
 	windows: QualityWindows;
 	headline: QualityHeadline;
 	reliability: QualityReliability;

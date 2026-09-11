@@ -249,6 +249,12 @@ export const da = {
 		error: 'Tallene kunne ikke hentes. Prøv igen om lidt.',
 		notMeasured: 'Ikke målt endnu.',
 		generatedAt: (when: string) => `Beregnet ${when}.`,
+		/**
+		 * To aldre, fordi siden har to: den levende halvdel bygges om hver
+		 * time, pålidelighedsdiagrammerne én gang i døgnet.
+		 */
+		refreshedAt: (updated: string, built: string) =>
+			`Opdateret ${updated} · fuld beregning ${built}.`,
 		/** Procenttegn med dansk mellemrum; bruges overalt på siden. */
 		percent: (value: number) => `${value} %`,
 		headline: {

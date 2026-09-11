@@ -1,4 +1,4 @@
-"""The nightly ``quality.json`` build (Phase F, F4).
+"""The ``quality.json`` build (Phase F, F4).
 
 Once a day, on its own scheduler, this task turns the corpora, the warning
 replay and the live gauge scoreboard into the document the website's
@@ -6,6 +6,25 @@ replay and the live gauge scoreboard into the document the website's
 ``<storage.data_dir>/nowcast/quality.json`` — the directory the
 ``/nowcast/*`` routes serve from, so publishing is a file write and
 nothing else.
+
+**Two schedules, one document.** The nightly cron job above is the FULL
+build. Beside it runs a second, ``IntervalTrigger`` job every
+``quality_report.live_refresh_min`` minutes (hourly by default, ``0``
+turns it off) that rebuilds only the document's live half — the warning
+scoreboard, the station map, the recent warnings, the "is it raining
+now?" check — and carries the corpus-based reliability sections over
+unchanged from the document already on disk. The live inputs move every
+10 minutes; the corpus fits take minutes and change once a day, so
+refreshing them hourly would be minutes of CPU spent reproducing
+yesterday's numbers.
+
+The two jobs share one ``asyncio.Lock``. They read the same decision
+rows and write the same file, and two builders racing on a tmp+rename
+would leave whichever finished second in place regardless of which had
+the better evidence. The nightly build waits for the lock; a live tick
+that finds it held is SKIPPED with a log line rather than queued —
+another one is due in an hour, and a queued refresh would only pile up
+behind a long build.
 
 Phase G adds one step in front of the build: the nightly **push-threshold
 fit** (``quality_report.fit_thresholds``). It replays the same decision
@@ -67,6 +86,7 @@ from typing import Any, Callable
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Config
 from .push.paths import resolved_thresholds_path
@@ -105,6 +125,11 @@ class QualityBuildResult:
     """What one build did — the shape of its log line, and of its tests."""
 
     ok: bool = False
+    #: Which half of the document this run rebuilt: ``"full"`` for the
+    #: nightly build, ``"live"`` for a live refresh. Recorded so
+    #: ``last_result`` — which keeps the last run of EITHER kind — can
+    #: still be read for what it was.
+    mode: str = "full"
     path: Path | None = None
     bytes_written: int = 0
     sections: list[str] = field(default_factory=list)
@@ -160,6 +185,11 @@ class QualityReportTask:
         #: test can point it at a stub that records its argv.
         self._executable = executable or sys.executable
         self._scheduler = AsyncIOScheduler(timezone=timezone.utc)
+        #: Serialises the nightly build against the live refresh. Both
+        #: read the same decision rows and write the same file, so they
+        #: must never overlap; see the module docstring for who waits and
+        #: who is skipped.
+        self._lock = asyncio.Lock()
         self._started = False
         self._last: QualityBuildResult | None = None
 
@@ -259,13 +289,17 @@ class QualityReportTask:
             workers=int(settings.workers),
         )
 
-    def job_config(self) -> dict:
+    def job_config(self, *, live_only: bool = False) -> dict:
         """Everything the job needs, resolved, as one JSON-able document.
 
         This is the whole contract with the child: paths already resolved
         against the config, the sweep's options already reduced to the
         live rule's constants. The child reads no YAML and no
         environment, so what the parent decided is what runs.
+
+        A live refresh never carries a fit. The job refuses to run one
+        under ``--live-only`` anyway; switching it off here as well means
+        the command line a reader sees says what actually happens.
         """
         settings = self.settings
         fit = settings.fit_thresholds
@@ -280,7 +314,7 @@ class QualityReportTask:
             },
             "fit": {"enabled": False},
         }
-        if fit.enabled:
+        if fit.enabled and not live_only:
             payload["fit"] = {
                 "enabled": True,
                 "thresholds_out": str(self.thresholds_out()),
@@ -290,13 +324,20 @@ class QualityReportTask:
             }
         return payload
 
-    def child_argv(self, payload: dict | None = None) -> list[str]:
-        """The command line the nightly build is spawned as."""
-        config = self.job_config() if payload is None else payload
-        return [
+    def child_argv(
+        self, payload: dict | None = None, *, live_only: bool = False,
+    ) -> list[str]:
+        """The command line one build is spawned as."""
+        config = (
+            self.job_config(live_only=live_only) if payload is None else payload
+        )
+        argv = [
             self._executable, "-m", JOB_MODULE,
             "--config-json", json.dumps(config, sort_keys=True),
         ]
+        if live_only:
+            argv.append("--live-only")
+        return argv
 
     # -- the job ----------------------------------------------------------
 
@@ -321,6 +362,9 @@ class QualityReportTask:
         path = summary.get("path")
         return QualityBuildResult(
             ok=bool(summary.get("ok")),
+            # An older job (or a stub) that does not say gets "full",
+            # which is what every summary meant before live refreshes.
+            mode=str(summary.get("mode") or "full"),
             path=Path(path) if path else None,
             bytes_written=int(summary.get("bytes") or 0),
             sections=[str(s) for s in (summary.get("sections") or [])],
@@ -348,7 +392,9 @@ class QualityReportTask:
         except (asyncio.TimeoutError, TimeoutError):  # pragma: no cover
             _log.warning("quality_report_child_unreaped", pid=proc.pid)
 
-    async def _run_child(self, payload: dict) -> QualityBuildResult:
+    async def _run_child(
+        self, payload: dict, *, live_only: bool = False,
+    ) -> QualityBuildResult:
         """Spawn the job, await it under a timeout, read its summary.
 
         Every failure mode ends the same way: a result with ``ok=False``
@@ -356,7 +402,8 @@ class QualityReportTask:
         the report on disk is last night's, and the process that held the
         gigabytes is gone.
         """
-        argv = self.child_argv(payload)
+        argv = self.child_argv(payload, live_only=live_only)
+        mode = "live" if live_only else "full"
         timeout = float(self.settings.timeout_s)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -366,7 +413,8 @@ class QualityReportTask:
             )
         except OSError as exc:
             return QualityBuildResult(
-                ok=False, error=f"spawn failed: {type(exc).__name__}: {exc}",
+                ok=False, mode=mode,
+                error=f"spawn failed: {type(exc).__name__}: {exc}",
             )
         try:
             # communicate(), not wait(): it drains both pipes, so a chatty
@@ -377,13 +425,14 @@ class QualityReportTask:
         except (asyncio.TimeoutError, TimeoutError):
             await self._kill(proc)
             return QualityBuildResult(
-                ok=False, error=f"timed out after {timeout:g}s",
+                ok=False, mode=mode, error=f"timed out after {timeout:g}s",
             )
         summary = self._summary_of(stdout)
         if summary is None:
             tail = _tail(stderr)
             return QualityBuildResult(
                 ok=False,
+                mode=mode,
                 error=(
                     f"no summary from the job (exit {proc.returncode})"
                     + (f": {tail}" if tail else "")
@@ -395,13 +444,16 @@ class QualityReportTask:
             # in the job, not a report worth trusting.
             return QualityBuildResult(
                 ok=False,
+                mode=mode,
                 error=f"job exited {proc.returncode} after claiming success",
             )
         if not result.ok and result.error is None:
             result.error = _tail(stderr) or f"exit {proc.returncode}"
         return result
 
-    async def _run_in_process(self, payload: dict) -> QualityBuildResult:
+    async def _run_in_process(
+        self, payload: dict, *, live_only: bool = False,
+    ) -> QualityBuildResult:
         """The injected-hook path: the same job, in a worker thread.
 
         Only tests reach it (see :attr:`in_process`), and it exists so
@@ -412,37 +464,48 @@ class QualityReportTask:
             summary = await asyncio.to_thread(
                 run_job,
                 payload,
+                live_only=live_only,
                 builder=self._builder,
                 renderer=self._renderer,
                 fitter=self._fitter,
             )
         except Exception as exc:  # noqa: BLE001
             return QualityBuildResult(
-                ok=False, error=f"{type(exc).__name__}: {exc}",
+                ok=False, mode="live" if live_only else "full",
+                error=f"{type(exc).__name__}: {exc}",
             )
         return self._result_of(summary)
 
-    async def build_once(self) -> QualityBuildResult:
+    async def build_once(self, *, live_only: bool = False) -> QualityBuildResult:
         """One build. Never raises: a failure leaves the previous report.
 
         The whole point of the atomic write plus this swallow is that the
         page's worst case is a stale document with an honest
         ``generated_at_utc``, never a 500 and never a truncated one.
+
+        ``live_only`` runs the hourly refresh instead of the full build:
+        no threshold fit, no markdown twin, and the corpus-based sections
+        carried over from the document on disk. A live refresh with no
+        usable document to carry from fails like any other build — one
+        log line, and the good document untouched.
         """
+        mode = "live" if live_only else "full"
         started = datetime.now(timezone.utc)
         try:
             # Resolving the config can fail on its own (a fit configured
             # without a corpus dir, say), and this method promises never
             # to raise — so it is inside the guard with everything else.
-            payload = self.job_config()
+            payload = self.job_config(live_only=live_only)
         except Exception as exc:  # noqa: BLE001
             result = QualityBuildResult(
-                ok=False, error=f"job config failed: {type(exc).__name__}: {exc}",
+                ok=False, mode=mode,
+                error=f"job config failed: {type(exc).__name__}: {exc}",
             )
         else:
             result = await (
-                self._run_in_process(payload) if self.in_process
-                else self._run_child(payload)
+                self._run_in_process(payload, live_only=live_only)
+                if self.in_process
+                else self._run_child(payload, live_only=live_only)
             )
         elapsed = round(
             (datetime.now(timezone.utc) - started).total_seconds(), 1,
@@ -450,6 +513,7 @@ class QualityReportTask:
         if result.ok:
             _log.info(
                 "quality_report_built",
+                mode=mode,
                 path=str(result.path),
                 bytes=result.bytes_written,
                 sections=result.sections,
@@ -466,6 +530,7 @@ class QualityReportTask:
         else:
             _log.warning(
                 "quality_report_build_failed",
+                mode=mode,
                 error=result.error,
                 elapsed_s=elapsed,
             )
@@ -487,9 +552,25 @@ class QualityReportTask:
         self._last = result
         return result
 
-    async def _run_once(self) -> None:
-        """apscheduler job target — swallows everything by contract."""
-        await self.build_once()
+    async def _run_once(self, live_only: bool = False) -> None:
+        """apscheduler job target — swallows everything by contract.
+
+        The lock is what keeps the nightly build and the hourly refresh
+        off each other: they read the same decision rows and rename onto
+        the same file. The nightly build waits for it. A live tick that
+        finds it held gives up instead, because another is due within the
+        interval and a queue of refreshes behind a long build would all
+        write the same thing in a row.
+
+        ``Lock.locked()`` followed by ``async with`` is safe here without
+        a second guard: acquiring a free ``asyncio.Lock`` never suspends,
+        so nothing else on this loop can take it in between.
+        """
+        if live_only and self._lock.locked():
+            _log.info("quality_report_live_refresh_skipped", reason="build in progress")
+            return
+        async with self._lock:
+            await self.build_once(live_only=live_only)
 
     # -- lifecycle --------------------------------------------------------
 
@@ -510,16 +591,33 @@ class QualityReportTask:
             trigger=CronTrigger(
                 hour=int(hour), minute=int(minute), timezone=timezone.utc,
             ),
+            kwargs={"live_only": False},
             id="quality_report_build",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
+        live_min = int(self.settings.live_refresh_min)
+        if live_min:
+            # ``IntervalTrigger`` with no ``start_date`` first fires one
+            # interval from now, which is what this wants: a restart must
+            # not spend CPU refreshing a document that was just written,
+            # and the nightly build is the one that makes the first one.
+            self._scheduler.add_job(
+                self._run_once,
+                trigger=IntervalTrigger(minutes=live_min, timezone=timezone.utc),
+                kwargs={"live_only": True},
+                id="quality_report_live",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
         self._scheduler.start()
         self._started = True
         _log.info(
             "quality_report_task_running",
             at_utc=self.settings.at_utc,
+            live_refresh_min=live_min,
             out=str(quality_path(self.config)),
         )
 

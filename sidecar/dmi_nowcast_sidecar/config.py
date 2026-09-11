@@ -596,6 +596,17 @@ class QualityReportConfig(BaseModel):
     #: calibration and any overnight replay, and nowhere near the busy
     #: minute of a radar cycle.
     at_utc: str = "03:30"
+    #: Minutes between LIVE refreshes of the same document, and ``0`` to
+    #: turn them off.
+    #:
+    #: The page's scoreboard, station map, recent warnings and "is it
+    #: raining now?" check all come from decision rows and a gauge store
+    #: that move every 10 minutes; the reliability diagrams behind them
+    #: take minutes to fit and change once a day. A live refresh rebuilds
+    #: only the first half and carries the second over from the document
+    #: already on disk, so it is cheap enough to run hourly. The nightly
+    #: full build is unaffected and remains the only thing that refits.
+    live_refresh_min: int = 60
     #: How long the child process gets before it is killed. The build is
     #: minutes over a season of rows and the fit adds more, so the default
     #: is generous; what it really bounds is a job wedged on a corrupt
@@ -630,6 +641,26 @@ class QualityReportConfig(BaseModel):
                 "quality_report at_utc must be a 24-hour 'HH:MM' UTC string",
             )
         return v
+
+    @field_validator("live_refresh_min")
+    @classmethod
+    def _live_refresh_valid(cls, v: int) -> int:
+        """0 (off) or 5–720 minutes.
+
+        The floor is not arbitrary: a live refresh still re-reads a
+        season of decision rows and the gauge store in a child process,
+        which is seconds of CPU beside a live service on a 12 GB VM.
+        Anything under five minutes would also outrun its own inputs —
+        the decision rows it reads are written once per radar cycle. The
+        ceiling is half a day, past which the nightly build is the
+        cheaper answer.
+        """
+        if v == 0 or 5 <= v <= 720:
+            return v
+        raise ValueError(
+            "quality_report live_refresh_min must be 0 (off) or between "
+            "5 and 720 minutes",
+        )
 
 
 class SyncConfig(BaseModel):

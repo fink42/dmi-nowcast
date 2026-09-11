@@ -416,6 +416,10 @@ export function parseQuality(raw: unknown): QualityReport | null {
 	return {
 		schema_version: version ?? 0,
 		generated_at_utc: generatedAt,
+		// Additive, and both null on any producer older than the hourly live
+		// refresh — the page falls back to the single "computed" line there.
+		built_at_utc: iso(raw.built_at_utc),
+		live_refreshed_at_utc: iso(raw.live_refreshed_at_utc),
 		windows: parseWindows(raw.windows),
 		headline: parseHeadline(raw.headline),
 		reliability: parseReliability(raw.reliability),

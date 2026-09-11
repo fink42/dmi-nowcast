@@ -1,6 +1,8 @@
 {
 	"schema_version": 1,
 	"generated_at_utc": "2026-09-05T02:14:37Z",
+	"built_at_utc": "2026-09-04T03:30:00Z",
+	"live_refreshed_at_utc": "2026-09-05T02:14:37Z",
 	"windows": {
 		"radar": {
 			"from": "2026-03-01T00:00:00Z",

@@ -129,6 +129,27 @@ class TestQualityReportConfig:
         assert minimal_config.quality_report.at_utc == "03:30"
         assert minimal_config.quality_report.live_days == 90
         assert minimal_config.quality_report.live_days_secondary == 30
+        # The live refresh is hourly whenever the build itself is on.
+        assert minimal_config.quality_report.live_refresh_min == 60
+
+    @pytest.mark.parametrize("minutes", [0, 5, 60, 720])
+    def test_live_refresh_accepts_off_and_the_useful_range(
+        self, tmp_path: Path, minutes: int,
+    ) -> None:
+        config = _config(tmp_path, quality_report={
+            "enabled": True, "live_refresh_min": minutes,
+        })
+        assert config.quality_report.live_refresh_min == minutes
+
+    @pytest.mark.parametrize("minutes", [1, 4, 721, -1])
+    def test_live_refresh_refuses_a_cadence_that_outruns_its_inputs(
+        self, tmp_path: Path, minutes: int,
+    ) -> None:
+        """Below five minutes it would rebuild faster than the rows change."""
+        with pytest.raises(ValueError, match="live_refresh_min"):
+            _config(tmp_path, quality_report={
+                "enabled": True, "live_refresh_min": minutes,
+            })
 
     def test_public_mode_refuses_the_builder(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="public_mode"):
@@ -351,11 +372,12 @@ class TestQualityReportTask:
         async def run() -> None:
             await task.start()
             try:
-                jobs = task._scheduler.get_jobs()
-                assert len(jobs) == 1
-                trigger = jobs[0].trigger
-                assert "hour='4'" in str(trigger)
-                assert "minute='15'" in str(trigger)
+                job = task._scheduler.get_job("quality_report_build")
+                assert job is not None
+                trigger = str(job.trigger)
+                assert "hour='4'" in trigger
+                assert "minute='15'" in trigger
+                assert job.kwargs == {"live_only": False}
                 # The default start does NOT rebuild: a restart at noon
                 # must not spend the CPU on a report already on disk.
                 assert not quality_path(config).exists()
@@ -363,6 +385,292 @@ class TestQualityReportTask:
                 await task.shutdown()
 
         anyio_run(run())
+
+
+# ---------------------------------------------------------------------------
+# The hourly live refresh
+# ---------------------------------------------------------------------------
+
+
+def _live_doc(**overrides) -> dict:
+    """``DOC`` as a full build that a live refresh may carry sections from."""
+    doc = dict(DOC)
+    doc["built_at_utc"] = doc["generated_at_utc"]
+    doc["live_refreshed_at_utc"] = doc["generated_at_utc"]
+    doc.update(overrides)
+    return doc
+
+
+class TestLiveRefreshSchedule:
+    """Two jobs, one lock.
+
+    The document has two halves that move at different speeds: the
+    scoreboard and the map follow decision rows rewritten every 10
+    minutes, the reliability diagrams take minutes to fit and change once
+    a night. So the nightly cron job gets a sibling on an interval, and
+    the two are serialised — they read the same rows and rename onto the
+    same file.
+    """
+
+    def test_start_registers_the_nightly_and_the_hourly_job(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _config(tmp_path, quality_report={
+            "enabled": True, "live_refresh_min": 30,
+        })
+        task = QualityReportTask(config, builder=lambda _inputs: dict(DOC))
+
+        async def run() -> None:
+            await task.start()
+            try:
+                assert {j.id for j in task._scheduler.get_jobs()} == {
+                    "quality_report_build", "quality_report_live",
+                }
+                live = task._scheduler.get_job("quality_report_live")
+                assert live.kwargs == {"live_only": True}
+                assert live.max_instances == 1
+                assert live.coalesce is True
+                assert "0:30:00" in str(live.trigger)
+                # First run is one interval out, not now: a restart must
+                # not refresh a document that was just written.
+                assert live.trigger.start_date > datetime.now(timezone.utc)
+            finally:
+                await task.shutdown()
+
+        anyio_run(run())
+
+    def test_zero_turns_the_live_refresh_off(self, tmp_path: Path) -> None:
+        config = _config(tmp_path, quality_report={
+            "enabled": True, "live_refresh_min": 0,
+        })
+        task = QualityReportTask(config, builder=lambda _inputs: dict(DOC))
+
+        async def run() -> None:
+            await task.start()
+            try:
+                assert [j.id for j in task._scheduler.get_jobs()] == [
+                    "quality_report_build",
+                ]
+            finally:
+                await task.shutdown()
+
+        anyio_run(run())
+
+    def test_a_live_tick_over_a_running_build_is_skipped_not_queued(
+        self, tmp_path: Path,
+    ) -> None:
+        """Another one is due within the interval; a queue would only pile up."""
+        config = _config(tmp_path, quality_report={"enabled": True})
+        task = QualityReportTask(config, builder=lambda _i, **kw: dict(DOC))
+
+        async def run() -> None:
+            await task._lock.acquire()
+            try:
+                await task._run_once(live_only=True)
+            finally:
+                task._lock.release()
+            assert task.last_result is None
+            assert not quality_path(config).exists()
+
+        anyio_run(run())
+
+    def test_the_nightly_build_waits_for_the_lock_rather_than_giving_up(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _config(tmp_path, quality_report={"enabled": True})
+        task = QualityReportTask(config, builder=lambda _i, **kw: dict(DOC))
+
+        async def run() -> None:
+            import asyncio
+
+            await task._lock.acquire()
+            pending = asyncio.ensure_future(task._run_once())
+            await asyncio.sleep(0)
+            assert task.last_result is None, "it must not build under the lock"
+            task._lock.release()
+            await pending
+            assert task.last_result is not None
+            assert task.last_result.ok
+            assert task.last_result.mode == "full"
+
+        anyio_run(run())
+
+    def test_a_live_build_is_spawned_with_the_flag_and_no_fit(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _fit_config(tmp_path)
+        fake, record = _fake_interpreter(
+            tmp_path, summary=_ok_summary(quality_path(config), mode="live"),
+        )
+        task = QualityReportTask(config, executable=str(fake))
+        result = anyio_run(task.build_once(live_only=True))
+        assert result.ok
+        assert result.mode == "live"
+
+        argv = json.loads(record.read_text())
+        assert argv[-1] == "--live-only"
+        # Which threshold a horizon warns at is a nightly decision, and a
+        # second pass over the season besides.
+        assert json.loads(argv[3])["fit"] == {"enabled": False}
+        # The nightly command line still carries it.
+        assert task.job_config()["fit"]["enabled"] is True
+
+    def test_last_result_keeps_whichever_ran_last_with_its_mode(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _config(tmp_path, quality_report={"enabled": True})
+        task = QualityReportTask(config, builder=lambda _i, **kw: _live_doc())
+        anyio_run(task.build_once())
+        assert task.last_result.mode == "full"
+        anyio_run(task.build_once(live_only=True))
+        assert task.last_result.mode == "live"
+
+    def test_a_refresh_with_nothing_to_carry_from_keeps_the_old_document(
+        self, tmp_path: Path,
+    ) -> None:
+        """No previous report is an error, never a document full of nulls."""
+        config = _config(tmp_path, quality_report={"enabled": True})
+        task = QualityReportTask(config, builder=lambda _i, **kw: dict(DOC))
+        result = anyio_run(task.build_once(live_only=True))
+        assert result.ok is False
+        assert result.mode == "live"
+        assert "previous report" in (result.error or "")
+        assert not quality_path(config).exists()
+
+
+class TestLiveRefreshJob:
+    """``run_job(live_only=True)``: no fit, no markdown, previous carried in."""
+
+    def test_it_never_runs_the_fitter_and_never_writes_markdown(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _job_config(tmp_path)
+        config["fit"] = {
+            "enabled": True,
+            "thresholds_out": str(tmp_path / "push_thresholds.json"),
+            "options": {"decisions_dirs": [], "corpus_dir": str(tmp_path)},
+        }
+        out = Path(config["quality"]["out_json"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(_live_doc()))
+
+        def explode(_options):
+            raise AssertionError("a live refresh must not refit the thresholds")
+
+        summary = run_job(
+            config, live_only=True,
+            builder=lambda _inputs, **kw: dict(DOC),
+            renderer=lambda _report: "# nope",
+            fitter=explode,
+        )
+        assert summary["ok"] is True
+        assert summary["mode"] == "live"
+        assert summary["thresholds_path"] is None
+        assert not (tmp_path / "push_thresholds.json").exists()
+        # The archive twin is the DAY's copy; an hourly rewrite of it
+        # would say twenty-four different things about one day.
+        assert not (tmp_path / "archive").exists()
+
+    def test_it_hands_the_builder_the_document_on_disk(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _job_config(tmp_path)
+        out = Path(config["quality"]["out_json"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        previous = _live_doc(generated_at_utc="2026-09-05T03:30:00Z")
+        out.write_text(json.dumps(previous))
+        seen: dict = {}
+
+        def builder(_inputs, *, live_only=False, previous=None):
+            seen["live_only"] = live_only
+            seen["previous"] = previous
+            return _live_doc(generated_at_utc="2026-09-05T14:30:00Z")
+
+        summary = run_job(config, live_only=True, builder=builder)
+        assert summary["ok"] is True
+        assert seen["live_only"] is True
+        assert seen["previous"] == previous
+        assert json.loads(out.read_text())["generated_at_utc"] == (
+            "2026-09-05T14:30:00Z"
+        )
+
+    def test_a_full_build_still_writes_the_markdown_twin(
+        self, tmp_path: Path,
+    ) -> None:
+        """The nightly path is untouched by any of this."""
+        summary = run_job(
+            _job_config(tmp_path),
+            builder=lambda _inputs: dict(DOC),
+            renderer=lambda report: f"# {report['generated_at_utc']}",
+        )
+        assert summary["mode"] == "full"
+        assert (tmp_path / "archive" / "2026-09-05.md").is_file()
+
+    @pytest.mark.parametrize(
+        "content, expected",
+        [
+            (None, "and there is none"),
+            ("{ not json", "unreadable"),
+            ("[1, 2, 3]", "not a JSON object"),
+        ],
+    )
+    def test_an_unusable_previous_document_is_left_exactly_where_it_is(
+        self, tmp_path: Path, content: str | None, expected: str,
+    ) -> None:
+        config = _job_config(tmp_path)
+        out = Path(config["quality"]["out_json"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if content is not None:
+            out.write_text(content)
+
+        with pytest.raises(ValueError, match=expected):
+            run_job(config, live_only=True, builder=lambda _i, **kw: dict(DOC))
+        if content is None:
+            assert not out.exists()
+        else:
+            assert out.read_text() == content
+
+    def test_the_real_builder_refuses_a_previous_it_cannot_trust(
+        self, tmp_path: Path,
+    ) -> None:
+        """End to end through the real producer, with no injected builder."""
+        config = _job_config(tmp_path)
+        out = Path(config["quality"]["out_json"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"schema_version": 99}))
+        with pytest.raises(ValueError, match="schema_version"):
+            run_job(config, live_only=True)
+        assert json.loads(out.read_text()) == {"schema_version": 99}
+
+    def test_the_cli_flag_runs_the_live_mode(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        config = _job_config(tmp_path)
+        # A full build first, so there is something to carry over.
+        assert job_main(["--config-json", json.dumps(config)]) == 0
+        capsys.readouterr()
+
+        assert job_main(
+            ["--config-json", json.dumps(config), "--live-only"],
+        ) == 0
+        summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert summary["ok"] is True
+        assert summary["mode"] == "live"
+        document = json.loads(Path(summary["path"]).read_text())
+        assert document["built_at_utc"] == "2026-09-05T03:30:00Z"
+        assert document["live_refreshed_at_utc"] == "2026-09-05T03:30:00Z"
+
+    def test_the_cli_reports_the_mode_even_when_it_fails(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        config = _job_config(tmp_path)
+        assert job_main(
+            ["--config-json", json.dumps(config), "--live-only"],
+        ) == 1
+        summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert summary["ok"] is False
+        assert summary["mode"] == "live"
+        assert "previous report" in (summary["error"] or "")
 
 
 # ---------------------------------------------------------------------------

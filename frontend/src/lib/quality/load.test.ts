@@ -57,6 +57,11 @@ describe('parseQuality on the fixture', () => {
 		expect(empty[0].n).toBe(0);
 	});
 
+	it('reads the two build stamps the hourly refresh writes', () => {
+		expect(report!.built_at_utc).toBe('2026-09-04T03:30:00Z');
+		expect(report!.live_refreshed_at_utc).toBe('2026-09-05T02:14:37Z');
+	});
+
 	it('exercises the fallback the station colouring needs', () => {
 		const withoutPod = report!.stations!.features.filter((f) => f.properties.warn_pod === null);
 		expect(withoutPod).toHaveLength(1);
@@ -90,6 +95,17 @@ describe('parseQuality with sections missing', () => {
 		expect(report!.stations).toBeNull();
 		expect(report!.events).toBeNull();
 		expect(report!.methods).toBeNull();
+	});
+
+	it('nulls the build stamps on a document that predates them', () => {
+		const raw = doc();
+		delete raw.built_at_utc;
+		raw.live_refreshed_at_utc = 'last night';
+		const parsed = parseQuality(raw);
+		expect(parsed!.built_at_utc).toBeNull();
+		expect(parsed!.live_refreshed_at_utc).toBeNull();
+		// …and the document still renders everywhere else.
+		expect(parsed!.generated_at_utc).toBe(fixture.generated_at_utc);
 	});
 
 	it('survives sections that are missing entirely', () => {

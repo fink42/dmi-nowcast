@@ -238,6 +238,18 @@ quality_report:
   enabled: true
   # UTC. After the overnight replay, well away from a cycle's busy minute.
   at_utc: "03:30"
+  # Minutes between LIVE refreshes of the same document; 0 turns them off.
+  # The page's scoreboard, station map, recent warnings and "is it raining
+  # now?" check come from decision rows and a gauge store that move every
+  # 10 minutes, while the reliability diagrams behind them take minutes to
+  # fit and change once a day. A live refresh rebuilds only the first half
+  # and carries the second over from the document already on disk, so it
+  # costs seconds rather than minutes. It never refits the push thresholds
+  # and never writes a markdown twin — both are nightly decisions.
+  # NOTE: on the PUBLIC stack, sync.interval_min bounds how soon a refresh
+  # is actually visible on the page; there is no point setting this below
+  # that.
+  live_refresh_min: 60
   # How long the child gets before it is killed. Generous on purpose: the
   # report is minutes over a season of rows and the fit below adds more.
   # What this really bounds is a job wedged on a corrupt parquet — and a

@@ -76,6 +76,32 @@ of distinct UTC days that carry a decision row, which is a union of replay
 days and live days and not a rolling "last N days"; the page's sentence
 says "over D measured days" for that reason.
 
+Two cadences, one document
+--------------------------
+
+The corpus-based half of this document — the two reliability diagrams,
+their headline bins, the corpus windows and the ``methods`` block that
+describes them — takes minutes to fit over millions of rows and changes
+once a day at most. The live half — the decision rows, the gauge store
+behind them, the scoreboard, the station map, the recent warnings and the
+"is it raining now?" check — moves every 10 minutes.
+
+So the build has two modes. A FULL build (``live_only=False``) computes
+everything. A LIVE REFRESH (``live_only=True``, given the last full build
+as ``previous``) skips both corpus fits, carries their sections over
+unchanged, and rebuilds only what the live evidence feeds. Three
+timestamps say which is which, and they are additive — a reader that
+knows only ``generated_at_utc`` is still correct:
+
+``generated_at_utc``
+    When THIS document was written. Moves on every write, of either kind.
+``built_at_utc``
+    When the full build behind its corpus-based sections ran. A live
+    refresh copies it from ``previous``.
+``live_refreshed_at_utc``
+    When the live sections were last rebuilt. Equal to ``built_at_utc``
+    on a full build.
+
 Everything is timezone-aware UTC end to end; conversion to a viewer's
 clock is the browser's business.
 """
@@ -84,6 +110,7 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1626,7 +1653,96 @@ def _reliability_sentence(
 # ---------------------------------------------------------------------------
 
 
-def build_quality_report(inputs: QualityInputs) -> dict:
+def _usable_previous(previous: Any) -> dict:
+    """The last full build, checked hard enough to carry sections from.
+
+    A live refresh does not recompute the corpus-based sections, it COPIES
+    them — so the document it copies from has to be one this module would
+    have written itself. Anything less is a :class:`ValueError` rather
+    than a best effort, because the failure mode of carrying on anyway is
+    a ``quality.json`` with a null ``reliability`` written over a good
+    one: the page renders null as "not measured yet", which would be a
+    false statement republished every hour about the very measurement the
+    page exists for. A raised error costs one log line and leaves the good
+    document exactly where it is.
+
+    Passing here also earns the caller its unchecked lookups:
+    :func:`validate_report` has already established that every top-level
+    section is present and that ``windows``, ``headline``,
+    ``headline.reliability`` and ``reliability`` are objects.
+    """
+    if previous is None:
+        raise ValueError(
+            "a live-only refresh needs the previous quality document to "
+            "carry the corpus-based sections from, and got none",
+        )
+    if not isinstance(previous, Mapping):
+        raise ValueError(
+            "the previous quality document must be an object, got "
+            f"{type(previous).__name__}",
+        )
+    version = previous.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise ValueError(
+            f"the previous quality document is schema_version {version!r}, "
+            f"expected {SCHEMA_VERSION}: rebuild it in full before "
+            "refreshing only its live sections",
+        )
+    problems = validate_report(previous)
+    if problems:
+        shown = "; ".join(problems[:3])
+        more = f" (+{len(problems) - 3} more)" if len(problems) > 3 else ""
+        raise ValueError(
+            "the previous quality document fails the schema check, so its "
+            f"sections cannot be carried over: {shown}{more}",
+        )
+    return dict(previous)
+
+
+def _carried_gauge_brier(previous: Mapping[str, Any]) -> dict[str, float]:
+    """The per-station gauge Brier of the last full build, read off its map.
+
+    :func:`_stations_section` takes the mapping
+    ``reliability_from_corpus(per_point=True)`` produces —
+    ``{station_id: brier}`` at the headline lead. A live refresh does not
+    run that fit, and the document keeps no other copy of those numbers:
+    the one place they survive is the ``brier_gauge`` property of each
+    station feature, so that is where this reads them back from.
+
+    Only non-null values are carried, which reproduces the nightly
+    mapping exactly: a station absent from it took ``None`` out of
+    ``dict.get`` then and takes ``None`` now. The one loss is a station
+    the fit scored but the map could not place — no coordinates, no
+    feature, nothing to read back — and that station was already absent
+    from the document it would be read from.
+    """
+    stations = previous.get("stations")
+    features = (
+        stations.get("features") if isinstance(stations, Mapping) else None
+    )
+    out: dict[str, float] = {}
+    for feature in features or []:
+        if not isinstance(feature, Mapping):
+            continue
+        props = feature.get("properties")
+        if not isinstance(props, Mapping):
+            continue
+        station = props.get("station_id")
+        brier = props.get("brier_gauge")
+        if not isinstance(station, str) or isinstance(brier, bool):
+            continue
+        if not isinstance(brier, (int, float)):
+            continue
+        out[station] = float(brier)
+    return out
+
+
+def build_quality_report(
+    inputs: QualityInputs,
+    *,
+    live_only: bool = False,
+    previous: Mapping[str, Any] | None = None,
+) -> dict:
     """Produce the ``quality.json`` document for these inputs.
 
     Never raises on a missing or unreadable input: each section is built
@@ -1635,34 +1751,51 @@ def build_quality_report(inputs: QualityInputs) -> dict:
     ``generated_at_utc`` — without those the client renders nothing at
     all, and a document that says only "here is when I was built, and I
     know nothing" is still an honest document.
+
+    ``live_only`` is the hourly refresh. It skips both
+    :func:`reliability_from_corpus` fits — the minutes-long, corpus-bound
+    part of the build — and carries every section they feed over from
+    ``previous`` unchanged: ``reliability``, ``headline.reliability``,
+    ``windows.radar``, ``windows.gauge``, ``methods`` and the per-station
+    gauge Brier behind the map's colours (:func:`_carried_gauge_brier`).
+    Everything the decision rows and the gauge store feed is rebuilt:
+    ``windows.live``, ``headline.warnings``,
+    ``headline.persistence_margin``, ``raining_now``, ``stations``,
+    ``events`` and ``thresholds``.
+
+    In that mode a usable ``previous`` is REQUIRED, and its absence is a
+    :class:`ValueError` rather than a document with a null reliability
+    section — see :func:`_usable_previous`.
     """
-    curves = _load_curves(inputs.national_curves)
+    carried = _usable_previous(previous) if live_only else {}
 
     radar: dict | None = None
-    if inputs.radar_corpus is not None and Path(inputs.radar_corpus).is_file():
-        # OUT-OF-SAMPLE. The served curves were fitted on this corpus, so
-        # applying them here would draw a perfect diagonal and call it a
-        # measurement. Leave-one-month-out CV grades a calibration that
-        # never saw the row.
-        # ``radar_corpus`` is the UNION corpus one build now produces;
-        # its station rows are the gauge section's, read there through the
-        # gauge-joined file. See RADAR_POINT_SET.
-        radar = reliability_from_corpus(
-            Path(inputs.radar_corpus), outcome_column="outcome",
-            curves=curves, inputs=inputs, calibration="cv",
-            point_set=RADAR_POINT_SET,
-        )
     gauge: dict | None = None
-    if inputs.station_corpus is not None and Path(inputs.station_corpus).is_file():
-        # The SERVED curves, and legitimately so: the fit never saw
-        # ``gauge_outcome``. A rain gauge is an independent instrument, so
-        # "what we published against what the ground recorded" is already
-        # an out-of-sample claim.
-        gauge = reliability_from_corpus(
-            Path(inputs.station_corpus), outcome_column="gauge_outcome",
-            curves=curves, inputs=inputs, calibration="served",
-            per_point=True,
-        )
+    if not live_only:
+        curves = _load_curves(inputs.national_curves)
+        if inputs.radar_corpus is not None and Path(inputs.radar_corpus).is_file():
+            # OUT-OF-SAMPLE. The served curves were fitted on this corpus,
+            # so applying them here would draw a perfect diagonal and call
+            # it a measurement. Leave-one-month-out CV grades a
+            # calibration that never saw the row.
+            # ``radar_corpus`` is the UNION corpus one build now produces;
+            # its station rows are the gauge section's, read there through
+            # the gauge-joined file. See RADAR_POINT_SET.
+            radar = reliability_from_corpus(
+                Path(inputs.radar_corpus), outcome_column="outcome",
+                curves=curves, inputs=inputs, calibration="cv",
+                point_set=RADAR_POINT_SET,
+            )
+        if inputs.station_corpus is not None and Path(inputs.station_corpus).is_file():
+            # The SERVED curves, and legitimately so: the fit never saw
+            # ``gauge_outcome``. A rain gauge is an independent
+            # instrument, so "what we published against what the ground
+            # recorded" is already an out-of-sample claim.
+            gauge = reliability_from_corpus(
+                Path(inputs.station_corpus), outcome_column="gauge_outcome",
+                curves=curves, inputs=inputs, calibration="served",
+                per_point=True,
+            )
 
     radar_curves = list(radar["curves"]) if radar else []
     gauge_curves = list(gauge["curves"]) if gauge else []
@@ -1674,31 +1807,58 @@ def build_quality_report(inputs: QualityInputs) -> dict:
     names = {sid: geo.get("name") or sid for sid, geo in geometry.items()}
 
     gauge_brier: dict[str, float] = {}
-    if gauge and gauge["per_point_brier"]:
+    if live_only:
+        gauge_brier = _carried_gauge_brier(carried)
+    elif gauge and gauge["per_point_brier"]:
         headline_curve = _closest_lead(gauge_curves, inputs.headline_lead_min)
         if headline_curve is not None:
             gauge_brier = gauge["per_point_brier"].get(
                 int(headline_curve["lead_min"]), {},
             )
 
-    summary = _replay_summary(inputs)
-
-    windows_radar = None
-    if radar and radar["window"] and radar["window"]["from"]:
-        windows_radar = {
-            "from": radar["window"]["from"],
-            "to": radar["window"]["to"],
-            "events": radar["window"]["events"],
-            "points": radar["window"]["rows"],
+    stamp = _iso(_now(inputs))
+    if live_only:
+        # Copied, not recomputed — and deep-copied, so the document this
+        # returns shares no mutable state with the one it was handed.
+        windows_radar = deepcopy(carried["windows"].get("radar"))
+        windows_gauge = deepcopy(carried["windows"].get("gauge"))
+        reliability = deepcopy(carried["reliability"])
+        headline_reliability = deepcopy(carried["headline"]["reliability"])
+        methods = deepcopy(carried["methods"])
+        # A document written before these fields existed is still a full
+        # build, and the moment it was written is when that build ran.
+        built_at = carried.get("built_at_utc") or carried.get("generated_at_utc")
+    else:
+        summary = _replay_summary(inputs)
+        windows_radar = None
+        if radar and radar["window"] and radar["window"]["from"]:
+            windows_radar = {
+                "from": radar["window"]["from"],
+                "to": radar["window"]["to"],
+                "events": radar["window"]["events"],
+                "points": radar["window"]["rows"],
+            }
+        windows_gauge = None
+        if gauge and gauge["window"] and gauge["window"]["from"]:
+            windows_gauge = {
+                "from": gauge["window"]["from"],
+                "to": gauge["window"]["to"],
+                "events": gauge["window"]["events"],
+                "stations": gauge["window"]["points"],
+            }
+        reliability = {
+            "radar": radar_curves or None,
+            "gauge": gauge_curves or None,
         }
-    windows_gauge = None
-    if gauge and gauge["window"] and gauge["window"]["from"]:
-        windows_gauge = {
-            "from": gauge["window"]["from"],
-            "to": gauge["window"]["to"],
-            "events": gauge["window"]["events"],
-            "stations": gauge["window"]["points"],
+        headline_reliability = {
+            "radar": _headline_reliability(radar_curves, inputs),
+            "gauge": _headline_reliability(gauge_curves, inputs),
         }
+        methods = _methods_section(
+            inputs, radar, gauge, summary, radar_curves, gauge_curves,
+            dead_gauges=board.dead_gauges,
+        )
+        built_at = stamp
 
     events = [
         {
@@ -1716,31 +1876,28 @@ def build_quality_report(inputs: QualityInputs) -> dict:
 
     return {
         "schema_version": SCHEMA_VERSION,
-        "generated_at_utc": _iso(_now(inputs)),
+        "generated_at_utc": stamp,
+        # Additive, and the pair that tells a full nightly build from an
+        # hourly live refresh apart. ``generated_at_utc`` keeps its old
+        # meaning — when THIS document was written — so a reader that
+        # knows only that field is still correct, just coarser.
+        "built_at_utc": built_at,
+        "live_refreshed_at_utc": stamp,
         "windows": {
             "radar": windows_radar,
             "gauge": windows_gauge,
             "live": _live_window(inputs),
         },
         "headline": {
-            "reliability": {
-                "radar": _headline_reliability(radar_curves, inputs),
-                "gauge": _headline_reliability(gauge_curves, inputs),
-            },
+            "reliability": headline_reliability,
             "warnings": board.headline,
             "persistence_margin": _persistence_margin(inputs),
         },
-        "reliability": {
-            "radar": radar_curves or None,
-            "gauge": gauge_curves or None,
-        },
+        "reliability": reliability,
         "raining_now": board.raining_now,
         "stations": _stations_section(board, geometry, gauge_brier),
         "events": events or None,
-        "methods": _methods_section(
-            inputs, radar, gauge, summary, radar_curves, gauge_curves,
-            dead_gauges=board.dead_gauges,
-        ),
+        "methods": methods,
         "thresholds": _thresholds_section(inputs),
     }
 
@@ -1809,6 +1966,14 @@ def validate_report(report: Any) -> list[str]:
     ``frontend/src/lib/quality/load.test.ts`` makes on the fixture — the
     producer must not be able to ship a document the client would silently
     drop half of.
+
+    ``built_at_utc`` and ``live_refreshed_at_utc`` are checked but not
+    required. They are additive: every document this module writes now
+    carries both, and a document written before they existed is still a
+    valid full build. Requiring them would also make the first live
+    refresh after a deploy impossible — the document it must carry
+    sections from is exactly the one written by the code that did not
+    know about them yet.
     """
     problems: list[str] = []
     if not isinstance(report, dict):
@@ -1820,6 +1985,18 @@ def validate_report(report: Any) -> list[str]:
         )
     if _parse_ts(report.get("generated_at_utc")) is None:
         problems.append("generated_at_utc: missing or not an ISO timestamp")
+    for key in ("built_at_utc", "live_refreshed_at_utc"):
+        if report.get(key) is not None and _parse_ts(report[key]) is None:
+            problems.append(f"{key}: not an ISO timestamp")
+    built = _parse_ts(report.get("built_at_utc"))
+    refreshed = _parse_ts(report.get("live_refreshed_at_utc"))
+    if built is not None and refreshed is not None and refreshed < built:
+        # The live sections cannot be older than the build they were
+        # carried into: that ordering is what the page's two-line
+        # freshness sentence reads.
+        problems.append(
+            "live_refreshed_at_utc: precedes built_at_utc",
+        )
 
     for key in ("windows", "headline", "reliability", "raining_now",
                 "stations", "events", "methods", "thresholds"):
@@ -2092,6 +2269,13 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     add("")
     add(f"Generated {report.get('generated_at_utc', '—')} · "
         f"schema version {report.get('schema_version', '—')}.")
+    built = report.get("built_at_utc")
+    refreshed = report.get("live_refreshed_at_utc")
+    if built and refreshed and built != refreshed:
+        # Only worth a line when the two differ: on a full build they are
+        # the same instant, and saying so twice is noise.
+        add("")
+        add(f"Full build {built} · live sections refreshed {refreshed}.")
     add("")
 
     windows = report.get("windows") or {}

@@ -228,6 +228,12 @@ export const en: Catalog = {
 		error: 'The numbers could not be loaded. Please try again shortly.',
 		notMeasured: 'Not measured yet.',
 		generatedAt: (when: string) => `Computed ${when}.`,
+		/**
+		 * Two ages, because the page has two: the live half is rebuilt every
+		 * hour, the reliability diagrams once a night.
+		 */
+		refreshedAt: (updated: string, built: string) =>
+			`Updated ${updated} · full build ${built}.`,
 		/** Percent sign, English spacing; used everywhere on the page. */
 		percent: (value: number) => `${value}%`,
 		headline: {

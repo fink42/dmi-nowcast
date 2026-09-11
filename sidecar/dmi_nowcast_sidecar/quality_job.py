@@ -1,12 +1,32 @@
-"""The nightly quality build, as a process that exits.
+"""The quality build, as a process that exits.
 
 ``python -m dmi_nowcast_sidecar.quality_job --config-json '{...}'``
+``python -m dmi_nowcast_sidecar.quality_job --config-json '{...}' --live-only``
 
 Everything the nightly job does — the push-threshold fit, the report
 build, the two atomic writes — lives here, behind a ``main()`` that takes
 its resolved inputs and outputs as one JSON document and prints a
 one-line JSON summary on stdout. Nothing else is written to stdout, so a
 caller can parse the last line and be sure of what it got.
+
+Two modes
+---------
+
+``--live-only`` is the hourly refresh (``mode: "live"`` in the summary).
+The document's live half — the scoreboard, the station map, the recent
+warnings, the "is it raining now?" check — comes from decision rows and
+a gauge store that move every 10 minutes, while its corpus half takes
+minutes to fit and changes once a day. So the live mode:
+
+* does NOT run the threshold fit, which is a nightly decision and a
+  second pass over the same season of rows;
+* reads the document already on disk (``quality.out_json``) and hands it
+  to the builder as ``previous``, which carries the corpus-based sections
+  over unchanged — no previous document, or an unusable one, is an error
+  and the good document stays exactly where it is;
+* skips the markdown twin: that is the daily archive copy, and an hourly
+  one would overwrite the day's file with a near-identical rewrite
+  twenty-four times.
 
 Why a separate process at all
 -----------------------------
@@ -188,6 +208,35 @@ def sweep_options_from_json(payload: dict) -> Any:
     return SweepOptions(**kwargs)
 
 
+def read_previous(path: Path) -> dict:
+    """The document already on disk, for a live refresh to carry over.
+
+    Raises rather than returning ``None`` on anything unreadable: the
+    caller's only alternative would be to build without the corpus
+    sections and publish nulls over good numbers. A raised error costs one
+    log line and leaves the good document in place, which is the same
+    failure policy as every other step here.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(
+            f"a live refresh needs the previous report at {path}, "
+            "and there is none: run a full build first",
+        )
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — every way a file can be junk
+        raise ValueError(
+            f"the previous report at {path} is unreadable "
+            f"({type(exc).__name__}: {exc})",
+        ) from exc
+    if not isinstance(previous, dict):
+        raise ValueError(
+            f"the previous report at {path} is not a JSON object",
+        )
+    return previous
+
+
 # ---------------------------------------------------------------------------
 # The two steps
 # ---------------------------------------------------------------------------
@@ -260,20 +309,27 @@ def run_threshold_fit(
 def run_job(
     config: dict,
     *,
-    builder: Callable[[Any], dict] | None = None,
+    live_only: bool = False,
+    builder: Callable[..., dict] | None = None,
     renderer: Callable[[dict], str] | None = None,
     fitter: Callable[[Any], dict] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict:
-    """The whole nightly job: fit, build, write, summarise.
+    """The whole job: fit, build, write, summarise.
+
+    ``live_only`` is the hourly refresh described in the module
+    docstring: no fit, no markdown twin, and the builder is handed the
+    document already on disk so it can carry the corpus-based sections
+    over instead of refitting them.
 
     The injectables exist for the tests, which exercise the wiring — the
     guard, the atomic writes, the summary — without a corpus on disk.
     Production passes none of them and gets the real builder.
 
-    Raises whatever the builder raises: a build that fails must not
-    overwrite the report that is already on disk, and the caller (the
-    parent task, or :func:`main`) is what turns that into a log line.
+    Raises whatever the builder raises, and whatever reading the previous
+    document raises: a build that fails must not overwrite the report
+    that is already on disk, and the caller (the parent task, or
+    :func:`main`) is what turns that into a log line.
     """
     from dmi_nowcast_core.quality_report import (
         build_quality_report,
@@ -284,27 +340,35 @@ def run_job(
     build = builder or build_quality_report
     render = renderer or render_markdown
     quality = config["quality"]
+    path = Path(quality["out_json"])
 
     # The fit first, so the builder is handed tonight's table and
     # ``quality.json``'s thresholds section describes the rule the service
-    # is on as of now.
+    # is on as of now. Nightly only: which threshold each horizon warns at
+    # is a once-a-day decision, and refitting it hourly would both cost a
+    # second pass over the season and make the served rule jitter.
     fit_summary: dict = {}
     fit = config.get("fit") or {}
-    if fit.get("enabled"):
+    if fit.get("enabled") and not live_only:
         fit_summary = run_threshold_fit(fit, fitter=fitter, log=log)
 
     inputs = inputs_from_json(quality.get("inputs") or {})
     if log:
-        log("building the report")
-    report = build(inputs)
+        log(f"building the report (mode={'live' if live_only else 'full'})")
+    if live_only:
+        report = build(inputs, live_only=True, previous=read_previous(path))
+    else:
+        report = build(inputs)
     problems = validate_report(report)
     payload = json.dumps(report, indent=1, sort_keys=False)
-    path = Path(quality["out_json"])
     write_atomic(path, payload)
 
     markdown_dir = quality.get("markdown_dir")
-    if markdown_dir is not None:
-        stamp = str(report.get("generated_at_utc") or "")[:10] or (
+    if markdown_dir is not None and not live_only:
+        # Stamped by the day of the FULL build, which on this path is
+        # this build — a live refresh never reaches here.
+        built = report.get("built_at_utc") or report.get("generated_at_utc")
+        stamp = str(built or "")[:10] or (
             datetime.now(timezone.utc).date().isoformat()
         )
         try:
@@ -315,6 +379,9 @@ def run_job(
 
     summary = {
         "ok": True,
+        # Which half of the document this run rebuilt. Additive: a reader
+        # that does not know the key sees the same summary it always did.
+        "mode": "live" if live_only else "full",
         "path": str(path),
         "bytes": len(payload.encode("utf-8")),
         "sections": [
@@ -360,6 +427,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--config-json", required=True,
         help="the resolved job config as JSON: inline, @file, or - for stdin",
     )
+    parser.add_argument(
+        "--live-only", action="store_true",
+        help="refresh only the live sections, carrying the corpus-based "
+             "ones over from the report already at quality.out_json; "
+             "skips the threshold fit and the markdown twin",
+    )
     return parser
 
 
@@ -377,11 +450,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = _read_config(args.config_json)
-        summary = run_job(config, log=log)
+        summary = run_job(config, live_only=args.live_only, log=log)
     except Exception as exc:  # noqa: BLE001 — the exit code is the contract
         traceback.print_exc(file=sys.stderr)
         summary = {
             "ok": False,
+            "mode": "live" if args.live_only else "full",
             "path": None,
             "bytes": 0,
             "sections": [],
@@ -402,6 +476,7 @@ __all__ = [
     "inputs_from_json",
     "inputs_to_json",
     "main",
+    "read_previous",
     "redirect_structlog_to_stderr",
     "run_job",
     "run_threshold_fit",

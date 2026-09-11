@@ -22,12 +22,13 @@
 	import SiteFooter from '$lib/components/SiteFooter.svelte';
 	import QualityDiagram from '$lib/components/QualityDiagram.svelte';
 	import QualityStationMap from '$lib/components/QualityStationMap.svelte';
-	import { localDate, localDateTime } from '$lib/quality/dates';
+	import { localDate } from '$lib/quality/dates';
 	import { eventRows } from '$lib/quality/events';
 	import { fetchQuality } from '$lib/quality/load';
 	import {
 		countText,
 		decimalText,
+		freshnessLine,
 		marginCard,
 		rainingNowLines,
 		reliabilityCard,
@@ -282,7 +283,7 @@
 
 		<p>
 			{t().quality.methods.cadence}
-			{t().quality.generatedAt(localDateTime(report.generated_at_utc, locale()))}
+			{freshnessLine(t(), locale(), report)}
 		</p>
 		<p>
 			{t().quality.methods.attribution}

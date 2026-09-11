@@ -13,13 +13,19 @@ import {
 	countText,
 	decimalText,
 	emphasise,
+	freshnessLine,
 	marginCard,
 	rainingNowLines,
 	reliabilityCard,
 	warningsCard,
 	type HeadlineCard
 } from './sentences';
-import type { HeadlineWarnings, PersistenceMargin, QualityHeadline } from './schema';
+import type {
+	HeadlineWarnings,
+	PersistenceMargin,
+	QualityHeadline,
+	QualityReport
+} from './schema';
 
 const text = (card: HeadlineCard): string => card.segments.map((s) => s.text).join('');
 const bold = (card: HeadlineCard): string[] =>
@@ -263,5 +269,76 @@ describe('number formatting', () => {
 	it('writes decimals the way the locale does', () => {
 		expect(decimalText(0.612, 'en')).toBe('0.61');
 		expect(decimalText(0.612, 'da')).toBe('0,61');
+	});
+});
+
+describe('freshnessLine', () => {
+	/** Only the three timestamps matter here; every section is null. */
+	const report = (
+		generated: string,
+		built: string | null,
+		refreshed: string | null
+	): QualityReport =>
+		({
+			schema_version: 1,
+			generated_at_utc: generated,
+			built_at_utc: built,
+			live_refreshed_at_utc: refreshed,
+			windows: { radar: null, gauge: null, live: null },
+			headline: {
+				reliability: { radar: null, gauge: null },
+				warnings: null,
+				persistence_margin: null
+			},
+			reliability: { radar: null, gauge: null },
+			raining_now: null,
+			stations: null,
+			events: null,
+			methods: null,
+			thresholds: null
+		}) as QualityReport;
+
+	it('names both ages when the halves were built at different times', () => {
+		const line = freshnessLine(
+			en,
+			'en',
+			report('2026-09-05T14:05:00Z', '2026-09-05T03:30:00Z', '2026-09-05T14:05:00Z')
+		);
+		expect(line).toContain('Updated');
+		expect(line).toContain('full build');
+		// The full build's date is spelled out; the refresh is a clock time.
+		expect(line).toMatch(/5 Sep/);
+	});
+
+	it('says the same thing in Danish', () => {
+		const line = freshnessLine(
+			da,
+			'da',
+			report('2026-09-05T14:05:00Z', '2026-09-05T03:30:00Z', '2026-09-05T14:05:00Z')
+		);
+		expect(line).toContain('Opdateret');
+		expect(line).toContain('fuld beregning');
+		expect(line).not.toContain('full build');
+	});
+
+	it('falls back to one line on a document without the new stamps', () => {
+		const line = freshnessLine(en, 'en', report('2026-09-05T02:14:37Z', null, null));
+		expect(line).toContain('Computed');
+		expect(line).not.toContain('full build');
+	});
+
+	it('says it once when a full build has only one age', () => {
+		const line = freshnessLine(
+			en,
+			'en',
+			report('2026-09-05T03:30:00Z', '2026-09-05T03:30:00Z', '2026-09-05T03:30:00Z')
+		);
+		expect(line).toContain('Computed');
+		expect(line).not.toContain('Updated');
+	});
+
+	it('ignores a stamp it cannot read rather than blanking the line', () => {
+		const line = freshnessLine(en, 'en', report('2026-09-05T03:30:00Z', 'last night', null));
+		expect(line).toContain('Computed');
 	});
 });

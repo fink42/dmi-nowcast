@@ -14,11 +14,14 @@
  *    `emphasise` marks the value tokens inside the finished string, so the
  *    markup never has to be built out of translated fragments.
  */
+import { clockTime } from '$lib/format';
 import type { Catalog, Locale } from '$lib/i18n';
+import { localDateTime } from './dates';
 import type {
 	HeadlineWarnings,
 	PersistenceMargin,
 	QualityHeadline,
+	QualityReport,
 	RainingNowCheck
 } from './schema';
 
@@ -260,4 +263,31 @@ export function rainingNowLines(
 		comparison: t.quality.rainingNow.comparison(fractionText(t, check.observation_agreement)),
 		detail: t.quality.rainingNow.detail(countText(check.n_slots, locale))
 	};
+}
+
+/**
+ * When the numbers on the page are from — one line, or two when the document
+ * has two ages.
+ *
+ * The live half of the page (the scoreboard, the map, the recent warnings)
+ * is rebuilt hourly; the reliability diagrams behind it are refitted once a
+ * night and carried over in between. When those two moments differ the line
+ * names both, because "computed 14:05" over a reliability diagram that was
+ * fitted at 03:30 would be the wrong claim about the more interesting half.
+ *
+ * A document from a producer that predates the live refresh carries neither
+ * stamp, and gets the single line it always had.
+ */
+export function freshnessLine(t: Catalog, locale: Locale, report: QualityReport): string {
+	const built = report.built_at_utc;
+	const refreshed = report.live_refreshed_at_utc ?? report.generated_at_utc;
+	if (
+		built !== null &&
+		Number.isFinite(Date.parse(built)) &&
+		Number.isFinite(Date.parse(refreshed)) &&
+		Date.parse(built) !== Date.parse(refreshed)
+	) {
+		return t.quality.refreshedAt(clockTime(refreshed, locale), localDateTime(built, locale));
+	}
+	return t.quality.generatedAt(localDateTime(report.generated_at_utc, locale));
 }

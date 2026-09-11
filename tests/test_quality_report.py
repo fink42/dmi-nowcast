@@ -24,12 +24,14 @@ DMI, no real STEPS run.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from dmi_nowcast_core import quality_report as quality_report_module
 from dmi_nowcast_core.quality_report import (
     CORPUS_COLUMNS,
     DECISION_COLUMNS_READ,
@@ -1697,6 +1699,235 @@ class TestFrontendLoaderAssertions:
         again = json.loads(json.dumps(report))
         assert validate_report(again) == []
         assert again["headline"]["warnings"] == report["headline"]["warnings"]
+
+
+# ---------------------------------------------------------------------------
+# The hourly live refresh
+# ---------------------------------------------------------------------------
+
+
+def _mute_the_last_false_alarm(rows: list[dict]) -> list[dict]:
+    """The same decision rows with 06181's 11:30 warning never sent.
+
+    One row changed, and it is a row the scoreboard counts: the warning
+    disappears from ``events``, from ``headline.warnings.warnings`` and
+    from its false alarms. Nothing a corpus feeds moves, which is the
+    point — a live refresh has to pick this up and leave everything else
+    alone.
+    """
+    when = DAY + timedelta(minutes=690)
+    out: list[dict] = []
+    for row in rows:
+        if (
+            row["station_id"] == "06181"
+            and row["action"] == "notify"
+            and row["generated_at"] == when
+        ):
+            row = {**row, "action": "hold", "eta_min": None, "p_rain": 0.1}
+        out.append(row)
+    return out
+
+
+class TestLiveRefresh:
+    """``live_only=True``: rebuild the live half, carry the rest over.
+
+    The split exists because the two halves move at different speeds. The
+    decision rows and the gauge store behind the scoreboard, the map, the
+    recent warnings and the "is it raining now?" check are rewritten every
+    10 minutes; the two reliability fits take minutes over millions of
+    rows and change once a night. So the properties under test are:
+    carried sections come across byte-for-byte, live sections are genuinely
+    rebuilt, the timestamps say which is which, and a refresh with nothing
+    good to carry from refuses rather than publishing nulls over numbers.
+    """
+
+    #: An hour after the nightly build the fixtures are stamped at.
+    LATER = NOW + timedelta(hours=1)
+
+    def test_it_carries_the_corpus_sections_over_unchanged(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        full = build_quality_report(full_inputs)
+        live = build_quality_report(
+            replace(full_inputs, now=self.LATER), live_only=True,
+            previous=json.loads(json.dumps(full)),
+        )
+        assert live["reliability"] == full["reliability"]
+        assert live["headline"]["reliability"] == full["headline"]["reliability"]
+        assert live["windows"]["radar"] == full["windows"]["radar"]
+        assert live["windows"]["gauge"] == full["windows"]["gauge"]
+        assert live["methods"] == full["methods"]
+        # Not the same objects: a refresh must not be able to mutate the
+        # document it was handed.
+        assert live["reliability"] is not full["reliability"]
+
+    def test_it_rebuilds_the_live_sections_from_the_new_rows(
+        self, full_inputs: QualityInputs, tmp_path: Path,
+    ) -> None:
+        full = build_quality_report(full_inputs)
+        previous = json.loads(json.dumps(full))
+
+        # One warning un-sent, in both the replay and the live rows.
+        write_replay(
+            tmp_path / "replay", _mute_the_last_false_alarm(
+                decision_rows(live=False),
+            ),
+        )
+        write_live_eval(
+            tmp_path / "corpus", _mute_the_last_false_alarm(
+                decision_rows(live=True),
+            ),
+        )
+
+        live = build_quality_report(
+            replace(full_inputs, now=self.LATER), live_only=True,
+            previous=previous,
+        )
+        before = full["headline"]["warnings"]
+        after = live["headline"]["warnings"]
+        assert after["warnings"] == before["warnings"] - 1
+        assert after["false_alarms"] == before["false_alarms"] - 1
+        assert len(live["events"]) == len(full["events"]) - 1
+        assert not any(
+            e["station_id"] == "06181"
+            and e["warned_at_utc"] == _iso_z(DAY + timedelta(minutes=690))
+            for e in live["events"]
+        )
+        # …and the expensive half did not move with it.
+        assert live["reliability"] == previous["reliability"]
+        assert live["methods"] == previous["methods"]
+
+    def test_the_station_map_keeps_its_gauge_brier(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """Read back off the map, because nothing else in the document has it."""
+        full = build_quality_report(full_inputs)
+        live = build_quality_report(
+            replace(full_inputs, now=self.LATER), live_only=True,
+            previous=json.loads(json.dumps(full)),
+        )
+        briers = {
+            f["properties"]["station_id"]: f["properties"]["brier_gauge"]
+            for f in full["stations"]["features"]
+        }
+        assert any(v is not None for v in briers.values())
+        assert {
+            f["properties"]["station_id"]: f["properties"]["brier_gauge"]
+            for f in live["stations"]["features"]
+        } == briers
+
+    def test_the_three_timestamps_say_which_build_produced_what(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        full = build_quality_report(full_inputs)
+        assert full["generated_at_utc"] == _iso_z(NOW)
+        assert full["built_at_utc"] == full["generated_at_utc"]
+        assert full["live_refreshed_at_utc"] == full["generated_at_utc"]
+
+        live = build_quality_report(
+            replace(full_inputs, now=self.LATER), live_only=True,
+            previous=json.loads(json.dumps(full)),
+        )
+        assert live["generated_at_utc"] == _iso_z(self.LATER)
+        assert live["live_refreshed_at_utc"] == _iso_z(self.LATER)
+        # The corpus sections are still last night's, and say so.
+        assert live["built_at_utc"] == full["built_at_utc"]
+
+    def test_a_previous_document_without_the_new_stamps_is_still_a_full_build(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """The first refresh after a deploy carries an older document.
+
+        Its ``generated_at_utc`` IS when its full build ran — there was no
+        other kind of build when it was written.
+        """
+        previous = json.loads(json.dumps(build_quality_report(full_inputs)))
+        del previous["built_at_utc"]
+        del previous["live_refreshed_at_utc"]
+        live = build_quality_report(
+            replace(full_inputs, now=self.LATER), live_only=True,
+            previous=previous,
+        )
+        assert live["built_at_utc"] == previous["generated_at_utc"]
+
+    def test_a_refresh_still_validates_and_renders(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        full = build_quality_report(full_inputs)
+        live = build_quality_report(
+            replace(full_inputs, now=self.LATER), live_only=True,
+            previous=json.loads(json.dumps(full)),
+        )
+        assert validate_report(live) == []
+        text = render_markdown(live)
+        assert f"Full build {live['built_at_utc']}" in text
+        assert live["live_refreshed_at_utc"] in text
+        # A full build has one age, and says it once.
+        assert "Full build" not in render_markdown(full)
+
+    @pytest.mark.parametrize(
+        "previous, expected",
+        [
+            (None, "and got none"),
+            ("not a document", "must be an object"),
+            ({"schema_version": 99}, "schema_version 99"),
+        ],
+    )
+    def test_an_unusable_previous_refuses_rather_than_publishing_nulls(
+        self, full_inputs: QualityInputs, previous, expected: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=expected):
+            build_quality_report(full_inputs, live_only=True, previous=previous)
+
+    def test_a_previous_that_fails_the_schema_check_is_refused(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """The whole point: never a null reliability written over a good one."""
+        previous = json.loads(json.dumps(build_quality_report(full_inputs)))
+        del previous["reliability"]
+        with pytest.raises(ValueError, match="fails the schema check"):
+            build_quality_report(
+                full_inputs, live_only=True, previous=previous,
+            )
+
+    def test_it_never_touches_the_corpora(
+        self, full_inputs: QualityInputs, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The fits are the minutes; a refresh must not run either of them."""
+        previous = json.loads(json.dumps(build_quality_report(full_inputs)))
+
+        def explode(*args, **kwargs):
+            raise AssertionError("a live refresh must not fit the corpus")
+
+        monkeypatch.setattr(
+            quality_report_module, "reliability_from_corpus", explode,
+        )
+        report = build_quality_report(
+            replace(full_inputs, now=self.LATER), live_only=True,
+            previous=previous,
+        )
+        assert report["reliability"] == previous["reliability"]
+
+
+class TestNewTimestampsInTheChecker:
+    def test_they_are_optional_but_must_parse(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(full_inputs)
+        del report["built_at_utc"]
+        del report["live_refreshed_at_utc"]
+        assert validate_report(report) == []
+        report["built_at_utc"] = "last night"
+        assert any("built_at_utc" in p for p in validate_report(report))
+
+    def test_live_sections_cannot_predate_the_build_they_sit_in(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(full_inputs)
+        report["live_refreshed_at_utc"] = _iso_z(NOW - timedelta(hours=2))
+        assert any(
+            "precedes built_at_utc" in p for p in validate_report(report)
+        )
 
 
 # ---------------------------------------------------------------------------
