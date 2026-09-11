@@ -46,6 +46,14 @@
 #   STATION_UNION_CORPUS   union corpus to join instead of building
 #                          (default <corpus>/calibration/latest.parquet)
 #   STATION_REUSE_CORPUS   0 to always build, never reuse (default 1)
+#   GAUGE_OUTCOME_RULE     how the gauge verdict is scored: "within"
+#                          (default) is the CUMULATIVE truth the service
+#                          serves — wet at ANY 10-min slot up to the lead's
+#                          snapped instant, the same instants the radar
+#                          corpus scores. "instant" is the pre-2026-09-11
+#                          single-slot rule, kept only to reproduce an
+#                          older curve. Recorded on every joined row in
+#                          gauge_outcome_rule.
 #   BATCH_WORKERS          STEPS workers (default 2)
 #   BATCH_MEM_CAP          hard cap on the batch container (default 5000m)
 #   BATCH_FORCE            1 to run beside another batch job (don't)
@@ -76,11 +84,13 @@ out=$corpus_dir/stations/station_corpus_${stamp}.parquet
 joined=$corpus_dir/stations/station_corpus_${stamp}_gauge.parquet
 stable=$corpus_dir/stations/station_corpus_gauge.parquet
 union_corpus=${STATION_UNION_CORPUS:-$corpus_dir/calibration/latest.parquet}
+gauge_outcome_rule=${GAUGE_OUTCOME_RULE:-within}
 # The point_set label is the points file's STEM — the rule
 # build_calibration_corpus.py's points_set_name() applies.
 point_set=$(basename "$points" .json)
 
 echo "==> Station corpus (point_set ${point_set})"
+echo "    gauge outcome rule: ${gauge_outcome_rule}"
 echo "    joined → ${joined}"
 echo "    stable copy → ${stable}"
 
@@ -182,6 +192,7 @@ run_in_repo_capped python scripts/join_gauge_truth.py \
         --corpus "$out" \
         --corpus-dir "$corpus_dir" \
         --point-set "$point_set" \
+        --outcome-rule "$gauge_outcome_rule" \
         --out "$joined"
 
 # Stable name for quality_report.station_corpus. A copy for the same

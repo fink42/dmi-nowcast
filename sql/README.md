@@ -54,21 +54,31 @@ here as SQL instead of bespoke pandas.
 ## Gauge truth (Phase F)
 
 The last two queries read a corpus that
-`scripts/join_gauge_truth.py` has widened with three columns —
-`gauge_mm`, `gauge_dur_min`, `gauge_outcome` — taken from DMI's metObs
-rain gauges at the corpus's own points. They only mean anything on a
-corpus built over **station** points
-(`scripts/build_station_points.py`): a `point_id` has to be a
-`stationId` for the join to find a gauge.
+`scripts/join_gauge_truth.py` has widened with five columns —
+`gauge_mm`, `gauge_dur_min`, `gauge_outcome`, `gauge_mm_window`,
+`gauge_outcome_rule` — taken from DMI's metObs rain gauges at the
+corpus's own points. They only mean anything on a corpus built over
+**station** points (`scripts/build_station_points.py`): a `point_id` has
+to be a `stationId` for the join to find a gauge.
 
-- `gauge_outcome` is 1 when the gauge slot at the row's verification
-  instant recorded `precip_past10min >= 0.1 mm` OR
-  `precip_dur_past10min >= 1 min`, 0 when it recorded neither, and NULL
-  when the amount slot is missing. **Filter on it, not on `outcome`** —
-  the two are missing for different reasons (no gauge slot vs no
-  verification composite).
-- The verification instant is the builder's, unchanged:
-  `T + ceil((lead_min + frame_age_min)/timestep_min - 1e-9) *
+- `gauge_outcome` is the CUMULATIVE event the service serves — "rain
+  **within** L", the same truth `build_calibration_corpus.py` scores the
+  radar `outcome` under. It is 1 when ANY 10-minute gauge slot on the
+  instants `T + j*timestep_min` (`j = 1 … snapped/timestep_min`)
+  recorded `precip_past10min >= 0.1 mm` OR `precip_dur_past10min >= 1
+  min`, 0 when none did, and NULL when the FINAL slot's amount is
+  missing (a missing intermediate slot is skipped, not fatal).
+  **Filter on it, not on `outcome`** — the two are missing for different
+  reasons (no gauge slot vs no verification composite).
+- `gauge_outcome_rule` names the rule the row was scored under:
+  `within` (the default, above) or `instant`, the pre-2026-09-11
+  single-slot rule kept only to reproduce an older curve. Never pool the
+  two — they label different events.
+- The window's last instant is the builder's verification instant,
+  unchanged: `T + ceil((lead_min + frame_age_min)/timestep_min - 1e-9) *
   timestep_min`, matched to the 10-minute gauge stamp *ending* at it.
+- `gauge_mm` / `gauge_dur_min` are the readings at that final instant;
+  `gauge_mm_window` is the amount summed over the window's observed
+  slots, which is the amount that goes with a cumulative outcome.
 - Gauge data is DMI Open Data, licence **CC BY 4.0**. Attribute DMI in
   anything published from these queries.

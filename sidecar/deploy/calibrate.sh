@@ -70,6 +70,17 @@ ONE corpus build serves BOTH point sets. ``--points`` is repeatable
 #                               instead of one union run (default 1)
 #   STATION_POINTS              gauge points JSON (container path; default
 #                               <corpus>/stations/station_points.json)
+#   GAUGE_OUTCOME_RULE          how the gauge verdict is scored: "within"
+#                               (default) is the CUMULATIVE truth the
+#                               service serves — wet at ANY 10-min slot up
+#                               to the lead's snapped instant, the same
+#                               instants build_calibration_corpus.py scores
+#                               the radar outcome over. "instant" is the
+#                               pre-2026-09-11 single-slot rule, kept only
+#                               to reproduce an older curve. Recorded on
+#                               every joined row in gauge_outcome_rule, so
+#                               a report can say which event its curve was
+#                               scored against.
 #   CALIBRATION_WORKERS         parallel STEPS workers (default 2, from
 #                               BATCH_WORKERS). Each worker is a spawned
 #                               process holding 1.3-2.0 GB of anon RSS at
@@ -224,6 +235,7 @@ latest_path=/var/lib/dmi-nowcast-corpus/calibration/latest.parquet
 latest_md=/var/lib/dmi-nowcast-corpus/calibration/latest.md
 gauge_path=/var/lib/dmi-nowcast-corpus/stations/station_corpus_${stamp}_gauge.parquet
 gauge_stable=/var/lib/dmi-nowcast-corpus/stations/station_corpus_gauge.parquet
+gauge_outcome_rule=${GAUGE_OUTCOME_RULE:-within}
 # point_set labels are the points files' STEMS — the same rule
 # build_calibration_corpus.py's points_set_name() applies. Derived rather
 # than hardcoded so CALIBRATION_POINTS / STATION_POINTS stay honest.
@@ -433,10 +445,12 @@ elif [[ "$union" == 1 ]]; then
     echo
     echo "==> Gauge truth join over the union corpus  $(date -u +%FT%TZ)"
     echo "    --point-set ${station_set} → ${gauge_path}"
+    echo "    outcome rule: ${gauge_outcome_rule} (the served \"rain within L\")"
     if run_in_repo_capped python scripts/join_gauge_truth.py \
             --corpus "$corpus_path" \
             --corpus-dir "$corpus_dir" \
             --point-set "$station_set" \
+            --outcome-rule "$gauge_outcome_rule" \
             --out "$gauge_path" \
         && batch_publish_atomic "$gauge_path" "$gauge_stable"; then
         station_rc=0
