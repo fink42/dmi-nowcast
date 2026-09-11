@@ -687,6 +687,62 @@ def test_concat_unions_files_written_under_different_lead_sets() -> None:
     assert [r["p_rain_30"] for r in merged.to_pylist()] == [None, pytest.approx(0.7)]
 
 
+def test_a_day_written_before_threshold_pct_reads_back_null(
+    tmp_path,
+) -> None:
+    """The column is nullable and additive; an old file must still read.
+
+    ``threshold_pct`` records the percent a row was DECIDED at, which
+    moves with every nightly refit. A file written before it existed
+    cannot have it, and the one thing that must never happen is reading
+    back a plausible 40: that would claim a rule the row was not taken
+    under. Null, through the ordinary alignment machinery, everywhere the
+    rows are read.
+    """
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    from dmi_nowcast_core.quality_report import _read_decision_parquet
+    from dmi_nowcast_core.warning_score import (
+        align_decision_table,
+        decision_schema,
+        decision_table,
+    )
+
+    # A parquet in the schema as it was before the column: no
+    # ``threshold_pct`` field at all.
+    old_schema = pa.schema([
+        field for field in decision_schema((30,))
+        if field.name != "threshold_pct"
+    ])
+    row = {**_base_row(), "p_rain_30": 0.7}
+    old = pa.table(
+        {
+            name: pa.array([row.get(name)], type=old_schema.field(name).type)
+            for name in old_schema.names
+        },
+        schema=old_schema,
+    )
+    assert "threshold_pct" not in old.schema.names
+    path = tmp_path / "2026-09-03.parquet"
+    pq.write_table(old, path)
+
+    # 1. The alignment used by the sweep, the live merge and the replay.
+    aligned = align_decision_table(pq.read_table(path), (30,))
+    assert aligned.to_pylist()[0]["threshold_pct"] is None
+
+    # 2. The report's own projected read, which pins the schema.
+    rows = _read_decision_parquet(path)
+    assert rows and rows[0]["p_rain"] == pytest.approx(0.7)
+
+    # 3. A day with the column concatenates with one without it.
+    new = decision_table(
+        [{**row, "threshold_pct": 60}], leads_min=(30,),
+    )
+    merged = pa.concat_tables([aligned, align_decision_table(new, (30,))])
+    assert [r["threshold_pct"] for r in merged.to_pylist()] == [None, 60]
+
+
 def test_concat_of_nothing_is_an_empty_typed_table() -> None:
     pytest.importorskip("pyarrow")
     from dmi_nowcast_core.warning_score import concat_decision_tables

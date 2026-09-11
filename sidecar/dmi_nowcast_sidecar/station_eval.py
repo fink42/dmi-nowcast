@@ -310,11 +310,29 @@ def _merge_and_write(path: Path, rows: Sequence[dict], leads_min) -> int:
 
 
 class StationEvalService:
-    """Owns the per-cycle gauge evaluation. One instance per process."""
+    """Owns the per-cycle gauge evaluation. One instance per process.
 
-    def __init__(self, config: Config, engine: Any) -> None:
+    ``thresholds`` is the running service's
+    :class:`~dmi_nowcast_sidecar.push.thresholds.ThresholdTable` — the
+    same object the push fan-out evaluates against. Given one, the
+    virtual subscribers warn at the percent the table picks for their
+    horizon, and the nightly refit reaches them without a restart because
+    the table hot-reloads itself. Without one (a test, or a deployment
+    with no fitted table) the configured
+    ``station_eval.rules.threshold_pct`` stands, which is what shipped.
+
+    That argument is the whole reason the module's promise — "the
+    scoreboard measures the rule the SERVICE runs" — is true rather than
+    aspirational: a fixed 40 % here would be a measurement of a rule
+    nobody is subscribed to.
+    """
+
+    def __init__(
+        self, config: Config, engine: Any, *, thresholds: Any = None,
+    ) -> None:
         self.config = config
         self.engine = engine
+        self._thresholds = thresholds
         self._points: list[dict] | None = None
         self._states: dict[str, SubState] | None = None
         self._last_radar_ts: datetime | None = None
@@ -439,6 +457,37 @@ class StationEvalService:
             raining_now_mm_h=self.config.forecast.rain_threshold_mm_h,
         )
 
+    def _threshold(self) -> tuple[int, str]:
+        """``(percent, source)`` the virtual subscribers warn at this cycle.
+
+        The served table when there is one, the configured percent when
+        there is not. ``maybe_reload`` is one ``stat`` and a JSON parse
+        only when the file moved — the same call the push fan-out makes at
+        the start of its own cycle, and for the same reason: every station
+        of one cycle is judged under one version of the rule, and the
+        nightly refit takes effect without a restart.
+
+        Runs inside the worker thread, never on the event loop. Total: a
+        table that cannot answer costs the configured percent and a log
+        line, never the cycle.
+        """
+        configured = int(self.config.station_eval.rules.threshold_pct)
+        table = self._thresholds
+        if table is None:
+            return configured, "config"
+        try:
+            table.maybe_reload()
+            threshold, source = table.effective(
+                int(self.config.station_eval.rules.lead_min),
+            )
+            return int(threshold), str(source)
+        except Exception as exc:  # noqa: BLE001 — never cost a cycle
+            _log.warning(
+                "station_eval_threshold_unreadable",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return configured, "config"
+
     def _ensure_points(self) -> None:
         if self._points is None:
             self._points = load_points(Path(self.config.station_eval.points_file))
@@ -488,7 +537,7 @@ class StationEvalService:
         assert self._points is not None and self._states is not None
         rules = self._rules()
         lead = int(self.config.station_eval.rules.lead_min)
-        threshold_pct = int(self.config.station_eval.rules.threshold_pct)
+        threshold_pct, threshold_source = self._threshold()
 
         rows: list[dict] = []
         actions: dict[str, int] = {}
@@ -555,6 +604,11 @@ class StationEvalService:
                 "action": decision.action,
                 "armed_after": decision.state.armed,
                 "streak_after": decision.state.streak,
+                # The percent this row was actually decided at. It moves
+                # with the nightly refit, so a row is only interpretable
+                # beside the rule it was taken under — see
+                # ``warning_score.DECISION_COLUMNS``.
+                "threshold_pct": threshold_pct,
                 # Additive (Phase H): the features the nightly refit
                 # trains on and the probability the decision above was
                 # actually taken on. Unknown to every existing reader,
@@ -579,6 +633,13 @@ class StationEvalService:
             "eval_errors": errors,
             "actions": actions,
             "partition_rows": n_rows,
+            # Which rule this cycle ran, on the line that says what it
+            # did: "table" is the fitted pick for the scoreboard's lead,
+            # "fallback" the table's own default for a lead it cannot
+            # speak for, "config" the station_eval setting because there
+            # is no usable table.
+            "threshold_pct": threshold_pct,
+            "threshold_source": threshold_source,
         }
         _log.info("station_eval", **summary)
         return summary

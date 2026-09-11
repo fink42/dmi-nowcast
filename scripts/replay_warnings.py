@@ -269,6 +269,15 @@ DEFAULT_FLOW_COMPLETION = "confidence"
 FRAME_INTERVAL_MIN = 10        # fullRange cadence (Phase B addendum)
 FRAME_TOLERANCE_S = 60         # a frame is "on the grid" within a minute
 #: The live subscriber row this replay reproduces.
+#:
+#: ``threshold_pct`` here is only the FALLBACK — the percent a run warns
+#: at when it is given no fitted threshold table. The service has not
+#: warned at a fixed 40 % since Phase G: it warns at whatever
+#: ``push_thresholds.json`` picks for the subscriber's horizon, refitted
+#: nightly. Pass ``--thresholds`` (and leave ``--rules threshold_pct``
+#: alone) to generate a tree under the rule the service is actually on;
+#: the 40 here is what the run falls back to, and what every tree written
+#: before ``--thresholds`` existed was generated with.
 DEFAULT_RULES: dict[str, float] = {
     "threshold_pct": 40,
     "lead_min": 30,
@@ -277,6 +286,15 @@ DEFAULT_RULES: dict[str, float] = {
     "raining_now_eta_min": 1.5,
     "raining_now_mm_h": RAIN_THRESHOLD_MM_H,
 }
+
+#: Where a run's ``threshold_pct`` came from, recorded in
+#: ``summary.json``'s ``run.rules``. ``table`` is a fitted pick from a
+#: ``--thresholds`` document, ``fallback`` that document's own default for
+#: a lead it cannot speak for, ``rules`` the ``--rules`` / built-in value
+#: because no document was given.
+THRESHOLD_SOURCE_TABLE = "table"
+THRESHOLD_SOURCE_FALLBACK = "fallback"
+THRESHOLD_SOURCE_RULES = "rules"
 #: Live median compute latency — see the module docstring.
 DEFAULT_FRAME_AGE_MIN = 14.0
 #: Pad each scored day by this much so a 23:5x warning can still find its
@@ -323,8 +341,52 @@ def load_points(path: Path) -> tuple[StationPoint, ...]:
     return tuple(points)
 
 
+def apply_thresholds(
+    rules: dict[str, float], path: Path | str | None,
+) -> tuple[dict[str, float], str]:
+    """Override ``threshold_pct`` from a served threshold document.
+
+    ``(rules, source)``. Without a path nothing moves and the source is
+    ``"rules"`` — the ``--rules`` value, or the built-in fallback. With
+    one, the percent is the document's own answer for this run's lead,
+    read through :mod:`dmi_nowcast_core.push_thresholds` so a replayed
+    tree is generated under the rule the running service is on rather
+    than under a constant nobody is subscribed to.
+
+    A missing or unusable document is an ERROR here, not a silent
+    fallback: a replay is hours of CPU, and one that quietly warned at
+    40 % because a path was mistyped would be discovered a day later.
+    """
+    if path is None:
+        return rules, THRESHOLD_SOURCE_RULES
+    from dmi_nowcast_core.push_thresholds import (
+        effective_threshold,
+        lead_pick,
+        load_thresholds,
+    )
+
+    doc = load_thresholds(path)
+    if doc is None:
+        raise ValueError(
+            f"{path}: not a usable push-threshold document "
+            "(drop --thresholds to replay at the --rules percent)",
+        )
+    lead = str(int(rules["lead_min"]))
+    rules = dict(rules)
+    rules["threshold_pct"] = float(effective_threshold(doc, lead))
+    source = (
+        THRESHOLD_SOURCE_TABLE if lead_pick(doc, lead) is not None
+        else THRESHOLD_SOURCE_FALLBACK
+    )
+    return rules, source
+
+
 def parse_rules(spec: str | None) -> dict[str, float]:
-    """``k=v,k=v`` over :data:`DEFAULT_RULES`; unknown keys are an error."""
+    """``k=v,k=v`` over :data:`DEFAULT_RULES`; unknown keys are an error.
+
+    ``threshold_pct`` set here is the FALLBACK for a run with no
+    ``--thresholds`` document — see :data:`DEFAULT_RULES`.
+    """
     rules = dict(DEFAULT_RULES)
     if not spec:
         return rules
@@ -1116,6 +1178,11 @@ def run_day(args: tuple) -> dict:
                     "action": decision.action,
                     "armed_after": decision.state.armed,
                     "streak_after": decision.state.streak,
+                    # The percent this row was decided at — the served
+                    # table's pick for the run's lead, or the fallback.
+                    # It moves with every refit, so a row is only
+                    # interpretable beside the rule it was taken under.
+                    "threshold_pct": threshold_pct,
                     # H-P: additive, and only when --features is on.
                     **(sample.get("features") or {}),
                 })
@@ -1492,7 +1559,20 @@ def main(argv: Sequence[str] | None = None) -> int:
              "grid keeps fullRange's coverage.",
     )
     p.add_argument("--out-dir", required=True, type=Path)
-    p.add_argument("--rules", help="k=v,... over the live subscriber row")
+    p.add_argument(
+        "--rules",
+        help="k=v,... over the live subscriber row. threshold_pct here is "
+             "the FALLBACK percent, used only when --thresholds is not "
+             "given: since Phase G the service warns at the fitted table's "
+             "pick for the subscriber's horizon, not at a constant.",
+    )
+    p.add_argument(
+        "--thresholds", type=Path,
+        help="a served push_thresholds.json; its pick for --rules lead_min "
+             "overrides threshold_pct, so the tree is generated under the "
+             "rule the service is actually on. Recorded in the run summary "
+             "as rules.threshold_source (table|fallback|rules).",
+    )
     p.add_argument("--progress", type=Path,
                    help="JSON progress file; a finished day is not redone")
     p.add_argument("--national-curves", type=Path,
@@ -1530,7 +1610,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="replay only; skip the gauge scoring pass")
     args = p.parse_args(argv)
 
-    rules = parse_rules(args.rules)
+    rules, threshold_source = apply_thresholds(
+        parse_rules(args.rules), args.thresholds,
+    )
     points = load_points(args.points)
     days = _split(args.days)
     if args.days_file:
@@ -1665,7 +1747,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "counts": all_anchor_counts,
                 "frame_age_min": anchor_policy.frame_age_stats(all_frame_ages),
             },
-            "rules": rules,
+            # The effective rule, and where its percent came from: a
+            # tree generated at the fitted table's pick reads very
+            # differently from one generated at the 40 % fallback, and
+            # nothing else in the run records which happened.
+            "rules": {**rules, "threshold_source": threshold_source},
             "steps": {
                 "ensemble_size": settings.ensemble_size,
                 "n_cascade_levels": settings.n_cascade_levels,

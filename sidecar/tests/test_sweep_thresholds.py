@@ -330,6 +330,48 @@ def test_already_raining_silences_the_notification() -> None:
     ) == []
 
 
+def test_the_eta_arm_of_already_raining_defaults_to_the_engines_own() -> None:
+    """``raining_now_eta_min`` is spellable, and its default changes nothing.
+
+    The parameter exists so the served-rule scorer can state the whole
+    rule rather than inherit three quarters of it from a default. What
+    must not happen is the sweep's numbers moving because it was added:
+    both writers (``station_eval._rules``, the replay's ``DEFAULT_RULES``)
+    configure the engine's own 1.5, so passing None and passing 1.5 are
+    the same run.
+    """
+    track = _track([0.60])
+    default = sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+    )
+    assert default == sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+        raining_now_eta_min=1.5,
+    )
+    assert len(default) == 1
+
+    # And it is genuinely read: an ETA arm wide enough to cover this
+    # track's 25-minute ETA silences it.
+    assert sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+        raining_now_eta_min=30.0,
+    ) == []
+
+
+def test_with_probability_adds_the_number_the_rule_fired_on() -> None:
+    """Off by default: ``score_warnings`` unpacks two-tuples."""
+    track = _track([0.10, 0.60])
+    pairs = sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+    )
+    triples = sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+        with_probability=True,
+    )
+    assert [w[:2] for w in triples] == pairs
+    assert [w[2] for w in triples] == [pytest.approx(0.60)]
+
+
 # ---------------------------------------------------------------------------
 # End to end: the hand-worked counts
 # ---------------------------------------------------------------------------

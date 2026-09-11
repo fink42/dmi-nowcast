@@ -353,6 +353,14 @@ class ProbabilityFiller:
     * otherwise the row is DROPPED and counted. Scoring it would mean
       calling every frame of it below threshold, which is not a
       measurement of the rule, it is a measurement of the archive's depth.
+
+    ``drop_unfilled=False`` turns that last step off: the row survives
+    with a null probability and is still counted under ``dropped``. It is
+    for the one caller that has a SECOND answer for such a row — the
+    served-rule scorer, where the push engine's own per-observation
+    fallback puts it back on the curve-calibrated ``p_rain`` rather than
+    excluding it. Dropping there would make the page's rule differ from
+    the service's on exactly the rows the fallback exists for.
     """
 
     def __init__(
@@ -361,11 +369,14 @@ class ProbabilityFiller:
         leads: Sequence[int],
         design_leads: Sequence[int],
         column_for: Any,
+        *,
+        drop_unfilled: bool = True,
     ) -> None:
         self.model = model
         self.leads = tuple(int(lead) for lead in leads)
         self.design_leads = tuple(int(lead) for lead in design_leads)
         self.column_for = column_for
+        self.drop_unfilled = bool(drop_unfilled)
         self.counts: dict[str, int] = {
             "rows": 0, "stored": 0, "computed": 0, "dropped": 0,
         }
@@ -418,7 +429,7 @@ class ProbabilityFiller:
             table = table.append_column(name, pa.array(
                 values, type=pa.float64(), mask=~np.isfinite(values),
             ))
-        if not keep.all():
+        if self.drop_unfilled and not keep.all():
             table = table.filter(pa.array(keep))
         return table
 

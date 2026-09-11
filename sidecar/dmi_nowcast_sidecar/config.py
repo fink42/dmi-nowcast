@@ -739,6 +739,22 @@ class QualityReportConfig(BaseModel):
     gauge_reliability: GaugeReliabilityConfig = Field(
         default_factory=GaugeReliabilityConfig,
     )
+    #: RE-DECIDE the page's warning scoreboard under the rule the push
+    #: service actually runs, instead of counting the ``notify`` rows the
+    #: decision trees stored.
+    #:
+    #: The trees were generated with a fixed subscriber row (40 % at
+    #: 30 min); the service decides with the nightly fitted threshold
+    #: table on the post-processed probability. Scoring the stored actions
+    #: therefore measures a rule nobody is subscribed to. With this on,
+    #: the builder replays ``push.engine.evaluate`` over the rows' own
+    #: probabilities at the served threshold — nothing on disk is
+    #: rewritten, and the answer follows every refit. Both the nightly
+    #: build and the hourly live refresh do it.
+    #:
+    #: Off falls back to the stored actions, and ``methods`` says the
+    #: scoreboard is scored "as recorded" rather than "re-decided".
+    score_served_rule: bool = True
 
     @field_validator("at_utc")
     @classmethod

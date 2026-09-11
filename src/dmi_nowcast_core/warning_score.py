@@ -249,8 +249,16 @@ DEFAULT_COVERAGE_GAP_MIN = 20
 #: decision was actually taken on. It is joined on disk by one
 #: ``p_rain_<lead>`` column per served lead (:func:`decision_columns`), so
 #: a threshold/horizon sweep can be run offline against the gauges without
-#: re-running STEPS. This base tuple stays fixed: readers pin it, and files
-#: written before the per-lead columns existed have exactly these.
+#: re-running STEPS. This base tuple grows only by APPENDING: readers pin
+#: its prefix, and a file written before a column existed reads that column
+#: back as null through :func:`align_decision_table`.
+#:
+#: ``threshold_pct`` is the percent this row's ``action`` was actually
+#: decided at. It is NOT a constant: both writers take it from the served
+#: threshold table (``push_thresholds``), which is refitted nightly, so a
+#: row is only interpretable beside the number its rule used. Null on every
+#: file written before the column existed — which is the honest answer for
+#: a row whose rule cannot be recovered, and never a guess at 40.
 DECISION_COLUMNS: tuple[str, ...] = (
     "radar_ts",
     "generated_at",
@@ -263,6 +271,7 @@ DECISION_COLUMNS: tuple[str, ...] = (
     "action",
     "armed_after",
     "streak_after",
+    "threshold_pct",
 )
 
 #: Default per-lead probability columns: the leads the national products
@@ -328,6 +337,9 @@ def decision_schema(leads_min: Iterable[int] | None = None):
         ("action", pa.string()),
         ("armed_after", pa.bool_()),
         ("streak_after", pa.int32()),
+        # Nullable on purpose: a row from a file written before this
+        # existed must read back "unknown", not a plausible default.
+        ("threshold_pct", pa.int32()),
     ]
     fields += [(p_rain_column(lead), pa.float32()) for lead in _leads(leads_min)]
     return pa.schema(fields)

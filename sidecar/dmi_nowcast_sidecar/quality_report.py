@@ -26,6 +26,18 @@ that finds it held is SKIPPED with a log line rather than queued —
 another one is due in an hour, and a queued refresh would only pile up
 behind a long build.
 
+One step runs on BOTH schedules: the warning scoreboard is **re-decided
+under the served rule** (``quality_report.score_served_rule``). The two
+decision trees were generated with a fixed subscriber row — 40 % at
+30 min — while the push service warns at the nightly fitted threshold on
+the post-processed probability, so counting the trees' stored ``notify``
+rows measured a rule nobody is subscribed to (6 912 warnings at FAR 0.86
+nationally, against POD 0.35 / precision 0.31 for the served rule
+measured properly). Nothing on disk is rewritten: the warnings are
+re-derived from the probabilities the rows already carry, which is why it
+is cheap enough to redo on every hourly refresh — and it has to be, since
+the scoreboard is exactly what a refresh rebuilds.
+
 Phase G adds one step in front of the build: the nightly **push-threshold
 fit** (``quality_report.fit_thresholds``). It replays the same decision
 rows against the same gauge store to answer "which threshold should each
@@ -95,6 +107,7 @@ from .quality_job import (
     gauge_reliability_options_to_json,
     inputs_to_json,
     run_job,
+    served_rule_options_to_json,
     sweep_options_to_json,
 )
 
@@ -351,6 +364,47 @@ class QualityReportTask:
             min_known_slots=int(thresholds.min_known_slots),
         )
 
+    def _served_rule_options(self) -> Any:
+        """The :class:`ServedRuleOptions` this config describes.
+
+        The rule the page's warning scoreboard is re-decided under, and
+        it is assembled from the running service's own settings rather
+        than from anything the report owns: the fitted table the push
+        fan-out reads, the probability source the fan-out decides with,
+        the model that fills it, and the live subscriber row
+        ``station_eval`` runs. Shares the threshold fit's decision rows
+        for the same reason every other step here does — the scoreboard,
+        the gauge curve and the fitted thresholds have to stand on one
+        set of rows.
+        """
+        from .served_rule import ServedRuleOptions
+
+        settings = self.settings
+        thresholds = settings.fit_thresholds
+        dirs = settings.gauge_reliability.decisions_dirs or thresholds.decisions_dirs
+        rules = self.config.station_eval.rules
+        post = self.config.push.probability_source == "postprocess"
+        return ServedRuleOptions(
+            decisions_dirs=[Path(d) for d in dirs],
+            # The file the service is serving as of now — after tonight's
+            # fit, on a full build. The same path ``inputs()`` hands the
+            # report's ``thresholds`` section, so the percent the page
+            # prints and the percent it scored at cannot disagree.
+            thresholds_path=self.thresholds_out(),
+            lead_min=int(rules.lead_min),
+            probability_source=self.config.push.probability_source,
+            postprocess_model=self.postprocess_out() if post else None,
+            design_leads=tuple(
+                int(lead) for lead in self.config.forecast.national.leads_min
+            ),
+            persistence_obs=int(rules.persistence_obs),
+            rearm_after_min=int(rules.rearm_after_min),
+            # One detection threshold for the whole pipeline, exactly as
+            # ``station_eval._rules`` takes it.
+            raining_now_mm_h=float(self.config.forecast.rain_threshold_mm_h),
+            fallback_threshold_pct=int(rules.threshold_pct),
+        )
+
     def _gauge_reliability_options(self) -> Any:
         """The :class:`GaugeReliabilityOptions` this config describes.
 
@@ -473,7 +527,21 @@ class QualityReportTask:
             "fit": {"enabled": False},
             "fit_postprocess": {"enabled": False},
             "gauge_reliability": {"enabled": False},
+            "served_rule": {"enabled": False},
         }
+        # The one step that runs on BOTH schedules. The scoreboard, the
+        # station map and the recent warnings are exactly what a live
+        # refresh rebuilds, so re-deciding them has to happen on a live
+        # refresh too — otherwise the hourly document would publish the
+        # stored 40 % actions over the nightly build's served-rule ones.
+        served_dirs = settings.gauge_reliability.decisions_dirs or fit.decisions_dirs
+        if settings.score_served_rule and served_dirs:
+            payload["served_rule"] = {
+                "enabled": True,
+                "options": served_rule_options_to_json(
+                    self._served_rule_options(),
+                ),
+            }
         post = settings.fit_postprocess
         # The refit only runs where it can: it needs rows and a gauge
         # store, and ``decisions_dirs`` empty means there is nothing to

@@ -85,6 +85,22 @@
 #                             on: postprocess (default, matching
 #                             push.probability_source) or curve
 #
+# The warning scoreboard is RE-DECIDED under the served rule by default
+# (quality_report.score_served_rule). The decision trees were generated
+# at a fixed 40 % / 30 min; the service warns at the fitted table's pick
+# on the post-processed probability, so counting the trees' stored
+# `notify` rows measures a rule nobody is subscribed to. Nothing on disk
+# is rewritten — the warnings are re-derived from the probabilities the
+# rows already carry.
+#
+#   QUALITY_SERVED_RULE       0 to score the stored actions instead
+#                             (default 1: re-decide)
+#   QUALITY_SERVED_LEAD       the scoreboard's horizon, matching
+#                             station_eval.rules.lead_min (default 30)
+#   QUALITY_SERVED_FALLBACK   the percent used when there is no usable
+#                             threshold table, matching
+#                             station_eval.rules.threshold_pct (default 40)
+#
 # Usage:
 #   sidecar/deploy/quality_report.sh
 #   QUALITY_GAUGE_RELIABILITY=0 sidecar/deploy/quality_report.sh
@@ -139,6 +155,14 @@ gauge_reliability=${QUALITY_GAUGE_RELIABILITY:-1}
 # Score predictions from a model refitted without the month being graded.
 # 0 reproduces the in-sample tautology deliberately; nothing else should.
 gauge_out_of_fold=${QUALITY_GAUGE_OUT_OF_FOLD:-1}
+
+# The warning scoreboard, re-decided under the rule the service runs.
+# Defaults mirror station_eval.rules, which is what the live scoreboard
+# itself decides with — so the first manual build and every nightly one
+# after it measure the same rule.
+served_rule=${QUALITY_SERVED_RULE:-1}
+served_lead=${QUALITY_SERVED_LEAD:-30}
+served_fallback=${QUALITY_SERVED_FALLBACK:-40}
 
 # Bring scripts/ into the container on demand — the runtime image does not
 # carry them. Repo mounted read-only; every output goes to a volume.
@@ -242,7 +266,8 @@ config_json=$(run_in_repo python - \
     "$fit_workers" "$fit_min_warnings" "$fit_min_delta" \
     "$radar_decisions" "$decisions_dirs" \
     "$post_on" "$postprocess_out" "$fit_l2" "$fit_design_leads" \
-    "$fit_probability" "$gauge_reliability" "$gauge_out_of_fold" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
+    "$fit_probability" "$gauge_reliability" "$gauge_out_of_fold" \
+    "$served_rule" "$served_lead" "$served_fallback" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
 import json
 import sys
 
@@ -252,7 +277,8 @@ from dmi_nowcast_sidecar.threshold_sweep import parse_thresholds
 (corpus_dir, out, md_dir, live_days, fit_on, thresholds_out, sweep_json,
  leads, grid, workers, min_warnings, min_delta, radar_decisions,
  decisions_dirs, post_on, postprocess_out, l2, design_leads,
- probability, gauge_reliability, gauge_out_of_fold, *pairs) = sys.argv[1:]
+ probability, gauge_reliability, gauge_out_of_fold,
+ served_rule, served_lead, served_fallback, *pairs) = sys.argv[1:]
 
 inputs = {"corpus_dir": corpus_dir, "live_days": int(live_days)}
 for pair in pairs:
@@ -268,9 +294,28 @@ config = {
     "fit": {"enabled": False},
     "fit_postprocess": {"enabled": False},
     "gauge_reliability": {"enabled": False},
+    "served_rule": {"enabled": False},
 }
 lead_list = [int(v) for v in leads.split(",") if v.strip()]
 design_list = [int(v) for v in design_leads.split(",") if v.strip()]
+if served_rule == "1":
+    # The rule the push service runs, re-applied to the rows the report
+    # scores: the table it serves, the probability it decides on, and the
+    # live subscriber row at the gauges. Nothing is regenerated.
+    config["served_rule"] = {
+        "enabled": True,
+        "options": {
+            "decisions_dirs": decisions_dirs.split(),
+            "thresholds_path": thresholds_out,
+            "lead_min": int(served_lead),
+            "probability_source": probability,
+            "postprocess_model": (
+                postprocess_out if probability == "postprocess" else None
+            ),
+            "design_leads": design_list,
+            "fallback_threshold_pct": int(served_fallback),
+        },
+    }
 if gauge_reliability == "1":
     # The same rows, the same gauge rule and the same probability column
     # the threshold fit above uses — the page, the fitted model and the

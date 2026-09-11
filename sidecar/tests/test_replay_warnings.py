@@ -220,6 +220,107 @@ def test_parse_rules_rejects_nonsense() -> None:
         rw.parse_rules("lead_min=35")
 
 
+class TestServedThresholdDocument:
+    """``--thresholds``: generate the tree under the rule the service runs.
+
+    ``DEFAULT_RULES["threshold_pct"]`` is the FALLBACK, not the rule. The
+    service has warned at the nightly fitted pick for a subscriber's
+    horizon since Phase G, and a replay at a flat 40 % produces a tree
+    nobody is subscribed to — which is what put 6 912 warnings at FAR 0.86
+    on the quality page.
+    """
+
+    @staticmethod
+    def _doc(path: Path, leads: dict) -> Path:
+        row = {
+            "threshold_pct": 60, "insufficient": False,
+            "f1": 0.41, "precision": 0.47, "recall": 0.36, "far": 0.53,
+            "csi": 0.26, "warnings": 212, "hits": 99, "false_alarms": 113,
+            "misses": 160, "late": 17, "plateau": [55, 65],
+            "radar_plateau": [50, 70], "agrees_with_radar": True,
+        }
+        path.write_text(json.dumps({
+            "schema_version": 1,
+            "fitted_at_utc": "2026-09-11T03:40:00+00:00",
+            "objective": {
+                "metric": "f1", "min_useful_lead_min": 5.0,
+                "plateau_frac": 0.95, "min_warnings": 30,
+                "rearm_after_min": 60, "persistence_obs": 1,
+                "tolerance_min": 10, "dry_min": 60, "onset_min_mm": 0.2,
+            },
+            "window": {
+                "from": "2026-07-01T00:00:00+00:00",
+                "to": "2026-09-01T00:00:00+00:00",
+                "days": 62, "stations": 97, "rows": 1841203,
+            },
+            "fallback_threshold_pct": 35,
+            "leads": {
+                key: {**row, **value} for key, value in leads.items()
+            },
+        }))
+        return path
+
+    def test_no_document_leaves_the_rules_percent_alone(self) -> None:
+        rules, source = rw.apply_thresholds(rw.parse_rules(None), None)
+        assert rules == rw.DEFAULT_RULES
+        assert source == "rules"
+
+    def test_a_fitted_pick_overrides_the_fallback(self, tmp_path: Path) -> None:
+        path = self._doc(tmp_path / "t.json", {"30": {"threshold_pct": 70}})
+        rules, source = rw.apply_thresholds(rw.parse_rules(None), path)
+        assert rules["threshold_pct"] == 70
+        assert source == "table"
+        # Only the percent moves; the rest of the subscriber row is intact.
+        assert {k: v for k, v in rules.items() if k != "threshold_pct"} == {
+            k: v for k, v in rw.DEFAULT_RULES.items() if k != "threshold_pct"
+        }
+
+    def test_a_lead_the_table_cannot_speak_for_takes_its_fallback(
+        self, tmp_path: Path,
+    ) -> None:
+        """The document's own fallback, which is the service's answer too."""
+        path = self._doc(
+            tmp_path / "t.json",
+            {"30": {"threshold_pct": None, "insufficient": True}},
+        )
+        rules, source = rw.apply_thresholds(rw.parse_rules(None), path)
+        assert rules["threshold_pct"] == 35
+        assert source == "fallback"
+
+    def test_an_unusable_document_is_an_error_not_a_silent_40(
+        self, tmp_path: Path,
+    ) -> None:
+        """A replay is hours of CPU; a mistyped path must not cost a day."""
+        junk = tmp_path / "junk.json"
+        junk.write_text("{}")
+        for path in (tmp_path / "missing.json", junk):
+            with pytest.raises(ValueError, match="usable push-threshold"):
+                rw.apply_thresholds(rw.parse_rules(None), path)
+
+    def test_the_flag_is_wired_and_is_checked_before_any_work(
+        self, tmp_path: Path,
+    ) -> None:
+        """``main`` resolves the document first, ahead of the archive."""
+        with pytest.raises(ValueError, match="usable push-threshold"):
+            rw.main([
+                "--archive-dir", str(tmp_path), "--corpus-dir", str(tmp_path),
+                "--points", str(tmp_path / "never-read.json"),
+                "--days", DAY, "--out-dir", str(tmp_path),
+                "--thresholds", str(tmp_path / "missing.json"),
+            ])
+
+
+def test_the_rows_record_the_percent_they_were_decided_at(replayed_day) -> None:
+    """A row is only interpretable beside the rule it was taken under."""
+    _result, out_dir = replayed_day
+    rows = rw.read_decisions(
+        out_dir / "decisions" / f"{DAY}.parquet", TINY.leads_min,
+    )
+    assert {row["threshold_pct"] for row in rows} == {
+        int(rw.DEFAULT_RULES["threshold_pct"]),
+    }
+
+
 def test_full_range_frames_lists_only_what_is_on_disk(archive_dir: Path) -> None:
     frames = rw.full_range_frames(archive_dir, datetime(2026, 9, 5).date())
     assert frames == [

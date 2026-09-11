@@ -690,3 +690,129 @@ def test_append_rows_keeps_a_lead_the_partition_already_had(
     rows = {r["station_id"]: r for r in pq.read_table(path).to_pylist()}
     assert rows["06180"]["p_rain_45"] == pytest.approx(0.4)
     assert rows["06120"]["p_rain_45"] is None
+
+
+# ---------------------------------------------------------------------------
+# The threshold: the served table, not a constant
+# ---------------------------------------------------------------------------
+
+
+class TestServedThreshold:
+    """The virtual subscribers warn at the percent the real ones do.
+
+    The module's own promise is that "the scoreboard measures the rule the
+    SERVICE runs". Until the table reached this step that was false in the
+    one place it matters most: the service warns at the nightly fitted
+    pick for a subscriber's horizon, and this warned at a constant 40 %.
+    Nationally the difference was 6 912 warnings at FAR 0.86 against a
+    served rule that measures POD 0.35 / precision 0.31.
+    """
+
+    @staticmethod
+    def _table(pct: int | None, *, lead: int = 30):
+        """A stand-in for ``push.thresholds.ThresholdTable``.
+
+        A stub rather than the real class because what is under test is
+        the wiring — that this step asks, asks for ITS lead, and asks once
+        per cycle — not the table's own file handling, which
+        ``test_push_threshold_table.py`` owns.
+        """
+        class _Table:
+            def __init__(self) -> None:
+                self.reloads = 0
+                self.asked: list[object] = []
+
+            def maybe_reload(self) -> bool:
+                self.reloads += 1
+                return False
+
+            def effective(self, lead_min):
+                self.asked.append(lead_min)
+                if pct is None:
+                    return 40, "fallback"
+                return pct, "table"
+
+        return _Table()
+
+    async def test_the_table_decides_when_one_is_given(
+        self, config: Config,
+    ) -> None:
+        """p_rain_30 is 0.9: over 40 %, under 95 %. The table wins."""
+        table = self._table(95)
+        service = StationEvalService(
+            config, _engine(_products(0.9)), thresholds=table,
+        )
+        await service.after_cycle(_cycle_result())
+
+        assert table.reloads == 1
+        assert table.asked == [30]        # the scoreboard's own lead
+        summary = service.last_summary
+        assert summary["threshold_pct"] == 95
+        assert summary["threshold_source"] == "table"
+        # Nothing fired, because 0.9 is under the served 95 %.
+        assert summary["actions"].get("notify") is None
+        rows = _read_partition(config)
+        assert {r["threshold_pct"] for r in rows} == {95}
+        assert {r["action"] for r in rows} == {"none"}
+
+    async def test_without_a_table_the_configured_percent_stands(
+        self, config: Config,
+    ) -> None:
+        """A deployment with no fitted table is the rule that shipped."""
+        service = StationEvalService(config, _engine(_products(0.9)))
+        await service.after_cycle(_cycle_result())
+
+        summary = service.last_summary
+        assert summary["threshold_pct"] == 40
+        assert summary["threshold_source"] == "config"
+        rows = _read_partition(config)
+        assert {r["threshold_pct"] for r in rows} == {40}
+        # 0.9 clears 40 % at one observation of persistence.
+        assert {r["action"] for r in rows} == {"notify"}
+
+    async def test_a_table_that_cannot_answer_costs_a_log_line_not_a_cycle(
+        self, config: Config,
+    ) -> None:
+        """Never cost a cycle: the step's rule everywhere else too."""
+        class _Broken:
+            def maybe_reload(self):
+                raise OSError("the volume went away")
+
+            def effective(self, lead_min):  # pragma: no cover — never reached
+                raise AssertionError
+
+        service = StationEvalService(
+            config, _engine(_products(0.9)), thresholds=_Broken(),
+        )
+        await service.after_cycle(_cycle_result())
+
+        summary = service.last_summary
+        assert summary["threshold_pct"] == 40
+        assert summary["threshold_source"] == "config"
+        assert len(_read_partition(config)) == 2
+
+    async def test_a_refit_reaches_the_next_cycle_without_a_restart(
+        self, config: Config,
+    ) -> None:
+        """The table is asked once per cycle, so tonight's fit lands tomorrow."""
+        table = self._table(95)
+        service = StationEvalService(
+            config, _engine(_products(0.9)), thresholds=table,
+        )
+        await service.after_cycle(_cycle_result())
+        assert service.last_summary["threshold_pct"] == 95
+
+        # The nightly fit replaces the file; the table's own reload is
+        # what picks it up, and this step asks again next cycle.
+        later = RADAR_TS + timedelta(minutes=10)
+        table.effective = lambda lead_min: (25, "table")  # type: ignore[method-assign]
+        service.engine = _engine(_products(0.9), radar_ts=later)
+        await service.after_cycle(_cycle_result(later))
+
+        assert service.last_summary["threshold_pct"] == 25
+        rows = _read_partition(config, later)
+        by_ts = {}
+        for row in rows:
+            by_ts.setdefault(row["radar_ts"], set()).add(row["threshold_pct"])
+        assert by_ts[RADAR_TS] == {95}
+        assert by_ts[later] == {25}

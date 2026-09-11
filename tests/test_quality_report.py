@@ -2314,3 +2314,250 @@ class TestInjectedGaugeReliability:
         assert briers["06180"] == pytest.approx(0.071)
         # Deep-copied, as the rest of the carried half is.
         assert live["reliability"] is not full["reliability"]
+
+
+# ---------------------------------------------------------------------------
+# Re-deciding the scoreboard under the served rule
+# ---------------------------------------------------------------------------
+
+
+class TestServedRuleHook:
+    """``decide_warnings``: the page scores the rule the service runs.
+
+    The decision trees were generated with a fixed subscriber row — 40 %
+    at 30 min — while the push service warns at the nightly fitted
+    threshold on the post-processed probability. Counting the stored
+    ``notify`` rows therefore measured a rule nobody is subscribed to. The
+    hook lets the caller re-derive the warnings from the rows' own
+    probabilities; everything else about the scoreboard is unchanged.
+
+    The implementation of the rule lives in the sidecar (it needs the push
+    engine), so what is under test here is only the seam: that the hook's
+    warnings are used, that the stored actions are then ignored entirely,
+    and that without a hook nothing moved.
+    """
+
+    def test_without_a_hook_the_stored_actions_are_scored(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """The behaviour that shipped, and the default."""
+        report = build_quality_report(full_inputs)
+        assert report["headline"]["warnings"]["n_sent"] == len(WARNINGS)
+        assert report["methods"]["subscriber_rule"]["scored"] == "as recorded"
+        assert "threshold_source" not in report["methods"]["subscriber_rule"]
+
+    def test_the_hook_replaces_the_warnings_and_the_stored_actions_are_ignored(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """One warning in, one warning scored — whatever the rows said.
+
+        The hook returns a single warning at a station and instant that
+        the fixture's own ``action`` column says nothing about, so a
+        builder that merged the two lists (or fell back to them) would
+        come back with five.
+        """
+        sent = DAY + timedelta(minutes=150)      # 02:30 → onset 03:00, a hit
+        seen: list[int] = []
+
+        def decide(rows):
+            seen.append(len(rows))
+            return {"06181": [(sent, 21.0, 0.93)]}
+
+        report = build_quality_report(
+            replace(full_inputs, decide_warnings=decide),
+        )
+        assert seen and seen[0] > 0, "the hook was handed no rows"
+        warnings = report["headline"]["warnings"]
+        assert warnings["n_sent"] == 1
+        assert warnings["hits"] == 1
+        assert warnings["false_alarms"] == 0
+        events = report["events"]
+        assert [e["station_id"] for e in events] == ["06181"]
+        # The probability published is the one the RULE fired on, handed
+        # over by the hook — not the row's stored ``p_rain`` of 0.82.
+        assert events[0]["p_rain"] == pytest.approx(0.93)
+        assert events[0]["eta_min"] == pytest.approx(21.0)
+
+    def test_the_hook_sees_the_rows_the_report_scores(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """Same rows, same keys — that is what makes the two halves one sample."""
+        captured: list[list[dict]] = []
+
+        def decide(rows):
+            captured.append(list(rows))
+            return {}
+
+        build_quality_report(replace(full_inputs, decide_warnings=decide))
+        rows = captured[0]
+        assert rows, "no rows handed to the hook"
+        assert {str(r["station_id"]) for r in rows} <= set(STATIONS)
+        # Deduplicated on (radar_ts, station_id), exactly as scored.
+        keys = [(r["radar_ts"], str(r["station_id"])) for r in rows]
+        assert len(keys) == len(set(keys))
+
+    def test_a_silent_hook_sends_nothing_and_says_so(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """A rule that fires nothing is a real answer, never a fallback.
+
+        The headline block then nulls itself, which is the producer's
+        existing rule rather than anything this hook added: FAR over zero
+        warnings has no value, and the page renders null as "not measured"
+        rather than inventing a 0.
+        """
+        report = build_quality_report(
+            replace(full_inputs, decide_warnings=lambda rows: {}),
+        )
+        assert report["headline"]["warnings"] is None
+        assert report["events"] is None
+        # Not a fallback to the stored actions, which would have scored six.
+        assert all(
+            f["properties"]["warnings"] == 0
+            for f in report["stations"]["features"]
+        )
+
+    def test_a_hook_reproducing_the_stored_actions_reproduces_the_scoreboard(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """The seam is the warning list and nothing else.
+
+        Handed back exactly the warnings the ``notify`` rows describe, the
+        document must be the one the stored path produces — the same
+        coverage runs, the same gauge truth, the same counts. Anything
+        that differs is the hook reaching further than it should.
+        """
+        stored = build_quality_report(full_inputs)
+
+        def decide(rows):
+            out: dict[str, list] = {}
+            for station, minutes, eta in WARNINGS:
+                out.setdefault(station, []).append(
+                    (DAY + timedelta(minutes=minutes), eta, 0.82),
+                )
+            return out
+
+        hooked = build_quality_report(
+            replace(full_inputs, decide_warnings=decide),
+        )
+        assert hooked["headline"]["warnings"] == stored["headline"]["warnings"]
+        assert hooked["raining_now"] == stored["raining_now"]
+        assert hooked["stations"] == stored["stations"]
+        assert hooked["events"] == stored["events"]
+
+
+class TestServedRuleMethods:
+    """``methods.subscriber_rule``: the rule the scoreboard was produced under."""
+
+    RULE = {
+        "threshold_pct": 60,
+        "threshold_source": "table",
+        "probability": "postprocess",
+        "scored": "re-decided",
+        "rows_fallback": 17,
+    }
+
+    def test_the_served_rule_overrides_the_replays_rule(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(
+            replace(
+                full_inputs,
+                decide_warnings=lambda rows: {},
+                served_rule=self.RULE,
+            ),
+        )
+        rule = report["methods"]["subscriber_rule"]
+        # The replay summary says 40; the service warns at 60.
+        assert rule["threshold_pct"] == pytest.approx(60.0)
+        assert rule["threshold_source"] == "table"
+        assert rule["probability"] == "postprocess"
+        assert rule["scored"] == "re-decided"
+        assert rule["rows_fallback"] == pytest.approx(17.0)
+        # Untouched keys still come from the replay's own rules.
+        assert rule["lead_min"] == pytest.approx(30.0)
+        assert rule["rearm_after_min"] == pytest.approx(60.0)
+        assert not validate_report(report)
+
+    def test_the_markdown_names_the_threshold_and_the_probability(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(
+            replace(
+                full_inputs,
+                decide_warnings=lambda rows: {},
+                served_rule=self.RULE,
+            ),
+        )
+        text = render_markdown(report)
+        assert "warn at 60 % of rain within 30 min" in text
+        assert "threshold from the table" in text
+        assert "gauge-trained post-processed probability" in text
+        assert "re-decided under that rule" in text
+        assert "17 row(s) fell back to the curve" in text
+
+    def test_junk_from_a_hook_costs_the_field_not_the_document(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """The block is published; one bad value must not take it down."""
+        report = build_quality_report(
+            replace(
+                full_inputs,
+                served_rule={
+                    "threshold_pct": "sixty", "probability": "",
+                    "rows_fallback": float("nan"), "scored": "re-decided",
+                },
+            ),
+        )
+        rule = report["methods"]["subscriber_rule"]
+        assert rule["threshold_pct"] == pytest.approx(40.0)   # the replay's
+        assert "probability" not in rule
+        assert "rows_fallback" not in rule
+        assert rule["scored"] == "re-decided"
+        assert not validate_report(report)
+
+    def test_a_live_refresh_refreshes_the_rule_it_re_decided_under(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """Everything else in ``methods`` is carried; this is not.
+
+        The live half was just re-decided at tonight's threshold, so
+        publishing last night's percent beside it would put the page's
+        definition of the rule and the scoreboard it produced a refit
+        apart.
+        """
+        full = build_quality_report(
+            replace(
+                full_inputs,
+                decide_warnings=lambda rows: {},
+                served_rule={**self.RULE, "threshold_pct": 55},
+            ),
+        )
+        live = build_quality_report(
+            replace(
+                full_inputs,
+                now=NOW + timedelta(hours=1),
+                decide_warnings=lambda rows: {},
+                served_rule={**self.RULE, "threshold_pct": 70,
+                             "rows_fallback": 3},
+            ),
+            live_only=True,
+            previous=json.loads(json.dumps(full)),
+        )
+        assert full["methods"]["subscriber_rule"]["threshold_pct"] == 55.0
+        rule = live["methods"]["subscriber_rule"]
+        assert rule["threshold_pct"] == pytest.approx(70.0)
+        assert rule["rows_fallback"] == pytest.approx(3.0)
+        # The carried document is not mutated by the refresh.
+        assert full["methods"]["subscriber_rule"]["threshold_pct"] == 55.0
+        # The rest of methods is still the copy it always was.
+        assert live["methods"]["onset_rule"] == full["methods"]["onset_rule"]
+        assert not validate_report(live)
+
+    def test_validate_rejects_a_blank_word(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(full_inputs)
+        report["methods"]["subscriber_rule"]["threshold_source"] = "  "
+        problems = validate_report(report)
+        assert any("threshold_source" in p for p in problems)

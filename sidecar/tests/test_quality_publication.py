@@ -1657,3 +1657,170 @@ def test_the_helper_runs_a_coroutine() -> None:
         return datetime(2026, 9, 5, tzinfo=timezone.utc)
 
     assert anyio_run(answer()).year == 2026
+
+
+# ---------------------------------------------------------------------------
+# The served-rule scoreboard: wiring, both schedules
+# ---------------------------------------------------------------------------
+
+
+class TestServedRuleWiring:
+    """The hook that makes the page's scoreboard the service's rule.
+
+    The rule itself is tested in ``test_served_rule.py``; what matters
+    here is that it reaches the builder — on BOTH schedules, unlike every
+    other step in this job, because the scoreboard is precisely what an
+    hourly refresh rebuilds.
+    """
+
+    def test_it_is_on_by_default_and_carries_the_services_own_settings(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _fit_config(tmp_path)
+        assert config.quality_report.score_served_rule is True
+
+        block = QualityReportTask(config).job_config()["served_rule"]
+        assert block["enabled"] is True
+        options = block["options"]
+        # The table the push fan-out reads, and the report prints.
+        assert options["thresholds_path"] == str(
+            resolved_thresholds_path(config),
+        )
+        assert options["lead_min"] == config.station_eval.rules.lead_min
+        assert options["probability_source"] == config.push.probability_source
+        assert options["fallback_threshold_pct"] == (
+            config.station_eval.rules.threshold_pct
+        )
+        assert options["raining_now_mm_h"] == (
+            config.forecast.rain_threshold_mm_h
+        )
+        assert options["decisions_dirs"] == [
+            str(d) for d in config.quality_report.fit_thresholds.decisions_dirs
+        ]
+        # JSON-able end to end: it crosses a process boundary.
+        assert json.loads(json.dumps(block)) == block
+
+    def test_the_live_refresh_carries_it_too(self, tmp_path: Path) -> None:
+        """The fits are nightly; this is not.
+
+        A refresh that skipped it would publish the stored 40 % actions
+        over the nightly build's served-rule ones an hour later.
+        """
+        config = _fit_config(tmp_path)
+        task = QualityReportTask(config)
+        live = task.job_config(live_only=True)
+        assert live["fit"] == {"enabled": False}
+        assert live["gauge_reliability"] == {"enabled": False}
+        assert live["served_rule"]["enabled"] is True
+        assert live["served_rule"] == task.job_config()["served_rule"]
+
+    def test_the_switch_turns_it_off(self, tmp_path: Path) -> None:
+        config = _fit_config(tmp_path)
+        config = _config(tmp_path, quality_report={
+            "enabled": True,
+            "score_served_rule": False,
+            "fit_thresholds": config.quality_report.fit_thresholds.model_dump(),
+        })
+        assert QualityReportTask(config).job_config()["served_rule"] == {
+            "enabled": False,
+        }
+
+    def test_no_decision_trees_disables_it(self, tmp_path: Path) -> None:
+        """The same "empty disables it" rule the two fits have."""
+        config = _config(tmp_path, quality_report={"enabled": True})
+        assert QualityReportTask(config).job_config()["served_rule"] == {
+            "enabled": False,
+        }
+
+    def test_the_child_hands_the_decider_to_the_builder(
+        self, tmp_path: Path,
+    ) -> None:
+        """``run_job`` builds it and puts it on the inputs, stats and all."""
+        tree = tmp_path / "corpus" / "stations" / "eval"
+        tree.mkdir(parents=True)
+        config = _job_config(tmp_path)
+        config["served_rule"] = {
+            "enabled": True,
+            "options": {
+                "decisions_dirs": [str(tree)],
+                "thresholds_path": None,
+                "lead_min": 30,
+                "probability_source": "curve",
+                "fallback_threshold_pct": 40,
+            },
+        }
+        seen: list = []
+
+        def build(inputs, **kwargs):
+            seen.append(inputs)
+            return dict(DOC)
+
+        summary = run_job(config, builder=build)
+        inputs = seen[0]
+        assert inputs.decide_warnings is not None
+        # The stats dict on the inputs IS the decider's, so the builder
+        # reads what actually happened rather than what was planned.
+        assert inputs.served_rule is inputs.decide_warnings.stats
+        assert inputs.served_rule["threshold_pct"] == 40
+        assert inputs.served_rule["threshold_source"] == "config"
+        # The coverage gap comes from the report's own inputs: the state
+        # machine must reset where the coverage runs break.
+        assert (
+            inputs.decide_warnings.options.coverage_gap_min
+            == inputs.coverage_gap_min
+        )
+        assert summary["served_rule"]["scored"] == "re-decided"
+
+    def test_a_disabled_block_leaves_the_stored_actions_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _job_config(tmp_path)
+        seen: list = []
+
+        def build(inputs, **kwargs):
+            seen.append(inputs)
+            return dict(DOC)
+
+        summary = run_job(config, builder=build)
+        assert seen[0].decide_warnings is None
+        assert seen[0].served_rule is None
+        assert summary["served_rule"] is None
+
+    def test_a_block_that_cannot_be_built_falls_back_rather_than_failing(
+        self, tmp_path: Path,
+    ) -> None:
+        """One section, never the build — the job's rule everywhere."""
+        config = _job_config(tmp_path)
+        config["served_rule"] = {"enabled": True, "options": {
+            "decisions_dirs": [], "lead_min": 30,
+        }}
+        seen: list = []
+
+        def build(inputs, **kwargs):
+            seen.append(inputs)
+            return dict(DOC)
+
+        summary = run_job(config, builder=build)
+        assert summary["ok"] is True
+        assert seen[0].decide_warnings is None
+
+    def test_the_callable_never_crosses_the_process_boundary(
+        self, tmp_path: Path,
+    ) -> None:
+        """``inputs_to_json`` must stay JSON-able with the hook on it."""
+        from dataclasses import replace as _replace
+
+        from dmi_nowcast_sidecar.quality_job import (
+            inputs_from_json,
+            inputs_to_json,
+        )
+
+        inputs = QualityReportTask(_fit_config(tmp_path)).inputs()
+        hooked = _replace(
+            inputs, decide_warnings=lambda rows: {}, served_rule={"a": 1},
+        )
+        payload = inputs_to_json(hooked)
+        assert "decide_warnings" not in payload
+        assert "served_rule" not in payload
+        assert json.loads(json.dumps(payload)) == payload
+        assert inputs_from_json(payload).decide_warnings is None

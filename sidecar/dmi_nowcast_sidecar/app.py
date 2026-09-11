@@ -365,10 +365,19 @@ def create_app(
         try:
             from .station_eval import StationEvalService
 
-            station_eval_service = StationEvalService(config, engine)
+            station_eval_service = StationEvalService(
+                config, engine,
+                # The same table the push fan-out evaluates against, so
+                # the virtual subscribers at the gauges warn at the
+                # percent the real ones do — and follow it when the
+                # nightly fit replaces the file, because the table
+                # reloads itself.
+                thresholds=push_thresholds,
+            )
             _log.info(
                 "station_eval_enabled",
                 points_file=str(config.station_eval.points_file),
+                thresholds=str(resolved_thresholds_path(config)),
             )
         except Exception as exc:  # noqa: BLE001
             _log.error("station_eval_init_failed", error=str(exc))

@@ -114,7 +114,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -156,6 +156,8 @@ __all__ = [
     "CORPUS_COLUMNS",
     "RADAR_POINT_SET",
     "DECISION_COLUMNS_READ",
+    "SCORED_AS_RECORDED",
+    "SCORED_RE_DECIDED",
 ]
 
 #: The contract version ``frontend/src/lib/quality/schema.ts`` pins.
@@ -280,6 +282,39 @@ class QualityInputs:
     served_leads: tuple[int, ...] | None = None
     max_events: int = 20
     min_station_warnings: int = MIN_STATION_WARNINGS
+    #: RE-DECIDE the scoreboard under the rule the service is actually on,
+    #: instead of counting the ``action == "notify"`` rows the trees store.
+    #:
+    #: The stored actions were taken under whatever threshold each writer
+    #: was configured with at the time — historically a fixed 40 % on the
+    #: curve scale, which is not a rule anyone is subscribed to. Given this
+    #: hook, :func:`_score_decisions` hands it the rows it is about to
+    #: score and uses the warnings it gets back, so the page measures the
+    #: served rule on exactly the row set the rest of the document is built
+    #: from.
+    #:
+    #: ``rows`` in, ``{station_id: [(sent_utc, eta_min, probability)]}``
+    #: out. ``probability`` is the number the rule fired ON — the
+    #: post-processed one where that is what the service decides with —
+    #: and is what the ``events`` list publishes as ``p_rain``.
+    #:
+    #: The implementation lives in the sidecar (``served_rule.py``): it
+    #: needs the decision-row loader and the push engine, and this module
+    #: must keep importing neither. ``None`` scores the stored actions,
+    #: which is the behaviour that shipped.
+    decide_warnings: Callable[
+        [Sequence[Mapping[str, Any]]],
+        Mapping[str, list[tuple[datetime, float | None, float | None]]],
+    ] | None = None
+    #: What :attr:`decide_warnings` decided WITH, for ``methods``. Merged
+    #: into ``methods.subscriber_rule``, so the page's definition of the
+    #: rule and the rule the scoreboard was produced under are one object.
+    #:
+    #: Read AFTER the hook has run (``_score_decisions`` precedes
+    #: ``_methods_section``), so a caller may pass the very dict its hook
+    #: fills in as it goes — which is what the sidecar does, because the
+    #: counts are not known until the rows have been read.
+    served_rule: Mapping[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1110,20 @@ def _score_decisions(
     Null in, null out: without a corpus directory there is no gauge, and
     without a gauge there is no truth to score against, so the whole
     scoreboard stays empty rather than grading the radar against itself.
+
+    WHICH warnings are scored is a choice. By default they are the rows
+    whose stored ``action`` is ``"notify"`` — what the writer decided at
+    the time, under whatever threshold it was configured with. With
+    :attr:`QualityInputs.decide_warnings` supplied they are re-derived
+    from the rows' own probabilities under the rule the service is on
+    right now; the stored actions are then ignored entirely, so a tree
+    written under a stale threshold cannot put a warning on this page that
+    nobody would be sent today.
+
+    Everything else is unchanged either way: the same rows, the same
+    coverage runs, the same gauge truth and the same
+    :func:`~dmi_nowcast_core.warning_score.score_warnings`. Only the list
+    of warnings differs.
     """
     board = _Scoreboard()
     if not rows or inputs.corpus_dir is None:
@@ -1113,6 +1162,9 @@ def _score_decisions(
     warnings_by_station: dict[str, list[tuple[datetime, float | None]]] = defaultdict(list)
     frames_by_station: dict[str, list[datetime]] = defaultdict(list)
     p_rain_at: dict[tuple[str, datetime], float | None] = {}
+    # The frames are the coverage runs, and they come from every row
+    # regardless of how the warnings are decided: a cycle that decided
+    # "no" is still a cycle the service was watching.
     for row in rows:
         stamp = _parse_ts(row.get("generated_at"))
         if stamp is None:
@@ -1120,15 +1172,32 @@ def _score_decisions(
         station = str(row.get("station_id"))
         frame = _parse_ts(row.get("radar_ts")) or stamp
         frames_by_station[station].append(frame)
-        if row.get("action") != "notify":
-            continue
-        eta = row.get("eta_min")
-        warnings_by_station[station].append(
-            (stamp, None if eta is None else float(eta)),
-        )
-        p_rain_at[(station, stamp)] = (
-            None if row.get("p_rain") is None else float(row["p_rain"])
-        )
+
+    if inputs.decide_warnings is not None:
+        for station, sent_rows in inputs.decide_warnings(rows).items():
+            station = str(station)
+            for sent, eta, probability in sent_rows:
+                warnings_by_station[station].append(
+                    (sent, None if eta is None else float(eta)),
+                )
+                p_rain_at[(station, sent)] = (
+                    None if probability is None else float(probability)
+                )
+    else:
+        for row in rows:
+            if row.get("action") != "notify":
+                continue
+            stamp = _parse_ts(row.get("generated_at"))
+            if stamp is None:
+                continue
+            station = str(row.get("station_id"))
+            eta = row.get("eta_min")
+            warnings_by_station[station].append(
+                (stamp, None if eta is None else float(eta)),
+            )
+            p_rain_at[(station, stamp)] = (
+                None if row.get("p_rain") is None else float(row["p_rain"])
+            )
 
     # An onset is only a miss where a decision could have caught it. The
     # gauge archive is backfilled months deep; the decision rows cover the
@@ -1272,6 +1341,12 @@ def _score_decisions(
                 "station_id": station,
                 "warned_at_utc": _iso(warning.sent_utc),
                 "eta_min": _round(warning.eta_min, 3),
+                # The probability the rule FIRED ON, which since the
+                # served rule is re-decided here is ``p_post`` wherever
+                # the service decides on it. The key keeps its name for
+                # schema compatibility — the client reads ``p_rain`` —
+                # but it is "the number this warning was sent for", not
+                # necessarily the curve-calibrated one.
                 "p_rain": _round(probability),
                 "gauge_onset_utc": _iso(warning.onset_utc),
                 "outcome": warning.outcome,
@@ -1556,6 +1631,76 @@ def _brier_improvement(
     )
 
 
+#: Keys :attr:`QualityInputs.served_rule` may contribute to
+#: ``methods.subscriber_rule``, with the type each must have. Numbers stay
+#: numbers because the client reads four of them as numbers; the three
+#: strings are additive and the client ignores them.
+_SERVED_RULE_NUMBERS = (
+    "threshold_pct", "lead_min", "rearm_after_min", "persistence_obs",
+    "rows_fallback",
+)
+_SERVED_RULE_WORDS = ("threshold_source", "probability", "scored")
+
+#: What ``subscriber_rule.scored`` says when the scoreboard counted the
+#: stored ``action`` column rather than re-deciding it.
+SCORED_AS_RECORDED = "as recorded"
+#: ...and when it re-derived every warning under the served rule.
+SCORED_RE_DECIDED = "re-decided"
+
+
+def _subscriber_rule(
+    inputs: QualityInputs, summary: Mapping[str, Any],
+) -> dict:
+    """``methods.subscriber_rule``: the rule the scoreboard was produced under.
+
+    Two sources, in order. The replay summary's ``run.rules`` describes
+    the rule the decision TREE was generated with — which is the honest
+    answer while the scoreboard counts stored actions. When the scoreboard
+    was re-decided instead (:attr:`QualityInputs.decide_warnings`), the
+    caller's :attr:`QualityInputs.served_rule` describes the rule it was
+    re-decided under, and that wins key by key: the threshold, where it
+    came from, which probability it was compared against, and how many
+    rows fell back to the curve.
+
+    ``scored`` is always present and says which of the two happened, so a
+    reader never has to infer it from the presence of another key.
+    """
+    rules = (summary.get("run") or {}).get("rules") or {}
+    out: dict[str, Any] = {
+        "threshold_pct": float(rules.get("threshold_pct", 40)),
+        "lead_min": float(rules.get("lead_min", inputs.lead_min)),
+        "rearm_after_min": float(rules.get("rearm_after_min", 60)),
+        "persistence_obs": float(rules.get("persistence_obs", 1)),
+        "scored": SCORED_AS_RECORDED,
+    }
+    return _merge_served_rule(out, inputs.served_rule)
+
+
+def _merge_served_rule(
+    subscriber: dict, served: Mapping[str, Any] | None,
+) -> dict:
+    """Overlay the served rule onto a ``subscriber_rule`` block.
+
+    Total and defensive: the block is published, and a hook that came back
+    with junk in one field must cost that field rather than the document.
+    Anything not in the two key lists is ignored.
+    """
+    if not isinstance(served, Mapping):
+        return subscriber
+    for key in _SERVED_RULE_NUMBERS:
+        value = served.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(float(value)):
+            continue
+        subscriber[key] = float(value)
+    for key in _SERVED_RULE_WORDS:
+        value = served.get(key)
+        if isinstance(value, str) and value.strip():
+            subscriber[key] = value
+    return subscriber
+
+
 def _methods_section(
     inputs: QualityInputs,
     radar: Mapping[str, Any] | None,
@@ -1592,13 +1737,7 @@ def _methods_section(
     if threshold is None:
         threshold = float(inputs.raining_now_mm_h)
 
-    rules = (summary.get("run") or {}).get("rules") or {}
-    subscriber = {
-        "threshold_pct": float(rules.get("threshold_pct", 40)),
-        "lead_min": float(rules.get("lead_min", inputs.lead_min)),
-        "rearm_after_min": float(rules.get("rearm_after_min", 60)),
-        "persistence_obs": float(rules.get("persistence_obs", 1)),
-    }
+    subscriber = _subscriber_rule(inputs, summary)
     return {
         "gauge_wet_rule": (
             f"≥ {WET_PRECIP_MM:g} mm, or ≥ {WET_DUR_MIN:g} min with "
@@ -1896,6 +2035,15 @@ def build_quality_report(
         reliability = deepcopy(carried["reliability"])
         headline_reliability = deepcopy(carried["headline"]["reliability"])
         methods = deepcopy(carried["methods"])
+        # ...except the subscriber rule, which is not a corpus fact. The
+        # live half of the document was just re-decided under tonight's
+        # threshold, and carrying last night's over would put the page's
+        # definition of the rule and the scoreboard it produced a refit
+        # apart. Only the keys the served rule speaks for move.
+        if isinstance(methods, dict) and isinstance(
+            methods.get("subscriber_rule"), dict,
+        ):
+            _merge_served_rule(methods["subscriber_rule"], inputs.served_rule)
         # A document written before these fields existed is still a full
         # build, and the moment it was written is when that build ran.
         built_at = carried.get("built_at_utc") or carried.get("generated_at_utc")
@@ -2257,6 +2405,29 @@ def validate_report(report: Any) -> list[str]:
              "rearm_after_min": float, "persistence_obs": float},
             "methods.subscriber_rule", problems,
         )
+        # Additive: present only when the scoreboard was re-decided under
+        # the served rule. Checked when present because they are published
+        # words — "postprocess" against "curve" is the difference between
+        # two claims — and absent is not a problem, it is an older
+        # producer.
+        rule = (methods or {}).get("subscriber_rule")
+        if isinstance(rule, dict):
+            for key in _SERVED_RULE_WORDS:
+                if key in rule and not (
+                    isinstance(rule[key], str) and rule[key].strip()
+                ):
+                    problems.append(
+                        f"methods.subscriber_rule.{key}: expected a "
+                        "non-empty string",
+                    )
+            fallback = rule.get("rows_fallback")
+            if fallback is not None and (
+                isinstance(fallback, bool)
+                or not isinstance(fallback, (int, float))
+            ):
+                problems.append(
+                    "methods.subscriber_rule.rows_fallback: expected a number",
+                )
         _check_block(
             (methods or {}).get("sources"), {"radar": str, "gauges": str},
             "methods.sources", problems,
@@ -2504,10 +2675,35 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         add(f"- Onset: {methods['onset_rule']}.")
         add(f"- Forecast threshold: {methods['threshold_mm_h']} mm/h.")
         add(f"- Radar frame age behind a forecast: {ages[0]}–{ages[1]} min.")
+        # The threshold is the served table's pick for this horizon, and
+        # the probability it is compared against is a choice — so both are
+        # named, and so is whether the scoreboard above was produced by
+        # re-running this rule or by counting what the rows already said.
+        source = rule.get("threshold_source")
+        probability = {
+            "postprocess": "the gauge-trained post-processed probability",
+            "curve": "the served curve-calibrated probability",
+        }.get(str(rule.get("probability")), None)
         add(f"- Subscriber rule: warn at {rule['threshold_pct']:.0f} % of rain "
-            f"within {rule['lead_min']:.0f} min, "
-            f"{rule['persistence_obs']:.0f} observation(s) of persistence, "
+            f"within {rule['lead_min']:.0f} min"
+            + (f" (threshold from the {source})" if source else "")
+            + (f", on {probability}" if probability else "")
+            + f", {rule['persistence_obs']:.0f} observation(s) of persistence, "
             f"{rule['rearm_after_min']:.0f} min disarmed after a warning.")
+        scored = rule.get("scored")
+        if scored:
+            fallback = rule.get("rows_fallback")
+            add(
+                f"- Warning scoreboard: {scored} under that rule"
+                + (
+                    f"; {fallback:.0f} row(s) fell back to the curve"
+                    if isinstance(fallback, (int, float))
+                    and not isinstance(fallback, bool)
+                    and fallback
+                    else ""
+                )
+                + "."
+            )
         if methods.get("reliability_probability"):
             add(f"- Reliability is of — {methods['reliability_probability']}.")
         if methods.get("reliability_brier_improvement"):

@@ -21,6 +21,11 @@ minutes to fit and changes once a day. So the live mode:
 
 * does NOT run the threshold fit, which is a nightly decision and a
   second pass over the same season of rows;
+* DOES re-decide the warning scoreboard under the served rule
+  (:mod:`dmi_nowcast_sidecar.served_rule`), which is the one step that
+  runs on both schedules — the scoreboard is precisely what a refresh
+  rebuilds, so skipping it would publish the trees' stored 40 % actions
+  over the nightly build's served-rule ones an hour later;
 * reads the document already on disk (``quality.out_json``) and hands it
   to the builder as ``previous``, which carries the corpus-based sections
   over unchanged — no previous document, or an unusable one, is an error
@@ -95,6 +100,12 @@ _INPUT_PATH_FIELDS = frozenset({
     "thresholds_path",
 })
 
+#: ``QualityInputs`` fields that never cross the process boundary: a
+#: Python callable, and the mapping it fills in as it runs. The child
+#: builds both from its own ``served_rule`` block — see :func:`run_job` —
+#: so encoding them would be meaningless as well as impossible.
+_INPUT_SKIP_FIELDS = frozenset({"decide_warnings", "served_rule"})
+
 #: ``SweepOptions`` fields that carry a path, or a list of them.
 _SWEEP_PATH_FIELDS = frozenset({"corpus_dir", "postprocess_model"})
 _SWEEP_PATH_LIST_FIELDS = frozenset({"decisions_dirs", "radar_decisions_dirs"})
@@ -141,6 +152,8 @@ def inputs_to_json(inputs: Any) -> dict:
     """A :class:`QualityInputs` as plain JSON types."""
     out: dict[str, Any] = {}
     for field in dataclasses.fields(inputs):
+        if field.name in _INPUT_SKIP_FIELDS:
+            continue
         value = getattr(inputs, field.name)
         if value is None:
             out[field.name] = None
@@ -162,7 +175,7 @@ def inputs_from_json(payload: dict) -> Any:
     known = {field.name for field in dataclasses.fields(QualityInputs)}
     kwargs: dict[str, Any] = {}
     for name, value in (payload or {}).items():
-        if name not in known:
+        if name not in known or name in _INPUT_SKIP_FIELDS:
             continue  # a newer writer, an older reader: ignore, don't crash
         if name in _INPUT_PATH_FIELDS:
             kwargs[name] = _as_path(value)
@@ -215,6 +228,48 @@ def gauge_reliability_options_from_json(payload: dict) -> Any:
         else:
             kwargs[name] = value
     return GaugeReliabilityOptions(**kwargs)
+
+
+#: ``ServedRuleOptions`` fields that carry a path, or a list of them.
+_SERVED_PATH_FIELDS = frozenset({"thresholds_path", "postprocess_model"})
+_SERVED_PATH_LIST_FIELDS = frozenset({"decisions_dirs"})
+_SERVED_TUPLE_FIELDS = frozenset({"design_leads"})
+
+
+def served_rule_options_to_json(options: Any) -> dict:
+    """A :class:`ServedRuleOptions` as plain JSON types."""
+    out: dict[str, Any] = {}
+    for field in dataclasses.fields(options):
+        value = getattr(options, field.name)
+        if field.name in _SERVED_PATH_LIST_FIELDS:
+            out[field.name] = None if value is None else [str(p) for p in value]
+        elif field.name in _SERVED_PATH_FIELDS:
+            out[field.name] = None if value is None else str(value)
+        elif isinstance(value, (list, tuple)):
+            out[field.name] = list(value)
+        else:
+            out[field.name] = value
+    return out
+
+
+def served_rule_options_from_json(payload: dict) -> Any:
+    """The :class:`ServedRuleOptions` the encoder above produced."""
+    from .served_rule import ServedRuleOptions
+
+    known = {field.name for field in dataclasses.fields(ServedRuleOptions)}
+    kwargs: dict[str, Any] = {}
+    for name, value in (payload or {}).items():
+        if name not in known:
+            continue  # a newer writer, an older reader: ignore, don't crash
+        if name in _SERVED_PATH_LIST_FIELDS:
+            kwargs[name] = [] if value is None else [Path(str(v)) for v in value]
+        elif name in _SERVED_PATH_FIELDS:
+            kwargs[name] = _as_path(value)
+        elif name in _SERVED_TUPLE_FIELDS:
+            kwargs[name] = () if value is None else tuple(value)
+        else:
+            kwargs[name] = value
+    return ServedRuleOptions(**kwargs)
 
 
 def sweep_options_to_json(options: Any) -> dict:
@@ -451,6 +506,45 @@ def run_gauge_reliability(
     return result or None
 
 
+def build_served_rule_decider(
+    block: dict,
+    inputs: Any,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> Any:
+    """The scoreboard's served-rule hook, or ``None``.
+
+    ``None`` when the step is off, when it has no decision trees to read,
+    or when constructing it failed — all three of which mean the
+    scoreboard falls back to the stored ``notify`` rows, which is the
+    behaviour that shipped and is labelled "as recorded" in ``methods``.
+
+    ``coverage_gap_min`` is taken from the report's OWN inputs rather
+    than from the block: the state machine must reset at the same
+    instants the coverage runs break, and two settings for one gap is one
+    too many.
+    """
+    if not block.get("enabled"):
+        return None
+    try:
+        from .served_rule import ServedRuleDecider
+
+        options = served_rule_options_from_json(block.get("options") or {})
+        if not options.decisions_dirs:
+            return None
+        options = dataclasses.replace(
+            options, coverage_gap_min=int(inputs.coverage_gap_min),
+        )
+        return ServedRuleDecider(options, log=log)
+    except Exception as exc:  # noqa: BLE001 — one section, not the build
+        if log:
+            log(
+                "served rule: cannot be built, scoring the stored actions "
+                f"instead ({type(exc).__name__}: {exc})"
+            )
+        return None
+
+
 def run_job(
     config: dict,
     *,
@@ -519,6 +613,26 @@ def run_job(
         gauge_block = run_gauge_reliability(gauge, scorer=gauge_scorer, log=log)
 
     inputs = inputs_from_json(quality.get("inputs") or {})
+
+    # The warning scoreboard, re-decided under the rule the push service
+    # actually runs. Unlike every other step here it runs on BOTH
+    # schedules: the scoreboard, the station map and the recent warnings
+    # are precisely what a live refresh rebuilds, so a refresh that
+    # skipped this would publish the stored 40 % actions over the nightly
+    # build's served-rule ones an hour later.
+    decider = build_served_rule_decider(
+        config.get("served_rule") or {}, inputs, log=log,
+    )
+    if decider is not None:
+        inputs = dataclasses.replace(
+            inputs,
+            decide_warnings=decider,
+            # The very dict the hook fills in as it reads. The builder
+            # scores the decisions before it writes ``methods``, so by
+            # the time this is read it says what actually happened.
+            served_rule=decider.stats,
+        )
+
     if log:
         log(f"building the report (mode={'live' if live_only else 'full'})")
     if live_only:
@@ -596,6 +710,11 @@ def run_job(
                 "in_sample_fallbacks": gauge_block.get("in_sample_fallbacks"),
             }
         ),
+        # Additive: the rule the warning scoreboard was re-decided under,
+        # and the counts behind it. ``None`` when the scoreboard counted
+        # the stored actions instead — which is a fact worth reading off
+        # the summary line rather than inferring from the document.
+        "served_rule": None if decider is None else dict(decider.stats),
         "error": None,
     }
     summary.update(fit_summary)
@@ -671,6 +790,7 @@ def main(argv: list[str] | None = None) -> int:
             "postprocess_fitted_at": None,
             "postprocess": {},
             "postprocess_error": None,
+            "served_rule": None,
             "error": f"{type(exc).__name__}: {exc}",
         }
     print(json.dumps(summary, sort_keys=True), flush=True)
@@ -681,6 +801,7 @@ __all__ = [
     "JOB_MODULE",
     "REPORT_SECTIONS",
     "build_parser",
+    "build_served_rule_decider",
     "inputs_from_json",
     "inputs_to_json",
     "main",
@@ -689,6 +810,8 @@ __all__ = [
     "run_job",
     "run_postprocess_fit",
     "run_threshold_fit",
+    "served_rule_options_from_json",
+    "served_rule_options_to_json",
     "sweep_options_from_json",
     "sweep_options_to_json",
     "write_atomic",

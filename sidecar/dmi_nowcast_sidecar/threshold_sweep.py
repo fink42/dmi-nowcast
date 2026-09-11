@@ -782,7 +782,9 @@ def replay_station(
     persistence_obs: int,
     rearm_after_min: int,
     raining_now_mm_h: float = RAIN_THRESHOLD_MM_H,
-) -> list[tuple[datetime, float | None]]:
+    raining_now_eta_min: float | None = None,
+    with_probability: bool = False,
+) -> list[tuple]:
     """One station's warnings under one (lead, threshold) rule.
 
     The subscription starts armed at the head of every coverage run, and a
@@ -790,16 +792,34 @@ def replay_station(
     the state. Everything else is ``push.engine.evaluate`` — the arming,
     the persistence streak, the 60-minute re-arm and the "already raining"
     silence are the engine's, not this script's.
+
+    ``raining_now_eta_min`` is the ETA at or below which the rain counts
+    as already here. ``None`` means the engine's own default, which is
+    what every caller before this parameter existed got and what both
+    writers (``station_eval._rules``, the replay's ``DEFAULT_RULES``)
+    configure — so the sweep's numbers are unchanged. It is spellable
+    because the served-rule scorer states the whole rule explicitly rather
+    than inheriting three quarters of it from a default.
+
+    ``with_probability`` returns ``(sent_utc, eta_min, probability)``
+    instead of ``(sent_utc, eta_min)``: the probability the rule fired on,
+    which the quality page publishes beside each warning. Off by default —
+    ``score_warnings`` unpacks two-tuples, and the sweep's hot loop has no
+    use for a third.
     """
     eng = _engine()
     rules = eng.Rules(
         persistence_obs=int(persistence_obs),
         rearm_after_min=int(rearm_after_min),
         raining_now_mm_h=float(raining_now_mm_h),
+        **(
+            {} if raining_now_eta_min is None
+            else {"raining_now_eta_min": float(raining_now_eta_min)}
+        ),
     )
     state = eng.INITIAL_STATE
     run: int | None = None
-    warnings: list[tuple[datetime, float | None]] = []
+    warnings: list[tuple] = []
     for record in track:
         if record[_RUN] != run:
             run = record[_RUN]
@@ -825,7 +845,11 @@ def replay_station(
         )
         state = decision.state
         if decision.action == "notify":
-            warnings.append((record[_GENERATED], record[_ETA]))
+            warnings.append(
+                (record[_GENERATED], record[_ETA], p_rain)
+                if with_probability
+                else (record[_GENERATED], record[_ETA])
+            )
     return warnings
 
 
