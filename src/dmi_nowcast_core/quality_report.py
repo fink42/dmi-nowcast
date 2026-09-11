@@ -1488,7 +1488,22 @@ _MODE_WORDS = {
     # Phase H: the gauge-trained post-processing model, which is what the
     # panel shows and the push rule decides on. A different probability
     # from "the served curves", and the sentence has to say so.
-    "postprocess": "the gauge-trained post-processed probability the site serves",
+    #
+    # The two spellings are not interchangeable. The nightly model is
+    # fitted on ALL rows, so binning its own predictions against its own
+    # training rows draws a perfect diagonal — which is why the shipped
+    # curve is the ``_cv`` one, refitted per month and scored on the month
+    # it never saw. If a build ever falls back to the in-sample variant
+    # the sentence says "in-sample", because that number is a description
+    # of a fit rather than a measurement of the service.
+    "postprocess": (
+        "the gauge-trained post-processed probability the site serves, "
+        "in-sample"
+    ),
+    "postprocess_cv": (
+        "the gauge-trained post-processed probability the site serves, "
+        "refitted out-of-sample leave-one-{fold}-out"
+    ),
     "raw": "the raw ensemble exceedance fraction, uncalibrated",
     "mixed": "a mix of calibrated and raw leads",
     "none": "not measured",

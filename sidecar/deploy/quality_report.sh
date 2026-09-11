@@ -136,6 +136,9 @@ fit_probability=${QUALITY_FIT_PROBABILITY:-postprocess}
 # of a number nobody is shown. QUALITY_GAUGE_RELIABILITY=0 falls back to
 # the corpus fit, which is what the page showed before the model existed.
 gauge_reliability=${QUALITY_GAUGE_RELIABILITY:-1}
+# Score predictions from a model refitted without the month being graded.
+# 0 reproduces the in-sample tautology deliberately; nothing else should.
+gauge_out_of_fold=${QUALITY_GAUGE_OUT_OF_FOLD:-1}
 
 # Bring scripts/ into the container on demand — the runtime image does not
 # carry them. Repo mounted read-only; every output goes to a volume.
@@ -239,7 +242,7 @@ config_json=$(run_in_repo python - \
     "$fit_workers" "$fit_min_warnings" "$fit_min_delta" \
     "$radar_decisions" "$decisions_dirs" \
     "$post_on" "$postprocess_out" "$fit_l2" "$fit_design_leads" \
-    "$fit_probability" "$gauge_reliability" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
+    "$fit_probability" "$gauge_reliability" "$gauge_out_of_fold" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
 import json
 import sys
 
@@ -249,7 +252,7 @@ from dmi_nowcast_sidecar.threshold_sweep import parse_thresholds
 (corpus_dir, out, md_dir, live_days, fit_on, thresholds_out, sweep_json,
  leads, grid, workers, min_warnings, min_delta, radar_decisions,
  decisions_dirs, post_on, postprocess_out, l2, design_leads,
- probability, gauge_reliability, *pairs) = sys.argv[1:]
+ probability, gauge_reliability, gauge_out_of_fold, *pairs) = sys.argv[1:]
 
 inputs = {"corpus_dir": corpus_dir, "live_days": int(live_days)}
 for pair in pairs:
@@ -289,6 +292,10 @@ if gauge_reliability == "1":
                 postprocess_out if probability == "postprocess" else None
             ),
             "design_leads": design_list,
+            # Out-of-fold, or the diagram is a tautology: the nightly
+            # model is fitted on every row it would then be graded on.
+            "out_of_fold": gauge_out_of_fold == "1",
+            "l2": float(l2),
         },
     }
 if post_on == "true":

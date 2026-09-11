@@ -655,6 +655,14 @@ class GaugeReliabilityConfig(BaseModel):
     #: The horizons to publish a curve for. None -> the threshold fit's
     #: leads, i.e. the horizons a subscriber can actually choose.
     leads: list[int] | None = None
+    #: Score OUT-OF-FOLD predictions: for each (year, month) the whole
+    #: two-stage fit is redone on the other months and applied to the
+    #: held-out one. On by default and effectively mandatory — the nightly
+    #: model is fitted on ALL rows, so binning its own predictions against
+    #: its own training rows is a tautology, and the first live build
+    #: duly came back perfectly calibrated to three decimals. Costs about
+    #: one logistic fit per month per lead, nightly, in the child process.
+    out_of_fold: bool = True
 
 
 class QualityReportConfig(BaseModel):

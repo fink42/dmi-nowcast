@@ -155,12 +155,20 @@ def _model() -> "pp.PostprocessModel":
     )
 
 
+#: A per-month shift on the ensemble fraction. The gauge behaves the same
+#: way every month in this fixture, so without this the three months are
+#: identical and a model trained on two of them predicts the third
+#: perfectly — which would make "held out" and "in sample" the same
+#: number and the out-of-fold test unable to fail.
+MONTH_SHIFT: dict[int, float] = {1: -0.2, 4: 0.0, 6: 0.2}
+
+
 def _feature_values(station: str, ts: datetime) -> dict[str, float]:
     """One fixture row's feature columns, deterministic in station and frame."""
     minute = ts.hour * 60 + ts.minute
     phase = ((minute - FIRST_FRAME_MIN) / 10.0) / 12.0
     near = 1.0 if station == STATION_A else 0.0
-    fraction = min(1.0, 0.05 + 0.9 * phase)
+    fraction = min(1.0, max(0.0, 0.05 + 0.9 * phase + MONTH_SHIFT[ts.month]))
     return _features_from(fraction, near)
 
 
@@ -279,6 +287,46 @@ def _write_model(root: Path) -> Path:
     return path
 
 
+def _fit_on_own_rows(root: Path) -> Path:
+    """A model fitted on the very rows it will then be graded on.
+
+    The shape of the NIGHTLY refit: all rows, no folds
+    (``training.held_out: false``). Writing one here is what lets the test
+    below reproduce the bug this module was changed for — the diagram that
+    came back perfectly calibrated because it was a description of its own
+    training data.
+    """
+    rows = load_probabilities(
+        [root / "replay"], LEADS,
+        column_for=column_template(pp.POST_COLUMN_TEMPLATE),
+        extra_columns=pp.feature_source_columns(DESIGN_LEADS),
+    )
+    grid, _dead, scored = build_gauge_grid(
+        root / "corpus", sorted(set(rows["stations"])),
+        decision_window(rows["t"]),
+        dry_min=60, onset_min_mm=0.2, min_known_slots=0,
+    )
+    recode_stations(rows, scored)
+    t = rows["t"]
+    features: dict[str, object] = {
+        name: rows["extra"][name]
+        for name in pp.feature_source_columns(DESIGN_LEADS)
+    }
+    features["season"] = pp.seasons_from_epoch(t)
+    features["hour_utc"] = pp.hours_from_epoch(t).astype(np.float64)
+    truth = {}
+    for lead in LEADS:
+        outcome, usable = grid.outcome(t, rows["station"], lead)
+        truth[int(lead)] = (outcome, usable & ~rows["dropped"])
+    model = pp.fit_postprocess(
+        features, truth, LEADS, l2=1.0, design_leads=DESIGN_LEADS,
+        fitted_at=datetime(2026, 9, 11, 3, 40, tzinfo=timezone.utc),
+    )
+    path = root / "self_fitted.json"
+    path.write_text(model.dumps())
+    return path
+
+
 def _options(root: Path, **overrides) -> GaugeReliabilityOptions:
     kwargs = dict(
         decisions_dirs=[root / "replay"],
@@ -322,8 +370,21 @@ def _layer_b(root: Path, template: str) -> dict:
 
 class TestAgreementWithLayerB:
     def test_every_bin_matches_the_benchmarks(self, corpus: Path) -> None:
-        block = gauge_reliability_from_decisions(_options(corpus))
+        """Bin for bin, against Layer B on the same rows.
+
+        Layer B scores whatever probability column its rows carry — its
+        out-of-sample-ness comes from the file, since
+        ``scripts/fit_postprocess.py`` writes its held-out predictions
+        into a copy of the run. So the comparison is made on the
+        IN-SAMPLE path explicitly (``out_of_fold=False``): both sides then
+        score the identical stored column, and the equality is about the
+        two implementations rather than about two fitting regimes.
+        """
+        block = gauge_reliability_from_decisions(
+            _options(corpus, out_of_fold=False),
+        )
         assert block is not None
+        assert block["calibration"] == "in-sample"
         bench = _layer_b(corpus, pp.POST_COLUMN_TEMPLATE)
         curves = {int(c["lead_min"]): c for c in block["curves"]}
         assert set(curves) == set(LEADS)
@@ -350,13 +411,18 @@ class TestAgreementWithLayerB:
 
     def test_it_scored_the_model_and_not_the_curve(self, corpus: Path) -> None:
         """The two columns differ; the block has to be of the right one."""
-        model = gauge_reliability_from_decisions(_options(corpus))
+        model = gauge_reliability_from_decisions(
+            _options(corpus, out_of_fold=False),
+        )
         curve = gauge_reliability_from_decisions(
             _options(corpus, probability_column=None),
         )
         assert model is not None and curve is not None
         assert model["mode"] == "postprocess"
         assert curve["mode"] == "served"
+        # The curve was never fitted on a gauge, so scoring it at the
+        # gauges is already out-of-sample; there is nothing to hold out.
+        assert curve["calibration"] == "served"
         assert model["probability_column"] == "p_post_{lead}"
         assert curve["probability_column"] == "p_rain_{lead}"
         # The curve fixture is a flat 0.5 everywhere, so its whole diagram
@@ -373,7 +439,9 @@ class TestAgreementWithLayerB:
         assert model_bins == {2, 7}
 
     def test_the_window_describes_the_rows_it_scored(self, corpus: Path) -> None:
-        block = gauge_reliability_from_decisions(_options(corpus))
+        block = gauge_reliability_from_decisions(
+            _options(corpus, out_of_fold=False),
+        )
         assert block is not None
         window = block["window"]
         assert window["from"].startswith("2026-01-15T07:00")
@@ -546,8 +614,15 @@ class TestFillingFromFeatures:
         """
         _write_gauge(tmp_path / "corpus")
         _write_decisions(tmp_path / "replay", with_post=True, features=True)
+        # The in-sample path on purpose: this is about which value the
+        # FILLER keeps, and the out-of-fold refit replaces every stored
+        # value by design, which would hide the answer.
         block = gauge_reliability_from_decisions(
-            _options(tmp_path, postprocess_model=_write_model(tmp_path)),
+            _options(
+                tmp_path,
+                postprocess_model=_write_model(tmp_path),
+                out_of_fold=False,
+            ),
         )
         assert block is not None
         occupied = {
@@ -612,9 +687,205 @@ class TestFillingFromFeatures:
             _options(tmp_path, postprocess_model=junk),
         )
         assert block is not None
-        # The stored rows still score; nothing was filled.
+        # The stored rows still score; nothing was filled, and with no
+        # model there is nothing to refit either, so the block says so.
         assert block["fill"]["computed"] == 0
         assert block["fill"]["stored"] > 0
+        assert block["calibration"] == "in-sample"
+
+
+# ---------------------------------------------------------------------------
+# 3c. Out-of-fold, or the diagram measures nothing
+# ---------------------------------------------------------------------------
+
+
+class TestOutOfFold:
+    """The tautology this replaced, and the guard against it coming back.
+
+    The nightly refit fits on ALL rows (``training.held_out: false``).
+    Binning that model's own predictions against its own training rows
+    draws a perfect diagonal: the first live build came back 0.149 →
+    0.149, 0.754 → 0.753, 0.949 → 0.949 over hundreds of thousands of
+    rows, which says only that isotonic regression can describe its own
+    training data. Exactly the trap the radar curve had.
+
+    So the shipped diagram is of predictions from a model refitted per
+    ``(year, month)`` without the month it is graded on. What is asserted
+    here is that the two really are different numbers, that the block says
+    which one it is, and that a fold the refit cannot fit degrades to a
+    labelled, counted fallback rather than a hole in the curve.
+    """
+
+    @pytest.fixture()
+    def featured(self, tmp_path: Path) -> tuple[Path, Path]:
+        _write_gauge(tmp_path / "corpus")
+        _write_decisions(tmp_path / "replay", with_post=False, features=True)
+        return tmp_path, _write_model(tmp_path)
+
+    def test_it_differs_from_the_in_sample_curve_and_says_so(
+        self, featured: tuple[Path, Path],
+    ) -> None:
+        root, model = featured
+        folded = gauge_reliability_from_decisions(
+            _options(root, postprocess_model=model),
+        )
+        in_sample = gauge_reliability_from_decisions(
+            _options(root, postprocess_model=model, out_of_fold=False),
+        )
+        assert folded is not None and in_sample is not None
+
+        assert folded["calibration"] == "out-of-fold"
+        assert folded["mode"] == "postprocess_cv"
+        # One fold per (year, month); the fixture spans January, April
+        # and June.
+        assert folded["cv_folds"] == len(DAYS)
+        assert folded["fold"] == "month"
+
+        assert in_sample["calibration"] == "in-sample"
+        assert in_sample["mode"] == "postprocess"
+        assert in_sample["cv_folds"] == 0
+        assert in_sample["fold"] is None
+
+        # And they are genuinely different numbers. A model that never saw
+        # the month cannot describe it as well as one that did.
+        assert folded["curves"][0]["bins"] != in_sample["curves"][0]["bins"]
+        assert folded["curves"][0]["brier"] != in_sample["curves"][0]["brier"]
+
+    def test_the_in_sample_curve_is_the_tautology_it_is_labelled_as(
+        self, tmp_path: Path,
+    ) -> None:
+        """The reported failure, reproduced and then removed.
+
+        The model here is fitted on the very rows it is then graded on —
+        the nightly refit's shape exactly. In sample it lands ON the
+        diagonal to three decimals, which is the 0.149 → 0.149 the first
+        live build showed and is a statement about isotonic regression
+        rather than about the service. Held out, it does not.
+        """
+        _write_gauge(tmp_path / "corpus")
+        _write_decisions(tmp_path / "replay", with_post=False, features=True)
+        model = _fit_on_own_rows(tmp_path)
+
+        in_sample = gauge_reliability_from_decisions(
+            _options(tmp_path, postprocess_model=model, out_of_fold=False),
+        )
+        assert in_sample is not None
+        assert in_sample["calibration"] == "in-sample"
+        populated = [
+            b for b in in_sample["curves"][0]["bins"]
+            if b["n"] >= 5 and b["forecast_mean"] is not None
+        ]
+        assert len(populated) >= 2, "the fixture must occupy real bins"
+        for b in populated:
+            assert b["observed_freq"] == pytest.approx(
+                b["forecast_mean"], abs=1e-3,
+            ), "the in-sample diagram should be the perfect diagonal"
+
+        folded = gauge_reliability_from_decisions(
+            _options(tmp_path, postprocess_model=model),
+        )
+        assert folded is not None
+        assert folded["calibration"] == "out-of-fold"
+        off = [
+            b for b in folded["curves"][0]["bins"]
+            if b["n"] >= 5 and b["forecast_mean"] is not None
+            and abs(b["forecast_mean"] - b["observed_freq"]) > 1e-3
+        ]
+        assert off, "held out, the model must stop describing its own rows"
+
+    def test_the_baseline_stays_the_served_curve_on_the_same_rows(
+        self, featured: tuple[Path, Path],
+    ) -> None:
+        """``brier_raw`` is not refitted — it is what the site used to show."""
+        root, model = featured
+        folded = gauge_reliability_from_decisions(
+            _options(root, postprocess_model=model),
+        )
+        in_sample = gauge_reliability_from_decisions(
+            _options(root, postprocess_model=model, out_of_fold=False),
+        )
+        assert folded is not None and in_sample is not None
+        for left, right in zip(folded["curves"], in_sample["curves"]):
+            assert left["brier_raw"] == right["brier_raw"]
+            # ``p_rain_<lead>`` is a flat 0.5 in the fixture, so the
+            # paired baseline is a fixed number either way.
+            assert left["brier_raw"] == pytest.approx(0.25)
+
+    def test_one_month_is_no_fold(self, tmp_path: Path) -> None:
+        """A single month cannot hold anything out, and must not pretend to."""
+        import pyarrow.parquet as pq
+
+        _write_gauge(tmp_path / "corpus")
+        _write_decisions(tmp_path / "replay", with_post=False, features=True)
+        for day in DAYS[1:]:
+            (
+                tmp_path / "replay" / "decisions"
+                / f"{day[0]:04d}-{day[1]:02d}-{day[2]:02d}.parquet"
+            ).unlink()
+        assert len(list((tmp_path / "replay" / "decisions").glob("*.parquet"))) == 1
+        block = gauge_reliability_from_decisions(
+            _options(tmp_path, postprocess_model=_write_model(tmp_path)),
+        )
+        assert block is not None
+        assert block["calibration"] == "in-sample"
+        assert block["cv_folds"] == 0
+        assert pq  # the import is the reason the day files could be removed
+
+    def test_a_fold_that_cannot_be_fitted_falls_back_and_is_counted(
+        self, featured: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A hole in the curve would be the quieter lie.
+
+        The refit leaves NaN for a fold it could not fit. Those rows take
+        the served model's own prediction — in-sample for them — and the
+        block counts exactly how many, so a reader can see how much of the
+        diagram is not out-of-sample.
+        """
+        from dmi_nowcast_sidecar import gauge_reliability as module
+
+        real = module.core_postprocess.leave_one_month_out
+
+        def holed(*args, **kwargs):
+            out = real(*args, **kwargs)
+            for values in out["out_of_fold"].values():
+                values[: len(values) // 3] = np.nan
+            return out
+
+        monkeypatch.setattr(
+            module.core_postprocess, "leave_one_month_out", holed,
+        )
+        root, model = featured
+        block = gauge_reliability_from_decisions(
+            _options(root, postprocess_model=model),
+        )
+        assert block is not None
+        assert block["calibration"] == "out-of-fold"
+        assert block["in_sample_fallbacks"] > 0
+        # Nothing was dropped for it: every scoreable row still has a
+        # probability, so the curve covers the same sample.
+        assert all(curve["n_excluded"] == 0 for curve in block["curves"])
+
+    def test_a_refit_failure_degrades_to_the_served_model(
+        self, featured: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One diagram is not worth the nightly build."""
+        from dmi_nowcast_sidecar import gauge_reliability as module
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("a singular design")
+
+        monkeypatch.setattr(
+            module.core_postprocess, "leave_one_month_out", explode,
+        )
+        root, model = featured
+        block = gauge_reliability_from_decisions(
+            _options(root, postprocess_model=model),
+        )
+        assert block is not None
+        # It still publishes a curve — labelled for what it is, never
+        # labelled out-of-fold.
+        assert block["calibration"] == "in-sample"
+        assert block["curves"]
 
 
 # ---------------------------------------------------------------------------

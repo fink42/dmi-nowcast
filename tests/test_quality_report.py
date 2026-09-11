@@ -2157,7 +2157,7 @@ class TestInjectedGaugeReliability:
     """
 
     @staticmethod
-    def _block() -> dict:
+    def _block(*, mode: str = "postprocess_cv", folds: int = 10) -> dict:
         """A minimal block in ``reliability_from_corpus``' shape."""
         bins = [
             {
@@ -2183,9 +2183,10 @@ class TestInjectedGaugeReliability:
             "frame_age": None,
             "threshold_mm_h": None,
             "per_point_brier": {30: {"06180": 0.071}},
-            "mode": "postprocess",
-            "cv_folds": 0,
-            "fold": None,
+            "mode": mode,
+            "cv_folds": folds,
+            "fold": "month" if folds else None,
+            "calibration": "out-of-fold" if folds else "in-sample",
             "probability_column": "p_post_{lead}",
         }
 
@@ -2244,10 +2245,32 @@ class TestInjectedGaugeReliability:
         )
         sentence = report["methods"]["reliability_probability"]
         assert "gauges: the gauge-trained post-processed probability" in sentence
+        # The model is fitted on every row the page would grade it on, so
+        # the sentence has to say the diagram held a month out — without
+        # that it describes a fit rather than the service.
+        assert "refitted out-of-sample leave-one-month-out" in sentence
         assert "10-minute slots inside each lead" in sentence
         assert "dead gauges excluded" in sentence
         # And the radar half still says what it always said.
         assert "radar: calibrated out-of-sample" in sentence
+
+    def test_an_in_sample_gauge_curve_is_never_described_as_held_out(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """A build that fell back must say so in the same sentence.
+
+        The whole point of the label is that a reader can tell a
+        measurement from a tautology; a fallback that borrowed the
+        out-of-sample wording would be worse than no label at all.
+        """
+        report = build_quality_report(
+            full_inputs,
+            gauge_reliability=self._block(mode="postprocess", folds=0),
+        )
+        sentence = report["methods"]["reliability_probability"]
+        assert "gauges: the gauge-trained post-processed probability" in sentence
+        assert "in-sample" in sentence
+        assert "leave-one-month-out" not in sentence.split("gauges:")[1]
 
     def test_an_empty_block_falls_back_to_the_corpus_fit(
         self, full_inputs: QualityInputs,

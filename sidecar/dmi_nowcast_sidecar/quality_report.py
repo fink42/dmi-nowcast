@@ -384,6 +384,14 @@ class QualityReportTask:
             design_leads=tuple(
                 int(lead) for lead in self.config.forecast.national.leads_min
             ),
+            # Score predictions from a model that never saw the month it
+            # is graded on. The nightly refit has no folds — the served
+            # model is fitted on everything — so without this the page
+            # would draw a perfect diagonal of its own training data.
+            out_of_fold=bool(settings.out_of_fold),
+            # The served fit's ridge strength, so a fold model differs
+            # from the shipped one only in what it was shown.
+            l2=float(self.settings.fit_postprocess.l2),
             dry_min=int(thresholds.dry_min),
             onset_min_mm=float(thresholds.onset_min_mm),
             min_known_slots=int(thresholds.min_known_slots),

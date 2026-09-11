@@ -587,6 +587,13 @@ def run_job(
                 # operator can see at a glance whether the replay tree
                 # actually made it into the diagram.
                 "fill": gauge_block.get("fill"),
+                # Whether the diagram measures the service or describes a
+                # fit: "out-of-fold" (the shipped claim), "in-sample" (a
+                # tautology, and a bug if it appears on a nightly build)
+                # or "served" (the curve path).
+                "calibration": gauge_block.get("calibration"),
+                "cv_folds": gauge_block.get("cv_folds"),
+                "in_sample_fallbacks": gauge_block.get("in_sample_fallbacks"),
             }
         ),
         "error": None,
