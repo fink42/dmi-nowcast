@@ -89,7 +89,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Config
-from .push.paths import resolved_thresholds_path
+from .push.paths import resolved_postprocess_path, resolved_thresholds_path
 from .quality_job import JOB_MODULE, inputs_to_json, run_job, sweep_options_to_json
 
 _log = structlog.get_logger(__name__)
@@ -107,6 +107,30 @@ _REAP_TIMEOUT_S = 10.0
 #: to see the exception; short enough not to flood the log with a
 #: traceback the child already printed in full.
 _STDERR_TAIL = 500
+
+
+def post_column_template() -> str:
+    """``"p_post_{lead}"`` — the engine's probability column, as a template.
+
+    Read from the core module rather than typed out, so the sweep, the
+    live writer and the offline study cannot end up naming three
+    different columns.
+    """
+    from dmi_nowcast_core.postprocess import POST_COLUMN_TEMPLATE
+
+    return POST_COLUMN_TEMPLATE
+
+
+def _postprocess_options_to_json(options: Any) -> dict:
+    """Lazy shim around ``postprocess_fit.options_to_json``.
+
+    Imported inside the function for the same reason the sweep's options
+    are: ``postprocess_fit`` pulls in pyarrow and numpy, which an instance
+    with the nightly build switched off should not have to load to start.
+    """
+    from .postprocess_fit import options_to_json
+
+    return options_to_json(options)
 
 
 def quality_path(config: Config) -> Path:
@@ -142,6 +166,12 @@ class QualityBuildResult:
     thresholds_path: Path | None = None
     thresholds_guard: dict[str, str] = field(default_factory=dict)
     thresholds_error: str | None = None
+    #: The post-processing refit (Phase H), on the same terms: where the
+    #: model landed, its stamp, its counts, and the error when it did not.
+    postprocess_path: Path | None = None
+    postprocess_fitted_at: str | None = None
+    postprocess: dict = field(default_factory=dict)
+    postprocess_error: str | None = None
 
 
 class QualityReportTask:
@@ -166,7 +196,9 @@ class QualityReportTask:
         builder: Callable[[Any], dict] | None = None,
         renderer: Callable[[dict], str] | None = None,
         fitter: Callable[[Any], dict] | None = None,
+        postprocess_fitter: Callable[[Any], dict] | None = None,
         thresholds: Any = None,
+        postprocess: Any = None,
         executable: str | None = None,
     ) -> None:
         self.config = config
@@ -177,10 +209,16 @@ class QualityReportTask:
         #: the guard, the atomic write, the reload nudge, the report's
         #: embedded section — without a season of parquet on disk.
         self._fitter = fitter
+        #: The post-processing refit, injectable on the same terms.
+        self._postprocess_fitter = postprocess_fitter
         #: The running service's ``push.thresholds.ThresholdTable``, told
         #: to re-read after a successful fit. ``None`` means the file
         #: still lands; it just takes a restart to take effect.
         self._thresholds = thresholds
+        #: The engine's ``push.postprocess.PostprocessTable``, on the same
+        #: terms — nudged after a successful refit so the next cycle
+        #: scores with tonight's model.
+        self._postprocess = postprocess
         #: The interpreter the child is spawned with. Overridable so a
         #: test can point it at a stub that records its argv.
         self._executable = executable or sys.executable
@@ -207,7 +245,10 @@ class QualityReportTask:
         """
         return any(
             hook is not None
-            for hook in (self._builder, self._renderer, self._fitter)
+            for hook in (
+                self._builder, self._renderer, self._fitter,
+                self._postprocess_fitter,
+            )
         )
 
     # -- inputs -----------------------------------------------------------
@@ -258,6 +299,52 @@ class QualityReportTask:
             return Path(configured)
         return resolved_thresholds_path(self.config)
 
+    def postprocess_out(self) -> Path:
+        """Where the refit model is written, and read back from.
+
+        ``fit_postprocess.out`` when set, else the file the running cycle
+        reads (``push.postprocess_path``). The default is the point:
+        fitting into a file nothing loads would produce a very
+        well-documented no-op.
+        """
+        configured = self.settings.fit_postprocess.out
+        if configured is not None:
+            return Path(configured)
+        return resolved_postprocess_path(self.config)
+
+    def _postprocess_options(self) -> Any:
+        """The :class:`PostprocessFitOptions` this config describes.
+
+        Deliberately shares the threshold fit's rows, gauge rule and lead
+        set: the model and the thresholds fitted on top of it have to
+        stand on the same evidence, or the percent is a threshold on a
+        probability that was never measured there.
+        """
+        from .postprocess_fit import PostprocessFitOptions
+        from .push.routes import lead_options
+
+        settings = self.settings.fit_postprocess
+        thresholds = self.settings.fit_thresholds
+        dirs = settings.decisions_dirs or thresholds.decisions_dirs
+        return PostprocessFitOptions(
+            decisions_dirs=[Path(d) for d in dirs],
+            corpus_dir=Path(self.config.storage.corpus_dir),  # type: ignore[arg-type]
+            out=self.postprocess_out(),
+            # The horizons that can actually be subscribed to — the same
+            # set the threshold fit uses, for the same reason.
+            leads=tuple(thresholds.leads or lead_options(self.config)),
+            # Every lead the national products publish: the SHAPE of the
+            # ensemble fraction against lead is itself a predictor, and
+            # the cycle fills exactly these columns.
+            design_leads=tuple(
+                int(lead) for lead in self.config.forecast.national.leads_min
+            ),
+            l2=float(settings.l2),
+            dry_min=int(thresholds.dry_min),
+            onset_min_mm=float(thresholds.onset_min_mm),
+            min_known_slots=int(thresholds.min_known_slots),
+        )
+
     def _fit_options(self) -> Any:
         """The :class:`SweepOptions` this config describes."""
         from .push.routes import lead_options
@@ -287,6 +374,25 @@ class QualityReportTask:
             onset_min_mm=float(settings.onset_min_mm),
             min_known_slots=int(settings.min_known_slots),
             workers=int(settings.workers),
+            # Phase H: the sweep replays the rule on the SAME probability
+            # the engine decides with. A table fitted on the curve and
+            # served against the post-processed number would warn at the
+            # wrong percent on every horizon — so this follows
+            # ``push.probability_source`` and nothing else, and the
+            # thresholds document records which one it was.
+            probability_column=(
+                post_column_template()
+                if self.config.push.probability_source == "postprocess"
+                else None
+            ),
+            postprocess_model=(
+                self.postprocess_out()
+                if self.config.push.probability_source == "postprocess"
+                else None
+            ),
+            design_leads=tuple(
+                int(lead) for lead in self.config.forecast.national.leads_min
+            ),
         )
 
     def job_config(self, *, live_only: bool = False) -> dict:
@@ -313,7 +419,21 @@ class QualityReportTask:
                 "inputs": inputs_to_json(self.inputs()),
             },
             "fit": {"enabled": False},
+            "fit_postprocess": {"enabled": False},
         }
+        post = settings.fit_postprocess
+        # The refit only runs where it can: it needs rows and a gauge
+        # store, and ``decisions_dirs`` empty means there is nothing to
+        # fit on — the same "empty disables it" rule the threshold fit has.
+        post_dirs = post.decisions_dirs or fit.decisions_dirs
+        if post.enabled and post_dirs and not live_only:
+            payload["fit_postprocess"] = {
+                "enabled": True,
+                "out": str(self.postprocess_out()),
+                "options": _postprocess_options_to_json(
+                self._postprocess_options(),
+            ),
+            }
         if fit.enabled and not live_only:
             payload["fit"] = {
                 "enabled": True,
@@ -359,6 +479,7 @@ class QualityReportTask:
     def _result_of(summary: dict) -> QualityBuildResult:
         """One job summary as the result this task reports and logs."""
         thresholds = summary.get("thresholds_path")
+        postprocess = summary.get("postprocess_path")
         path = summary.get("path")
         return QualityBuildResult(
             ok=bool(summary.get("ok")),
@@ -378,6 +499,10 @@ class QualityReportTask:
                 for k, v in (summary.get("thresholds_guard") or {}).items()
             },
             thresholds_error=summary.get("thresholds_error"),
+            postprocess_path=Path(postprocess) if postprocess else None,
+            postprocess_fitted_at=summary.get("postprocess_fitted_at"),
+            postprocess=dict(summary.get("postprocess") or {}),
+            postprocess_error=summary.get("postprocess_error"),
         )
 
     @staticmethod
@@ -468,6 +593,7 @@ class QualityReportTask:
                 builder=self._builder,
                 renderer=self._renderer,
                 fitter=self._fitter,
+                postprocess_fitter=self._postprocess_fitter,
             )
         except Exception as exc:  # noqa: BLE001
             return QualityBuildResult(
@@ -536,6 +662,28 @@ class QualityReportTask:
             )
         if result.thresholds_error:
             _log.info("quality_report_fit_not_applied", reason=result.thresholds_error)
+        if result.postprocess_error:
+            _log.info(
+                "quality_report_postprocess_not_applied",
+                reason=result.postprocess_error,
+            )
+        # The same hook, for the model: the child wrote the file, the
+        # parent tells the running cycle to re-read it. Without this the
+        # refit takes effect on the next restart instead of the next
+        # cycle — and the thresholds fitted beside it would then be
+        # thresholds on a probability the engine is not yet computing.
+        if result.postprocess_path is not None:
+            note = getattr(self._postprocess, "note_changed", None)
+            if callable(note):
+                note()
+            _log.info(
+                "quality_report_postprocess_done",
+                path=str(result.postprocess_path),
+                fitted_at=result.postprocess_fitted_at,
+                rows=result.postprocess.get("rows"),
+                leads=result.postprocess.get("leads"),
+                reloaded=callable(note),
+            )
         # The hook the child cannot call: the service re-reads the table at
         # the start of its next fan-out. Without it the file still landed
         # and takes effect on restart.
@@ -632,7 +780,7 @@ class QualityReportTask:
 
 
 def build_quality_report_task(
-    config: Config, *, thresholds: Any = None,
+    config: Config, *, thresholds: Any = None, postprocess: Any = None,
 ) -> QualityReportTask | None:
     """The task for this config, or ``None`` when it must not run.
 
@@ -649,7 +797,9 @@ def build_quality_report_task(
     if config.storage.corpus_dir is None:
         _log.warning("quality_report_disabled_no_corpus_dir")
         return None
-    return QualityReportTask(config, thresholds=thresholds)
+    return QualityReportTask(
+        config, thresholds=thresholds, postprocess=postprocess,
+    )
 
 
 __all__ = [

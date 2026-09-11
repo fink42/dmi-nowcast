@@ -16,6 +16,8 @@ Phase F (F4) adds the verification surface:
 - ``GET /nowcast/quality.json`` — the "How good are we?" report, built
   nightly on the private instance and pulled by the public one.
 - ``GET /calibration/national_curves.json`` — the live isotonic curves.
+- ``GET /calibration/postprocess.json`` — the fitted post-processing
+  model the push engine decides on (Phase H, H-P).
   PRIVATE: not on the public allow-list; it is the source the public
   instance's ``sync`` task reads.
 
@@ -117,6 +119,7 @@ from .national_sample import finite_or_none, sample_point
 from .push.paths import (
     resolved_db_path,
     resolved_key_path,
+    resolved_postprocess_path,
     resolved_thresholds_path,
 )
 from .push.routes import build_router as build_push_router
@@ -243,7 +246,11 @@ def create_app(
         # corpus read or an unreachable peer must never delay a cycle.
         quality_task: QualityReportTask | None = (
             quality_report_task if quality_report_task is not None
-            else build_quality_report_task(config, thresholds=push_thresholds)
+            else build_quality_report_task(
+                config,
+                thresholds=push_thresholds,
+                postprocess=engine.postprocess,
+            )
         )
         app.state.quality_report_task = quality_task
         sync_task: ArtifactSync | None = (
@@ -367,6 +374,19 @@ def create_app(
             _log.error("station_eval_init_failed", error=str(exc))
             station_eval_service = None
     app.state.station_eval_service = station_eval_service
+
+    # H-P: who the cycle computes post-processing features for. Registered
+    # here rather than reached for from inside the cycle, because
+    # ``compute`` must not import the push package (``push.service``
+    # imports ``compute``) and because the engine has no business knowing
+    # what a subscription or a gauge station is — it asks for coordinates.
+    # Home is always scored; these two are additive on top of it.
+    if push_service is not None:
+        engine.add_point_source("push", push_service.decision_points)
+    if station_eval_service is not None:
+        engine.add_point_source(
+            "station_eval", station_eval_service.decision_points,
+        )
 
     @app.get("/healthz", response_model=HealthResponse, tags=["public"])
     async def healthz(request: Request) -> HealthResponse:
@@ -538,6 +558,32 @@ def create_app(
             raise HTTPException(
                 status_code=503,
                 detail="no fitted push thresholds on this instance yet",
+            )
+        return Response(
+            content=path.read_bytes(),
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    @app.get("/calibration/postprocess.json", tags=["calibration"])
+    async def postprocess_file(
+        request: Request, _: None = Depends(require_api_key),
+    ) -> Response:
+        """The fitted post-processing model, as this instance reads it (H-P).
+
+        The third of the published-artifact trio, private for the same
+        reason as the other two: ``_PUBLIC_PATHS`` does not list it, so
+        public mode 404s it. It exists so the public instance's ``sync``
+        task can pull the nightly refit across the shared docker network —
+        the public stack runs its own cycle and its own push engine but
+        has no gauge store, so it can serve this model and never fit one.
+        Subscribers see only the resolved answer at ``/api/push/options``.
+        """
+        path = resolved_postprocess_path(request.app.state.config)
+        if not path.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail="no fitted post-processing model on this instance yet",
             )
         return Response(
             content=path.read_bytes(),
@@ -878,6 +924,7 @@ def create_app(
             public_key=push_public_key,
             service=push_service,
             thresholds=push_thresholds,
+            postprocess=engine.postprocess,
         ),
     )
 

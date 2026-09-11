@@ -84,6 +84,17 @@ __all__ = [
     "DESIGN_SOURCE_COLUMNS",
     "RAW_FRACTION_PREFIX",
     "raw_fraction_column",
+    "POST_PREFIX",
+    "POST_COLUMN_TEMPLATE",
+    "post_column",
+    "post_schema",
+    "SHARED_SOURCE_COLUMNS",
+    "feature_source_columns",
+    "feature_only_columns",
+    "feature_schema",
+    "feature_documentation",
+    "feature_row",
+    "finite_or_none",
     "feature_columns",
     "SEASONS",
     "SEASON_MONTHS",
@@ -251,6 +262,166 @@ def feature_columns(leads: Sequence[int]) -> tuple[tuple[str, str], ...]:
 
 #: name → definition, flattened, for the leads the products publish today.
 FEATURE_DOC: dict[str, str] = dict(SCALAR_FEATURE_COLUMNS)
+
+
+#: Prefix of the POST-PROCESSED probability column — what the push engine
+#: decides on once ``push.probability_source`` is ``postprocess``. Written
+#: BESIDE the served ``p_rain_<lead>``, never over it: both arms of every
+#: comparison have to survive in the same row, for the same reason
+#: ``raw_frac_<lead>`` does.
+POST_PREFIX = "p_post_"
+
+
+def post_column(lead: int) -> str:
+    """Column holding the post-processed probability at ``lead`` minutes."""
+    return f"{POST_PREFIX}{int(lead)}"
+
+
+#: The same name as a ``str.format`` template, for the readers that take
+#: one (``benchmark_report --probability-column``,
+#: ``threshold_sweep.SweepOptions.probability_column``). Derived from the
+#: prefix so the writer and every reader cannot name three columns.
+POST_COLUMN_TEMPLATE = POST_PREFIX + "{lead}"
+
+
+#: Columns :func:`build_design` reads that the decision schema ALREADY
+#: carries, so their presence in a file says nothing about whether the
+#: writer computed features. Named once: the nightly fit and the threshold
+#: sweep both have to answer "does this row have features?", and a second
+#: opinion would silently change which rows are trained and scored on.
+SHARED_SOURCE_COLUMNS: frozenset[str] = frozenset(
+    {"observed_mm_h", "eta_min", "intensity_mm_h"}
+)
+
+
+def feature_source_columns(design_leads: Sequence[int]) -> list[str]:
+    """Every stored column the design reads, in a stable order.
+
+    ``hour_utc`` is absent on purpose: it is a function of the decision
+    instant, which every loader already has, so deriving it keeps the read
+    numeric-only. ``season`` comes from the same stamp. The writers still
+    put both in the parquet for a human or a DuckDB query, and
+    ``tests/test_postprocess.py`` pins the derivation against the column.
+    """
+    names = [
+        raw_fraction_column(lead) for lead in sorted({int(x) for x in design_leads})
+    ]
+    names += [name for name in DESIGN_SOURCE_COLUMNS if name != "hour_utc"]
+    return list(dict.fromkeys(names))
+
+
+def feature_only_columns(design_leads: Sequence[int]) -> list[str]:
+    """The design's source columns that exist ONLY when features were written.
+
+    A row carrying none of these cannot be scored by the model at all: the
+    nightly fit skips it and the threshold sweep excludes it, both
+    counting what they dropped rather than imputing a whole row.
+    """
+    return [
+        name for name in feature_source_columns(design_leads)
+        if name not in SHARED_SOURCE_COLUMNS
+    ]
+
+
+def feature_schema(leads: Sequence[int]):
+    """Arrow fields for the feature columns, in write order.
+
+    Additive to ``warning_score.decision_schema`` and deliberately NOT
+    part of it: ``align_decision_table`` conforms any file to the shared
+    schema, so every existing consumer (the threshold sweep, both
+    benchmark layers, the nightly fit) reads a run with features exactly
+    as it reads one without and simply never sees these columns.
+
+    Types mirror the decision schema's rules. Every numeric feature is
+    nullable float32 and a null means "not computable at this point this
+    cycle", never zero — a station off the composite has no upstream
+    corridor, and 0 mm/h would be a claim that it is dry there.
+
+    pyarrow is imported lazily for the same reason ``decision_schema``
+    does it: the scoring half of this module must stay importable in an
+    environment with no Arrow.
+    """
+    import pyarrow as pa
+
+    fields = []
+    for name, _definition in feature_columns(leads):
+        if name == "season":
+            fields.append((name, pa.string()))
+        elif name == "hour_utc":
+            fields.append((name, pa.int8()))
+        else:
+            fields.append((name, pa.float32()))
+    return pa.schema(fields)
+
+
+def post_schema(leads: Sequence[int]):
+    """Arrow fields for the ``p_post_<lead>`` columns, in lead order.
+
+    Nullable float32, like every other probability in a decision row: null
+    means "the model could not speak for this row" — no fitted model, a
+    lead it does not carry, or a point off coverage — and never 0 %.
+    """
+    import pyarrow as pa
+
+    return pa.schema([
+        (post_column(lead), pa.float32())
+        for lead in sorted({int(x) for x in leads})
+    ])
+
+
+def feature_documentation(leads: Sequence[int]) -> dict[str, str]:
+    """``{column: definition}`` — what goes in a run's ``summary.json``."""
+    return dict(feature_columns(leads))
+
+
+def finite_or_none(value: Any) -> float | None:
+    """A feature value for parquet: non-finite becomes a null, never a 0."""
+    if value is None:
+        return None
+    out = float(value)
+    return out if math.isfinite(out) else None
+
+
+def feature_row(
+    grid_features: Mapping[str, Any],
+    index: int,
+    *,
+    raw_fractions: Mapping[int, Any],
+    leads: Sequence[int],
+    season: str,
+    hour_utc: int,
+    frame_age_min: float,
+    station_radar_km: float,
+) -> dict[str, Any]:
+    """One point's feature columns for one cycle, in write order.
+
+    The single assembler for both writers — the offline replay and the
+    live cycle. Parity is the whole point: a model fitted on replay rows
+    is applied to live rows, so identical inputs must produce an identical
+    row, down to the key order. ``sidecar/tests/test_push_postprocess.py``
+    pins the two against each other.
+
+    ``grid_features`` is :func:`station_features`' output for the whole
+    point list and ``index`` selects this point's entry. ``raw_fractions``
+    maps lead → the UNcalibrated ensemble fraction ALREADY read at this
+    point's product pixel (``None`` off coverage): only the caller knows
+    which pixel the calibrated probability came off, and the two have to
+    be the same one.
+    """
+    row: dict[str, Any] = {}
+    for lead in leads:
+        row[raw_fraction_column(lead)] = finite_or_none(
+            raw_fractions.get(int(lead)),
+        )
+    for name, _definition in SCALAR_FEATURE_COLUMNS:
+        values = grid_features.get(name)
+        if values is not None:
+            row[name] = finite_or_none(values[index])
+    row["season"] = season
+    row["hour_utc"] = int(hour_utc)
+    row["frame_age_min"] = float(frame_age_min)
+    row["station_radar_km"] = float(station_radar_km)
+    return row
 
 
 # ---------------------------------------------------------------------------

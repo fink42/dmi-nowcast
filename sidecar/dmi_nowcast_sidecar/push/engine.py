@@ -36,6 +36,13 @@ The contract mirrors the Home Assistant integration:
   incoming", sent into falling rain. Two of the first four live pushes
   were exactly that.
 
+Since Phase H the *probability* the rule reads is a choice, not a
+constant: ``Observation.p_source`` selects between the served
+curve-calibrated ``p_rain`` and the gauge-trained post-processed
+``p_post``, with a per-observation fallback to the former. ``evaluate``
+itself is unchanged by that — it compares ``obs.p_decision`` to a number,
+as it always did, and never learns where either came from.
+
 Timestamps are UTC everywhere; the subscriber's IANA time zone is used
 for exactly one thing, the quiet-hours comparison.
 """
@@ -113,6 +120,38 @@ class Observation:
     #: silencing a notification on an extrapolation would mean the user
     #: hears nothing when the extrapolation is wrong.
     forecast_now_mm_h: float | None = None
+    #: P(rain within the lead) from the gauge-trained POST-PROCESSING
+    #: model (Phase H, H-P) — the same features the offline replay wrote,
+    #: scored per cycle. ``None`` means the model had nothing to say about
+    #: this observation: no fitted model, a lead it does not carry, a
+    #: point this cycle did not score, or a row it could not score.
+    p_post: float | None = None
+    #: WHICH probability this observation is to be judged on.
+    #: ``"curve"`` — the default, and the behaviour that shipped — is the
+    #: served isotonic-calibrated ``p_rain``. ``"postprocess"`` asks for
+    #: ``p_post``, and falls back to ``p_rain`` when it is None, per
+    #: observation: one point off coverage for the model must not silence
+    #: it, and one model outage must not silence everyone.
+    p_source: Literal["postprocess", "curve"] = "curve"
+
+    @property
+    def p_decision(self) -> float | None:
+        """The probability the rule actually compares to the threshold.
+
+        One definition, read by ``evaluate`` and by the caller that logs
+        the decision and writes the message — three places that must not
+        be able to disagree about which number was used.
+        """
+        if self.p_source == "postprocess" and self.p_post is not None:
+            return self.p_post
+        return self.p_rain
+
+    @property
+    def p_decision_source(self) -> Literal["postprocess", "curve"]:
+        """Where :attr:`p_decision` came from, after the per-row fallback."""
+        if self.p_source == "postprocess" and self.p_post is not None:
+            return "postprocess"
+        return "curve"
 
 
 @dataclass(frozen=True)
@@ -225,7 +264,11 @@ def evaluate(
     ):
         return Decision(state, "none")
 
-    over = obs.p_rain is not None and obs.p_rain >= threshold_pct / 100
+    # The rule reads ONE number, whichever source produced it: the whole
+    # H-P change on this path is which probability ``p_decision`` returns,
+    # and ``evaluate`` stays pure and unaware of the choice.
+    decision_p = obs.p_decision
+    over = decision_p is not None and decision_p >= threshold_pct / 100
 
     if not state.armed:
         # Disarmed. Settle the arm *before* judging this observation: a

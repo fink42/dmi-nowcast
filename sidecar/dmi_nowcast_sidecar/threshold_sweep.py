@@ -376,6 +376,7 @@ def load_decisions(
     *,
     leads_min: Iterable[int] | None = None,
     extra_columns: Sequence[str] = (),
+    derive: Callable[[Any], Any] | None = None,
     log=None,
 ) -> tuple[list[dict], tuple[int, ...], dict[str, int]]:
     """Read every decision parquet under ``directories`` into one row list.
@@ -395,6 +396,14 @@ def load_decisions(
     without one of them contributes ``None`` for it, exactly as an absent
     lead does. Everything else about the read is unchanged, so the default
     call reads precisely what it always read.
+
+    ``derive`` is handed each file's RAW Arrow table and returns it with
+    whatever columns the caller needs added (and, if it says so, with rows
+    removed). It runs per file, before anything becomes a Python dict, for
+    one reason: the nightly sweep fills ``p_post_<lead>`` from twenty
+    feature columns, and doing that after ``to_pylist`` would turn a few
+    megabytes of numpy into a few hundred megabytes of float objects. See
+    ``postprocess_fit.ProbabilityFiller``.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -428,6 +437,8 @@ def load_decisions(
         for path in paths:
             try:
                 raw = pq.read_table(path)
+                if derive is not None:
+                    raw = derive(raw)
                 table = align_decision_table(raw, union)
                 for name in extras:
                     table = table.append_column(name, (
@@ -1479,6 +1490,14 @@ def build_thresholds_document(
         "fitted_at_utc": payload["generated_at_utc"],
         "objective": {
             "metric": "f1",
+            # WHICH probability the percents below are thresholds ON. A
+            # table fitted on the curve and served against the
+            # post-processed number (or the reverse) would warn at the
+            # wrong percent on every horizon, and nothing else in the
+            # document would show it.
+            "probability_column": str(
+                settings.get("probability_column") or "p_rain_{lead}",
+            ),
             "min_useful_lead_min": float(settings["min_useful_lead_min"]),
             "plateau_frac": float(settings["plateau_frac"]),
             "min_warnings": int(settings["min_warnings"]),
@@ -1997,6 +2016,68 @@ class SweepOptions:
     #: the pooled fit is what ``payload["thresholds"]`` carries, and a
     #: stratum never moves it.
     strata: Sequence[str] = ()
+    #: WHICH probability column the rule is replayed on, as a template
+    #: (``"p_post_{lead}"``). None is the served ``p_rain_<lead>``, which
+    #: is what this always did.
+    #:
+    #: It exists because a threshold is only meaningful on the scale it
+    #: was fitted on: once the push engine decides on the post-processed
+    #: probability (``push.probability_source``), a table fitted on the
+    #: curve would warn at the wrong percent on every horizon. Fit the
+    #: thresholds on what the engine reads, or do not fit them.
+    probability_column: str | None = None
+    #: The freshly fitted model, used to fill ``probability_column`` for
+    #: rows that carry features but no stored value — the replay tree, and
+    #: every live partition written before the engine started writing the
+    #: column. Rows with neither are excluded and counted. None means "use
+    #: only what is stored".
+    postprocess_model: Path | None = None
+    #: The leads whose raw fraction the model's design reads. Only used
+    #: when filling; must match the model's own ``design_leads``.
+    design_leads: Sequence[int] = DEFAULT_PRODUCT_LEADS_MIN
+
+
+def _probability_column(
+    options: SweepOptions, leads: Sequence[int], log,
+) -> tuple[Callable[[int], str], Any]:
+    """``(column_for, filler)`` for the probability this fit is scored on.
+
+    ``(p_rain_column, None)`` unless ``probability_column`` asks for
+    something else, so the default path is byte-for-byte the fit that
+    shipped. A model that cannot be read is not fatal: the sweep then
+    scores whatever the rows already carry in that column and says so —
+    which is a narrower fit, never a wrong one.
+    """
+    template = options.probability_column
+    if not template:
+        return p_rain_column, None
+    from .postprocess_fit import ProbabilityFiller
+
+    def column_for(lead: int) -> str:
+        return template.format(lead=int(lead))
+
+    if column_for(20) == column_for(30):
+        raise SweepError(
+            f"probability_column {template!r} does not vary with the lead",
+        )
+    model = None
+    if options.postprocess_model is not None:
+        from dmi_nowcast_core.postprocess import PostprocessModel
+
+        try:
+            model = PostprocessModel.loads(
+                Path(options.postprocess_model).read_text(encoding="utf-8"),
+            )
+        except Exception as exc:  # noqa: BLE001 — every way a file can be junk
+            if log:
+                log(
+                    f"cannot read {options.postprocess_model} "
+                    f"({type(exc).__name__}: {exc}); scoring only the rows "
+                    "that already carry the column"
+                )
+    return column_for, ProbabilityFiller(
+        model, leads, options.design_leads, column_for,
+    )
 
 
 def run_fit(options: SweepOptions, *, log=None) -> dict:
@@ -2015,8 +2096,21 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
     thresholds = tuple(sorted({int(t) for t in options.thresholds}))
     strata_names = parse_strata(options.strata)
 
+    # The probability the rule is replayed on. Default: the served
+    # ``p_rain_<lead>``. Otherwise the engine's own column, filled from
+    # the freshly fitted model wherever a row has features but no stored
+    # value — see ``postprocess_fit.ProbabilityFiller`` for why that
+    # happens inside the read rather than after it.
+    column_for, filler = _probability_column(options, requested_leads, log)
     rows, file_leads, counts = load_decisions(
-        options.decisions_dirs, leads_min=(), log=log,
+        options.decisions_dirs,
+        leads_min=(),
+        extra_columns=(
+            () if filler is None
+            else [column_for(lead) for lead in requested_leads]
+        ),
+        derive=filler,
+        log=log,
     )
     if log:
         log(
@@ -2024,6 +2118,13 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
             f" file(s) ({counts['duplicates']} duplicate key(s),"
             f" {counts['skipped']} file(s) skipped)"
         )
+        if filler is not None:
+            log(
+                f"probability column {options.probability_column}: "
+                f"{filler.counts['stored']} stored, "
+                f"{filler.counts['computed']} computed from features, "
+                f"{filler.counts['dropped']} row(s) excluded (no features)"
+            )
     if not rows:
         raise SweepError("no decision rows found")
 
@@ -2040,7 +2141,9 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
         )
 
     tracks, frames = build_tracks(
-        rows, leads, coverage_gap_min=options.coverage_gap_min,
+        rows, leads,
+        coverage_gap_min=options.coverage_gap_min,
+        column_for=column_for,
     )
     # Everything downstream reads the compact tracks, so the row dicts —
     # the biggest object in the process, and the one a forked worker would
@@ -2180,6 +2283,15 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
             ],
             "strata": list(strata_names),
             "quiet_hours": False,
+            # WHICH probability was replayed. The thresholds document
+            # carries it too: a percent means nothing without the scale it
+            # was fitted on.
+            "probability_column": (
+                options.probability_column or "p_rain_{lead}"
+            ),
+            "probability_rows": (
+                None if filler is None else dict(filler.counts)
+            ),
         },
         "window": {
             "from": window_from.isoformat(),

@@ -765,6 +765,9 @@ def test_the_thresholds_document_validates_and_round_trips(
         "metric": "f1", "min_useful_lead_min": 5.0, "plateau_frac": 0.95,
         "min_warnings": 1, "rearm_after_min": 60, "persistence_obs": 1,
         "tolerance_min": 10, "dry_min": 60, "onset_min_mm": 0.2,
+        # A percent is a threshold ON something; the default is the
+        # served probability, and the document says so.
+        "probability_column": "p_rain_{lead}",
     }
     assert doc["window"]["days"] == 2
     assert doc["window"]["stations"] == 2

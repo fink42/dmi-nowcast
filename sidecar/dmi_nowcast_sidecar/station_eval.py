@@ -37,6 +37,17 @@ Design constraints, in the order they bite:
   load (``Config._station_eval_is_private``); this module checks again
   before it does anything, because a guard that exists in one place is a
   guard that gets removed by a refactor.
+
+Since Phase H each row also carries the post-processing feature columns
+and the model's own ``p_post_<lead>``, written through the same schema
+the replay writes (``postprocess.feature_schema`` /
+``postprocess.post_schema``). That is what puts a live row on the same
+footing as a replay row for the nightly refit: the model is fitted on
+both, and the threshold sweep replays the rule on the probability the
+engine actually used. They are additive columns —
+``align_decision_table`` conforms a file to the shared schema and drops
+what is not in it — so every existing reader sees exactly what it always
+saw.
 """
 from __future__ import annotations
 
@@ -49,6 +60,7 @@ from typing import Any, Sequence
 
 import structlog
 
+from dmi_nowcast_core import postprocess as core_postprocess
 from dmi_nowcast_core.warning_score import (
     DECISION_COLUMNS,
     align_decision_table,
@@ -158,6 +170,66 @@ def _write_atomic(path: Path, write) -> None:
 MERGE_KEY: tuple[str, str] = ("radar_ts", "station_id")
 
 
+def extra_schema(leads_min=None):
+    """The post-processing columns a decision row carries beside the shared ones.
+
+    The feature columns and ``p_post_<lead>``, in that order, from the
+    core module the replay also writes through — so a live partition and a
+    replay partition have the same columns with the same types and the
+    nightly refit sees one table.
+
+    Lead-bearing names (``raw_frac_<lead>``, ``p_post_<lead>``) follow the
+    same lead set the shared ``p_rain_<lead>`` columns do, read back
+    through ``decision_leads_in`` rather than restated, so a config that
+    serves different leads cannot end up with the two disagreeing.
+    """
+    import pyarrow as pa
+
+    leads = decision_leads_in(decision_schema(leads_min).names)
+    return pa.schema(
+        list(core_postprocess.feature_schema(leads))
+        + list(core_postprocess.post_schema(leads))
+    )
+
+
+def _with_extras(table, rows: Sequence[dict] | None, schema) -> Any:
+    """Append every field of ``schema``, from ``rows`` or from ``table``.
+
+    Two callers, one rule about what "missing" means. Building this
+    cycle's table the values come from the row dicts; conforming a month
+    partition written before a column existed they come from the file, and
+    a column the file does not have becomes nulls — never zeros, which
+    would claim the feature was computed and came out dry.
+    """
+    import pyarrow as pa
+
+    present = set(table.schema.names)
+    for field_ in schema:
+        if rows is not None:
+            values = pa.array(
+                [row.get(field_.name) for row in rows], type=field_.type,
+            )
+        elif field_.name in present:
+            values = table.column(field_.name).cast(field_.type)
+        else:
+            values = pa.nulls(table.num_rows, field_.type)
+        if field_.name in present:
+            table = table.drop_columns([field_.name])
+        table = table.append_column(field_, values)
+    return table
+
+
+def _conform(table, leads, schema) -> Any:
+    """A table in the shared decision schema for ``leads``, plus ``schema``.
+
+    ``align_decision_table`` deliberately drops everything it does not
+    know, which is what keeps every other reader unaffected by these
+    columns — and is exactly why a merge has to put them back, or the
+    first rewrite of a month would silently delete the features in it.
+    """
+    return _with_extras(align_decision_table(table, leads), None, schema)
+
+
 def append_rows(path: Path, rows: Sequence[dict], leads_min=None) -> int:
     """Merge ``rows`` into a month partition, keyed on (radar_ts, station_id).
 
@@ -199,7 +271,9 @@ def _merge_and_write(path: Path, rows: Sequence[dict], leads_min) -> int:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    merged = decision_table(rows, leads_min)
+    merged = _with_extras(
+        decision_table(rows, leads_min), rows, extra_schema(leads_min),
+    )
     if path.is_file():
         try:
             existing = pq.read_table(path)
@@ -209,9 +283,13 @@ def _merge_and_write(path: Path, rows: Sequence[dict], leads_min) -> int:
             )
             existing = None
         if existing is not None and existing.num_rows:
-            existing = align_decision_table(existing, leads_min)
-            leads = decision_leads_in(existing)
-            merged = align_decision_table(merged, leads)
+            leads = decision_leads_in(
+                decision_schema(leads_min).names,
+            ) or ()
+            leads = tuple(sorted(set(leads) | set(decision_leads_in(existing))))
+            schema = extra_schema(leads)
+            existing = _conform(existing, leads, schema)
+            merged = _conform(merged, leads, schema)
             kept = existing.join(
                 merged.select(list(MERGE_KEY)),
                 keys=list(MERGE_KEY),
@@ -247,6 +325,24 @@ class StationEvalService:
     @property
     def last_summary(self) -> dict | None:
         return self._last_summary
+
+    # -- what the cycle needs from us ---------------------------------------
+
+    def decision_points(self) -> list[tuple[float, float]]:
+        """Every gauge station's point, for the cycle's feature table (H-P).
+
+        Registered with the engine by ``app.create_app`` and called once
+        per full cycle, inside the cycle worker, so reading the points
+        file here is allowed to block. An unreadable file raises and the
+        engine's guard logs it: the scoreboard then writes rows without
+        features rather than costing the cycle, which is this module's
+        rule everywhere else too.
+        """
+        self._ensure_points()
+        return [
+            (float(point["lat"]), float(point["lon"]))
+            for point in (self._points or ())
+        ]
 
     # -- the cycle hook -----------------------------------------------------
 
@@ -312,10 +408,24 @@ class StationEvalService:
             generated_at,
             getattr(latest, "observed_mm_h", None),
             getattr(latest, "forecast_mm_h", None),
+            # The cycle's post-processing answer, checked against this
+            # frame the same way the products are: one frame's features
+            # must never be stamped with another frame's timestamp.
+            self._postprocess_for(radar_ts),
         )
         if summary is not None:
             self._last_radar_ts = radar_ts
             self._last_summary = summary
+
+    def _postprocess_for(self, radar_ts: datetime) -> Any:
+        """The cycle's ``CyclePostprocess`` for this frame, or None."""
+        latest = getattr(self.engine, "postprocess_latest", None)
+        if latest is None:
+            return None
+        stamp = getattr(latest, "radar_ts_utc", None)
+        if stamp is not None and stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return latest if stamp == radar_ts else None
 
     # -- the work (runs in a worker thread) ---------------------------------
 
@@ -329,9 +439,12 @@ class StationEvalService:
             raining_now_mm_h=self.config.forecast.rain_threshold_mm_h,
         )
 
-    def _ensure_loaded(self) -> None:
+    def _ensure_points(self) -> None:
         if self._points is None:
             self._points = load_points(Path(self.config.station_eval.points_file))
+
+    def _ensure_loaded(self) -> None:
+        self._ensure_points()
         if self._states is None:
             self._states = self._read_state()
 
@@ -368,6 +481,7 @@ class StationEvalService:
         generated_at: datetime,
         observed_mm_h: Any = None,
         forecast_mm_h: Any = None,
+        postprocess: Any = None,
     ) -> dict | None:
         """Sample, decide, persist. Blocking; returns None when it did nothing."""
         self._ensure_loaded()
@@ -388,6 +502,13 @@ class StationEvalService:
                     forecast_mm_h=forecast_mm_h,
                 )
                 series = sample.forecast_mm_h if sample else None
+                # The feature columns and ``p_post_<lead>`` for this
+                # station this cycle — computed once by the cycle for
+                # every point it serves, read here by coordinate.
+                extras = (
+                    {} if postprocess is None
+                    else postprocess.columns(point["lat"], point["lon"])
+                )
                 obs = Observation(
                     radar_ts_utc=radar_ts,
                     p_rain=sample.p_rain.get(lead) if sample else None,
@@ -395,6 +516,11 @@ class StationEvalService:
                     intensity_mm_h=sample.intensity_mm_h if sample else None,
                     observed_mm_h=sample.observed_mm_h if sample else None,
                     forecast_now_mm_h=series.get(0) if series else None,
+                    # The scoreboard measures the rule the SERVICE runs,
+                    # so it decides on the same probability the push
+                    # engine does, under the same per-row fallback.
+                    p_post=extras.get(core_postprocess.post_column(lead)),
+                    p_source=self.config.push.probability_source,
                 )
                 decision = evaluate(
                     self._states.get(station, INITIAL_STATE),
@@ -429,6 +555,12 @@ class StationEvalService:
                 "action": decision.action,
                 "armed_after": decision.state.armed,
                 "streak_after": decision.state.streak,
+                # Additive (Phase H): the features the nightly refit
+                # trains on and the probability the decision above was
+                # actually taken on. Unknown to every existing reader,
+                # which is the point — ``align_decision_table`` drops
+                # them and the sweep asks for them by name.
+                **extras,
             })
         if not rows:
             _log.info("station_eval_empty", radar_ts=radar_ts.isoformat())
@@ -458,6 +590,7 @@ __all__ = [
     "STATE_VERSION",
     "StationEvalService",
     "append_rows",
+    "extra_schema",
     "load_points",
     "partition_path",
     "state_from_json",

@@ -3,8 +3,9 @@
 ``python -m dmi_nowcast_sidecar.quality_job --config-json '{...}'``
 ``python -m dmi_nowcast_sidecar.quality_job --config-json '{...}' --live-only``
 
-Everything the nightly job does — the push-threshold fit, the report
-build, the two atomic writes — lives here, behind a ``main()`` that takes
+Everything the nightly job does — the post-processing refit, the
+push-threshold fit, the report build, the atomic writes — lives here,
+behind a ``main()`` that takes
 its resolved inputs and outputs as one JSON document and prints a
 one-line JSON summary on stdout. Nothing else is written to stdout, so a
 caller can parse the last line and be sure of what it got.
@@ -95,9 +96,11 @@ _INPUT_PATH_FIELDS = frozenset({
 })
 
 #: ``SweepOptions`` fields that carry a path, or a list of them.
-_SWEEP_PATH_FIELDS = frozenset({"corpus_dir"})
+_SWEEP_PATH_FIELDS = frozenset({"corpus_dir", "postprocess_model"})
 _SWEEP_PATH_LIST_FIELDS = frozenset({"decisions_dirs", "radar_decisions_dirs"})
-_SWEEP_TUPLE_FIELDS = frozenset({"leads", "thresholds", "strata"})
+_SWEEP_TUPLE_FIELDS = frozenset(
+    {"leads", "thresholds", "strata", "design_leads"},
+)
 
 #: The report sections named in the summary line, in document order.
 REPORT_SECTIONS = (
@@ -306,6 +309,64 @@ def run_threshold_fit(
     return {"thresholds_path": str(out), "thresholds_guard": guard}
 
 
+def run_postprocess_fit(
+    fit: dict,
+    *,
+    fitter: Callable[[Any], dict] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """Refit the gauge-trained post-processing model and publish it.
+
+    Returns the summary fields this step owns: ``postprocess_path`` and
+    ``postprocess`` (the fit's counts) on success, ``postprocess_error``
+    otherwise.
+
+    Runs BEFORE the threshold fit, and that order is the point: the
+    thresholds have to be fitted on the probability the engine will decide
+    with, so the model has to exist first. It also means a failed refit
+    leaves BOTH the model and the thresholds on last night's pair, which
+    is the consistent state — a new table fitted against an old model
+    would warn at the wrong percent.
+
+    Never raises. No rows, no features, no gauge truth, a model that will
+    not converge: each leaves the model already in service exactly where
+    it was, which is the failure policy of every other step here.
+    """
+    from .postprocess_fit import options_from_json, run_postprocess_fit as fit_it
+    from .threshold_sweep import SweepError
+
+    out = Path(fit["out"])
+    try:
+        run = fitter or fit_it
+        result = run(options_from_json(fit.get("options") or {}))
+        model = result["model"]
+        # Atomic, like every other publish here: the cycle may be reading
+        # this file at any instant, and a half-written model is a crash in
+        # the fan-out rather than a fallback.
+        write_atomic(out, model.dumps())
+    except SweepError as exc:
+        # Nothing to fit on: not a bug, and not worth a warning every
+        # night while a corpus is still filling up.
+        if log:
+            log(f"postprocess fit skipped: {exc}")
+        return {"postprocess_error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — the report still builds
+        if log:
+            log(f"postprocess fit failed: {type(exc).__name__}: {exc}")
+        return {"postprocess_error": f"{type(exc).__name__}: {exc}"}
+    summary = dict(result.get("summary") or {})
+    if log:
+        log(
+            f"postprocess fit done: {out} "
+            f"({summary.get('rows')} row(s), leads {summary.get('leads')})"
+        )
+    return {
+        "postprocess_path": str(out),
+        "postprocess_fitted_at": summary.get("fitted_at_utc"),
+        "postprocess": summary,
+    }
+
+
 def run_job(
     config: dict,
     *,
@@ -313,9 +374,10 @@ def run_job(
     builder: Callable[..., dict] | None = None,
     renderer: Callable[[dict], str] | None = None,
     fitter: Callable[[Any], dict] | None = None,
+    postprocess_fitter: Callable[[Any], dict] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict:
-    """The whole job: fit, build, write, summarise.
+    """The whole job: refit, fit, build, write, summarise.
 
     ``live_only`` is the hourly refresh described in the module
     docstring: no fit, no markdown twin, and the builder is handed the
@@ -348,9 +410,19 @@ def run_job(
     # is a once-a-day decision, and refitting it hourly would both cost a
     # second pass over the season and make the served rule jitter.
     fit_summary: dict = {}
+    # The post-processing model first of all, so the threshold sweep
+    # below is fitted on tonight's probability rather than last night's.
+    # Nightly only, for the same reason the threshold fit is: it is a
+    # once-a-day decision and an hourly refit would make the served rule
+    # jitter under the subscribers.
+    post = config.get("fit_postprocess") or {}
+    if post.get("enabled") and not live_only:
+        fit_summary.update(
+            run_postprocess_fit(post, fitter=postprocess_fitter, log=log),
+        )
     fit = config.get("fit") or {}
     if fit.get("enabled") and not live_only:
-        fit_summary = run_threshold_fit(fit, fitter=fitter, log=log)
+        fit_summary.update(run_threshold_fit(fit, fitter=fitter, log=log))
 
     inputs = inputs_from_json(quality.get("inputs") or {})
     if log:
@@ -392,6 +464,12 @@ def run_job(
         "thresholds_path": None,
         "thresholds_guard": {},
         "thresholds_error": None,
+        # Additive (Phase H): where the refit model landed, its stamp, and
+        # its counts. Null throughout when the step is off or skipped.
+        "postprocess_path": None,
+        "postprocess_fitted_at": None,
+        "postprocess": {},
+        "postprocess_error": None,
         "error": None,
     }
     summary.update(fit_summary)
@@ -463,6 +541,10 @@ def main(argv: list[str] | None = None) -> int:
             "thresholds_path": None,
             "thresholds_guard": {},
             "thresholds_error": None,
+            "postprocess_path": None,
+            "postprocess_fitted_at": None,
+            "postprocess": {},
+            "postprocess_error": None,
             "error": f"{type(exc).__name__}: {exc}",
         }
     print(json.dumps(summary, sort_keys=True), flush=True)
@@ -479,6 +561,7 @@ __all__ = [
     "read_previous",
     "redirect_structlog_to_stderr",
     "run_job",
+    "run_postprocess_fit",
     "run_threshold_fit",
     "sweep_options_from_json",
     "sweep_options_to_json",

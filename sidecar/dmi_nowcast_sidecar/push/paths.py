@@ -25,6 +25,13 @@ KEY_FILENAME = "vapid_private.pem"
 # data volume. ``push/`` holds the two secrets, and nothing else.
 THRESHOLDS_FILENAME = "push_thresholds.json"
 
+# The fitted post-processing model (Phase H, H-P), for the same reason and
+# on the same footing as the threshold table: fitted on the private
+# instance, served at ``/calibration/postprocess.json``, pulled by the
+# public instance's sync task, read by ``push.postprocess.PostprocessTable``
+# and by the cycle. Not a secret, so not under ``push/``.
+POSTPROCESS_FILENAME = "postprocess.json"
+
 
 def push_dir(config: Config) -> Path:
     """``<storage.data_dir>/push`` — the default home of both files."""
@@ -58,6 +65,20 @@ def resolved_thresholds_path(config: Config) -> Path:
     return Path(config.storage.data_dir) / THRESHOLDS_FILENAME
 
 
+def resolved_postprocess_path(config: Config) -> Path:
+    """Configured ``push.postprocess_path``, else ``<data_dir>/<name>``.
+
+    The twin of :func:`resolved_thresholds_path`, and for the same reason:
+    the nightly refit writes here, the sync task writes here,
+    ``/calibration/postprocess.json`` serves this, and the cycle's
+    ``PostprocessTable`` reads it. One answer, or the file appears and
+    nothing loads it.
+    """
+    if config.push.postprocess_path is not None:
+        return Path(config.push.postprocess_path)
+    return Path(config.storage.data_dir) / POSTPROCESS_FILENAME
+
+
 __all__ = [
     "DB_FILENAME",
     "KEY_FILENAME",
@@ -65,6 +86,8 @@ __all__ = [
     "push_dir",
     "resolved_db_path",
     "resolved_key_path",
+    "resolved_postprocess_path",
     "resolved_thresholds_path",
+    "POSTPROCESS_FILENAME",
     "THRESHOLDS_FILENAME",
 ]

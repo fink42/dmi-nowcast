@@ -41,8 +41,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import Config
 from ..national_sample import sample_point
-from .paths import resolved_thresholds_path
 from .endpoint_policy import validate_endpoint
+from .paths import resolved_postprocess_path, resolved_thresholds_path
+from .postprocess import PostprocessTable
 from .store import NewSubscription, PushStore, sub_id
 from .thresholds import ThresholdTable
 
@@ -186,12 +187,20 @@ class ThresholdOut(BaseModel):
 
 
 class PushOptionsResponse(BaseModel):
-    """The one knob, resolved: horizons on offer and the rule behind each."""
+    """The one knob, resolved: horizons on offer and the rule behind each.
+
+    ``probability_source`` and ``postprocess_fitted_at_utc`` are additive
+    (Phase H): which probability this instance's notifications are decided
+    on, and the stamp of the model behind it. A deployed client that does
+    not know the fields sees the answer it always did.
+    """
 
     lead_options: list[int]
     fallback_threshold_pct: int
     fitted_at_utc: str | None = None
     thresholds: dict[str, ThresholdOut]
+    probability_source: str = "curve"
+    postprocess_fitted_at_utc: str | None = None
 
 
 class SendResponse(BaseModel):
@@ -231,6 +240,7 @@ def build_router(
     public_key: str | None = None,
     service: "PushService | None" = None,
     thresholds: ThresholdTable | None = None,
+    postprocess: "PostprocessTable | None" = None,
 ) -> APIRouter:
     """Build the ``/api/push`` router.
 
@@ -245,6 +255,14 @@ def build_router(
     # built without one still answers — with the fallback for every lead.
     table = thresholds if thresholds is not None else ThresholdTable(
         resolved_thresholds_path(config),
+    )
+    # The engine's own post-processing table (Phase H), so what /options
+    # reports is the model the fan-out actually scored with. A router
+    # built without one reports the file on disk; one built with neither
+    # reports "no model", which is the honest answer for an instance that
+    # has never been fitted.
+    post_table = postprocess if postprocess is not None else PostprocessTable(
+        resolved_postprocess_path(config),
     )
 
     def _require_enabled() -> PushStore:
@@ -310,6 +328,10 @@ def build_router(
         response.headers.update(_CACHE_5_MIN)
         leads = lead_options(config)
         await asyncio.to_thread(table.maybe_reload)
+        await asyncio.to_thread(post_table.maybe_reload)
+        active = (
+            config.push.probability_source == "postprocess" and post_table.active
+        )
         return PushOptionsResponse(
             lead_options=leads,
             fallback_threshold_pct=table.fallback_threshold_pct,
@@ -318,6 +340,16 @@ def build_router(
                 key: ThresholdOut(**value)
                 for key, value in table.snapshot(leads).items()
             },
+            # What the rule reads, after the model's own availability:
+            # configured for the model but without one, this says
+            # "curve", because that is what a notification would be
+            # decided on right now.
+            probability_source=(
+                "postprocess" if active else "curve"
+            ),
+            postprocess_fitted_at_utc=(
+                post_table.fitted_at_utc if active else None
+            ),
         )
 
     @router.post("/subscribe", response_model=SubscribeResponse)

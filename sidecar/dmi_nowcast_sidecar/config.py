@@ -348,6 +348,25 @@ class PushConfig(BaseModel):
     # table is not an error: every lead falls back to
     # ``push_thresholds.DEFAULT_FALLBACK_THRESHOLD_PCT``.
     thresholds_path: Path | None = None
+    # The fitted post-processing model (Phase H, H-P), written by the
+    # nightly refit and read by ``push.postprocess.PostprocessTable``.
+    # None -> ``<storage.data_dir>/postprocess.json``; resolved by
+    # ``push.paths.resolved_postprocess_path``. A missing or unreadable
+    # model is not an error: every observation falls back to the served
+    # curve-calibrated probability, which is the rule that shipped.
+    postprocess_path: Path | None = None
+    # WHICH probability the decision rule compares against the threshold.
+    # ``postprocess`` is the gauge-trained model (ΔBSS +0.14…+0.19 at the
+    # gauges, ΔF1 +0.03…+0.06 on the warning rule -- see
+    # ``archive/l3_and_postprocess_20260911/``), falling back per
+    # observation to the curve whenever the model has nothing to say.
+    # ``curve`` is the pre-H-P behaviour, bit for bit, and is the
+    # rollback: one key, no redeploy of anything else.
+    #
+    # The website is deliberately NOT affected either way. It keeps
+    # showing the curve-calibrated number, which is what the reliability
+    # diagrams and the quality report are written about.
+    probability_source: Literal["postprocess", "curve"] = "postprocess"
     # Offered lead times are the national probability leads at or beyond
     # this. Below ~20 min a browser notification arrives too late to act on.
     min_lead_min: Annotated[int, Field(ge=0, le=180)] = 20
@@ -572,6 +591,42 @@ class FitThresholdsConfig(BaseModel):
     workers: Annotated[int, Field(ge=1, le=64)] = 1
 
 
+class FitPostprocessConfig(BaseModel):
+    """The nightly post-processing refit (Phase H, H-P).
+
+    A step of the quality-report task, ahead of the threshold fit, for the
+    same reasons that one is a step: it reads the same decision rows and
+    the same gauge store, and the threshold the service warns at has to be
+    fitted on the probability the service decides with. Fit first, sweep
+    second, report third.
+
+    Private-instance only, by construction rather than by a flag: the fit
+    needs gauge truth, and the gauge store is on the corpus volume the
+    public stack does not have. The public instance receives the finished
+    ``postprocess.json`` through ``sync`` and only ever serves it.
+
+    The fit is on ALL rows — no leave-one-month-out. The out-of-fold
+    evidence is the offline script's job
+    (``scripts/fit_postprocess.py``, ``archive/l3_and_postprocess_20260911/``);
+    running ten folds nightly would cost ten times the fit for a number
+    nothing here gates on, on a VM whose batch budget is already shared
+    with the threshold sweep.
+    """
+
+    enabled: bool = True
+    #: Decision-row trees to fit on. Empty -> ``fit_thresholds.decisions_dirs``,
+    #: which is what makes the default correct: one set of rows, fitted on
+    #: and swept over, replay first and the live scoreboard second.
+    decisions_dirs: list[Path] = Field(default_factory=list)
+    #: Ridge strength on the slopes (scikit-learn's 1/C). The intercept is
+    #: never penalised. 1.0 is what the archived fit used.
+    l2: Annotated[float, Field(ge=0.0)] = 1.0
+    #: Where the fitted model is written. None -> the file the service
+    #: reads, ``push.postprocess_path`` (resolved) — fitting into a file
+    #: nothing loads would be a very well-documented no-op.
+    out: Path | None = None
+
+
 class QualityReportConfig(BaseModel):
     """The nightly ``quality.json`` build (Phase F, F4).
 
@@ -631,6 +686,13 @@ class QualityReportConfig(BaseModel):
     #: service is serving as of tonight rather than last night's.
     fit_thresholds: FitThresholdsConfig = Field(
         default_factory=FitThresholdsConfig,
+    )
+    #: Refit the gauge-trained post-processing model (Phase H, H-P) BEFORE
+    #: the threshold fit, so tonight's thresholds are fitted on tonight's
+    #: probability. Full nightly build only — never on the hourly live
+    #: refresh, which exists to move the live sections and nothing else.
+    fit_postprocess: FitPostprocessConfig = Field(
+        default_factory=FitPostprocessConfig,
     )
 
     @field_validator("at_utc")
@@ -694,6 +756,12 @@ class SyncConfig(BaseModel):
         default_factory=lambda: [
             "nowcast/quality.json",
             "calibration/national_curves.json",
+            # The gauge-trained post-processing model (Phase H, H-P). The
+            # public instance runs its own push engine but has no gauge
+            # store, so it can only ever receive this file. Without it the
+            # notifications there fall back to the curve — a working
+            # service with the worse probability.
+            "calibration/postprocess.json",
         ],
     )
     timeout_s: Annotated[float, Field(gt=0, le=300)] = 30.0

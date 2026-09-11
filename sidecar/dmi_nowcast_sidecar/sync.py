@@ -15,6 +15,13 @@ Two files the public instance serves but cannot produce:
     Copying it here is what makes the public instance's notifications
     warn at the measured threshold for each horizon instead of the
     shipped fallback.
+``calibration/postprocess.json``
+    The gauge-trained post-processing model, refit nightly beside the
+    thresholds (Phase H, H-P). The public instance runs its own cycle and
+    its own push engine but has no gauge store, so it can never fit this
+    and only ever serves it. Without the copy its notifications fall back
+    to the curve-calibrated probability — a working service, with the
+    worse number.
 
 Both are small, static-per-cycle JSON documents on a network only these
 two containers share, so the transport is deliberately dull: one
@@ -55,26 +62,28 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Config
-from .push.paths import resolved_thresholds_path
+from .push.paths import resolved_postprocess_path, resolved_thresholds_path
 
 _log = structlog.get_logger(__name__)
 
 #: Spread the poll off the exact minute boundary, as every other task does.
 JITTER_SEC = 30
 
-#: The two files that do NOT land under ``data_dir`` by their relative
+#: The three files that do NOT land under ``data_dir`` by their relative
 #: path: the engine reads its curves from
-#: ``calibration.national_curves_path`` and the push service reads its
-#: thresholds from ``push.thresholds_path``, wherever the operator put
-#: them.
+#: ``calibration.national_curves_path``, the push service reads its
+#: thresholds from ``push.thresholds_path`` and the cycle reads its
+#: post-processing model from ``push.postprocess_path``, wherever the
+#: operator put them.
 CURVES_FILE = "calibration/national_curves.json"
 THRESHOLDS_FILE = "calibration/push_thresholds.json"
+POSTPROCESS_FILE = "calibration/postprocess.json"
 
 
 def target_path(config: Config, name: str) -> Path:
     """Where a synced file lands on this instance.
 
-    Everything is ``<storage.data_dir>/<name>`` except the two fitted
+    Everything is ``<storage.data_dir>/<name>`` except the three fitted
     files, which go to the paths the engine and the push service actually
     read. Getting this wrong is silent — the file appears, nothing loads
     it — so it lives in one function with one test.
@@ -83,6 +92,8 @@ def target_path(config: Config, name: str) -> Path:
         return Path(config.calibration.national_curves_path)
     if name == THRESHOLDS_FILE:
         return resolved_thresholds_path(config)
+    if name == POSTPROCESS_FILE:
+        return resolved_postprocess_path(config)
     return Path(config.storage.data_dir).joinpath(*PurePosixPath(name).parts)
 
 
@@ -297,10 +308,11 @@ def build_artifact_sync(
     """The sync task for this config, or ``None`` when it must not run.
 
     When ``engine`` is given, a freshly-synced curve file nudges it to
-    re-read the curves at the start of its next cycle; ``push_thresholds``
-    is the same arrangement for the fitted threshold table, nudged at the
-    start of the next fan-out. Without either, the file still lands — it
-    just takes a restart to take effect.
+    re-read the curves at the start of its next cycle, and a freshly-synced
+    post-processing model nudges its ``PostprocessTable`` the same way;
+    ``push_thresholds`` is the same arrangement for the fitted threshold
+    table, nudged at the start of the next fan-out. Without them, the file
+    still lands — it just takes a restart to take effect.
     """
     if not config.sync.enabled:
         return None
@@ -314,6 +326,8 @@ def build_artifact_sync(
             target = (engine, "note_curves_changed")
         elif name == THRESHOLDS_FILE:
             target = (push_thresholds, "note_changed")
+        elif name == POSTPROCESS_FILE:
+            target = (getattr(engine, "postprocess", None), "note_changed")
         if target is None or target[0] is None:
             return
         owner, hook = target
@@ -331,6 +345,7 @@ def build_artifact_sync(
 
 __all__ = [
     "CURVES_FILE",
+    "POSTPROCESS_FILE",
     "THRESHOLDS_FILE",
     "ArtifactSync",
     "SyncFileResult",

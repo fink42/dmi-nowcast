@@ -66,15 +66,37 @@
 #   QUALITY_SWEEP_JSON        also keep the full sweep record here
 #                             (default $CORPUS_DIR/thresholds/sweep.json)
 #
+# The gauge-trained post-processing refit (Phase H, H-P) is a second
+# OPTIONAL step, off unless QUALITY_FIT_POSTPROCESS=1, and it runs BEFORE
+# the threshold fit — a threshold is a percent ON a probability, so the
+# model has to exist before the sweep can be fitted on what the engine
+# reads. This is how the FIRST model is made (or seeded: an artefact from
+# scripts/fit_postprocess.py is the same document, and copying it into
+# QUALITY_POSTPROCESS_OUT is a valid seed); after that, turn on
+# quality_report.fit_postprocess.enabled and it happens nightly.
+#
+#   QUALITY_FIT_POSTPROCESS   1 to refit the model first (default off)
+#   QUALITY_POSTPROCESS_OUT   the model the cycle reads
+#                             (default /var/lib/dmi-nowcast/postprocess.json)
+#   QUALITY_FIT_L2            ridge on the slopes (default 1.0)
+#   QUALITY_FIT_DESIGN_LEADS  leads whose raw fraction enters the design
+#                             (default 10,20,30,45,60 — the served leads)
+#   QUALITY_FIT_PROBABILITY   which probability the THRESHOLD fit is fitted
+#                             on: postprocess (default, matching
+#                             push.probability_source) or curve
+#
 # Usage:
 #   sidecar/deploy/quality_report.sh
 #   QUALITY_FIT_THRESHOLDS=1 sidecar/deploy/quality_report.sh
+#   QUALITY_FIT_POSTPROCESS=1 QUALITY_FIT_THRESHOLDS=1 \
+#       sidecar/deploy/quality_report.sh
 #   QUALITY_RADAR_CORPUS=/var/lib/dmi-nowcast-corpus/calibration/national_corpus_20260901_020000.parquet \
 #       sidecar/deploy/quality_report.sh
 #
 # Verify afterwards, from the host:
 #   curl -fs http://localhost:8081/nowcast/quality.json | head -c 400
 #   curl -fs http://localhost:8081/calibration/push_thresholds.json | head -c 400
+#   curl -fs http://localhost:8081/calibration/postprocess.json | head -c 400
 #   curl -fs http://localhost:8081/api/push/options
 set -euo pipefail
 
@@ -100,6 +122,12 @@ fit_workers=${QUALITY_FIT_WORKERS:-4}
 fit_min_warnings=${QUALITY_FIT_MIN_WARNINGS:-30}
 fit_min_delta=${QUALITY_FIT_MIN_DELTA:-5}
 sweep_json=${QUALITY_SWEEP_JSON:-$corpus_dir/thresholds/sweep.json}
+
+fit_postprocess=${QUALITY_FIT_POSTPROCESS:-0}
+postprocess_out=${QUALITY_POSTPROCESS_OUT:-/var/lib/dmi-nowcast/postprocess.json}
+fit_l2=${QUALITY_FIT_L2:-1.0}
+fit_design_leads=${QUALITY_FIT_DESIGN_LEADS:-10,20,30,45,60}
+fit_probability=${QUALITY_FIT_PROBABILITY:-postprocess}
 
 # Bring scripts/ into the container on demand — the runtime image does not
 # carry them. Repo mounted read-only; every output goes to a volume.
@@ -144,6 +172,22 @@ add_if_exists() {   # add_if_exists <json-key> <path> <test-flag>
 # The stability guard is against the file already in service: the job
 # reads it before it overwrites it, and an absent one reads as a first
 # fit. That is the same code the nightly task runs.
+# --- optional: refit the post-processing model first -------------------
+# Before the threshold fit, and for the reason in the header: a percent is
+# a threshold ON a probability.
+post_on=false
+if [[ "$fit_postprocess" == "1" ]]; then
+    echo "==> Refitting the post-processing model (Phase H)"
+    echo "    decisions → $decisions_dirs"
+    echo "    leads $fit_leads, design leads $fit_design_leads, L2 $fit_l2"
+    echo "    out → $postprocess_out"
+    echo "    rows without feature columns are skipped and counted"
+    post_on=true
+    echo "    the running cycle re-reads it at its next full cycle"
+else
+    echo "==> Skipping the post-processing refit (QUALITY_FIT_POSTPROCESS=1 to run it)"
+fi
+
 fit_on=false
 if [[ "$fit_thresholds" == "1" ]]; then
     echo "==> Fitting the push thresholds (Phase G)"
@@ -185,15 +229,19 @@ config_json=$(run_in_repo python - \
     "$corpus_dir" "$out" "$md_dir" "$live_days" \
     "$fit_on" "$thresholds_out" "$sweep_json" "$fit_leads" "$fit_grid" \
     "$fit_workers" "$fit_min_warnings" "$fit_min_delta" \
-    "$radar_decisions" "$decisions_dirs" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
+    "$radar_decisions" "$decisions_dirs" \
+    "$post_on" "$postprocess_out" "$fit_l2" "$fit_design_leads" \
+    "$fit_probability" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
 import json
 import sys
 
+from dmi_nowcast_core.postprocess import POST_COLUMN_TEMPLATE
 from dmi_nowcast_sidecar.threshold_sweep import parse_thresholds
 
 (corpus_dir, out, md_dir, live_days, fit_on, thresholds_out, sweep_json,
  leads, grid, workers, min_warnings, min_delta, radar_decisions,
- decisions_dirs, *pairs) = sys.argv[1:]
+ decisions_dirs, post_on, postprocess_out, l2, design_leads,
+ probability, *pairs) = sys.argv[1:]
 
 inputs = {"corpus_dir": corpus_dir, "live_days": int(live_days)}
 for pair in pairs:
@@ -207,7 +255,23 @@ config = {
         "inputs": inputs,
     },
     "fit": {"enabled": False},
+    "fit_postprocess": {"enabled": False},
 }
+lead_list = [int(v) for v in leads.split(",") if v.strip()]
+design_list = [int(v) for v in design_leads.split(",") if v.strip()]
+if post_on == "true":
+    config["fit_postprocess"] = {
+        "enabled": True,
+        "out": postprocess_out,
+        "options": {
+            "decisions_dirs": decisions_dirs.split(),
+            "corpus_dir": corpus_dir,
+            "out": postprocess_out,
+            "leads": lead_list,
+            "design_leads": design_list,
+            "l2": float(l2),
+        },
+    }
 if fit_on == "true":
     config["fit"] = {
         "enabled": True,
@@ -219,10 +283,19 @@ if fit_on == "true":
             "decisions_dirs": decisions_dirs.split(),
             "corpus_dir": corpus_dir,
             "radar_decisions_dirs": [radar_decisions] if radar_decisions else None,
-            "leads": [int(v) for v in leads.split(",") if v.strip()],
+            "leads": lead_list,
             "thresholds": list(parse_thresholds(grid)),
             "workers": int(workers),
             "min_warnings": int(min_warnings),
+            # Fitted on the probability the engine decides with, or the
+            # served one — never a third answer.
+            "probability_column": (
+                POST_COLUMN_TEMPLATE if probability == "postprocess" else None
+            ),
+            "postprocess_model": (
+                postprocess_out if probability == "postprocess" else None
+            ),
+            "design_leads": design_list,
         },
     }
 print(json.dumps(config, sort_keys=True))

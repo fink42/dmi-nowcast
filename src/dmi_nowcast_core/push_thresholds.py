@@ -104,6 +104,13 @@ OBJECTIVE_SPEC: dict[str, type] = {
 #: made by a schema check rather than by a measurement.
 OBJECTIVE_OPTIONAL_SPEC: dict[str, type] = {
     "onset_min_mm": float,
+    # Which probability the percents are thresholds on (Phase H): the
+    # served ``p_rain_{lead}``, or the post-processed ``p_post_{lead}``
+    # the push engine decides with. Optional for the same reason
+    # ``onset_min_mm`` is — a table fitted before the key existed must
+    # keep loading, or a deploy would drop every lead to the fallback
+    # until the next nightly refit.
+    "probability_column": str,
 }
 
 #: ``window``: the evidence the fit stands on.

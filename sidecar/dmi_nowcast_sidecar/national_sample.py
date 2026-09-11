@@ -72,13 +72,27 @@ def product_pixel(
 ) -> tuple[int, int] | None:
     """Nearest product-grid pixel for ``(lat, lon)``; ``None`` off coverage."""
     idx = geo.lonlat_to_grid(lon, lat)
+    return product_pixel_of(products, idx.row, idx.col)
+
+
+def product_pixel_of(
+    products: NationalProducts, row: float, col: float,
+) -> tuple[int, int] | None:
+    """The same pixel, from a FRACTIONAL native index already in hand.
+
+    The cycle projects its served points once — the post-processing
+    features need the native index anyway — and would otherwise pay for a
+    second pyproj pass per point to come back here. The arithmetic stays
+    in one place: :func:`product_pixel` is this function plus the
+    projection, and the browser-side sampler mirrors this one.
+    """
     f = products.downsample_factor
-    row = int(round(idx.row / f))
-    col = int(round(idx.col / f))
+    r = int(round(row / f))
+    c = int(round(col / f))
     h, w = products.eta_min.shape
-    if not (0 <= row < h and 0 <= col < w):
+    if not (0 <= r < h and 0 <= c < w):
         return None
-    return row, col
+    return r, c
 
 
 def sample_point(
@@ -143,4 +157,10 @@ def finite_or_none(value: Any) -> float | None:
     return v if math.isfinite(v) else None
 
 
-__all__ = ["PointSample", "product_pixel", "sample_point", "finite_or_none"]
+__all__ = [
+    "PointSample",
+    "finite_or_none",
+    "product_pixel",
+    "product_pixel_of",
+    "sample_point",
+]

@@ -114,12 +114,11 @@ DEFAULT_LEADS: tuple[int, ...] = (20, 30, 45, 60)
 #: what separates a distant band from an overhead drizzle edge.
 DEFAULT_DESIGN_LEADS: tuple[int, ...] = (10, 20, 30, 45, 60)
 
-#: Column the write-back adds, per lead.
-POST_COLUMN_TEMPLATE = "p_post_{lead}"
-
-
-def post_column(lead: int) -> str:
-    return POST_COLUMN_TEMPLATE.format(lead=int(lead))
+#: Column the write-back adds, per lead. The core module's name, so the
+#: study, the nightly refit, the live writer and the sweep all mean one
+#: column.
+POST_COLUMN_TEMPLATE = pp.POST_COLUMN_TEMPLATE
+post_column = pp.post_column
 
 
 # ---------------------------------------------------------------------------
@@ -127,36 +126,13 @@ def post_column(lead: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def feature_source_columns(design_leads: Sequence[int]) -> list[str]:
-    """Every stored column the design reads, in a stable order.
-
-    ``season`` and ``hour_utc`` are absent on purpose: both are functions
-    of the decision instant, which is already loaded, and deriving them
-    keeps the loader numeric-only. The replay writes them to the parquet
-    for a human or a DuckDB query, and
-    ``tests/test_postprocess.py`` pins the derivation against the column.
-    """
-    names = [pp.raw_fraction_column(lead) for lead in sorted(set(design_leads))]
-    names += [
-        name for name in pp.DESIGN_SOURCE_COLUMNS
-        if name not in ("hour_utc",)
-    ]
-    return list(dict.fromkeys(names))
-
-
-#: Columns the decision schema already carries, so their presence says
-#: nothing about whether the replay was run with ``--features``.
-SHARED_SOURCE_COLUMNS: frozenset[str] = frozenset(
-    {"observed_mm_h", "eta_min", "intensity_mm_h"}
-)
-
-
-def feature_only_columns(design_leads: Sequence[int]) -> list[str]:
-    """The columns that exist ONLY when the replay wrote features."""
-    return [
-        name for name in feature_source_columns(design_leads)
-        if name not in SHARED_SOURCE_COLUMNS
-    ]
+#: The design's source columns, and the subset that exists only when a run
+#: wrote features. Both live in the core module now: the nightly refit in
+#: the sidecar asks the same two questions of the same rows, and a second
+#: opinion would silently change which rows are trained on.
+feature_source_columns = pp.feature_source_columns
+feature_only_columns = pp.feature_only_columns
+SHARED_SOURCE_COLUMNS = pp.SHARED_SOURCE_COLUMNS
 
 
 def load_rows(

@@ -25,6 +25,17 @@ the state has been written. From there:
    every ``push_eval`` line of a cycle was decided under the same rule and
    says which rule that was.
 
+3a. **And one probability, chosen once per cycle.** Under
+   ``push.probability_source: postprocess`` (the default since Phase H)
+   the rule reads the gauge-trained post-processed probability the cycle
+   computed for this subscription's point — ΔBSS +0.14…+0.19 against the
+   curve at the gauges, ΔF1 +0.03…+0.06 on this very rule. The fallback is
+   per observation, not per cycle: a point the model could not score is
+   judged on the curve and the log line says so, because one point off the
+   model's coverage must not silence it, and one model outage must not
+   silence everyone. ``push.probability_source: curve`` restores the
+   pre-Phase-H behaviour exactly, and is the rollback.
+
 4. **Persist first, send second.** The new state is written before any
    network call, so a crash mid-fan-out can only cost a notification, not
    cause a repeat. The failure the user forgives is a missed alert; the
@@ -101,6 +112,18 @@ class PushService:
     def last_fanout(self) -> dict | None:
         return self._last_fanout
 
+    # -- what the cycle needs from us ---------------------------------------
+
+    def decision_points(self) -> list[tuple[float, float]]:
+        """Every subscription's point, for the cycle's feature table (H-P).
+
+        Registered with the engine by ``app.create_app`` and called once
+        per full cycle, inside the cycle worker. Coordinates only: the
+        cycle scores *places*, and the endpoint — a bearer capability —
+        never leaves this store.
+        """
+        return [(sub.lat, sub.lon) for sub in self.store.list()]
+
     # -- the cycle hook -----------------------------------------------------
 
     async def after_cycle(self, result: CycleResult) -> None:
@@ -170,6 +193,32 @@ class PushService:
             raining_now_mm_h=self.config.forecast.rain_threshold_mm_h,
         )
 
+    def _postprocess_for(self, radar_ts: datetime) -> Any:
+        """This cycle's post-processing answer, or None to use the curve.
+
+        Three ways to get None, all of them meaning "decide on the served
+        probability": the operator asked for ``curve``; the cycle produced
+        nothing (no model, a feature failure, a points source that
+        raised); or the object belongs to a different frame — the same
+        trap the products check guards, and for the same reason.
+        """
+        if self.config.push.probability_source != "postprocess":
+            return None
+        latest = getattr(self.engine, "postprocess_latest", None)
+        if latest is None or not getattr(latest, "active", False):
+            return None
+        stamp = getattr(latest, "radar_ts_utc", None)
+        if stamp is not None and stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if stamp != radar_ts:
+            _log.info(
+                "push_postprocess_stale",
+                postprocess_ts=stamp.isoformat() if stamp else None,
+                radar_ts=radar_ts.isoformat(),
+            )
+            return None
+        return latest
+
     def _evaluate_and_send(
         self,
         products: Any,
@@ -186,10 +235,15 @@ class PushService:
         # version of the rule, and the ``push_eval`` lines of a cycle are
         # comparable with each other.
         self.thresholds.maybe_reload()
+        # Resolved once, for the same reason: every subscription of one
+        # cycle is judged on one probability source.
+        post = self._postprocess_for(radar_ts)
+        source: str = self.config.push.probability_source
         subs = self.store.list()
         rules = self._rules()
         pending: list[tuple[Subscription, dict]] = []
         errors = 0
+        curve_fallbacks = 0
         actions: dict[str, int] = {}
 
         for sub in subs:
@@ -206,7 +260,14 @@ class PushService:
                 intensity_mm_h=sample.intensity_mm_h if sample else None,
                 observed_mm_h=sample.observed_mm_h if sample else None,
                 forecast_now_mm_h=series.get(0) if series else None,
+                p_post=(
+                    None if post is None
+                    else post.probability(sub.lat, sub.lon, sub.lead_min)
+                ),
+                p_source="postprocess" if post is not None else "curve",
             )
+            if post is not None and obs.p_post is None:
+                curve_fallbacks += 1
             state = SubState(
                 armed=sub.armed,
                 streak=sub.streak,
@@ -260,13 +321,19 @@ class PushService:
                 lead_min=sub.lead_min,
                 threshold_pct=threshold_pct,
                 threshold_source=threshold_source,
+                # Both probabilities, and which one the decision used:
+                # every ``push_eval`` line has to be replayable on its own,
+                # and "would the curve have fired here?" is the first
+                # question anyone asks of a post-processed warning.
+                p_source=obs.p_decision_source,
                 p_rain=obs.p_rain,
+                p_post=obs.p_post,
                 eta_min=obs.eta_min,
                 intensity_mm_h=obs.intensity_mm_h,
                 observed_mm_h=obs.observed_mm_h,
                 forecast_now_mm_h=obs.forecast_now_mm_h,
             )
-            notify = decision.action == "notify" and obs.p_rain is not None
+            notify = decision.action == "notify" and obs.p_decision is not None
             new_state = decision.state
             # Persist BEFORE sending: a crash may cost a notification, it
             # must never cause a duplicate one.
@@ -286,7 +353,10 @@ class PushService:
                         lat=sub.lat,
                         lon=sub.lon,
                         eta_min=obs.eta_min,
-                        p_rain=float(obs.p_rain),  # type: ignore[arg-type]
+                        # The number the decision was taken on, so the
+                        # text a subscriber reads and the rule that woke
+                        # them are the same probability.
+                        p_rain=float(obs.p_decision),  # type: ignore[arg-type]
                         lead_min=sub.lead_min,
                         intensity_mm_h=obs.intensity_mm_h,
                         sent_utc=now_utc,
@@ -297,6 +367,15 @@ class PushService:
         summary = {
             "radar_ts": radar_ts.isoformat(),
             "thresholds_fitted_at": self.thresholds.fitted_at_utc,
+            # Additive (Phase H): which probability this cycle decided on,
+            # the model behind it, and how many observations fell back to
+            # the curve because the model could not speak for them.
+            "probability_source": source,
+            "postprocess_active": post is not None,
+            "postprocess_fitted_at": (
+                None if post is None else post.fitted_at_utc
+            ),
+            "postprocess_curve_fallbacks": curve_fallbacks,
             "subscriptions": len(subs),
             "notified": len(pending),
             "eval_errors": errors,

@@ -135,6 +135,26 @@ lightning:
 #   # <storage.data_dir>/push_thresholds.json. Missing or unreadable is
 #   # not an error: every horizon falls back to 40 %.
 #   thresholds_path: null
+#   # The fitted post-processing model the notifications are DECIDED on
+#   # (Phase H, H-P), written by quality_report.fit_postprocess below and
+#   # re-read without a restart. null -> <storage.data_dir>/postprocess.json.
+#   # Missing or unreadable is not an error: every observation falls back
+#   # to the curve-calibrated probability.
+#   postprocess_path: null
+#   # WHICH probability the rule compares to the threshold above.
+#   #   postprocess  the gauge-trained model (default). At the gauges,
+#   #                leave-one-month-out: BSS +0.14..+0.19 over the curve
+#   #                at every lead and season, F1 +0.03..+0.06 on this
+#   #                very rule at three of four leads
+#   #                (archive/l3_and_postprocess_20260911/).
+#   #   curve        the pre-Phase-H behaviour, bit for bit. THE ROLLBACK.
+#   # The website is unaffected either way: it keeps showing the
+#   # curve-calibrated number the reliability diagrams are written about.
+#   #
+#   # Order of operations on a first deploy: the served postprocess.json
+#   # must exist BEFORE this is set to postprocess, and the thresholds
+#   # must then be refit on it (the nightly job does both, in that order).
+#   probability_source: postprocess
 #   # NOT a menu any more: the bounds and default of the hidden
 #   # threshold_pct OVERRIDE that POST /api/push/subscribe still accepts.
 #   threshold_options_pct: [40, 60, 80]
@@ -335,6 +355,27 @@ quality_report:
     dry_min: 60
     onset_min_mm: 0.2
     workers: 4
+  # The nightly post-processing refit (Phase H, H-P). Runs BEFORE the
+  # threshold fit above, and that order is the whole point: a threshold is
+  # a percent ON a probability, so the model has to exist before the sweep
+  # can be fitted on what the engine will read. Fitted on ALL rows — the
+  # out-of-fold evidence is the offline study's job
+  # (scripts/fit_postprocess.py, archive/l3_and_postprocess_20260911/).
+  #
+  # Rows without the feature columns are skipped and counted, so a corpus
+  # that still holds pre-feature replay days fits on the rest rather than
+  # on an imputed mean.
+  fit_postprocess:
+    enabled: true
+    # null/empty -> fit_thresholds.decisions_dirs, which is what makes the
+    # default correct: one set of rows, fitted on and then swept over.
+    decisions_dirs: []
+    # Ridge on the slopes (scikit-learn's 1/C); the intercept is never
+    # penalised. 1.0 is what the archived fit used.
+    l2: 1.0
+    # null -> push.postprocess_path, i.e. the file the running cycle
+    # reads. Fitting into anything else would be a no-op.
+    out: null
 
 # --- Artifact sync (Phase F, F4) --------------------------------------
 # OFF here, and correctly so: this instance PRODUCES the quality report
@@ -343,3 +384,17 @@ quality_report:
 #
 # sync:
 #   enabled: false
+#   source_url: http://dmi-nowcast-sidecar:8081
+#   interval_min: 60
+#   # Everything the public instance cannot produce for itself. The two
+#   # calibration files land where the running process READS them
+#   # (calibration.national_curves_path, push.postprocess_path), not under
+#   # data_dir by their URL path.
+#   files:
+#     - nowcast/quality.json
+#     - calibration/national_curves.json
+#     # The gauge-trained post-processing model (Phase H). The public
+#     # stack runs its own cycle and its own push engine but has no gauge
+#     # store, so it can only ever receive this. Without it the
+#     # notifications there fall back to the curve.
+#     - calibration/postprocess.json

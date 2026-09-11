@@ -1038,3 +1038,155 @@ def test_national_config_defaults() -> None:
         NationalConfig(leads_min=[20, 10])
     with pytest.raises(ValueError):
         NationalConfig(keep_cycles=0)
+
+
+# ---------------------------------------------------------------------------
+# H-P — the post-processing features, through the real cycle
+# ---------------------------------------------------------------------------
+
+
+def _fit_a_model(leads):
+    """A model of the right SHAPE, fitted on noise.
+
+    Whether it predicts well is the offline study's question
+    (``archive/l3_and_postprocess_20260911/``); what the cycle has to get
+    right is that it fills every column the design reads, off the anchor
+    field and the completed flow, before STEPS runs.
+    """
+    from datetime import timezone as _tz
+
+    from dmi_nowcast_core import postprocess as pp
+
+    rng = np.random.default_rng(3)
+    n = 300
+    signal = rng.random(n)
+    rows = {
+        name: rng.random(n)
+        for name in pp.DESIGN_SOURCE_COLUMNS if name != "hour_utc"
+    }
+    for lead in leads:
+        rows[pp.raw_fraction_column(lead)] = signal
+    rows["hour_utc"] = rng.integers(0, 24, n).astype(float)
+    rows["season"] = np.where(signal > 0.5, "summer", "winter").astype("<U8")
+    truth = {
+        lead: ((signal > 0.5).astype(float), np.ones(n, dtype=bool))
+        for lead in leads
+    }
+    return pp.fit_postprocess(
+        rows, truth, leads, l2=1.0, design_leads=leads,
+        fitted_at=datetime(2026, 9, 11, 3, 40, tzinfo=_tz.utc),
+    )
+
+
+def test_the_cycle_publishes_features_and_probabilities_for_its_points(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H-P: one feature table per cycle, for home plus every served point.
+
+    The whole serving path hangs off this object, so the test drives the
+    real ``_compute_sync``: real flow, real ``station_features``, real
+    national reduction, with only ``run_ensemble`` faked as everywhere
+    else in this module.
+    """
+    from dmi_nowcast_core import postprocess as pp
+    from dmi_nowcast_core.calibrate import IsotonicCalibrator
+    from dmi_nowcast_sidecar.push.postprocess import point_key
+
+    leads = tuple(engine.config.forecast.national.leads_min)
+    path = Path(engine.config.storage.data_dir) / "postprocess.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_fit_a_model(leads).dumps())
+
+    # National curves on, so the RAW fraction and the SERVED probability
+    # are different numbers and the test can tell which one the feature
+    # row carries. The curve maps 0.625 to something well away from it.
+    engine._national_curves = {
+        int(lead): IsotonicCalibrator(
+            raw_breakpoints=(0.0, 0.5, 1.0), calibrated_values=(0.0, 0.1, 0.2),
+        )
+        for lead in leads
+    }
+
+    # A second point, 5 km east of home, so the table has more than one row.
+    other = (HOME_LAT, HOME_LON + 0.08)
+    engine.add_point_source("test", lambda: [other])
+    monkeypatch.setattr(
+        compute_mod, "run_ensemble", _make_fake_run_ensemble([]),
+    )
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+
+    cycle = engine.postprocess_latest
+    assert cycle is not None
+    assert cycle.keys == (
+        point_key(HOME_LAT, HOME_LON), point_key(*other),
+    )
+    assert cycle.radar_ts_utc == engine.national_latest[1]
+    assert cycle.active is True
+    assert cycle.fitted_at_utc == "2026-09-11T03:40:00+00:00"
+    assert cycle.leads == leads
+
+    row = cycle.features(HOME_LAT, HOME_LON)
+    assert row is not None
+    assert set(row) == set(pp.feature_schema(leads).names)
+    # The field is uniformly ~3 mm/h, so the observed disc sees it.
+    assert row["obs_max_5km_mm_h"] == pytest.approx(3.0, abs=0.5)
+    # The upwind corridor is honestly UNKNOWN here, and that is the
+    # behaviour worth pinning: three identical frames carry no motion, so
+    # there is no direction to lay a corridor along and every corridor
+    # feature is null rather than a 0 mm/h claim that it is dry upwind.
+    assert row["up_max_40km_mm_h"] is None
+    assert row["up_dist_km"] is None
+    assert row["bulk_kmh"] is not None
+    assert row["stalled_share"] is not None
+    # The UNcalibrated fraction, read at the same product pixel the
+    # served probability came off, and read BEFORE the curves replaced
+    # the grid: 5 of the fake ensemble's 8 members cross by lead 10. The
+    # served probability at that pixel is ~0.15 after the curve above, so
+    # a row carrying 0.625 can only have come off the raw grid.
+    assert row[pp.raw_fraction_column(leads[0])] == pytest.approx(0.625)
+    served = engine.national_latest[0].p_rain[leads[0]]
+    assert float(np.nanmax(served)) < 0.3
+    assert row["season"] in ("summer", "winter", "shoulder")
+    assert 0 <= row["hour_utc"] <= 23
+    assert row["frame_age_min"] > 0
+    assert row["station_radar_km"] > 0
+
+    for lead in leads:
+        assert 0.0 <= cycle.probability(HOME_LAT, HOME_LON, lead) <= 1.0
+
+
+def test_without_a_model_the_cycle_still_publishes_the_features(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bootstrap: the first refit trains on rows written with no model."""
+    monkeypatch.setattr(
+        compute_mod, "run_ensemble", _make_fake_run_ensemble([]),
+    )
+    engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+    cycle = engine.postprocess_latest
+    assert cycle is not None
+    assert cycle.active is False
+    assert cycle.rows and cycle.rows[0]["obs_max_5km_mm_h"] is not None
+
+
+def test_a_feature_failure_costs_the_features_and_not_the_cycle(
+    engine: CycleEngine,
+    synthetic_paths: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*args, **kwargs):
+        raise RuntimeError("the corridor gather exploded")
+
+    monkeypatch.setattr(
+        compute_mod.core_postprocess, "station_features", _boom,
+    )
+    monkeypatch.setattr(
+        compute_mod, "run_ensemble", _make_fake_run_ensemble([]),
+    )
+    state = engine._compute_sync(synthetic_paths, fetch_ms=0.0)
+    assert state.probabilistic is not None       # the cycle is unharmed
+    assert engine.postprocess_latest is None

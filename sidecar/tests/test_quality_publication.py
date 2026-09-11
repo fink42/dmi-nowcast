@@ -64,6 +64,7 @@ from dmi_nowcast_sidecar.quality_report import (
 )
 from dmi_nowcast_sidecar.sync import (
     CURVES_FILE,
+    POSTPROCESS_FILE,
     ArtifactSync,
     build_artifact_sync,
     target_path,
@@ -199,13 +200,15 @@ class TestQualityReportConfig:
 
 
 class TestSyncConfig:
-    def test_off_by_default_with_the_two_expected_files(
+    def test_off_by_default_with_the_expected_files(
         self, minimal_config: Config,
     ) -> None:
         assert minimal_config.sync.enabled is False
         assert minimal_config.sync.source_url is None
         assert minimal_config.sync.interval_min == 60
-        assert minimal_config.sync.files == [QUALITY_FILE, CURVES_FILE]
+        assert minimal_config.sync.files == [
+            QUALITY_FILE, CURVES_FILE, POSTPROCESS_FILE,
+        ]
 
     def test_enabled_requires_a_source_url(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="source_url"):
@@ -266,6 +269,11 @@ class TestSyncConfig:
         assert target_path(config, CURVES_FILE) == tmp_path / "national_curves.json"
         assert target_path(config, QUALITY_FILE) == (
             tmp_path / "data" / "nowcast" / "quality.json"
+        )
+        # The post-processing model lands where the cycle reads it, not
+        # under ``data_dir/calibration/`` where its URL would suggest.
+        assert target_path(config, POSTPROCESS_FILE) == (
+            tmp_path / "data" / "postprocess.json"
         )
 
 
@@ -1315,16 +1323,24 @@ class TestQualityJobModule:
 
 
 class TestArtifactSync:
-    def test_a_200_lands_both_files_in_their_own_places(
+    def test_a_200_lands_every_file_in_its_own_place(
         self, tmp_path: Path,
     ) -> None:
         config = _sync_config(tmp_path)
-        peer = _Peer({QUALITY_FILE: [_ok(DOC)], CURVES_FILE: [_ok(CURVES)]})
+        model = {"schema_version": 1, "models": {}}
+        peer = _Peer({
+            QUALITY_FILE: [_ok(DOC)],
+            CURVES_FILE: [_ok(CURVES)],
+            POSTPROCESS_FILE: [_ok(model)],
+        })
         sync = ArtifactSync(config, client=peer.client())
         result = anyio_run(sync.sync_once())
-        assert result.ok and result.updated == 2
+        assert result.ok and result.updated == 3
         assert json.loads(target_path(config, QUALITY_FILE).read_text()) == DOC
         assert json.loads(target_path(config, CURVES_FILE).read_text()) == CURVES
+        assert json.loads(
+            target_path(config, POSTPROCESS_FILE).read_text(),
+        ) == model
 
     def test_a_304_leaves_the_file_alone_and_sends_the_etag(
         self, tmp_path: Path,
@@ -1413,7 +1429,7 @@ class TestArtifactSync:
     def test_one_failing_file_does_not_stop_the_other(
         self, tmp_path: Path,
     ) -> None:
-        config = _sync_config(tmp_path)
+        config = _sync_config(tmp_path, files=[QUALITY_FILE, CURVES_FILE])
         peer = _Peer({
             QUALITY_FILE: [httpx.Response(503)],
             CURVES_FILE: [_ok(CURVES)],

@@ -621,12 +621,19 @@ async def test_the_live_step_writes_the_cycles_own_lead_columns(
 ) -> None:
     from dmi_nowcast_core.warning_score import decision_columns
 
+    from dmi_nowcast_sidecar.station_eval import extra_schema
+
     service = StationEvalService(config, _engine(_products()))
     await service.after_cycle(_cycle_result())
     rows = _read_partition(config)
     # The products serve 10/20/30, so those are the columns written — not
     # the module default, which would invent leads this cycle never had.
-    assert set(rows[0]) == set(decision_columns((10, 20, 30)))
+    # Since Phase H the post-processing columns ride along on the same
+    # lead set, for the same reason.
+    assert set(rows[0]) == (
+        set(decision_columns((10, 20, 30)))
+        | set(extra_schema((10, 20, 30)).names)
+    )
 
 
 def test_append_rows_merges_into_a_partition_without_the_new_columns(
@@ -639,6 +646,7 @@ def test_append_rows_merges_into_a_partition_without_the_new_columns(
         DECISION_COLUMNS,
         decision_table,
     )
+    from dmi_nowcast_sidecar.station_eval import extra_schema
 
     path = tmp_path / "09.parquet"
     old = decision_table([_row("06180", RADAR_TS)], leads_min=())
@@ -652,7 +660,7 @@ def test_append_rows_merges_into_a_partition_without_the_new_columns(
     assert n == 2
     rows = pq.read_table(path).to_pylist()
     assert tuple(pq.read_table(path).schema.names) == (
-        DECISION_COLUMNS + ("p_rain_30",)
+        DECISION_COLUMNS + ("p_rain_30",) + tuple(extra_schema((30,)).names)
     )
     by_station = {r["station_id"]: r for r in rows}
     assert by_station["06180"]["p_rain_30"] is None      # backfilled unknown

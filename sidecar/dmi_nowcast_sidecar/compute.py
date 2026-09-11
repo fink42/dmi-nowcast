@@ -24,11 +24,12 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 import structlog
 
+from dmi_nowcast_core import postprocess as core_postprocess
 from dmi_nowcast_core.advect import advect_field_series
 from dmi_nowcast_core.basemap import build_basemap
 from dmi_nowcast_core.cache import CacheConfig, DiskCache
@@ -60,6 +61,7 @@ from dmi_nowcast_core.probabilistic import (
     frame_age_corrected_leads,
     run_ensemble,
 )
+from dmi_nowcast_core.product_pairs import nearest_radar_km
 from dmi_nowcast_core.raining_now import RainingNow, RainingNowConfig
 from dmi_nowcast_core.sample import sample_disc
 from dmi_nowcast_core.transform import dbz_to_rain_rate
@@ -68,6 +70,14 @@ from .config import Config
 from .eta_smoother import EtaSmoother
 from .lightning_tracker import LightningTracker
 from .national_artifacts import write_national_artifacts
+from .national_sample import finite_or_none, product_pixel_of
+from .push.paths import resolved_postprocess_path
+from .push.postprocess import (
+    CyclePostprocess,
+    PostprocessTable,
+    build_cycle_postprocess,
+    point_key,
+)
 from .render import render_frames
 from .strike_archive import StrikeArchive
 from .state_schema import (
@@ -125,6 +135,34 @@ def _bearing_compass_label(dy_per_min: float, dx_per_min: float) -> str:
     return _COMPASS_LABELS[idx]
 
 
+#: Hard cap on the points one cycle computes post-processing features
+#: for. ``push.max_subscriptions`` is 200 and the gauge scoreboard adds
+#: ~103 stations, so the real number is a few hundred; this only exists so
+#: a misconfigured point source cannot turn a cheap step into a cycle-long
+#: one. Anything past it is dropped, loudly.
+_MAX_POSTPROCESS_POINTS = 2000
+
+
+@dataclass(frozen=True)
+class PointProducts:
+    """Per-point reads of one cycle's national grids.
+
+    Taken at the ONE moment both halves exist together: inside
+    ``_run_steps_ensemble``, after ``national_products`` and *before*
+    ``_calibrate_national`` replaces each ``p_rain`` grid with its
+    calibrated twin. ``raw_frac_<lead>`` is the post-processing model's
+    main predictor and the calibrated ``p_rain_<lead>`` is the baseline it
+    has to beat, so both have to survive that swap — exactly as the replay
+    keeps ``raw_p_rain`` by reference across the same line.
+
+    ``pixels`` is the product-grid pixel each point read, carried so the
+    rest of the cycle reads the same one without a second projection pass.
+    """
+
+    pixels: tuple[tuple[int, int] | None, ...]
+    raw_fractions: dict[int, tuple[float | None, ...]]
+
+
 @dataclass(frozen=True)
 class EnsembleOutcome:
     """Home-reduced STEPS ensemble result for one cycle (plan §A0).
@@ -153,6 +191,10 @@ class EnsembleOutcome:
     # (§B4). None when no national curves are loaded (raw pre-B4 path);
     # possibly-empty tuple when curves are loaded but don't cover a lead.
     calibrated_leads: tuple[int, ...] | None = None
+    # Per-point reads of the national grids for the post-processing
+    # features (H-P). None when the cycle serves no points, or when the
+    # national reduction produced nothing to read.
+    points: PointProducts | None = None
 
 
 class NationalSnapshot(tuple):
@@ -326,6 +368,25 @@ class CycleEngine:
         # §A3) and the push decision engine. Swapped as one object so
         # readers on other threads never see a torn set.
         self._national_latest: NationalSnapshot | None = None
+        # Gauge-trained post-processing (Phase H, H-P). The model is read
+        # from the served file and hot-reloaded on an mtime change, like
+        # the national curves and the push threshold table; the per-cycle
+        # answer is published as one immutable object beside the national
+        # products so a reader on another thread can never pair one
+        # frame's features with another frame's probabilities.
+        #
+        # ``_point_sources`` are the things that ask to be scored: the
+        # push store's subscriptions and the gauge scoreboard's stations,
+        # registered by ``app.create_app``. Callables rather than a list,
+        # because both move between cycles. Home is always in, so the
+        # cycle has at least one point to answer for.
+        self._postprocess = PostprocessTable(resolved_postprocess_path(config))
+        self._point_sources: list[tuple[str, Any]] = []
+        self._postprocess_latest: CyclePostprocess | None = None
+        #: ``(lat, lon)`` → km to the nearest radar. A property of the
+        #: point, not of the cycle, and the cycle asks for it once per
+        #: point per frame.
+        self._radar_km: dict[tuple[float, float], float] = {}
         # Basemap dir + cached image; lazy-loaded on first cycle.
         self._basemap_dir = config.storage.data_dir / "basemap"
         self._basemap_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +430,39 @@ class CycleEngine:
     def geo(self) -> CompositeGeo | None:
         """Cached projection from the latest composite (None before first cycle)."""
         return self._geo
+
+    @property
+    def postprocess(self) -> PostprocessTable:
+        """The fitted post-processing model this process reads (H-P).
+
+        Shared with ``/api/push/options`` and with the sync task's reload
+        nudge, so what the panel reports and what the cycle scored with
+        can never drift apart.
+        """
+        return self._postprocess
+
+    @property
+    def postprocess_latest(self) -> CyclePostprocess | None:
+        """The last cycle's post-processing answer, or None.
+
+        Swapped as one object; a reader checks ``radar_ts_utc`` before
+        trusting it, exactly as it does for ``national_latest``.
+        """
+        return self._postprocess_latest
+
+    def add_point_source(self, name: str, provider: Any) -> None:
+        """Register a supplier of points the cycle should score (H-P).
+
+        ``provider()`` returns an iterable of ``(lat, lon)`` and is called
+        once per full cycle, inside the cycle worker — so it may block,
+        and it must not raise anything the cycle cannot survive (it is
+        called under a guard that logs and skips the source).
+
+        Coordinates only, deliberately: the cycle computes features for a
+        set of *places* and has no business learning whose they are. A
+        push endpoint is a bearer capability that never leaves the store.
+        """
+        self._point_sources.append((str(name), provider))
 
     @property
     def national_latest(self) -> NationalSnapshot | None:
@@ -728,6 +822,41 @@ class CycleEngine:
             ),
         }
         motion_stalled_share = motion.stalled_share
+
+        # H-P: the post-processing features, for every point this cycle
+        # serves, off the SAME anchor field and the SAME completed flow
+        # the ensemble is about to run on — no second motion estimate, no
+        # second STEPS. Computed here, before the cascade, because the
+        # MotionEstimate carries the bulk motion and the stall share the
+        # features need and is dropped on the next line.
+        #
+        # The table itself is a few hundred rows of float32 and keeps no
+        # reference to any grid; the transient inside ``station_features``
+        # is the 40 km corridor gather, a few megabytes at the point
+        # counts this service can reach.
+        self._postprocess.maybe_reload()
+        pp_keys = self._serving_points()
+        pp_native: list[Any] = []
+        pp_grid: dict[str, np.ndarray] | None = None
+        if pp_keys:
+            try:
+                pp_native = [geo.lonlat_to_grid(lon, lat) for lat, lon in pp_keys]
+                pp_grid = core_postprocess.station_features(
+                    rain_now, vy, vx,
+                    np.array([idx.row for idx in pp_native], dtype=np.float64),
+                    np.array([idx.col for idx in pp_native], dtype=np.float64),
+                    pixel_km=pixel_km,
+                    dt_min=dt_min,
+                    bulk_vy=motion.bulk_vy,
+                    bulk_vx=motion.bulk_vx,
+                    stalled_share=motion.stalled_share,
+                )
+            except Exception as exc:  # noqa: BLE001 — a feature failure costs
+                # the post-processed probability for one cycle, never the
+                # cycle: the engine falls back to the served curve.
+                _log.warning("postprocess_features_failed", error=str(exc))
+                pp_grid = None
+
         # ``motion`` also holds the two RAW native grids (~14 MB each) that
         # only the stall diagnostic needed; the served arrows now show the
         # completed field. Drop them before STEPS, the cycle's memory
@@ -758,6 +887,7 @@ class CycleEngine:
         # deterministic-only state below.
         ensemble = self._run_steps_ensemble(
             composites, vy, vx, geo, frame_age_min=frame_age_min, dt_min=dt_min,
+            points=pp_native if pp_grid is not None else None,
         )
 
         # Native-500 m advected fields double as the national overlay frames
@@ -947,6 +1077,21 @@ class CycleEngine:
                 observed_grid,
                 forecast_grids,
                 generated_at_utc,
+            )
+            # H-P: the served points' feature rows and post-processed
+            # probabilities, published right beside the snapshot they were
+            # read off. Same instant, same grids, same frame stamp — the
+            # push fan-out and the gauge scoreboard both check
+            # ``radar_ts_utc`` before trusting either object.
+            self._publish_postprocess(
+                keys=pp_keys,
+                grid_features=pp_grid,
+                points=ensemble.points,
+                products=ensemble.national,
+                observed_grid=observed_grid,
+                radar_ts_utc=composite_now.timestamp_utc,
+                generated_at_utc=generated_at_utc,
+                frame_age_min=frame_age_min,
             )
             # R2 cell-motion grids: the display product, on the product
             # grid, in km/h. Fed the COMPLETED flow — the same array the
@@ -1144,6 +1289,7 @@ class CycleEngine:
         *,
         frame_age_min: float,
         dt_min: float,
+        points: Sequence[Any] | None = None,
     ) -> EnsembleOutcome | None:
         """Run STEPS and reduce it at home; None means "fall back" (plan §A0).
 
@@ -1232,6 +1378,7 @@ class CycleEngine:
         )
         national: NationalProducts | None = None
         national_ms = 0.0
+        point_products: PointProducts | None = None
         try:
             home = aggregate_at_home(
                 forecast,
@@ -1255,20 +1402,29 @@ class CycleEngine:
                 try:
                     # §B4: the calibrated grid REPLACES the raw one — one
                     # grid set served (raw is recoverable by inverting the
-                    # published breakpoints). Composed in one assignment so
-                    # a calibration failure leaves ``national`` None (a
-                    # products failure), never half-calibrated grids that
-                    # the manifest's metadata would then misdescribe. One
-                    # np.interp per lead grid — O(grid), inside the
-                    # existing national timing.
-                    national = self._calibrate_national(national_products(
+                    # published breakpoints). ``national`` is still
+                    # assigned by exactly one expression, so a calibration
+                    # failure leaves it None (a products failure) rather
+                    # than half-calibrated grids the manifest's metadata
+                    # would then misdescribe. One np.interp per lead grid —
+                    # O(grid), inside the existing national timing.
+                    raw_national = national_products(
                         forecast,
                         leads_min=nat_cfg.leads_min,
                         threshold_mm_h=self._rain_threshold,
                         timestep_min=timestep_min,
                         frame_age_min=frame_age_min,
                         downsample_factor=steps_cfg.downsample_factor,
-                    ))
+                    )
+                    # H-P: the UNcalibrated fractions at the served points,
+                    # read before the line below replaces the grids. The
+                    # model's main predictor is the raw fraction and its
+                    # baseline is the calibrated one, so both have to
+                    # survive the swap — the same reason the replay keeps
+                    # ``raw_p_rain`` across it.
+                    point_products = _read_points(raw_national, points)
+                    national = self._calibrate_national(raw_national)
+                    del raw_national
                 except Exception as exc:  # noqa: BLE001
                     _log.warning("national_products_failed", error=str(exc))
                 national_ms = (time.perf_counter() - t_nat) * 1000
@@ -1334,7 +1490,137 @@ class CycleEngine:
             national=national,
             national_ms=national_ms,
             calibrated_leads=calibrated_leads,
+            points=point_products if national is not None else None,
         )
+
+    # -- post-processing (Phase H, H-P) -------------------------------------
+
+    def _serving_points(self) -> list[tuple[float, float]]:
+        """Every point this cycle should score, deduplicated, home first.
+
+        Runs inside the cycle worker, so a source may block on SQLite or
+        on a points file. A source that raises is skipped with one log
+        line: a broken subscription store must cost the post-processed
+        probability, never the nowcast.
+
+        Two points that round to the same coordinate are one point — the
+        rounding is far finer than the 500 m pixel, so this only ever
+        merges rows that would have read the same pixel anyway, and it is
+        what keeps a gauge station and a subscriber at the same address
+        from being computed twice.
+        """
+        home = point_key(self.config.home.lat, self.config.home.lon)
+        keys: list[tuple[float, float]] = [home]
+        seen = {home}
+        for name, provider in self._point_sources:
+            try:
+                points = list(provider())
+            except Exception as exc:  # noqa: BLE001 — one bad source only
+                _log.warning(
+                    "postprocess_points_failed", source=name, error=str(exc),
+                )
+                continue
+            for lat, lon in points:
+                try:
+                    key = point_key(lat, lon)
+                except (TypeError, ValueError):
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                keys.append(key)
+                if len(keys) >= _MAX_POSTPROCESS_POINTS:
+                    _log.warning(
+                        "postprocess_points_truncated",
+                        limit=_MAX_POSTPROCESS_POINTS,
+                    )
+                    return keys
+        return keys
+
+    def _station_radar_km(self, lat: float, lon: float) -> float:
+        """Great-circle km to the nearest DMI radar, memoised per point."""
+        key = point_key(lat, lon)
+        hit = self._radar_km.get(key)
+        if hit is None:
+            hit = float(nearest_radar_km(float(lat), float(lon)))
+            self._radar_km[key] = hit
+        return hit
+
+    def _publish_postprocess(
+        self,
+        *,
+        keys: Sequence[tuple[float, float]],
+        grid_features: dict[str, np.ndarray] | None,
+        points: PointProducts | None,
+        products: NationalProducts,
+        observed_grid: np.ndarray | None,
+        radar_ts_utc: datetime,
+        generated_at_utc: datetime,
+        frame_age_min: float,
+    ) -> None:
+        """Assemble and score this cycle's feature rows; publish the result.
+
+        Best-effort by construction: every failure mode leaves
+        ``postprocess_latest`` at the previous cycle's object, whose
+        ``radar_ts_utc`` no longer matches the frame — which is exactly
+        how every consumer already decides not to use it.
+
+        The three decision columns the design also reads
+        (``observed_mm_h``, ``eta_min``, ``intensity_mm_h``) are sampled
+        here and handed to the model, but are NOT written into the feature
+        row: the decision schema already carries them, and one column has
+        one writer.
+        """
+        if not keys or grid_features is None or points is None:
+            return
+        try:
+            shared: list[dict[str, Any]] = []
+            for pixel in points.pixels:
+                if pixel is None:
+                    shared.append(
+                        {"observed_mm_h": None, "eta_min": None,
+                         "intensity_mm_h": None},
+                    )
+                    continue
+                row, col = pixel
+                observed = None
+                if (
+                    observed_grid is not None
+                    and observed_grid.shape == products.eta_min.shape
+                ):
+                    observed = finite_or_none(observed_grid[row, col])
+                shared.append({
+                    "observed_mm_h": observed,
+                    "eta_min": finite_or_none(products.eta_min[row, col]),
+                    "intensity_mm_h": finite_or_none(
+                        products.intensity_mm_h[row, col],
+                    ),
+                })
+            self._postprocess_latest = build_cycle_postprocess(
+                self._postprocess,
+                radar_ts_utc=radar_ts_utc,
+                generated_at_utc=generated_at_utc,
+                keys=keys,
+                grid_features=grid_features,
+                raw_fractions=points.raw_fractions,
+                shared=shared,
+                station_radar_km=[
+                    self._station_radar_km(lat, lon) for lat, lon in keys
+                ],
+                leads=products.leads_min,
+                season=core_postprocess.season_of_month(generated_at_utc.month),
+                hour_utc=generated_at_utc.hour,
+                frame_age_min=frame_age_min,
+            )
+            _log.info(
+                "postprocess_cycle",
+                points=len(keys),
+                active=self._postprocess_latest.active,
+                leads=list(self._postprocess_latest.leads),
+                fitted_at=self._postprocess_latest.fitted_at_utc,
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            _log.warning("postprocess_cycle_failed", error=str(exc))
 
     def _calibrate_national(self, products: NationalProducts | None) -> NationalProducts | None:
         """Map each lead's ``p_rain`` grid through that lead's national curve (§B4).
@@ -1466,6 +1752,33 @@ def _disc_motion(
     else:
         dvy = dvx = 0.0
     return dvy, dvx
+
+
+def _read_points(
+    products: NationalProducts, points: Sequence[Any] | None,
+) -> PointProducts | None:
+    """Per-point reads of the RAW national grids (H-P).
+
+    ``points`` are the fractional NATIVE indices the cycle already
+    projected for the feature extraction; the product pixel comes off them
+    through ``national_sample.product_pixel_of``, which is the same
+    arithmetic ``/forecast``, the push fan-out and the browser sampler use.
+    A point off the product grid contributes ``None`` at every lead —
+    unknown, never 0 %.
+    """
+    if not points:
+        return None
+    pixels = tuple(
+        product_pixel_of(products, idx.row, idx.col) for idx in points
+    )
+    raw: dict[int, tuple[float | None, ...]] = {}
+    for lead in products.leads_min:
+        grid = products.p_rain[int(lead)]
+        raw[int(lead)] = tuple(
+            None if pixel is None else finite_or_none(grid[pixel[0], pixel[1]])
+            for pixel in pixels
+        )
+    return PointProducts(pixels=pixels, raw_fractions=raw)
 
 
 def _bearing_from_deg(dy_per_min: float, dx_per_min: float) -> float:

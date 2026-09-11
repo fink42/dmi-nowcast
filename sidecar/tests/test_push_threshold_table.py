@@ -286,6 +286,11 @@ class TestOptionsRoute:
                 "45": {"threshold_pct": 40, "source": "fallback"},
                 "60": {"threshold_pct": 40, "source": "fallback"},
             },
+            # Phase H, additive: which probability a notification would be
+            # decided on right now. Configured for the model but without
+            # one on disk, the honest answer is still "curve".
+            "probability_source": "curve",
+            "postprocess_fitted_at_utc": None,
         }
 
     def test_without_a_table_every_horizon_is_the_fallback(

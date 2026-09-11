@@ -870,12 +870,9 @@ def station_radar_km(lat: float, lon: float) -> float:
     return hit
 
 
-def _finite(value: Any) -> float | None:
-    """A feature value for parquet: non-finite becomes a null, never a 0."""
-    if value is None:
-        return None
-    out = float(value)
-    return out if math.isfinite(out) else None
+#: Non-finite → null, never 0. Kept as a module name because the replay's
+#: own tests reach for it; the definition is the shared one.
+_finite = postprocess.finite_or_none
 
 
 def _feature_row(
@@ -895,27 +892,30 @@ def _feature_row(
     ``pixel`` is the PRODUCT-grid pixel ``sample_point`` read, so the raw
     ensemble fraction comes off exactly the pixel the calibrated one did;
     ``None`` means the station is off coverage and every ensemble feature
-    is unknown. The grid-derived features are read from ``grid_features``
-    by position — they were computed for the whole station list in one
-    pass, on the native grid, and a station off the native grid already
-    carries NaN there.
+    is unknown.
+
+    The row itself is assembled by ``postprocess.feature_row`` — the same
+    function the live cycle calls (``dmi_nowcast_sidecar.push.postprocess``),
+    so a replay row and a live row for identical inputs are identical. All
+    this adds is the two things only the replay knows: which product pixel
+    this station read, and the memoised distance to the nearest radar.
     """
-    row: dict[str, Any] = {}
-    for lead in leads_min:
-        grid = raw_p_rain.get(int(lead))
-        row[postprocess.raw_fraction_column(lead)] = (
-            None if pixel is None or grid is None
-            else _finite(grid[pixel[0], pixel[1]])
-        )
-    for name, _definition in postprocess.SCALAR_FEATURE_COLUMNS:
-        values = grid_features.get(name)
-        if values is not None:
-            row[name] = _finite(values[index])
-    row["season"] = season
-    row["hour_utc"] = int(hour_utc)
-    row["frame_age_min"] = float(frame_age_min)
-    row["station_radar_km"] = station_radar_km(point.lat, point.lon)
-    return row
+    return postprocess.feature_row(
+        grid_features,
+        index,
+        raw_fractions={
+            int(lead): (
+                None if pixel is None or raw_p_rain.get(int(lead)) is None
+                else raw_p_rain[int(lead)][pixel[0], pixel[1]]
+            )
+            for lead in leads_min
+        },
+        leads=leads_min,
+        season=season,
+        hour_utc=hour_utc,
+        frame_age_min=frame_age_min,
+        station_radar_km=station_radar_km(point.lat, point.lon),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1158,38 +1158,21 @@ def _write_table_atomic(table, path: Path) -> None:
 def feature_schema(leads_min=None):
     """Arrow fields for the H-P feature columns, in write order.
 
-    Additive to :func:`dmi_nowcast_core.warning_score.decision_schema` and
-    deliberately NOT part of it: the live decision step writes the shared
-    schema and has no features, and ``align_decision_table`` conforms any
-    file to that schema — so every existing consumer (the threshold sweep,
-    both benchmark layers, the nightly fit) reads a run with features
-    exactly as it reads one without, and simply never sees these columns.
-
-    Types mirror the decision schema's rules. Every numeric feature is
-    nullable float32 and a null means "not computable at this station this
-    cycle", never zero — a station off the composite has no upstream
-    corridor, and 0 mm/h would be a claim that it is dry there.
+    The schema itself is ``postprocess.feature_schema`` — shared with the
+    live cycle's writer (``station_eval``), so the replay's parquet and
+    the live parquet concatenate. All this adds is the replay's default
+    lead set.
     """
-    import pyarrow as pa
-
-    fields = []
-    for name, _definition in postprocess.feature_columns(
+    return postprocess.feature_schema(
         NATIONAL_LEADS if leads_min is None else leads_min,
-    ):
-        if name == "season":
-            fields.append((name, pa.string()))
-        elif name == "hour_utc":
-            fields.append((name, pa.int8()))
-        else:
-            fields.append((name, pa.float32()))
-    return pa.schema(fields)
+    )
 
 
 def feature_documentation(leads_min=None) -> dict[str, str]:
     """``{column: definition}`` — what goes in ``summary.json``."""
-    return dict(postprocess.feature_columns(
+    return postprocess.feature_documentation(
         NATIONAL_LEADS if leads_min is None else leads_min,
-    ))
+    )
 
 
 def write_decisions(
