@@ -118,7 +118,10 @@
 
 		<h2>{t().quality.stations.title}</h2>
 		{#if report.stations}
-			<QualityStationMap stations={report.stations} />
+			<QualityStationMap
+				stations={report.stations}
+				reference={report.headline.warnings?.pod ?? null}
+			/>
 		{:else}
 			<p class="quiet">{t().quality.stations.none}</p>
 		{/if}

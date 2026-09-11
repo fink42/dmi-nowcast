@@ -13,6 +13,11 @@
 	 * latter as one colour), the band boundaries are written out in the
 	 * legend, and every dot's numbers are also in the list underneath — so the
 	 * colour is never the only place a number lives.
+	 *
+	 * The bands are cut relative to the national hit rate (`reference`), so
+	 * the legend has to print the cut points it was actually given rather than
+	 * a set of constants — and say, in one line, that a station under the
+	 * national rate is under average and not therefore broken.
 	 */
 	import { locale, t } from '$lib/i18n';
 	import {
@@ -20,14 +25,34 @@
 		MAP_HEIGHT,
 		MAP_WIDTH,
 		plotStations,
+		podBandEdges,
 		type PlottedStation
 	} from '$lib/quality/stations';
 	import { countText, decimalText, fractionText } from '$lib/quality/sentences';
 	import type { StationCollection } from '$lib/quality/schema';
 
-	let { stations }: { stations: StationCollection } = $props();
+	let {
+		stations,
+		reference
+	}: {
+		stations: StationCollection;
+		/** The national POD as a 0–1 fraction; null when it has not been measured. */
+		reference: number | null;
+	} = $props();
 
-	const plotted = $derived(plotStations(stations.features));
+	const plotted = $derived(plotStations(stations.features, reference));
+	const edges = $derived(podBandEdges(reference));
+
+	/** An edge as a bare percent — the low end of a range, whose unit sits on the high end. */
+	const bare = (edge: number): string => countText(edge * 100, locale());
+	/** An edge as a percent carrying its unit, spaced the way the locale spaces it. */
+	const withUnit = (edge: number): string => fractionText(t(), edge);
+
+	const legendTitle = $derived(
+		reference === null
+			? t().quality.stations.legendTitleAbsolute
+			: t().quality.stations.legendTitle(fractionText(t(), reference))
+	);
 
 	/** The line of numbers a station carries, in the tooltip and in the list. */
 	function detail(station: PlottedStation): string {
@@ -85,11 +110,34 @@
 
 <p class="hint">{t().quality.stations.hint}</p>
 
+<p class="legend-title">{legendTitle}</p>
+{#if reference !== null}
+	<p class="legend-note">{t().quality.stations.legendNote}</p>
+{/if}
+
 <ul class="legend">
-	<li><span class="dot poor" aria-hidden="true"></span>{t().quality.stations.legendPoor}</li>
-	<li><span class="dot fair" aria-hidden="true"></span>{t().quality.stations.legendFair}</li>
-	<li><span class="dot good" aria-hidden="true"></span>{t().quality.stations.legendGood}</li>
-	<li><span class="dot best" aria-hidden="true"></span>{t().quality.stations.legendBest}</li>
+	<li>
+		<span class="dot poor" aria-hidden="true"></span>{t().quality.stations.legendPoor(
+			withUnit(edges[0])
+		)}
+	</li>
+	<li>
+		<span class="dot fair" aria-hidden="true"></span>{t().quality.stations.legendFair(
+			bare(edges[0]),
+			withUnit(edges[1])
+		)}
+	</li>
+	<li>
+		<span class="dot good" aria-hidden="true"></span>{t().quality.stations.legendGood(
+			bare(edges[1]),
+			withUnit(edges[2])
+		)}
+	</li>
+	<li>
+		<span class="dot best" aria-hidden="true"></span>{t().quality.stations.legendBest(
+			withUnit(edges[2])
+		)}
+	</li>
 	<li>
 		<span class="dot unknown" aria-hidden="true"></span>{t().quality.stations.legendUnknown}
 	</li>
@@ -191,6 +239,18 @@
 		font-size: 0.78rem;
 		color: var(--muted);
 		text-align: center;
+	}
+
+	.legend-title {
+		margin: 0 0 0.2rem;
+		font-size: 0.8rem;
+		font-weight: 600;
+	}
+
+	.legend-note {
+		margin: 0 0 0.5rem;
+		font-size: 0.78rem;
+		color: var(--muted);
 	}
 
 	.legend {

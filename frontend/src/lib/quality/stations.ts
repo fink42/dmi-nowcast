@@ -14,6 +14,15 @@
  * too few warnings for a POD, and to "no score" where it has neither. The
  * fallback is stated in the legend rather than hidden: a dot coloured by a
  * different measurement is not the same dot.
+ *
+ * The POD bands are **relative to the national hit rate**, not to a fixed
+ * aspiration. The first version of this map banded at 50/65/80 %, numbers
+ * chosen before the metric had been measured; the served rule actually hits
+ * about 35 % of onsets at 30 minutes' lead, so every dot came out red and
+ * the map read as "every station is broken" — which the reliability diagrams
+ * directly above it contradict. Banding against the measured national rate
+ * says the thing the map is for: where this station sits relative to the
+ * country, not relative to a wish.
  */
 import { DENMARK_OUTLINE } from './denmark';
 import type { StationFeature, StationProperties } from './schema';
@@ -72,22 +81,55 @@ export interface StationScore {
 const BRIER_GOOD = 0.05;
 const BRIER_POOR = 0.25;
 
-const bandOf = (value: number): QualityBand =>
-	value < 0.5 ? 'poor' : value < 0.65 ? 'fair' : value < 0.8 ? 'good' : 'best';
+/**
+ * The band edges a score is cut at when there is nothing to compare it with:
+ * the POD scale's original fixed bands, and the only scale the rescaled
+ * Brier score is ever banded on. A Brier score is not a hit rate, so it must
+ * never be measured against the national hit rate.
+ */
+const ABSOLUTE_EDGES: readonly [number, number, number] = [0.5, 0.65, 0.8];
 
-export function stationScore(properties: StationProperties): StationScore {
+/** How far either side of the national rate the two middle bands reach. */
+const BAND_STEP = 0.1;
+
+const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
+
+/**
+ * The three absolute cut points of the POD scale, for a national hit rate of
+ * `reference` — so the legend can print the same numbers the dots are
+ * coloured by, instead of a second copy of the arithmetic.
+ *
+ * Clamped into [0, 1]: a national rate inside 10 points of either end gives a
+ * degenerate outer band rather than an edge off the scale, and the legend
+ * then honestly reads "under 0 %" as an empty band.
+ */
+export function podBandEdges(reference: number | null): [number, number, number] {
+	if (reference === null || !Number.isFinite(reference)) return [...ABSOLUTE_EDGES];
+	const national = clamp01(reference);
+	return [clamp01(national - BAND_STEP), national, clamp01(national + BAND_STEP)];
+}
+
+const bandOf = (value: number, edges: readonly [number, number, number]): QualityBand =>
+	value < edges[0] ? 'poor' : value < edges[1] ? 'fair' : value < edges[2] ? 'good' : 'best';
+
+/**
+ * `reference` is the national POD as a fraction, or null when the headline
+ * has no warnings section to take it from — in which case the POD falls back
+ * to the fixed bands, and the legend says so.
+ */
+export function stationScore(
+	properties: StationProperties,
+	reference: number | null
+): StationScore {
 	const pod = properties.warn_pod;
 	if (pod !== null && Number.isFinite(pod)) {
-		const value = Math.min(1, Math.max(0, pod));
-		return { value, basis: 'pod', band: bandOf(value) };
+		const value = clamp01(pod);
+		return { value, basis: 'pod', band: bandOf(value, podBandEdges(reference)) };
 	}
 	const brier = properties.brier_gauge;
 	if (brier !== null && Number.isFinite(brier)) {
-		const value = Math.min(
-			1,
-			Math.max(0, 1 - (brier - BRIER_GOOD) / (BRIER_POOR - BRIER_GOOD))
-		);
-		return { value, basis: 'brier', band: bandOf(value) };
+		const value = clamp01(1 - (brier - BRIER_GOOD) / (BRIER_POOR - BRIER_GOOD));
+		return { value, basis: 'brier', band: bandOf(value, ABSOLUTE_EDGES) };
 	}
 	return { value: null, basis: null, band: 'unknown' };
 }
@@ -104,7 +146,10 @@ export interface PlottedStation {
  * Project and score the stations, dropping any that fall outside the frame —
  * a station in Greenland is a producer bug, not a reason to stretch the map.
  */
-export function plotStations(features: readonly StationFeature[]): PlottedStation[] {
+export function plotStations(
+	features: readonly StationFeature[],
+	reference: number | null
+): PlottedStation[] {
 	const plotted: PlottedStation[] = [];
 	for (const feature of features) {
 		const [lon, lat] = feature.geometry.coordinates;
@@ -117,7 +162,7 @@ export function plotStations(features: readonly StationFeature[]): PlottedStatio
 			continue;
 		}
 		const { x, y } = project(lon, lat);
-		plotted.push({ feature, x, y, score: stationScore(feature.properties) });
+		plotted.push({ feature, x, y, score: stationScore(feature.properties, reference) });
 	}
 	return plotted;
 }
