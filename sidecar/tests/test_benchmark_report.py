@@ -695,13 +695,31 @@ def test_f1_of_pools_the_day_counts_instead_of_averaging_them() -> None:
     assert pooled != pytest.approx((1.0 + report_module._f1_of([busy])) / 2)
 
 
-def test_layer_c_day_blocks_count_a_missed_onset(corpus: Path) -> None:
-    """A missed onset lands in its day's `misses` (the 2026-09-11 KeyError).
+def test_score_fold_books_a_missed_onset_in_its_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unwarned onset lands in its day's `misses` (the 2026-09-11 KeyError).
 
-    Every onset the sweep leaves unwarned is bumped with the outcome name
-    `miss`, which the block map translates to the `misses` count; passing
-    the count name instead raised KeyError on the first real fold.
+    `score_fold` bumps outcomes by their NAME (`miss`) and the block map
+    translates that to the count (`misses`); the first real fold with a
+    miss raised KeyError when the count name was passed instead. The
+    fixture never produces a miss, so the sweep pieces are stubbed and
+    only the accounting is exercised.
     """
-    payload = _run(corpus, "--layers", "c", "--thresholds", "90:90:10")
-    pooled = payload["layer_c"]["leads"]["20"]["out_of_fold"]
-    assert pooled["misses"] > 0
+    from types import SimpleNamespace
+
+    onset_day = datetime(2026, 3, 13, 9, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(report_module, "replay_station", lambda *a, **k: [])
+    monkeypatch.setattr(
+        report_module, "score_warnings",
+        lambda *a, **k: SimpleNamespace(
+            warnings=[], onsets=[SimpleNamespace(outcome="miss", onset_utc=onset_day)],
+        ),
+    )
+    shared = {
+        "leads": [20], "stations": ["06120"], "tracks": {"06120": object()},
+        "persistence_obs": 1, "rearm_after_min": 60, "raining_now_mm_h": 0.5,
+        "onsets": {}, "tolerance_min": 10, "dry_min": 60, "onset_min_mm": 0.2,
+        "known_until": {}, "coverage": {20: {}}, "min_useful_lead_min": 5.0,
+    }
+    results, per_day, n_sent = report_module.score_fold(shared, 20, 40)
+    assert n_sent == 0 and len(results) == 1
+    assert per_day[onset_day.date().toordinal()]["misses"] == 1
