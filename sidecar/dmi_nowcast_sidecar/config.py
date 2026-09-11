@@ -627,6 +627,36 @@ class FitPostprocessConfig(BaseModel):
     out: Path | None = None
 
 
+class GaugeReliabilityConfig(BaseModel):
+    """The quality page's gauge reliability curve, from the decision rows.
+
+    Phase H. The curve used to be the station calibration corpus scored
+    against ``gauge_outcome``, which described the isotonic curve — and
+    the site stopped serving the curve on 2026-09-11. This step scores the
+    probability the site actually serves (``p_post_<lead>`` when
+    ``push.probability_source`` is ``postprocess``, the curve column
+    otherwise) against the same "gauge wet within L" outcome the
+    benchmark's Layer B uses, off the same decision rows the threshold
+    sweep and the nightly refit read.
+
+    Nightly full build only: it is the corpus half of the document, and
+    the hourly live refresh carries it over like every other reliability
+    field. Private-instance only by construction — it needs the gauge
+    store on the corpus volume.
+    """
+
+    enabled: bool = True
+    #: Decision-row trees, later directories winning a ``(radar_ts,
+    #: station_id)`` tie. Empty -> ``fit_thresholds.decisions_dirs``,
+    #: which is the point: the page, the fitted model and the served
+    #: thresholds all stand on one set of rows, or the three numbers on
+    #: the page are about three different samples.
+    decisions_dirs: list[Path] = Field(default_factory=list)
+    #: The horizons to publish a curve for. None -> the threshold fit's
+    #: leads, i.e. the horizons a subscriber can actually choose.
+    leads: list[int] | None = None
+
+
 class QualityReportConfig(BaseModel):
     """The nightly ``quality.json`` build (Phase F, F4).
 
@@ -693,6 +723,13 @@ class QualityReportConfig(BaseModel):
     #: refresh, which exists to move the live sections and nothing else.
     fit_postprocess: FitPostprocessConfig = Field(
         default_factory=FitPostprocessConfig,
+    )
+    #: Score the page's gauge reliability curve on the SERVED probability,
+    #: off the decision rows, instead of on the station corpus's curve
+    #: (Phase H). Full nightly build only; the hourly refresh carries the
+    #: result over with the rest of the reliability section.
+    gauge_reliability: GaugeReliabilityConfig = Field(
+        default_factory=GaugeReliabilityConfig,
     )
 
     @field_validator("at_utc")

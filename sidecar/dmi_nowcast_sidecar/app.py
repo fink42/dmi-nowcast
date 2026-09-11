@@ -656,8 +656,20 @@ def create_app(
                 status_code=400,
                 detail="coordinates outside the radar composite grid",
             )
+        # H-P: the gauge-trained model's probability for THIS point, beside
+        # the curve-calibrated one. A point the cycle already scored — a
+        # subscriber's, a gauge-eval station's, home — is read straight
+        # out of the cycle's own table, so the panel shows the very number
+        # the notification was decided on; anything else gets a feature
+        # row assembled on demand off the cycle's retained grids. Both
+        # paths are the engine's, and both come back ``None`` when no
+        # model can speak, which leaves the response exactly as it was.
+        post = engine.postprocess_point(lat, lon)
+        p_post = {} if post is None else post.p_post
         per_lead = [
-            ForecastPointLead(lead_min=lead, p_rain=p)
+            ForecastPointLead(
+                lead_min=lead, p_rain=p, p_post=p_post.get(int(lead)),
+            )
             for lead, p in sample.p_rain.items()
         ]
         # The deterministic rain series, timestamped from the cycle's own
@@ -705,6 +717,17 @@ def create_app(
             eta_min=sample.eta_min,
             intensity_mm_h=sample.intensity_mm_h,
             observed_mm_h=sample.observed_mm_h,
+            # "postprocess" only when a number actually came out for this
+            # point: a model that is loaded but silent here is a point
+            # served on the curve, and saying otherwise would describe a
+            # probability nobody was shown.
+            probability_source=(
+                "postprocess" if post is not None and post.active else "curve"
+            ),
+            postprocess_fitted_at_utc=(
+                _parse_stamp(post.fitted_at_utc)
+                if post is not None and post.active else None
+            ),
             generated_at_utc=generated_at,
             forecast_mm_h=forecast_series,
             confidence=float(state.confidence) if state is not None else None,
@@ -959,6 +982,23 @@ def create_app(
         ),
     )
     return app
+
+
+def _parse_stamp(value: str | None) -> datetime | None:
+    """An ISO-8601 stamp from a fitted file, or None if it is not one.
+
+    Defensive on purpose: ``fitted_at_utc`` is free text inside a JSON
+    document the nightly fit (or a ``sync``) wrote, and an unparseable one
+    must cost the field, never the response — a ``/forecast`` that 500s
+    because a model file has a typo in a timestamp would be a very poor
+    trade for one piece of provenance.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 def _on_cycle_complete(app: Any, result: CycleResult) -> None:

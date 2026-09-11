@@ -378,10 +378,14 @@ def test_forecast_values_at_known_pixel(client: TestClient) -> None:
     assert datetime.fromisoformat(body["radar_ts_utc"]) == RADAR_TS
     assert body["n_members"] == 8
     assert body["calibrated"] is False
+    # ``p_post`` is additive and null here: this engine has no fitted
+    # post-processing model, which is the pre-Phase-H answer exactly.
     assert body["per_lead"] == [
-        {"lead_min": 10, "p_rain": pytest.approx(0.625)},
-        {"lead_min": 20, "p_rain": pytest.approx(0.75)},
+        {"lead_min": 10, "p_rain": pytest.approx(0.625), "p_post": None},
+        {"lead_min": 20, "p_rain": pytest.approx(0.75), "p_post": None},
     ]
+    assert body["probability_source"] == "curve"
+    assert body["postprocess_fitted_at_utc"] is None
     assert body["eta_min"] == pytest.approx(6.0)
     assert body["intensity_mm_h"] == pytest.approx(2.5)
     # The observation, on the same pixel as every forecast product.

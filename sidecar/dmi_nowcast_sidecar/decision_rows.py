@@ -81,6 +81,8 @@ def load_probabilities(
     stations: Sequence[str] | None = None,
     column_for: Callable[[int], str] = p_rain_column,
     extra_columns: Sequence[str] = (),
+    derive: Callable[[Any], Any] | None = None,
+    derive_columns: Sequence[str] = (),
     log=None,
 ) -> dict:
     """Decision rows as columns: ``t``, station code, and one p per lead.
@@ -105,6 +107,24 @@ def load_probabilities(
     file carries comes back all-NaN rather than missing, so a model can be
     fitted against a run that predates a feature.
 
+    ``derive`` is handed each file's RAW Arrow table and returns it with
+    whatever columns it needs added, and (if it says so) with rows removed
+    — the same hook ``threshold_sweep.load_decisions`` takes, for the same
+    reason and with the same implementation on the other end
+    (``postprocess_fit.ProbabilityFiller``). It exists because most of the
+    archive predates the serving path: the replay tree carries the twenty
+    feature columns and no ``p_post_<lead>``, so a reader that scored only
+    the stored column would be measuring how far back the parquet goes.
+    Filling happens per file, inside the read, while the features are
+    still numpy — after the concat they would be a hundred million float
+    objects.
+
+    ``derive_columns`` are read from each file ONLY to feed ``derive``
+    and are dropped before the tables are concatenated: the filler needs
+    twenty feature columns to produce one probability, and carrying them
+    into the merged table would cost twenty times the memory for numbers
+    nothing downstream reads.
+
     Returns ``{"t": int64 epoch seconds of the decision instant,
     "radar_ts": int64 epoch seconds of the anchor frame, "station": int32
     codes, "stations": [id], "p": {lead: float64 with NaN for null},
@@ -122,6 +142,11 @@ def load_probabilities(
     #: The columns asked of every file, in one order: the scored
     #: probabilities first, then whatever extras the caller wants.
     asked = list(dict.fromkeys(list(p_columns.values()) + extras))
+    #: Read for ``derive`` alone, and dropped again before the concat.
+    derived = [
+        str(name) for name in dict.fromkeys(derive_columns)
+        if name not in asked
+    ]
     tables: list[Any] = []
     counts = {"files": 0, "skipped": 0, "rows": 0}
     for directory in directories:
@@ -140,6 +165,7 @@ def load_probabilities(
                     log(f"skipping {path.name}: not a decision table")
                 continue
             present = [name for name in asked if name in names]
+            present += [name for name in derived if name in names]
             columns = ["radar_ts", "generated_at", "station_id"] + present
             try:
                 table = pq.read_table(path, columns=columns)
@@ -153,6 +179,11 @@ def load_probabilities(
                     table = table.append_column(
                         name, pa.nulls(table.num_rows, pa.float64()),
                     )
+            if derive is not None:
+                # Before the select, so the hook can see the columns it
+                # was given them for; after the null-fill, so a file with
+                # no probability column at all still has one to write into.
+                table = derive(table)
             table = table.select(
                 ["radar_ts", "generated_at", "station_id"] + asked
             )

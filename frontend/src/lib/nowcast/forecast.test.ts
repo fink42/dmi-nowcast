@@ -9,7 +9,7 @@
  * series for the field, never `undefined` leaking through.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchPointForecast } from './forecast';
+import { fetchPointForecast, withServedProbabilities } from './forecast';
 import { NoDataError } from './manifest';
 
 function stubFetch(responder: (url: string) => Response) {
@@ -56,8 +56,8 @@ describe('fetchPointForecast', () => {
 			lon: 12.5683,
 			radarTsUtc: '2026-08-28T12:00:00+00:00',
 			perLead: [
-				{ leadMin: 10, pRain: 0.62 },
-				{ leadMin: 20, pRain: null }
+				{ leadMin: 10, pRain: 0.62, pPost: null },
+				{ leadMin: 20, pRain: null, pPost: null }
 			],
 			etaMin: 16,
 			intensityMmH: 2.4,
@@ -70,6 +70,9 @@ describe('fetchPointForecast', () => {
 			motion: null,
 			confidence: 0.72,
 			calibrated: true,
+			// A body without `probability_source` is a sidecar older than the
+			// model: the curve is what it served, and saying so is not a guess.
+			probabilitySource: 'curve',
 			source: 'server'
 		});
 	});
@@ -139,5 +142,81 @@ describe('fetchPointForecast', () => {
 		await expect(fetchPointForecast(55.6, 12.5)).rejects.toBeInstanceOf(NoDataError);
 		stubFetch(() => json({ detail: 'boom' }, 500));
 		await expect(fetchPointForecast(55.6, 12.5)).rejects.toThrow(/HTTP 500/);
+	});
+});
+
+/**
+ * The merge the point store performs on every selection.
+ *
+ * The grids answer instantly and answer almost everything; the one thing they
+ * cannot carry is the gauge-trained probability the site serves, because
+ * computing it needs the cycle's flow field and its raw ensemble fractions
+ * and neither is published. So `/forecast` is fetched for every point and
+ * only its probabilities are folded in — the sampled series, ETA and motion
+ * are the client's and must survive untouched.
+ */
+describe('withServedProbabilities', () => {
+	const client = {
+		lat: 55.6,
+		lon: 12.5,
+		radarTsUtc: '2026-08-28T12:00:00+00:00',
+		perLead: [
+			{ leadMin: 10, pRain: 0.9, pPost: null },
+			{ leadMin: 20, pRain: 0.95, pPost: null }
+		],
+		etaMin: 14,
+		intensityMmH: 2.1,
+		observedMmH: 0.4,
+		rainSeries: [{ leadMin: 0, validTsUtc: '2026-08-28T12:00:00+00:00', mmH: 1.1 }],
+		motion: { speedKmh: 31, bearingFromDeg: 250, compass: 'w' as const },
+		confidence: null,
+		calibrated: false,
+		probabilitySource: null,
+		source: 'client' as const
+	};
+
+	const server = {
+		...client,
+		perLead: [
+			{ leadMin: 10, pRain: 0.62, pPost: 0.41 },
+			{ leadMin: 20, pRain: 0.71, pPost: 0.55 }
+		],
+		rainSeries: [],
+		motion: null,
+		confidence: 0.72,
+		calibrated: true,
+		probabilitySource: 'postprocess' as const,
+		source: 'server' as const
+	};
+
+	it('takes the probabilities and leaves everything else alone', () => {
+		const merged = withServedProbabilities(client, server);
+		expect(merged.perLead).toEqual([
+			{ leadMin: 10, pRain: 0.62, pPost: 0.41 },
+			{ leadMin: 20, pRain: 0.71, pPost: 0.55 }
+		]);
+		expect(merged.probabilitySource).toBe('postprocess');
+		expect(merged.confidence).toBe(0.72);
+		expect(merged.calibrated).toBe(true);
+		// The client's own answers: the endpoint serves no motion and no
+		// series, and blanking them would cost the headline and the arrow.
+		expect(merged.rainSeries).toBe(client.rainSeries);
+		expect(merged.motion).toBe(client.motion);
+		expect(merged.etaMin).toBe(14);
+		expect(merged.source).toBe('client');
+	});
+
+	it('matches leads by value, never by position', () => {
+		const partial = { ...server, perLead: [{ leadMin: 20, pRain: 0.71, pPost: 0.55 }] };
+		const merged = withServedProbabilities(client, partial);
+		// Lead 10 is absent from the server's answer: it keeps the sampled
+		// value rather than taking lead 20's.
+		expect(merged.perLead[0]).toEqual({ leadMin: 10, pRain: 0.9, pPost: null });
+		expect(merged.perLead[1]).toEqual({ leadMin: 20, pRain: 0.71, pPost: 0.55 });
+	});
+
+	it('reads a server without a source as the curve', () => {
+		const older = { ...server, probabilitySource: null };
+		expect(withServedProbabilities(client, older).probabilitySource).toBe('curve');
 	});
 });

@@ -251,14 +251,45 @@ export function confidenceWord(t: Catalog, confidence: number): string {
 
 export const percent = (p: number): number => Math.round(p * 100);
 
-/** The lead closest to `minutes` that the cycle actually served. */
+/**
+ * The probability to SHOW at each lead, and where it came from.
+ *
+ * Since 2026-09-11 the site serves the gauge-trained post-processed model:
+ * the panel, the push notification and the quality page's gauge curve are all
+ * about that one number. `p_post` is therefore preferred wherever the server
+ * supplied it, and the curve-calibrated `pRain` is the fallback for every
+ * lead it did not — per lead, not per point, because a model may be fitted
+ * for some horizons and not others and a bar chart mixing the two silently
+ * would be a chart of two different claims.
+ *
+ * `source` is `postprocess` only when at least one lead is actually the
+ * model's: a forecast where every bar is the curve must not carry a note
+ * saying the numbers are gauge-calibrated.
+ */
+export function servedProbabilities(forecast: PointForecast): {
+	leads: { leadMin: number; pRain: number | null }[];
+	source: 'postprocess' | 'curve';
+} {
+	let usedModel = false;
+	const leads = forecast.perLead.map((lead) => {
+		const post = lead.pPost ?? null;
+		if (post !== null) usedModel = true;
+		return { leadMin: lead.leadMin, pRain: post !== null ? post : lead.pRain };
+	});
+	return { leads, source: usedModel ? 'postprocess' : 'curve' };
+}
+
+/**
+ * The lead closest to `minutes` that the cycle actually served, at the
+ * probability the panel shows for it — the model's where there is one.
+ */
 export function probabilityWithin(
 	forecast: PointForecast,
 	minutes: number
 ): { leadMin: number; pRain: number } | null {
 	let best: { leadMin: number; pRain: number } | null = null;
 	let bestDistance = Infinity;
-	for (const lead of forecast.perLead) {
+	for (const lead of servedProbabilities(forecast).leads) {
 		if (lead.pRain === null) continue;
 		const distance = Math.abs(lead.leadMin - minutes);
 		if (distance < bestDistance) {

@@ -60,6 +60,16 @@ class PerLeadEntry(BaseModel):
     # error here (website Phase A plan §A0, "calibration honesty").
     # Null when the ensemble didn't run this cycle.
     p_ensemble: float | None = None
+    # The GAUGE-TRAINED post-processed probability of rain at home within
+    # this lead (Phase H, H-P) — the number the push notifications have
+    # decided on since 2026-09-11 and the website's panel shows. Additive,
+    # and additive in the strong sense: ``p_calibrated`` keeps exactly the
+    # meaning and the value it has always had, so an HA integration pinned
+    # to it is unaffected and can migrate to this field deliberately, on
+    # its own schedule. Null whenever no model spoke for this lead — none
+    # loaded, a lead the national products do not publish, a lead the fit
+    # does not cover, or a cycle whose feature extraction failed.
+    p_post: float | None = None
 
 
 class ForecastBlock(BaseModel):
@@ -72,6 +82,13 @@ class ForecastBlock(BaseModel):
     peak_intensity_mm_h: float
     peak_lead_min: int
     per_lead: list[PerLeadEntry]
+    # Which probability the service would DECIDE on at home this cycle:
+    # ``postprocess`` when the gauge-trained model scored the home point,
+    # ``curve`` when it did not and the isotonic-calibrated number is all
+    # there is. Additive with a ``curve`` default, so a state written
+    # before the model existed reads correctly, and it says nothing about
+    # ``p_calibrated``, which is unchanged either way.
+    probability_source: Literal["curve", "postprocess"] = "curve"
 
 
 class ProbabilisticBlock(BaseModel):
@@ -162,6 +179,18 @@ class ForecastPointLead(BaseModel):
     """
     lead_min: int
     p_rain: float | None
+    # The GAUGE-TRAINED post-processed probability at the same pixel
+    # (Phase H, H-P): the share of the model's belief that rain reaches
+    # this point within the lead, fitted on what DMI's rain gauges
+    # recorded rather than on what the radar composite did. This is the
+    # number the website's panel shows and the push rule decides on.
+    #
+    # Additive, and ``p_rain`` above is untouched — it stays the
+    # curve-calibrated ensemble fraction it has always been, so a pinned
+    # client keeps reading the same field with the same meaning. Null
+    # when no model is loaded, when the point is off the product grid, or
+    # when the model was not fitted for the lead.
+    p_post: float | None = None
 
 
 class ForecastPointRain(BaseModel):
@@ -228,6 +257,17 @@ class ForecastPointResponse(BaseModel):
     # empty list) when the cycle published no series. Additive, so pinned
     # clients are unaffected.
     forecast_mm_h: list[ForecastPointRain] | None = None
+    # Which probability this response's per-lead ``p_post`` came from, for
+    # THIS point: ``postprocess`` when the gauge-trained model produced a
+    # number at any lead, ``curve`` when it produced none and the
+    # curve-calibrated ``p_rain`` is all there is. A consumer reads
+    # ``p_post`` where it is non-null and falls back to ``p_rain``; this
+    # field is what lets it say which of the two it is showing. Additive,
+    # defaulting to the pre-Phase-H answer.
+    probability_source: Literal["curve", "postprocess"] = "curve"
+    # ``fitted_at_utc`` of the post-processing model behind ``p_post``;
+    # null when none spoke for this point.
+    postprocess_fitted_at_utc: datetime | None = None
     # Global confidence scalar from the latest ``state.json`` (Phase A keeps
     # confidence global, plan §A1); null when no state is available yet.
     confidence: float | None

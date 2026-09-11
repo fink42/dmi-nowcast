@@ -108,6 +108,8 @@ export const en: Catalog = {
 		probabilityValue: (pct: number) => `${pct}%`,
 		probabilityWithin: (min: number, pct: number) =>
 			`Probability of rain within ${min} min: ${pct}%`,
+		gaugeCalibratedNote:
+			'These probabilities are calibrated against DMI’s rain gauges — what the ground actually recorded, not what the radar saw.',
 		confidenceLabel: 'Confidence',
 		confidenceValue: (pct: number) => `${pct}%`,
 		confidenceHigh: 'high',
@@ -203,7 +205,7 @@ export const en: Catalog = {
 			'Two consecutive images give a motion field — dense optical flow showing where the showers are heading.',
 			'The rain field is then carried forward along that motion, minute by minute, up to an hour ahead.',
 			'A STEPS ensemble repeats this 24 times with stochastic noise on the small scales that lose predictability first, and the fraction of members with rain becomes a probability.',
-			'That probability is finally calibrated against a backtest corpus from DMI’s own archive, so “70%” is meant to be worth 70%.'
+			'That probability is finally corrected against what DMI’s rain gauges recorded on the ground, so “70%” is meant to be worth 70%.'
 		],
 		limitsTitle: 'The limits',
 		limits: [

@@ -1,10 +1,16 @@
 /**
- * The server fallback: `GET /forecast?lat=&lon=`.
+ * `GET /forecast?lat=&lon=` — the server's answer for one point.
  *
- * Used when the client-side decode or projection fails for any reason (an
- * exotic PNG, a browser without `DecompressionStream`, a grid that failed to
- * download). It answers the same questions with the same conventions, and it
- * carries one thing the grids do not: the global confidence scalar.
+ * It started as the fallback for a failed client-side decode and is now also
+ * the *only* source of two things the artifacts cannot carry: the global
+ * confidence scalar, and (since 2026-09-11) the gauge-trained post-processed
+ * probability the site shows. Computing that needs the cycle's flow field and
+ * its raw ensemble fractions, neither of which is published as a grid — so
+ * the store fetches this for every selected point and merges the
+ * probabilities into whatever the client-side sampler produced.
+ *
+ * It answers the same questions with the same conventions, so it also remains
+ * a complete substitute when the grids are unavailable.
  */
 import { apiUrl, NoDataError } from './manifest';
 import type { PointForecast, RainSample } from './sampler';
@@ -12,6 +18,13 @@ import type { PointForecast, RainSample } from './sampler';
 interface ForecastPointLead {
 	lead_min: number;
 	p_rain: number | null;
+	/**
+	 * The gauge-trained post-processed probability. Additive: absent from a
+	 * sidecar older than the model, null from a cycle or a point the model
+	 * could not speak for. Both mean "no model number here", and the mapping
+	 * below normalises one into the other.
+	 */
+	p_post?: number | null;
 }
 
 /** One step of the advected rain field, as the endpoint serves it. */
@@ -51,6 +64,14 @@ interface ForecastPointResponse {
 	 * "no field evidence", never as "dry".
 	 */
 	forecast_mm_h?: ForecastPointRain[] | null;
+	/**
+	 * Which probability this response's `p_post` came from. Additive, with
+	 * the pre-model answer (`curve`) as the default an older sidecar implies
+	 * by omitting it.
+	 */
+	probability_source?: 'postprocess' | 'curve' | null;
+	/** When the model behind `p_post` was fitted; null without one. */
+	postprocess_fitted_at_utc?: string | null;
 	confidence: number | null;
 }
 
@@ -87,7 +108,11 @@ export async function fetchPointForecast(
 		lat: body.lat,
 		lon: body.lon,
 		radarTsUtc: body.radar_ts_utc,
-		perLead: body.per_lead.map((l) => ({ leadMin: l.lead_min, pRain: l.p_rain })),
+		perLead: body.per_lead.map((l) => ({
+			leadMin: l.lead_min,
+			pRain: l.p_rain,
+			pPost: l.p_post ?? null
+		})),
 		etaMin: body.eta_min,
 		intensityMmH: body.intensity_mm_h,
 		observedMmH: body.observed_mm_h ?? null,
@@ -97,6 +122,37 @@ export async function fetchPointForecast(
 		motion: null,
 		confidence: body.confidence,
 		calibrated: body.calibrated,
+		probabilitySource: body.probability_source ?? 'curve',
 		source: 'server'
+	};
+}
+
+/**
+ * The server's probabilities, folded into a forecast the client sampled.
+ *
+ * Everything positional stays the client's: it read the same pixel out of the
+ * same cycle's grids, and it carries the motion vector and the deterministic
+ * rain series the endpoint does not serve. Only the per-lead probabilities,
+ * the source label, the calibration flag and the confidence scalar come
+ * across — the things the server knows and the grids do not.
+ *
+ * Leads are matched by value, not by position: the two paths read the same
+ * manifest, but a cycle that served a lead to one and not the other must lose
+ * that lead's probability rather than silently take its neighbour's.
+ */
+export function withServedProbabilities(
+	client: PointForecast,
+	server: PointForecast
+): PointForecast {
+	const byLead = new Map(server.perLead.map((lead) => [lead.leadMin, lead]));
+	return {
+		...client,
+		perLead: client.perLead.map((lead) => {
+			const served = byLead.get(lead.leadMin);
+			return served ? { ...lead, pRain: served.pRain, pPost: served.pPost ?? null } : lead;
+		}),
+		probabilitySource: server.probabilitySource ?? 'curve',
+		confidence: server.confidence ?? client.confidence,
+		calibrated: server.calibrated
 	};
 }

@@ -74,9 +74,11 @@ from .national_sample import finite_or_none, product_pixel_of
 from .push.paths import resolved_postprocess_path
 from .push.postprocess import (
     CyclePostprocess,
+    PostprocessContext,
     PostprocessTable,
     build_cycle_postprocess,
     point_key,
+    score_point,
 )
 from .render import render_frames
 from .strike_archive import StrikeArchive
@@ -157,10 +159,40 @@ class PointProducts:
 
     ``pixels`` is the product-grid pixel each point read, carried so the
     rest of the cycle reads the same one without a second projection pass.
+
+    ``raw_grids`` is the whole RAW ``p_rain`` grid set, by reference and
+    only when a model is loaded. A point the cycle never heard of — the
+    pixel a website visitor clicks — has to read its own fraction off the
+    same grids the served points read theirs off, and after
+    ``_calibrate_national`` those numbers exist nowhere else. ``None``
+    when no model is loaded, which is when nothing could ask.
     """
 
     pixels: tuple[tuple[int, int] | None, ...]
     raw_fractions: dict[int, tuple[float | None, ...]]
+    raw_grids: dict[int, np.ndarray] | None = None
+
+
+@dataclass(frozen=True)
+class PointPostprocess:
+    """One point's post-processed probabilities, however they were obtained.
+
+    ``p_post`` is keyed by lead minutes, ``None`` at a lead the model has
+    nothing to say about. ``reused`` records which of the two paths
+    answered — the cycle's own table for a point it already scored, or a
+    feature row assembled on demand — because "the panel and the
+    notification agree" is only a true statement while the first path is
+    the one a subscriber's point takes.
+    """
+
+    p_post: dict[int, float | None]
+    fitted_at_utc: str | None
+    reused: bool
+
+    @property
+    def active(self) -> bool:
+        """Did the model actually produce a number for this point?"""
+        return any(value is not None for value in self.p_post.values())
 
 
 @dataclass(frozen=True)
@@ -383,6 +415,10 @@ class CycleEngine:
         self._postprocess = PostprocessTable(resolved_postprocess_path(config))
         self._point_sources: list[tuple[str, Any]] = []
         self._postprocess_latest: CyclePostprocess | None = None
+        #: The grids behind that answer, kept only while a model is loaded
+        #: so a point the cycle never heard of can still be scored (see
+        #: :class:`~dmi_nowcast_sidecar.push.postprocess.PostprocessContext`).
+        self._postprocess_context: PostprocessContext | None = None
         #: ``(lat, lon)`` → km to the nearest radar. A property of the
         #: point, not of the cycle, and the cycle asks for it once per
         #: point per frame.
@@ -449,6 +485,114 @@ class CycleEngine:
         trusting it, exactly as it does for ``national_latest``.
         """
         return self._postprocess_latest
+
+    @property
+    def postprocess_context(self) -> PostprocessContext | None:
+        """The grids the last cycle's post-processing answer was read off.
+
+        ``None`` before the first cycle, and on any deployment with no
+        model loaded — the arrays are only worth holding where something
+        can score against them.
+        """
+        return self._postprocess_context
+
+    def postprocess_point(self, lat: float, lon: float) -> PointPostprocess | None:
+        """The gauge-trained model's probability at ONE point, or ``None``.
+
+        Two paths to the same number, and the order matters:
+
+        1. the point is one this cycle already scored — home, a
+           subscription, a gauge-eval station — so the answer is read
+           straight out of :class:`CyclePostprocess`. A subscriber looking
+           at the panel then sees the very number their notification was
+           decided on, not a recomputation of it;
+        2. otherwise the feature row is assembled on demand off the
+           cycle's retained grids, through the same two core functions the
+           cycle uses for its whole point list.
+
+        ``None`` means "no model spoke here" and the caller serves the
+        curve-calibrated probability, exactly as the push path does: no
+        model loaded, no cycle yet, a snapshot and a post-processing
+        object belonging to different frames, a point off the product
+        grid, or a row the model could not score.
+
+        Never raises. Runs on the event loop with the rest of
+        ``/forecast``'s arithmetic: the on-demand path is a 5 km disc and
+        a 40 km corridor gather around one pixel plus a one-row design.
+
+        The distance-to-radar lookup deliberately does NOT go through the
+        cycle's memo (``_station_radar_km``): that dict is keyed by point
+        and this endpoint takes its coordinates from the public internet,
+        so memoising here would be an unbounded map a visitor can grow.
+        """
+        table = self._postprocess
+        if not table.active:
+            return None
+        snapshot = self._national_latest
+        if snapshot is None:
+            return None
+        products, radar_ts = snapshot[0], snapshot[1]
+        latest = self._postprocess_latest
+        if (
+            latest is not None
+            and latest.active
+            and latest.radar_ts_utc == radar_ts
+        ):
+            index = latest.index_of(lat, lon)
+            if index is not None:
+                return PointPostprocess(
+                    p_post={
+                        int(lead): values[index]
+                        for lead, values in sorted(latest.p_post.items())
+                    },
+                    fitted_at_utc=latest.fitted_at_utc,
+                    reused=True,
+                )
+        context = self._postprocess_context
+        geo = self._geo
+        if context is None or geo is None or context.radar_ts_utc != radar_ts:
+            return None
+        try:
+            idx = geo.lonlat_to_grid(lon, lat)
+            pixel = product_pixel_of(products, idx.row, idx.col)
+            if pixel is None:
+                return None
+            row, col = pixel
+            raw = {
+                int(lead): finite_or_none(grid[row, col])
+                for lead, grid in context.raw_fraction_grids.items()
+                if grid.shape == products.eta_min.shape
+            }
+            observed = getattr(snapshot, "observed_mm_h", None)
+            shared = {
+                "observed_mm_h": (
+                    finite_or_none(observed[row, col])
+                    if observed is not None
+                    and observed.shape == products.eta_min.shape
+                    else None
+                ),
+                "eta_min": finite_or_none(products.eta_min[row, col]),
+                "intensity_mm_h": finite_or_none(
+                    products.intensity_mm_h[row, col],
+                ),
+            }
+            scored, _features = score_point(
+                table, context,
+                row=idx.row, col=idx.col,
+                raw_fractions=raw,
+                shared=shared,
+                station_radar_km=nearest_radar_km(float(lat), float(lon)),
+            )
+        except Exception as exc:  # noqa: BLE001 — a scoring failure costs the
+            # post-processed number for one request, never the response:
+            # ``/forecast`` still serves the curve-calibrated probability.
+            _log.warning("postprocess_point_failed", error=str(exc))
+            return None
+        if not scored:
+            return None
+        return PointPostprocess(
+            p_post=scored, fitted_at_utc=table.fitted_at_utc, reused=False,
+        )
 
     def add_point_source(self, name: str, provider: Any) -> None:
         """Register a supplier of points the cycle should score (H-P).
@@ -822,6 +966,10 @@ class CycleEngine:
             ),
         }
         motion_stalled_share = motion.stalled_share
+        # Kept as scalars past ``del motion`` below: a feature row assembled
+        # later in the cycle — or later still, for a point ``/forecast`` is
+        # asked about — must read the same bulk motion the served rows did.
+        motion_bulk_vy, motion_bulk_vx = motion.bulk_vy, motion.bulk_vx
 
         # H-P: the post-processing features, for every point this cycle
         # serves, off the SAME anchor field and the SAME completed flow
@@ -1092,6 +1240,14 @@ class CycleEngine:
                 radar_ts_utc=composite_now.timestamp_utc,
                 generated_at_utc=generated_at_utc,
                 frame_age_min=frame_age_min,
+                rain_mm_h=rain_now,
+                vy=vy,
+                vx=vx,
+                pixel_km=pixel_km,
+                dt_min=dt_min,
+                bulk_vy=motion_bulk_vy,
+                bulk_vx=motion_bulk_vx,
+                stalled_share=motion_stalled_share,
             )
             # R2 cell-motion grids: the display product, on the product
             # grid, in km/h. Fed the COMPLETED flow — the same array the
@@ -1151,6 +1307,26 @@ class CycleEngine:
                 _log.warning("national_artifacts_failed", error=str(exc))
             national_ms += (time.perf_counter() - t_art) * 1000
 
+        # H-P: the home point's post-processed probability, written BESIDE
+        # ``p_calibrated`` rather than over it. Home is always the first
+        # point the cycle scores, so this is a lookup, never a second
+        # computation — and the frame guard is the same one every other
+        # consumer applies before trusting the object.
+        probability_source = "curve"
+        post_latest = self._postprocess_latest
+        if (
+            post_latest is not None
+            and post_latest.active
+            and post_latest.radar_ts_utc == composite_now.timestamp_utc
+        ):
+            scored: list[PerLeadEntry] = []
+            for entry in per_lead:
+                value = post_latest.probability(lat, lon, entry.lead_min)
+                if value is not None:
+                    probability_source = "postprocess"
+                scored.append(entry.model_copy(update={"p_post": value}))
+            per_lead = scored
+
         # State payload.
         now_utc = datetime.now(timezone.utc)
 
@@ -1182,6 +1358,7 @@ class CycleEngine:
                 peak_intensity_mm_h=peak_rate,
                 peak_lead_min=peak_lead,
                 per_lead=per_lead,
+                probability_source=probability_source,  # type: ignore[arg-type]
             ),
             probabilistic=(
                 ProbabilisticBlock(
@@ -1422,7 +1599,13 @@ class CycleEngine:
                     # baseline is the calibrated one, so both have to
                     # survive the swap — the same reason the replay keeps
                     # ``raw_p_rain`` across it.
-                    point_products = _read_points(raw_national, points)
+                    point_products = _read_points(
+                        raw_national, points,
+                        # The whole raw grid set survives the swap only
+                        # where something can read it: the on-demand
+                        # ``/forecast`` scoring path, which needs a model.
+                        keep_grids=self._postprocess.active,
+                    )
                     national = self._calibrate_national(raw_national)
                     del raw_national
                 except Exception as exc:  # noqa: BLE001
@@ -1557,6 +1740,14 @@ class CycleEngine:
         radar_ts_utc: datetime,
         generated_at_utc: datetime,
         frame_age_min: float,
+        rain_mm_h: np.ndarray,
+        vy: np.ndarray,
+        vx: np.ndarray,
+        pixel_km: float,
+        dt_min: float,
+        bulk_vy: float,
+        bulk_vx: float,
+        stalled_share: float,
     ) -> None:
         """Assemble and score this cycle's feature rows; publish the result.
 
@@ -1570,6 +1761,14 @@ class CycleEngine:
         here and handed to the model, but are NOT written into the feature
         row: the decision schema already carries them, and one column has
         one writer.
+
+        The grids and flow are published alongside as a
+        :class:`~dmi_nowcast_sidecar.push.postprocess.PostprocessContext`,
+        and ONLY while a model is loaded: they are ~45 MB held for the
+        life of the cycle, and without a model nothing could read them.
+        A cycle that publishes nothing leaves the previous context in
+        place, stamped with the previous frame — which is exactly how
+        every reader already decides not to use it.
         """
         if not keys or grid_features is None or points is None:
             return
@@ -1612,12 +1811,36 @@ class CycleEngine:
                 hour_utc=generated_at_utc.hour,
                 frame_age_min=frame_age_min,
             )
+            self._postprocess_context = (
+                PostprocessContext(
+                    radar_ts_utc=radar_ts_utc,
+                    generated_at_utc=generated_at_utc,
+                    rain_mm_h=rain_mm_h,
+                    vy=vy,
+                    vx=vx,
+                    raw_fraction_grids=dict(points.raw_grids or {}),
+                    leads=tuple(int(lead) for lead in products.leads_min),
+                    pixel_km=float(pixel_km),
+                    dt_min=float(dt_min),
+                    bulk_vy=float(bulk_vy),
+                    bulk_vx=float(bulk_vx),
+                    stalled_share=float(stalled_share),
+                    season=core_postprocess.season_of_month(
+                        generated_at_utc.month,
+                    ),
+                    hour_utc=generated_at_utc.hour,
+                    frame_age_min=float(frame_age_min),
+                )
+                if self._postprocess.active and points.raw_grids
+                else None
+            )
             _log.info(
                 "postprocess_cycle",
                 points=len(keys),
                 active=self._postprocess_latest.active,
                 leads=list(self._postprocess_latest.leads),
                 fitted_at=self._postprocess_latest.fitted_at_utc,
+                on_demand=self._postprocess_context is not None,
             )
         except Exception as exc:  # noqa: BLE001 — see the docstring
             _log.warning("postprocess_cycle_failed", error=str(exc))
@@ -1755,7 +1978,10 @@ def _disc_motion(
 
 
 def _read_points(
-    products: NationalProducts, points: Sequence[Any] | None,
+    products: NationalProducts,
+    points: Sequence[Any] | None,
+    *,
+    keep_grids: bool = False,
 ) -> PointProducts | None:
     """Per-point reads of the RAW national grids (H-P).
 
@@ -1765,6 +1991,11 @@ def _read_points(
     arithmetic ``/forecast``, the push fan-out and the browser sampler use.
     A point off the product grid contributes ``None`` at every lead —
     unknown, never 0 %.
+
+    ``keep_grids`` additionally keeps the raw grids themselves alive past
+    ``_calibrate_national``, for the on-demand ``/forecast`` lookup. ~7 MB
+    of float32 at the shipped downsample, so the cycle only asks for it
+    when a post-processing model is actually loaded.
     """
     if not points:
         return None
@@ -1778,7 +2009,14 @@ def _read_points(
             None if pixel is None else finite_or_none(grid[pixel[0], pixel[1]])
             for pixel in pixels
         )
-    return PointProducts(pixels=pixels, raw_fractions=raw)
+    return PointProducts(
+        pixels=pixels,
+        raw_fractions=raw,
+        raw_grids=(
+            {int(lead): products.p_rain[int(lead)] for lead in products.leads_min}
+            if keep_grids else None
+        ),
+    )
 
 
 def _bearing_from_deg(dy_per_min: float, dx_per_min: float) -> float:

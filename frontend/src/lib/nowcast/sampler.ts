@@ -114,6 +114,15 @@ export interface LeadProbability {
 	leadMin: number;
 	/** Probability of rain by this lead, or null where the grid has no value. */
 	pRain: number | null;
+	/**
+	 * The gauge-trained post-processed probability at this lead — the number
+	 * the site shows and the push notifications fire on. Only the server can
+	 * produce it: it needs the cycle's flow field and the raw ensemble
+	 * fractions, neither of which travels in the artifacts, so the
+	 * client-side sampler always leaves it null and the panel falls back to
+	 * `pRain`.
+	 */
+	pPost?: number | null;
 }
 
 /**
@@ -173,6 +182,15 @@ export interface PointForecast {
 	confidence: number | null;
 	/** True only when every served lead went through a calibration curve. */
 	calibrated: boolean;
+	/**
+	 * Which probability the per-lead numbers should be read as: `postprocess`
+	 * when the gauge-trained model answered for this point, `curve` when it
+	 * did not and the isotonic-calibrated ensemble fraction is what there is.
+	 * Null on a forecast that has not been told — the client-side sample
+	 * before the server's answer arrives — which the panel treats as "not
+	 * the model", never as a claim either way.
+	 */
+	probabilitySource?: 'postprocess' | 'curve' | null;
 	/** Where the numbers came from — shown in the panel, honestly. */
 	source: 'client' | 'server';
 }
@@ -245,6 +263,9 @@ export function samplePoint(
 		motion: sampleMotion(grids, pixel),
 		confidence: null,
 		calibrated: isCalibrated(manifest),
+		// The grids carry the curve-calibrated probability and nothing else.
+		// The store merges the server's answer in when it lands.
+		probabilitySource: null,
 		source: 'client'
 	};
 }

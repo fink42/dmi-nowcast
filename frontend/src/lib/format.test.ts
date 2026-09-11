@@ -16,8 +16,8 @@
  *     instant, so the sentence and the picture cannot disagree.
  */
 import { describe, expect, it } from 'vitest';
-import { RAINING_NOW_MIN, RAINING_NOW_MM_H, arrivalClock, clockTime, countdownEtaMin, headline, headlineDecision, nextWetMinutes, rainNowMmH } from './format';
-import type { RainSample } from './nowcast/sampler';
+import { RAINING_NOW_MIN, RAINING_NOW_MM_H, arrivalClock, clockTime, countdownEtaMin, headline, headlineDecision, nextWetMinutes, probabilityWithin, rainNowMmH, servedProbabilities } from './format';
+import type { LeadProbability, PointForecast, RainSample } from './nowcast/sampler';
 import { da } from './i18n/da';
 import { en } from './i18n/en';
 
@@ -320,5 +320,105 @@ describe('headline', () => {
 		expect(headline(en, headlineDecision(0, series(3, 0.1, 0, 4), after(12)))).toBe(
 			'Rain in about 18 min'
 		);
+	});
+});
+
+
+/**
+ * Which probability the panel shows.
+ *
+ * Since 2026-09-11 the site serves the gauge-trained post-processed model:
+ * the panel's bars, the "within 20 min" line and the push notification are
+ * all meant to be about that one number. The preference is per LEAD, not per
+ * point — a model may be fitted for some horizons and not others, and a bar
+ * chart mixing the two without saying so would be a chart of two claims.
+ */
+describe('servedProbabilities', () => {
+	const forecast = (perLead: LeadProbability[]): PointForecast => ({
+		lat: 55.6,
+		lon: 12.5,
+		radarTsUtc: GENERATED,
+		perLead,
+		etaMin: null,
+		intensityMmH: null,
+		observedMmH: null,
+		rainSeries: [],
+		motion: null,
+		confidence: null,
+		calibrated: true,
+		source: 'server'
+	});
+
+	it('prefers the model where it spoke', () => {
+		const out = servedProbabilities(
+			forecast([
+				{ leadMin: 10, pRain: 0.9, pPost: 0.42 },
+				{ leadMin: 20, pRain: 0.95, pPost: 0.51 }
+			])
+		);
+		expect(out.leads).toEqual([
+			{ leadMin: 10, pRain: 0.42 },
+			{ leadMin: 20, pRain: 0.51 }
+		]);
+		expect(out.source).toBe('postprocess');
+	});
+
+	it('falls back to the curve where it did not', () => {
+		// A sidecar with no model, or a point off its coverage: every bar is
+		// the curve-calibrated number and nothing may claim the gauges.
+		const out = servedProbabilities(
+			forecast([
+				{ leadMin: 10, pRain: 0.9, pPost: null },
+				{ leadMin: 20, pRain: 0.95 }
+			])
+		);
+		expect(out.leads).toEqual([
+			{ leadMin: 10, pRain: 0.9 },
+			{ leadMin: 20, pRain: 0.95 }
+		]);
+		expect(out.source).toBe('curve');
+	});
+
+	it('falls back per lead, and still names the model', () => {
+		const out = servedProbabilities(
+			forecast([
+				{ leadMin: 10, pRain: 0.9, pPost: 0.42 },
+				{ leadMin: 60, pRain: 0.95, pPost: null }
+			])
+		);
+		expect(out.leads).toEqual([
+			{ leadMin: 10, pRain: 0.42 },
+			{ leadMin: 60, pRain: 0.95 }
+		]);
+		expect(out.source).toBe('postprocess');
+	});
+
+	it('keeps a model zero, which is a forecast rather than a gap', () => {
+		const out = servedProbabilities(
+			forecast([{ leadMin: 10, pRain: 0.9, pPost: 0 }])
+		);
+		expect(out.leads[0].pRain).toBe(0);
+		expect(out.source).toBe('postprocess');
+	});
+
+	it('leaves an unknown lead unknown rather than reaching for the curve', () => {
+		// A nodata pixel is null in both columns and must stay null: the bar
+		// is omitted, never drawn at zero.
+		const out = servedProbabilities(
+			forecast([{ leadMin: 10, pRain: null, pPost: null }])
+		);
+		expect(out.leads[0].pRain).toBeNull();
+	});
+
+	it('is what the “within 20 min” line reads', () => {
+		const highlight = probabilityWithin(
+			forecast([
+				{ leadMin: 10, pRain: 0.9, pPost: 0.42 },
+				{ leadMin: 20, pRain: 0.95, pPost: 0.51 },
+				{ leadMin: 60, pRain: 0.99, pPost: 0.8 }
+			]),
+			20
+		);
+		expect(highlight).toEqual({ leadMin: 20, pRain: 0.51 });
 	});
 });

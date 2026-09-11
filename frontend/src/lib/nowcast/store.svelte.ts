@@ -11,7 +11,7 @@
 import { browser } from '$app/environment';
 import { loadOverlayFrames, overlayGeometry, type OverlayFrame } from '$lib/map/overlay';
 import type { Corners } from '$lib/map/warp';
-import { fetchPointForecast } from './forecast';
+import { fetchPointForecast, withServedProbabilities } from './forecast';
 import { freshness, type Freshness } from './freshness';
 import { loadGrids } from './grids';
 import { fetchManifest, isCalibrated, NoDataError, type Manifest } from './manifest';
@@ -45,6 +45,17 @@ export interface PointState {
 	lon: number;
 	status: 'loading' | 'ready' | 'off-coverage' | 'error';
 	forecast: PointForecast | null;
+	/**
+	 * True while the server's `/forecast` answer for this point is still in
+	 * flight. The client-side sample lands first and carries everything that
+	 * comes off the grids — the deterministic series, the ETA, the motion
+	 * arrow — but NOT the probability the site serves, which only the server
+	 * can compute. The panel therefore withholds the probability bars and the
+	 * "within 20 min" line until this clears, rather than drawing the
+	 * curve-calibrated numbers for a moment and swapping them under the
+	 * reader's eye.
+	 */
+	probabilitiesPending: boolean;
 }
 
 class NowcastStore {
@@ -81,6 +92,8 @@ class NowcastStore {
 	#frameTimer: ReturnType<typeof setTimeout> | null = null;
 	#onVisible: (() => void) | null = null;
 	#lastPollAt = 0;
+	/** Bumped per `selectPoint`, so a superseded answer is dropped on arrival. */
+	#pointToken = 0;
 
 	/** Radar age and pipeline liveness, kept apart on purpose — see freshness.ts. */
 	get freshness(): Freshness {
@@ -301,32 +314,71 @@ class NowcastStore {
 	// --- point forecast ----------------------------------------------------
 
 	/**
-	 * Forecast for one point: sampled from the decoded grids when they are
-	 * available, otherwise from the server. The two paths use the same
-	 * conventions and produce the same shape.
+	 * Forecast for one point, in two arrivals.
+	 *
+	 * The decoded grids answer instantly and answer almost everything: the
+	 * pixel, the deterministic rain series the headline is read from, the
+	 * ETA, the intensity, the motion arrow. What they cannot answer is the
+	 * probability the site actually serves — the gauge-trained model needs
+	 * the cycle's flow field and its raw ensemble fractions, and neither is
+	 * published as a grid. So `/forecast` is fetched for EVERY selected
+	 * point, not only as a fallback, and its probabilities are merged in when
+	 * they land.
+	 *
+	 * The two-arrival shape is deliberate. Making the whole panel wait on the
+	 * network would cost the instant answer that is the reason the grids are
+	 * decoded at all; drawing the sampled probabilities and then replacing
+	 * them would show the reader a number the site does not serve. So the
+	 * panel gets everything except the bars at once, and the bars when the
+	 * server answers.
+	 *
+	 * A selection that is superseded — a second click, or the next cycle's
+	 * re-sample — is dropped on arrival rather than racing the newer one.
 	 */
 	async selectPoint(lat: number, lon: number): Promise<void> {
-		this.point = { lat, lon, status: 'loading', forecast: null };
+		const token = ++this.#pointToken;
+		const current = () => this.#pointToken === token;
+		this.point = { lat, lon, status: 'loading', forecast: null, probabilitiesPending: true };
 		const manifest = this.manifest;
+		let sampled: PointForecast | null = null;
 		if (manifest && this.#grids) {
 			try {
-				const forecast = samplePoint(manifest, this.#grids, lat, lon);
-				this.point = forecast
-					? { lat, lon, status: 'ready', forecast }
-					: { lat, lon, status: 'off-coverage', forecast: null };
-				return;
+				sampled = samplePoint(manifest, this.#grids, lat, lon);
+				this.point = sampled
+					? { lat, lon, status: 'ready', forecast: sampled, probabilitiesPending: true }
+					: { lat, lon, status: 'off-coverage', forecast: null, probabilitiesPending: false };
+				// Off coverage on the client is off coverage: the sampler read
+				// the same grid the endpoint would have, and asking again
+				// cannot change the answer.
+				if (!sampled) return;
 			} catch (err) {
-				console.warn('client-side sampling failed, falling back to /forecast', err);
+				console.warn('client-side sampling failed, using /forecast alone', err);
+				sampled = null;
 			}
 		}
 		try {
-			const forecast = await fetchPointForecast(lat, lon);
-			this.point = forecast
-				? { lat, lon, status: 'ready', forecast }
-				: { lat, lon, status: 'off-coverage', forecast: null };
+			const served = await fetchPointForecast(lat, lon);
+			if (!current()) return;
+			if (served) {
+				const forecast = sampled ? withServedProbabilities(sampled, served) : served;
+				this.point = { lat, lon, status: 'ready', forecast, probabilitiesPending: false };
+			} else if (sampled) {
+				// The server says off-coverage where the grids answered. Trust
+				// the sampled answer and leave the bars on the curve-calibrated
+				// numbers rather than blanking a panel that has real content.
+				this.point = { lat, lon, status: 'ready', forecast: sampled, probabilitiesPending: false };
+			} else {
+				this.point = { lat, lon, status: 'off-coverage', forecast: null, probabilitiesPending: false };
+			}
 		} catch (err) {
+			if (!current()) return;
 			console.warn('/forecast failed', err);
-			this.point = { lat, lon, status: 'error', forecast: null };
+			// A failed fetch costs the served probability, not the panel: the
+			// sampled numbers are the honest fallback and the source label
+			// stays null, so nothing claims to be the model.
+			this.point = sampled
+				? { lat, lon, status: 'ready', forecast: sampled, probabilitiesPending: false }
+				: { lat, lon, status: 'error', forecast: null, probabilitiesPending: false };
 		}
 	}
 

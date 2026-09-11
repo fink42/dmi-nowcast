@@ -175,6 +175,48 @@ def inputs_from_json(payload: dict) -> Any:
     return QualityInputs(**kwargs)
 
 
+#: ``GaugeReliabilityOptions`` fields that carry a path, or a list of them.
+_GAUGE_PATH_FIELDS = frozenset({"corpus_dir", "postprocess_model"})
+_GAUGE_PATH_LIST_FIELDS = frozenset({"decisions_dirs"})
+_GAUGE_TUPLE_FIELDS = frozenset({"leads", "stations", "design_leads"})
+
+
+def gauge_reliability_options_to_json(options: Any) -> dict:
+    """A :class:`GaugeReliabilityOptions` as plain JSON types."""
+    out: dict[str, Any] = {}
+    for field in dataclasses.fields(options):
+        value = getattr(options, field.name)
+        if field.name in _GAUGE_PATH_LIST_FIELDS:
+            out[field.name] = None if value is None else [str(p) for p in value]
+        elif field.name in _GAUGE_PATH_FIELDS:
+            out[field.name] = None if value is None else str(value)
+        elif isinstance(value, (list, tuple)):
+            out[field.name] = list(value)
+        else:
+            out[field.name] = value
+    return out
+
+
+def gauge_reliability_options_from_json(payload: dict) -> Any:
+    """The :class:`GaugeReliabilityOptions` the encoder above produced."""
+    from .gauge_reliability import GaugeReliabilityOptions
+
+    known = {field.name for field in dataclasses.fields(GaugeReliabilityOptions)}
+    kwargs: dict[str, Any] = {}
+    for name, value in (payload or {}).items():
+        if name not in known:
+            continue  # a newer writer, an older reader: ignore, don't crash
+        if name in _GAUGE_PATH_LIST_FIELDS:
+            kwargs[name] = [] if value is None else [Path(str(v)) for v in value]
+        elif name in _GAUGE_PATH_FIELDS:
+            kwargs[name] = _as_path(value)
+        elif name in _GAUGE_TUPLE_FIELDS:
+            kwargs[name] = None if value is None else tuple(value)
+        else:
+            kwargs[name] = value
+    return GaugeReliabilityOptions(**kwargs)
+
+
 def sweep_options_to_json(options: Any) -> dict:
     """A :class:`SweepOptions` as plain JSON types."""
     out: dict[str, Any] = {}
@@ -367,6 +409,48 @@ def run_postprocess_fit(
     }
 
 
+def run_gauge_reliability(
+    block: dict,
+    *,
+    scorer: Callable[[Any], dict | None] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict | None:
+    """The page's gauge curve, scored on the decision rows. ``None`` on any
+    failure, which the builder reads as "fall back to the station corpus".
+
+    Deliberately total. This is one section of a document whose whole
+    premise is that a missing input nulls its own section and nothing
+    else; a build that died because a decision tree was unreadable would
+    take the scoreboard, the station map and the freshness stamps down
+    with it for the sake of one diagram.
+    """
+    options = gauge_reliability_options_from_json(block.get("options") or {})
+    score = scorer
+    if score is None:
+        from .gauge_reliability import gauge_reliability_from_decisions
+
+        def score(opts: Any) -> dict | None:
+            return gauge_reliability_from_decisions(opts, log=log)
+
+    try:
+        result = score(options)
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        if log:
+            log(
+                "gauge reliability failed, falling back to the station "
+                f"corpus: {type(exc).__name__}: {exc}"
+            )
+        return None
+    if log:
+        curves = (result or {}).get("curves") or []
+        log(
+            f"gauge reliability: {len(curves)} lead(s) scored on "
+            f"{(result or {}).get('probability_column')}"
+            if curves else "gauge reliability: nothing scored"
+        )
+    return result or None
+
+
 def run_job(
     config: dict,
     *,
@@ -375,6 +459,7 @@ def run_job(
     renderer: Callable[[dict], str] | None = None,
     fitter: Callable[[Any], dict] | None = None,
     postprocess_fitter: Callable[[Any], dict] | None = None,
+    gauge_scorer: Callable[[Any], dict | None] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict:
     """The whole job: refit, fit, build, write, summarise.
@@ -424,11 +509,25 @@ def run_job(
     if fit.get("enabled") and not live_only:
         fit_summary.update(run_threshold_fit(fit, fitter=fitter, log=log))
 
+    # The page's gauge reliability curve, scored on the probability the
+    # site serves rather than on the station corpus's curve (Phase H).
+    # Nightly only: it is a corpus-sized read, and the hourly refresh
+    # carries the whole reliability section over from the last full build.
+    gauge_block: dict | None = None
+    gauge = config.get("gauge_reliability") or {}
+    if gauge.get("enabled") and not live_only:
+        gauge_block = run_gauge_reliability(gauge, scorer=gauge_scorer, log=log)
+
     inputs = inputs_from_json(quality.get("inputs") or {})
     if log:
         log(f"building the report (mode={'live' if live_only else 'full'})")
     if live_only:
         report = build(inputs, live_only=True, previous=read_previous(path))
+    elif gauge_block is not None:
+        # Passed only when there IS one: an injected test builder takes
+        # the inputs and nothing else, and a keyword it never asked for
+        # would be a TypeError rather than a fallback.
+        report = build(inputs, gauge_reliability=gauge_block)
     else:
         report = build(inputs)
     problems = validate_report(report)
@@ -470,6 +569,26 @@ def run_job(
         "postprocess_fitted_at": None,
         "postprocess": {},
         "postprocess_error": None,
+        # Additive (Phase H): which probability column the page's gauge
+        # curve was scored on and how many leads it covers. Null when the
+        # step is off, skipped, or fell back to the station corpus — which
+        # is a fact worth being able to read off the summary line rather
+        # than inferring from the document.
+        "gauge_reliability": (
+            None if gauge_block is None else {
+                "probability_column": gauge_block.get("probability_column"),
+                "leads": [
+                    int(curve["lead_min"])
+                    for curve in gauge_block.get("curves") or []
+                ],
+                "rows": (gauge_block.get("window") or {}).get("rows"),
+                "stations": (gauge_block.get("window") or {}).get("points"),
+                # stored / computed-from-features / excluded, so the
+                # operator can see at a glance whether the replay tree
+                # actually made it into the diagram.
+                "fill": gauge_block.get("fill"),
+            }
+        ),
         "error": None,
     }
     summary.update(fit_summary)

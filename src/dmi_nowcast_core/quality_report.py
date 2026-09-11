@@ -1485,10 +1485,29 @@ def _replay_summary(inputs: QualityInputs) -> dict:
 _MODE_WORDS = {
     "cv": "calibrated out-of-sample, leave-one-{fold}-out CV",
     "served": "the served curves",
+    # Phase H: the gauge-trained post-processing model, which is what the
+    # panel shows and the push rule decides on. A different probability
+    # from "the served curves", and the sentence has to say so.
+    "postprocess": "the gauge-trained post-processed probability the site serves",
     "raw": "the raw ensemble exceedance fraction, uncalibrated",
     "mixed": "a mix of calibrated and raw leads",
     "none": "not measured",
 }
+
+#: What each diagram's outcome column MEANS, per truth. The two are not
+#: the same event: the radar curve grades a forecast against the composite
+#: it was made from, cumulatively over the lead; the gauge curve grades it
+#: against what a bucket on the ground reported in the 10-minute slots
+#: inside that lead. Reading one number as the other is the single easiest
+#: mistake to make on this page.
+_RADAR_OUTCOME = (
+    "scored against the radar composite's own cumulative outcome within "
+    "each lead"
+)
+_GAUGE_OUTCOME = (
+    "scored against the gauge's 10-minute slots inside each lead, dead "
+    "gauges excluded"
+)
 
 
 def _mode_phrase(block: Mapping[str, Any] | None) -> str | None:
@@ -1637,14 +1656,22 @@ def _dead_gauge_sentence(
 def _reliability_sentence(
     radar: Mapping[str, Any] | None, gauge: Mapping[str, Any] | None,
 ) -> str:
-    """Which probability each reliability diagram is of, named separately."""
+    """Which probability each diagram is of, and what it is scored against.
+
+    Both halves matter and both used to be missing one of them. The two
+    curves differ in the probability (a cross-validated curve against the
+    model the site actually serves) AND in the event (the composite's own
+    cumulative outcome against a rain gauge's 10-minute slots), so a
+    reader comparing the two lines without being told either difference is
+    comparing two things that were never the same claim.
+    """
     parts = []
     radar_phrase = _mode_phrase(radar)
     if radar_phrase is not None:
-        parts.append(f"radar: {radar_phrase}")
+        parts.append(f"radar: {radar_phrase}, {_RADAR_OUTCOME}")
     gauge_phrase = _mode_phrase(gauge)
     if gauge_phrase is not None:
-        parts.append(f"gauges: {gauge_phrase} against gauge truth")
+        parts.append(f"gauges: {gauge_phrase}, {_GAUGE_OUTCOME}")
     return "; ".join(parts) if parts else "not measured"
 
 
@@ -1742,6 +1769,7 @@ def build_quality_report(
     *,
     live_only: bool = False,
     previous: Mapping[str, Any] | None = None,
+    gauge_reliability: Mapping[str, Any] | None = None,
 ) -> dict:
     """Produce the ``quality.json`` document for these inputs.
 
@@ -1766,6 +1794,23 @@ def build_quality_report(
     In that mode a usable ``previous`` is REQUIRED, and its absence is a
     :class:`ValueError` rather than a document with a null reliability
     section — see :func:`_usable_previous`.
+
+    ``gauge_reliability`` REPLACES the station-corpus fit behind
+    ``reliability.gauge``, ``windows.gauge`` and the per-station
+    ``brier_gauge``. It is the same block shape
+    :func:`reliability_from_corpus` returns, computed instead from the
+    decision rows — the probability the site actually serves, scored
+    against the gauge outcome the benchmark's Layer B uses
+    (``dmi_nowcast_sidecar.gauge_reliability``). It arrives injected
+    rather than computed here because the loader it needs lives in the
+    sidecar package and this module must keep importing nothing from it;
+    the caller is the nightly job, which can see both. ``None`` — or a
+    block with no curves — falls back to the corpus fit, so a deployment
+    without decision rows keeps the page it had.
+
+    All three replaced sections move together on purpose. A window that
+    describes one sample under a curve fitted on another is the kind of
+    quiet mismatch this page exists to not have.
     """
     carried = _usable_previous(previous) if live_only else {}
 
@@ -1786,11 +1831,22 @@ def build_quality_report(
                 curves=curves, inputs=inputs, calibration="cv",
                 point_set=RADAR_POINT_SET,
             )
-        if inputs.station_corpus is not None and Path(inputs.station_corpus).is_file():
-            # The SERVED curves, and legitimately so: the fit never saw
-            # ``gauge_outcome``. A rain gauge is an independent
+        if gauge_reliability and gauge_reliability.get("curves"):
+            # Phase H: the decision rows, scored on the probability the
+            # site serves. Preferred over the corpus fit whenever it can
+            # be computed — and it is also the cheaper of the two, so the
+            # corpus is not read at all when this is present.
+            gauge = dict(gauge_reliability)
+        elif (
+            inputs.station_corpus is not None
+            and Path(inputs.station_corpus).is_file()
+        ):
+            # The fallback, and what the page showed before the model
+            # existed: the SERVED curves, legitimately so because the fit
+            # never saw ``gauge_outcome``. A rain gauge is an independent
             # instrument, so "what we published against what the ground
-            # recorded" is already an out-of-sample claim.
+            # recorded" is already an out-of-sample claim — it is simply
+            # no longer a claim about the number anyone is shown.
             gauge = reliability_from_corpus(
                 Path(inputs.station_corpus), outcome_column="gauge_outcome",
                 curves=curves, inputs=inputs, calibration="served",

@@ -90,7 +90,13 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Config
 from .push.paths import resolved_postprocess_path, resolved_thresholds_path
-from .quality_job import JOB_MODULE, inputs_to_json, run_job, sweep_options_to_json
+from .quality_job import (
+    JOB_MODULE,
+    gauge_reliability_options_to_json,
+    inputs_to_json,
+    run_job,
+    sweep_options_to_json,
+)
 
 _log = structlog.get_logger(__name__)
 
@@ -345,6 +351,44 @@ class QualityReportTask:
             min_known_slots=int(thresholds.min_known_slots),
         )
 
+    def _gauge_reliability_options(self) -> Any:
+        """The :class:`GaugeReliabilityOptions` this config describes.
+
+        Shares the threshold fit's rows, leads and gauge rule, and follows
+        ``push.probability_source`` for the column — so the curve on the
+        page is of the number the panel shows and the push rule decides
+        on, measured on the rows the served thresholds were fitted over.
+        Any other combination would put three different claims on one
+        page and call them one measurement.
+        """
+        from .gauge_reliability import GaugeReliabilityOptions
+        from .push.routes import lead_options
+
+        settings = self.settings.gauge_reliability
+        thresholds = self.settings.fit_thresholds
+        dirs = settings.decisions_dirs or thresholds.decisions_dirs
+        post = self.config.push.probability_source == "postprocess"
+        return GaugeReliabilityOptions(
+            decisions_dirs=[Path(d) for d in dirs],
+            corpus_dir=Path(self.config.storage.corpus_dir),  # type: ignore[arg-type]
+            leads=tuple(
+                settings.leads or thresholds.leads or lead_options(self.config)
+            ),
+            probability_column=post_column_template() if post else None,
+            # The same model the sweep is handed, at the same path — so
+            # the rows the page scores and the rows the served thresholds
+            # were fitted on carry identical probabilities. Most of the
+            # archive predates the column; without this the diagram would
+            # be drawn from the hours since the serving path shipped.
+            postprocess_model=self.postprocess_out() if post else None,
+            design_leads=tuple(
+                int(lead) for lead in self.config.forecast.national.leads_min
+            ),
+            dry_min=int(thresholds.dry_min),
+            onset_min_mm=float(thresholds.onset_min_mm),
+            min_known_slots=int(thresholds.min_known_slots),
+        )
+
     def _fit_options(self) -> Any:
         """The :class:`SweepOptions` this config describes."""
         from .push.routes import lead_options
@@ -420,6 +464,7 @@ class QualityReportTask:
             },
             "fit": {"enabled": False},
             "fit_postprocess": {"enabled": False},
+            "gauge_reliability": {"enabled": False},
         }
         post = settings.fit_postprocess
         # The refit only runs where it can: it needs rows and a gauge
@@ -433,6 +478,23 @@ class QualityReportTask:
                 "options": _postprocess_options_to_json(
                 self._postprocess_options(),
             ),
+            }
+        gauge = settings.gauge_reliability
+        gauge_dirs = gauge.decisions_dirs or fit.decisions_dirs
+        # Same "empty disables it" rule the two fits have: without rows
+        # there is nothing to score, and the builder falls back to the
+        # station corpus rather than nulling the section.
+        if (
+            gauge.enabled
+            and gauge_dirs
+            and self.config.storage.corpus_dir is not None
+            and not live_only
+        ):
+            payload["gauge_reliability"] = {
+                "enabled": True,
+                "options": gauge_reliability_options_to_json(
+                    self._gauge_reliability_options(),
+                ),
             }
         if fit.enabled and not live_only:
             payload["fit"] = {

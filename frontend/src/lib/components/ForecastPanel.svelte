@@ -21,7 +21,8 @@
 		headlineDecision,
 		intensityWord,
 		percent,
-		probabilityWithin
+		probabilityWithin,
+		servedProbabilities
 	} from '$lib/format';
 	import { nowcast } from '$lib/nowcast/store.svelte';
 	import NotifyPanel from './NotifyPanel.svelte';
@@ -76,8 +77,23 @@
 	);
 	const confidence = $derived(forecast?.confidence ?? nowcast.confidence);
 	const ageMin = $derived(nowcast.radarAgeMin);
-	const highlight = $derived(forecast ? probabilityWithin(forecast, 20) : null);
-	const bars = $derived(forecast?.perLead.filter((l) => l.pRain !== null) ?? []);
+	/**
+	 * The probabilities come from the server, so they arrive one round trip
+	 * after everything else. While they are in flight the bars and the
+	 * "within 20 min" line are simply not rendered: drawing the sampled
+	 * curve-calibrated numbers first and swapping them for the model's a
+	 * moment later would show a number the site does not serve, and show it
+	 * moving. Everything above — headline, ETA, intensity, motion — is off
+	 * the grids and is there instantly.
+	 */
+	const pending = $derived(point?.probabilitiesPending ?? false);
+	/**
+	 * What to show per lead, and which of the two it is. `p_post` where the
+	 * gauge-trained model spoke, the curve-calibrated value where it did not.
+	 */
+	const served = $derived(forecast ? servedProbabilities(forecast) : null);
+	const highlight = $derived(!pending && forecast ? probabilityWithin(forecast, 20) : null);
+	const bars = $derived(pending ? [] : (served?.leads.filter((l) => l.pRain !== null) ?? []));
 	const maxP = $derived(Math.max(0.05, ...bars.map((b) => b.pRain ?? 0)));
 
 	let collapsed = $state(false);
@@ -166,7 +182,12 @@
 				{#if point.status === 'off-coverage'}
 					<p class="muted">{t().panel.offCoverageBody}</p>
 				{:else if forecast}
-					{#if highlight}
+					{#if pending}
+						<!-- The bars' own loading state. The rest of the panel is
+						     already answered off the grids; this one line holds the
+						     space so the layout does not jump when it fills. -->
+						<p class="muted lede">{t().panel.loading}</p>
+					{:else if highlight}
 						<p class="lede">
 							{t().panel.probabilityWithin(highlight.leadMin, percent(highlight.pRain))}
 						</p>
@@ -194,6 +215,12 @@
 							{/each}
 						</div>
 						<p class="axis">{t().panel.leadAxis}</p>
+						<!-- Whose calibration these numbers carry. Shown only when
+						     the model actually answered for this point: a panel
+						     falling back to the curve must not claim the gauges. -->
+						{#if served?.source === 'postprocess'}
+							<p class="muted note">{t().panel.gaugeCalibratedNote}</p>
+						{/if}
 					{/if}
 
 					<dl class="facts">
@@ -465,6 +492,13 @@
 		font-size: 0.7rem;
 		color: var(--muted);
 		text-align: center;
+	}
+
+	/* The calibration footnote under the bars: present, not shouting. */
+	.note {
+		margin: -0.45rem 0 0.75rem;
+		font-size: 0.7rem;
+		line-height: 1.35;
 	}
 
 	.facts {

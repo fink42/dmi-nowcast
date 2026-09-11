@@ -302,11 +302,18 @@ def test_forecast_endpoint_flags_calibrated_with_full_coverage(
     assert body["calibrated"] is True
     fitted = datetime.fromisoformat(body["calibration_fitted_at"].replace("Z", "+00:00"))
     assert fitted == datetime(2026, 8, 15, 3, 0, tzinfo=timezone.utc)
-    # The served values ARE the calibrated grid samples.
+    # The served values ARE the calibrated grid samples. ``p_post`` rides
+    # alongside and is null: this engine has no post-processing model, and
+    # §B4's calibrated ``p_rain`` is untouched by Phase H either way.
     assert body["per_lead"] == [
-        {"lead_min": lead, "p_rain": pytest.approx(_expected(lead), abs=1e-9)}
+        {
+            "lead_min": lead,
+            "p_rain": pytest.approx(_expected(lead), abs=1e-9),
+            "p_post": None,
+        }
         for lead in NATIONAL_LEADS
     ]
+    assert body["probability_source"] == "curve"
 
 
 # ---------------------------------------------------------------------------

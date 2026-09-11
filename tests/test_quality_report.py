@@ -827,10 +827,15 @@ class TestFullReport:
             "first wet slot after ≥ 60 dry min, with ≥ 0.2 mm over that "
             "slot and the next",
         )
-        # The two truths are two different claims and must be named as such.
+        # The two truths are two different claims and must be named as
+        # such — in the probability AND in the event each is scored
+        # against, which are two separate ways to misread the page.
         assert methods["reliability_probability"] == (
-            "radar: calibrated out-of-sample, leave-one-month-out CV; "
-            "gauges: the served curves against gauge truth"
+            "radar: calibrated out-of-sample, leave-one-month-out CV, "
+            "scored against the radar composite's own cumulative outcome "
+            "within each lead; "
+            "gauges: the served curves, scored against the gauge's "
+            "10-minute slots inside each lead, dead gauges excluded"
         )
         assert "raw →" in methods["reliability_brier_improvement"]
         assert "n ≥ 200" in methods["headline_bin_rule"]
@@ -1099,8 +1104,11 @@ class TestOutOfSampleRadarReliability:
         """Two truths, two different and correctly-labelled claims."""
         report = build_quality_report(full_inputs)
         assert report["methods"]["reliability_probability"] == (
-            "radar: calibrated out-of-sample, leave-one-month-out CV; "
-            "gauges: the served curves against gauge truth"
+            "radar: calibrated out-of-sample, leave-one-month-out CV, "
+            "scored against the radar composite's own cumulative outcome "
+            "within each lead; "
+            "gauges: the served curves, scored against the gauge's "
+            "10-minute slots inside each lead, dead gauges excluded"
         )
 
     def test_every_curve_carries_the_paired_raw_brier(
@@ -2124,3 +2132,162 @@ class TestUnionCorpusPointSet:
         served = doc["reliability"]["radar"]
         assert served is not None
         assert [c["n"] for c in served] == [c["n"] for c in expected["curves"]]
+
+
+# ---------------------------------------------------------------------------
+# The gauge curve of the SERVED probability (Phase H)
+# ---------------------------------------------------------------------------
+
+
+class TestInjectedGaugeReliability:
+    """``reliability.gauge`` from the decision rows, not the corpus.
+
+    The site serves the gauge-trained post-processed model, so the page's
+    gauge diagram has to be of that number. Computing it needs the Arrow
+    decision-row loader, which lives in the sidecar package and must not
+    be imported here — so the builder takes the finished block and the
+    nightly job supplies it (``dmi_nowcast_sidecar.gauge_reliability``,
+    pinned against the benchmark's Layer B in
+    ``sidecar/tests/test_gauge_reliability.py``).
+
+    What this class owns is the swap: the block wins over the corpus fit,
+    it takes the whole gauge section with it — curve, window and the
+    per-station Brier behind the map — and an hourly refresh carries it
+    over like everything else the corpus half feeds.
+    """
+
+    @staticmethod
+    def _block() -> dict:
+        """A minimal block in ``reliability_from_corpus``' shape."""
+        bins = [
+            {
+                "lo": round(k / 10, 6), "hi": round((k + 1) / 10, 6),
+                "forecast_mean": 0.75 if k == 7 else None,
+                "observed_freq": 0.73 if k == 7 else None,
+                "n": 400 if k == 7 else 0,
+                "eff_n": 400.0 if k == 7 else 0.0,
+            }
+            for k in range(10)
+        ]
+        return {
+            "curves": [
+                {
+                    "lead_min": 30, "brier": 0.0812, "brier_raw": 0.1044,
+                    "n": 400, "eff_n": 400.0, "n_excluded": 12, "bins": bins,
+                },
+            ],
+            "window": {
+                "from": "2026-06-01T00:00:00Z", "to": "2026-06-30T23:50:00Z",
+                "events": 4176, "rows": 8352, "points": 97,
+            },
+            "frame_age": None,
+            "threshold_mm_h": None,
+            "per_point_brier": {30: {"06180": 0.071}},
+            "mode": "postprocess",
+            "cv_folds": 0,
+            "fold": None,
+            "probability_column": "p_post_{lead}",
+        }
+
+    def test_it_replaces_the_corpus_fit_entirely(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """Curve, window and station Brier move together.
+
+        Keeping one of the three from the corpus would put a window
+        describing one sample under a curve fitted on another — the exact
+        quiet mismatch this page exists not to have.
+        """
+        corpus_only = build_quality_report(full_inputs)
+        report = build_quality_report(
+            full_inputs, gauge_reliability=self._block(),
+        )
+        assert [c["lead_min"] for c in report["reliability"]["gauge"]] == [30]
+        assert report["reliability"]["gauge"] != corpus_only["reliability"]["gauge"]
+        assert report["windows"]["gauge"] == {
+            "from": "2026-06-01T00:00:00Z", "to": "2026-06-30T23:50:00Z",
+            "events": 4176, "stations": 97,
+        }
+        # The radar half is untouched: a different probability, a different
+        # truth, and no reason for either to move.
+        assert report["reliability"]["radar"] == corpus_only["reliability"]["radar"]
+        assert report["windows"]["radar"] == corpus_only["windows"]["radar"]
+
+    def test_the_headline_sentence_reads_from_the_new_curve(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(
+            full_inputs, gauge_reliability=self._block(),
+        )
+        headline = report["headline"]["reliability"]["gauge"]
+        assert headline["lead_min"] == 30
+        assert headline["said_pct"] == pytest.approx(75.0)
+        assert headline["happened_pct"] == pytest.approx(73.0)
+
+    def test_the_station_map_colours_come_from_the_served_probability(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(
+            full_inputs, gauge_reliability=self._block(),
+        )
+        briers = {
+            f["properties"]["station_id"]: f["properties"]["brier_gauge"]
+            for f in report["stations"]["features"]
+        }
+        assert briers["06180"] == pytest.approx(0.071)
+
+    def test_methods_names_the_model_and_what_it_is_scored_against(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(
+            full_inputs, gauge_reliability=self._block(),
+        )
+        sentence = report["methods"]["reliability_probability"]
+        assert "gauges: the gauge-trained post-processed probability" in sentence
+        assert "10-minute slots inside each lead" in sentence
+        assert "dead gauges excluded" in sentence
+        # And the radar half still says what it always said.
+        assert "radar: calibrated out-of-sample" in sentence
+
+    def test_an_empty_block_falls_back_to_the_corpus_fit(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """A deployment with no decision rows keeps the page it had."""
+        corpus_only = build_quality_report(full_inputs)
+        for empty in (None, {}, {"curves": []}):
+            report = build_quality_report(
+                full_inputs, gauge_reliability=empty,
+            )
+            assert report["reliability"]["gauge"] == corpus_only["reliability"]["gauge"]
+            assert report["windows"]["gauge"] == corpus_only["windows"]["gauge"]
+
+    def test_a_live_refresh_carries_it_over(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        """The hourly refresh never recomputes it — it copies it.
+
+        Same rule as the two corpus fits: the gauge curve is a read over
+        a season of rows and changes once a night, and the refresh exists
+        to move the scoreboard.
+        """
+        full = build_quality_report(
+            full_inputs, gauge_reliability=self._block(),
+        )
+        live = build_quality_report(
+            replace(full_inputs, now=NOW + timedelta(hours=1)),
+            live_only=True,
+            previous=json.loads(json.dumps(full)),
+        )
+        assert live["reliability"]["gauge"] == full["reliability"]["gauge"]
+        assert live["windows"]["gauge"] == full["windows"]["gauge"]
+        assert live["headline"]["reliability"] == full["headline"]["reliability"]
+        assert live["methods"] == full["methods"]
+        # The per-station Brier survives through the map's own properties,
+        # which is the only place a live refresh can read it back from.
+        briers = {
+            f["properties"]["station_id"]: f["properties"]["brier_gauge"]
+            for f in live["stations"]["features"]
+        }
+        assert briers["06180"] == pytest.approx(0.071)
+        # Deep-copied, as the rest of the carried half is.
+        assert live["reliability"] is not full["reliability"]

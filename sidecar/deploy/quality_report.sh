@@ -87,6 +87,7 @@
 #
 # Usage:
 #   sidecar/deploy/quality_report.sh
+#   QUALITY_GAUGE_RELIABILITY=0 sidecar/deploy/quality_report.sh
 #   QUALITY_FIT_THRESHOLDS=1 sidecar/deploy/quality_report.sh
 #   QUALITY_FIT_POSTPROCESS=1 QUALITY_FIT_THRESHOLDS=1 \
 #       sidecar/deploy/quality_report.sh
@@ -128,6 +129,13 @@ postprocess_out=${QUALITY_POSTPROCESS_OUT:-/var/lib/dmi-nowcast/postprocess.json
 fit_l2=${QUALITY_FIT_L2:-1.0}
 fit_design_leads=${QUALITY_FIT_DESIGN_LEADS:-10,20,30,45,60}
 fit_probability=${QUALITY_FIT_PROBABILITY:-postprocess}
+
+# The page's gauge reliability curve, scored on the decision rows rather
+# than on the station corpus (Phase H). On by default: the site serves the
+# post-processed probability, so a diagram of the isotonic curve would be
+# of a number nobody is shown. QUALITY_GAUGE_RELIABILITY=0 falls back to
+# the corpus fit, which is what the page showed before the model existed.
+gauge_reliability=${QUALITY_GAUGE_RELIABILITY:-1}
 
 # Bring scripts/ into the container on demand — the runtime image does not
 # carry them. Repo mounted read-only; every output goes to a volume.
@@ -231,7 +239,7 @@ config_json=$(run_in_repo python - \
     "$fit_workers" "$fit_min_warnings" "$fit_min_delta" \
     "$radar_decisions" "$decisions_dirs" \
     "$post_on" "$postprocess_out" "$fit_l2" "$fit_design_leads" \
-    "$fit_probability" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
+    "$fit_probability" "$gauge_reliability" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
 import json
 import sys
 
@@ -241,7 +249,7 @@ from dmi_nowcast_sidecar.threshold_sweep import parse_thresholds
 (corpus_dir, out, md_dir, live_days, fit_on, thresholds_out, sweep_json,
  leads, grid, workers, min_warnings, min_delta, radar_decisions,
  decisions_dirs, post_on, postprocess_out, l2, design_leads,
- probability, *pairs) = sys.argv[1:]
+ probability, gauge_reliability, *pairs) = sys.argv[1:]
 
 inputs = {"corpus_dir": corpus_dir, "live_days": int(live_days)}
 for pair in pairs:
@@ -256,9 +264,33 @@ config = {
     },
     "fit": {"enabled": False},
     "fit_postprocess": {"enabled": False},
+    "gauge_reliability": {"enabled": False},
 }
 lead_list = [int(v) for v in leads.split(",") if v.strip()]
 design_list = [int(v) for v in design_leads.split(",") if v.strip()]
+if gauge_reliability == "1":
+    # The same rows, the same gauge rule and the same probability column
+    # the threshold fit above uses — the page, the fitted model and the
+    # served thresholds have to stand on one sample.
+    config["gauge_reliability"] = {
+        "enabled": True,
+        "options": {
+            "decisions_dirs": decisions_dirs.split(),
+            "corpus_dir": corpus_dir,
+            "leads": lead_list,
+            "probability_column": (
+                POST_COLUMN_TEMPLATE if probability == "postprocess" else None
+            ),
+            # The served model, so the ten months of replay rows that
+            # carry features and no stored probability are scored rather
+            # than excluded. Without it the diagram would cover only the
+            # hours since the serving path shipped.
+            "postprocess_model": (
+                postprocess_out if probability == "postprocess" else None
+            ),
+            "design_leads": design_list,
+        },
+    }
 if post_on == "true":
     config["fit_postprocess"] = {
         "enabled": True,

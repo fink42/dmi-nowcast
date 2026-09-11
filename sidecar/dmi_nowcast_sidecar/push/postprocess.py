@@ -280,6 +280,41 @@ class PostprocessTable:
         out = float(values[0])
         return out if math.isfinite(out) else None
 
+    def predict_row(
+        self, features: Mapping[str, Any],
+    ) -> dict[int, float | None]:
+        """One point, EVERY fitted lead — ``{lead: probability | None}``.
+
+        :meth:`predict` builds a design matrix per call, which is the right
+        shape when a caller wants one lead and the wrong one when it wants
+        all of them: the design does not depend on the lead being
+        predicted, so asking five times over rebuilds it five times. This
+        lifts the row to single-element columns ONCE and reads every lead
+        off the same matrix — the single-point twin of
+        :func:`build_cycle_postprocess`'s table path, and what the
+        on-demand ``/forecast`` lookup is scored through.
+
+        ``{}`` when the table is inactive; a lead whose value is not
+        finite comes back ``None``, never a fabricated number.
+        """
+        if self._model is None:
+            return {}
+        columns = {
+            name: np.asarray([value], dtype=np.float64)
+            if not isinstance(value, str) else np.asarray([value])
+            for name, value in features.items()
+            if value is not None
+        }
+        if not columns:
+            return {}
+        return {
+            int(lead): (
+                None if values.size == 0
+                else core_postprocess.finite_or_none(values[0])
+            )
+            for lead, values in self.predict_table(columns).items()
+        }
+
 
 # ---------------------------------------------------------------------------
 # One cycle's answer
@@ -444,6 +479,115 @@ def build_cycle_postprocess(
     )
 
 
+# ---------------------------------------------------------------------------
+# The same answer for a point nobody asked about in advance
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PostprocessContext:
+    """The grids and per-cycle scalars a LATE feature row needs.
+
+    :class:`CyclePostprocess` answers for the points the cycle knew about
+    when it ran — home, the subscriptions, the gauge-eval stations. The
+    website's ``/forecast`` serves whatever pixel a visitor clicked, which
+    is none of those, and the honest answer for that point is the model's
+    number rather than the curve's. Computing it needs the very fields the
+    cycle drops on its way out: the anchor rain field, the completed flow,
+    and the UNcalibrated ensemble fractions that ``_calibrate_national``
+    replaces.
+
+    So the cycle keeps them, as one immutable object swapped beside
+    :class:`CyclePostprocess` — and ONLY when a model is loaded, because
+    without one the arrays would be ~45 MB of resident memory (41 MB of
+    native fields plus ~4 MB of raw product grids, measured on the
+    production composite) answering a question nobody can ask. ``radar_ts_utc`` is the same guard every
+    other published object carries: a reader refuses to pair one frame's
+    grids with another frame's stamp.
+
+    The arrays are held by reference, never copied. They are the cycle's
+    own, and the cycle is done with them by the time this is published.
+    """
+
+    radar_ts_utc: datetime
+    generated_at_utc: datetime
+    #: The cycle's ANCHOR rain field, native grid, mm/h (NaN off coverage).
+    rain_mm_h: np.ndarray
+    #: The COMPLETED flow the forecast was advected with, px per frame.
+    vy: np.ndarray
+    vx: np.ndarray
+    #: lead → the RAW (uncalibrated) ensemble fraction grid, on the PRODUCT
+    #: grid. The model's main predictor, and the one product the served
+    #: grids no longer carry once the national curves have been applied.
+    raw_fraction_grids: dict[int, np.ndarray]
+    #: The leads whose ``raw_frac_<lead>`` column the row must fill.
+    leads: tuple[int, ...]
+    pixel_km: float
+    dt_min: float
+    bulk_vy: float
+    bulk_vx: float
+    stalled_share: float
+    season: str
+    hour_utc: int
+    frame_age_min: float
+
+
+def score_point(
+    table: PostprocessTable,
+    context: PostprocessContext,
+    *,
+    row: float,
+    col: float,
+    raw_fractions: Mapping[int, float | None],
+    shared: Mapping[str, Any],
+    station_radar_km: float,
+) -> tuple[dict[int, float | None], dict[str, Any]]:
+    """One point's ``({lead: p_post}, feature_row)``, computed on demand.
+
+    The SAME two calls the cycle makes for its whole point list —
+    :func:`~dmi_nowcast_core.postprocess.station_features` and
+    :func:`~dmi_nowcast_core.postprocess.feature_row` — with a list of
+    one. That is the point: a row assembled by a second code path would
+    be a row the model was not fitted on, and the difference would be
+    invisible in the output.
+
+    ``row``/``col`` are the FRACTIONAL native index of the point,
+    ``raw_fractions`` the uncalibrated ensemble fractions already read at
+    its product pixel, and ``shared`` the three decision columns the
+    design also reads (``observed_mm_h``, ``eta_min``,
+    ``intensity_mm_h``) — the caller reads all of those off the pixel,
+    because only the caller knows which pixel the served numbers came from.
+
+    Cost is a 40 km corridor gather and a 5 km disc around one point plus
+    a one-row design — local windows, not whole-grid passes. Measured at
+    **0.42 ms per point** on the production 1728x1984 composite, which is
+    why it stays on the event loop beside the rest of ``/forecast``'s
+    arithmetic rather than paying for a thread hop.
+    """
+    leads = [int(lead) for lead in context.leads]
+    grid_features = core_postprocess.station_features(
+        context.rain_mm_h, context.vy, context.vx,
+        np.asarray([float(row)], dtype=np.float64),
+        np.asarray([float(col)], dtype=np.float64),
+        pixel_km=context.pixel_km,
+        dt_min=context.dt_min,
+        bulk_vy=context.bulk_vy,
+        bulk_vx=context.bulk_vx,
+        stalled_share=context.stalled_share,
+    )
+    features = core_postprocess.feature_row(
+        grid_features, 0,
+        raw_fractions={lead: raw_fractions.get(lead) for lead in leads},
+        leads=leads,
+        season=context.season,
+        hour_utc=context.hour_utc,
+        frame_age_min=context.frame_age_min,
+        station_radar_km=float(station_radar_km),
+    )
+    scored = table.predict_row({**features, **dict(shared)})
+    return scored, features
+
+
 def _columns_of(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Feature rows → the column dict ``build_design`` reads.
 
@@ -476,8 +620,10 @@ def _columns_of(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 __all__ = [
     "CyclePostprocess",
+    "PostprocessContext",
     "PostprocessTable",
     "ProbabilitySource",
     "build_cycle_postprocess",
     "point_key",
+    "score_point",
 ]

@@ -110,6 +110,8 @@ export const da = {
 		probabilityValue: (pct: number) => `${pct} %`,
 		probabilityWithin: (min: number, pct: number) =>
 			`Sandsynlighed for regn inden for ${min} min: ${pct} %`,
+		gaugeCalibratedNote:
+			'Sandsynlighederne er kalibreret mod DMI’s regnmålere — det, der faktisk blev målt på jorden, ikke det, radaren så.',
 		confidenceLabel: 'Sikkerhed',
 		confidenceValue: (pct: number) => `${pct} %`,
 		confidenceHigh: 'høj',
@@ -217,7 +219,7 @@ export const da = {
 			'To på hinanden følgende billeder giver et bevægelsesfelt — tæt optisk flow, der viser hvor byger er på vej hen.',
 			'Regnfeltet flyttes derefter fremad langs bevægelsen, minut for minut, op til en time.',
 			'Et STEPS-ensemble gentager det 24 gange med tilfældig støj på de små skalaer, som mister forudsigelighed først, og andelen af medlemmer med regn bliver til en sandsynlighed.',
-			'Sandsynligheden kalibreres til sidst mod et backtest-korpus fra DMI’s eget arkiv, så “70 %” gerne skulle betyde 70 %.'
+			'Sandsynligheden korrigeres til sidst efter det, DMI’s regnmålere har målt på jorden, så “70 %” gerne skulle betyde 70 %.'
 		],
 		limitsTitle: 'Grænserne',
 		limits: [
