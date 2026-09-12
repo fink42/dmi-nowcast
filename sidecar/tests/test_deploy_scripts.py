@@ -122,7 +122,11 @@ def test_layer_a_checks_variant_names_before_the_first_container() -> None:
 def test_layer_a_output_names_carry_the_variant_and_stride() -> None:
     """Two runs in one directory must not collide, and must be readable."""
     text = (DEPLOY_DIR / "layer_a.sh").read_text()
-    assert '${out_dir}/${variant}_stride${stride}_${stamp}' in text
+    assert '${out_dir}/${variant}${align_with:+_align-${align_with}}_stride${stride}_${stamp}' in text
+    # An aligned baseline is a different case list: its file says so,
+    # and the harness is told what to align with.
+    assert '${align_with:+--align-with "$align_with"}' in text
+    assert 'align_with=${LAYER_A_ALIGN_WITH:-}' in text
     assert '--out-json "${base}.json"' in text
     assert '--out-md "${base}.md"' in text
     # The harness writes with Path.write_text, which makes no parents.
