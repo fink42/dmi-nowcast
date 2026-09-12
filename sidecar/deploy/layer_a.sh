@@ -44,6 +44,11 @@
 #                       read-only (default ~/layer_a_days.txt)
 #   LAYER_A_STRIDE      use every Nth candidate frame (default 2)
 #   LAYER_A_HORIZONS    forecast horizons in minutes (default 10,20,30,45)
+#   LAYER_A_ALIGN_WITH  also require the frames this OTHER registry variant
+#                       needs (harness --align-with), so a baseline scores
+#                       the same case list a later run of that variant will
+#                       — e.g. LAYER_A_ALIGN_WITH=oracle LAYER_A_VARIANT=confidence.
+#                       Output names carry _align-<NAME>. Default: unset.
 #   LAYER_A_CORPUS_DIR  corpus root (default /var/lib/dmi-nowcast-corpus)
 #   LAYER_A_OUT_DIR     container path for the outputs
 #                       (default <corpus>/layer_a)
@@ -83,6 +88,7 @@ days_file=${LAYER_A_DAYS_FILE:-$HOME/layer_a_days.txt}
 out_dir=${LAYER_A_OUT_DIR:-$corpus_dir/layer_a}
 stride=${LAYER_A_STRIDE:-2}
 horizons=${LAYER_A_HORIZONS:-10,20,30,45}
+align_with=${LAYER_A_ALIGN_WITH:-}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 
@@ -133,6 +139,9 @@ for variant in "${variants[@]}"; do
         bad+=("$variant")
     fi
 done
+if [[ -n "$align_with" ]] && ! grep -qxF "$align_with" <<< "$known"; then
+    bad+=("$align_with (LAYER_A_ALIGN_WITH)")
+fi
 if [[ ${#bad[@]} -gt 0 ]]; then
     echo "FATAL: unknown flow variant(s): ${bad[*]}" >&2
     echo "  Registered:" >&2
@@ -145,6 +154,7 @@ echo "    variants: ${variants[*]} (${#variants[@]} run(s), sequential)"
 echo "    days: $(wc -l < "$days_file" | tr -d ' ') from ${days_file}"
 echo "    archive → ${corpus_dir}/composites"
 echo "    stride ${stride}, horizons ${horizons}"
+[[ -n "$align_with" ]] && echo "    case list aligned with: ${align_with}"
 echo "    out → ${out_dir} (stamp ${stamp})"
 echo "    workers: ${BATCH_WORKERS}   memory cap: ${BATCH_MEM_CAP}"
 
@@ -161,7 +171,7 @@ BATCH_RUN_ARGS=(-v "$days_file:/tmp/layer_a_days.txt:ro")
 # the end and the exit status carries the failure.
 failed=()
 for variant in "${variants[@]}"; do
-    base="${out_dir}/${variant}_stride${stride}_${stamp}"
+    base="${out_dir}/${variant}${align_with:+_align-${align_with}}_stride${stride}_${stamp}"
     echo
     echo "==> ${variant} → ${base}.{json,md}"
     if run_in_repo_capped python scripts/persistence_vs_advection.py \
@@ -171,6 +181,7 @@ for variant in "${variants[@]}"; do
             --stride "$stride" \
             --horizons "$horizons" \
             --variant "$variant" \
+            ${align_with:+--align-with "$align_with"} \
             --out-json "${base}.json" \
             --out-md "${base}.md"; then
         echo "    ${variant} done"
@@ -185,7 +196,7 @@ echo
 echo "==> Done → ${out_dir}"
 echo "    stamp ${stamp}, stride ${stride}"
 for variant in "${variants[@]}"; do
-    echo "    ${variant}_stride${stride}_${stamp}.{json,md}"
+    echo "    ${variant}${align_with:+_align-${align_with}}_stride${stride}_${stamp}.{json,md}"
 done
 echo "    Compare with scripts/compare_layer_a.py; check each report's"
 echo "    'cases (frames)' and 'skipped by reason' agree before reading a"
