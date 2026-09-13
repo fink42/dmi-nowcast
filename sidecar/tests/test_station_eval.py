@@ -83,7 +83,12 @@ def _products(p_rain_30: float = 0.9) -> NationalProducts:
 
 def _geo() -> FakeGeo:
     # ×4 downsample: native row 4 → product row 1, native row 8 → row 2.
+    # Home rides along because the cycle's point list always starts with
+    # it (``compute._serving_points``), so a station's feature row is
+    # never at index 0 — a lookup that quietly assumed it would be has to
+    # fail here rather than on the VM.
     return FakeGeo({
+        (10.32, 55.33): (2.0, 2.0),
         (12.6454, 55.614): (4.0, 4.0),
         (10.3297, 55.4735): (8.0, 8.0),
     })
@@ -93,12 +98,19 @@ class Snapshot(tuple):
     """Mirrors ``compute.NationalSnapshot``: a 2-tuple carrying extras."""
 
 
-def _engine(products, *, observed=0.0, forecast=0.0, radar_ts=RADAR_TS):
+def _engine(
+    products, *, observed=0.0, forecast=0.0, radar_ts=RADAR_TS, postprocess=None,
+):
     snap = Snapshot((products, radar_ts))
     snap.observed_mm_h = None if observed is None else _grid(observed)
     snap.forecast_mm_h = None if forecast is None else {0: _grid(forecast)}
     snap.generated_at_utc = radar_ts + timedelta(minutes=14)
-    return SimpleNamespace(national_latest=snap, geo=_geo())
+    # ``postprocess_latest`` is what the real ``CycleEngine`` publishes
+    # beside the snapshot; None is the deployment with no fitted model,
+    # which is what every test written before H-P assumes.
+    return SimpleNamespace(
+        national_latest=snap, geo=_geo(), postprocess_latest=postprocess,
+    )
 
 
 def _cycle_result(radar_ts=RADAR_TS):
@@ -844,3 +856,372 @@ class TestServedThreshold:
             by_ts.setdefault(row["radar_ts"], set()).add(row["threshold_pct"])
         assert by_ts[RADAR_TS] == {95}
         assert by_ts[later] == {25}
+
+
+# ---------------------------------------------------------------------------
+# The post-processing columns on a live row (Phase H, H-P)
+# ---------------------------------------------------------------------------
+#
+# The nightly refit trains on live rows and replay rows as one table, which
+# is only true while a live row carries the twenty feature columns and the
+# ``p_post_<lead>`` the decision was taken on. It stopped being true
+# silently — the columns were in the schema and null in every row — so the
+# tests below assert VALUES, not names, and they do it across the second
+# cycle of a month, because that is the shape production is in every
+# minute except the first one of the month.
+
+NATIVE_PX = 16                 # a 4×4 product grid at downsample 4
+FEATURE_LEADS = (10, 20, 30)   # what ``_products`` serves
+#: The three points the cycle scores, in ``_serving_points`` order.
+CYCLE_POINTS: tuple[tuple[float, float], ...] = (
+    (55.33, 10.32),            # home, always first
+    (55.614, 12.6454),         # 06180
+    (55.4735, 10.3297),        # 06120
+)
+#: The features the module promises a live row carries, one per kind: a
+#: per-lead raw fraction, a grid-derived scalar, the two cycle scalars a
+#: reader can check by eye, and the model's own answer.
+FEATURE_PROBE = (
+    "raw_frac_30", "obs_max_5km_mm_h", "season", "hour_utc",
+    "station_radar_km", "p_post_30",
+)
+
+
+def _native_rain() -> np.ndarray:
+    """A wet band over every point, NaN in the far south (to exercise it)."""
+    field = np.zeros((NATIVE_PX, NATIVE_PX), dtype=np.float32)
+    field[1:12, :] = 3.5
+    field[14:, :] = np.nan
+    return field
+
+
+def _native_flow() -> tuple[np.ndarray, np.ndarray]:
+    """A uniform south-easterly drift of 2 px per frame."""
+    vy = np.full((NATIVE_PX, NATIVE_PX), 2.0, dtype=np.float32)
+    vx = np.full((NATIVE_PX, NATIVE_PX), 1.5, dtype=np.float32)
+    return vy, vx
+
+
+def _postprocess_model():
+    """A model fitted on noise. Only its SHAPE reaches the assertions."""
+    from dmi_nowcast_core import postprocess as pp
+
+    rng = np.random.default_rng(11)
+    n = 400
+    signal = rng.random(n)
+    rows: dict[str, object] = {
+        name: rng.random(n) * 5.0
+        for name in pp.DESIGN_SOURCE_COLUMNS if name != "hour_utc"
+    }
+    for lead in FEATURE_LEADS:
+        rows[pp.raw_fraction_column(lead)] = signal
+    rows["hour_utc"] = rng.integers(0, 24, n).astype(float)
+    rows["season"] = np.where(signal > 0.5, "summer", "winter").astype("<U8")
+    truth = {
+        lead: ((signal > 0.5).astype(float), np.ones(n, dtype=bool))
+        for lead in FEATURE_LEADS
+    }
+    return pp.fit_postprocess(
+        rows, truth, FEATURE_LEADS, l2=1.0, design_leads=FEATURE_LEADS,
+        fitted_at=datetime(2026, 9, 11, 3, 40, tzinfo=timezone.utc),
+    )
+
+
+def _postprocess_table(tmp_path: Path):
+    """A loaded :class:`PostprocessTable` — the real read path, from a file."""
+    from dmi_nowcast_sidecar.push.postprocess import PostprocessTable
+
+    path = tmp_path / "postprocess.json"
+    path.write_text(_postprocess_model().dumps())
+    table = PostprocessTable(path)
+    table.load()
+    assert table.active
+    return table
+
+
+def _cycle_postprocess(table, *, radar_ts=RADAR_TS, products=None):
+    """What ``CycleEngine._publish_postprocess`` publishes, assembled by hand.
+
+    The real ``build_cycle_postprocess`` over the real
+    ``station_features`` / ``feature_row`` / ``_read_points``, for the real
+    point list (home first, then both stations) — so the only thing this
+    stands in for is the cycle that produced the grids.
+    """
+    from dmi_nowcast_core import postprocess as pp
+    from dmi_nowcast_core.product_pairs import nearest_radar_km
+    from dmi_nowcast_sidecar import compute as compute_mod
+    from dmi_nowcast_sidecar.push.postprocess import (
+        build_cycle_postprocess,
+        point_key,
+    )
+
+    products = _products() if products is None else products
+    generated_at = radar_ts + timedelta(minutes=14)
+    geo = _geo()
+    native = [geo.lonlat_to_grid(lon, lat) for lat, lon in CYCLE_POINTS]
+    point_products = compute_mod._read_points(products, native)
+    assert point_products is not None
+    observed = np.full(products.eta_min.shape, 0.2, dtype=np.float32)
+    shared = []
+    for pixel in point_products.pixels:
+        assert pixel is not None
+        row, col = pixel
+        shared.append({
+            "observed_mm_h": float(observed[row, col]),
+            "eta_min": float(products.eta_min[row, col]),
+            "intensity_mm_h": float(products.intensity_mm_h[row, col]),
+        })
+    vy, vx = _native_flow()
+    grid_features = pp.station_features(
+        _native_rain(), vy, vx,
+        np.array([idx.row for idx in native], dtype=np.float64),
+        np.array([idx.col for idx in native], dtype=np.float64),
+        pixel_km=0.5, dt_min=10.0,
+        bulk_vy=2.0, bulk_vx=1.5, stalled_share=0.011,
+    )
+    return build_cycle_postprocess(
+        table,
+        radar_ts_utc=radar_ts,
+        generated_at_utc=generated_at,
+        keys=[point_key(lat, lon) for lat, lon in CYCLE_POINTS],
+        grid_features=grid_features,
+        raw_fractions=point_products.raw_fractions,
+        shared=shared,
+        station_radar_km=[
+            nearest_radar_km(lat, lon) for lat, lon in CYCLE_POINTS
+        ],
+        leads=products.leads_min,
+        season=pp.season_of_month(generated_at.month),
+        hour_utc=generated_at.hour,
+        frame_age_min=14.0,
+    )
+
+
+def _eval_dir(config: Config) -> Path:
+    return Path(config.storage.corpus_dir) / "stations" / "eval"
+
+
+async def test_a_live_row_carries_the_cycles_features_and_p_post(
+    config: Config, tmp_path: Path,
+) -> None:
+    """One cycle: every probe column has a value, for both stations."""
+    cycle = _cycle_postprocess(_postprocess_table(tmp_path))
+    assert cycle.active and cycle.leads == FEATURE_LEADS
+
+    service = StationEvalService(
+        config, _engine(_products(), postprocess=cycle),
+    )
+    await service.after_cycle(_cycle_result())
+
+    rows = {r["station_id"]: r for r in _read_partition(config)}
+    assert set(rows) == {"06180", "06120"}
+    for station, row in rows.items():
+        missing = [name for name in FEATURE_PROBE if row[name] is None]
+        assert not missing, f"{station} lost {missing}"
+    assert service.last_summary["rows_with_features"] == 2
+    assert service.last_summary["rows_without_features"] == 0
+
+
+async def test_the_months_rewrite_keeps_every_rows_features(
+    config: Config, tmp_path: Path,
+) -> None:
+    """The second cycle of a month must not null the first cycle's features.
+
+    The regression that cost eight days of live rows: ``append_rows``
+    read-modify-writes the month partition, and the conform step that is
+    supposed to carry the additive columns across the rewrite was reading
+    them out of a table ``align_decision_table`` had already stripped. So
+    the first cycle of a month wrote features and every cycle after it
+    erased them — the incoming rows AND every row already on disk.
+    """
+    table = _postprocess_table(tmp_path)
+    service = StationEvalService(
+        config, _engine(_products(), postprocess=_cycle_postprocess(table)),
+    )
+    await service.after_cycle(_cycle_result())
+
+    later = RADAR_TS + timedelta(minutes=10)
+    service.engine = _engine(
+        _products(), radar_ts=later,
+        postprocess=_cycle_postprocess(table, radar_ts=later),
+    )
+    await service.after_cycle(_cycle_result(later))
+
+    rows = _read_partition(config, later)
+    assert len(rows) == 4        # two stations × two frames, one file
+    for row in rows:
+        missing = [name for name in FEATURE_PROBE if row[name] is None]
+        assert not missing, (
+            f"{row['station_id']} at {row['radar_ts']} lost {missing}"
+        )
+
+
+def test_append_rows_keeps_the_features_of_a_month_already_on_disk(
+    tmp_path: Path,
+) -> None:
+    """The same regression at the merge itself, without a cycle in the way."""
+    import pyarrow.parquet as pq
+
+    def row(station: str, ts: datetime) -> dict:
+        return {
+            **_row(station, ts),
+            "threshold_pct": 40,
+            "raw_frac_30": 0.81,
+            "obs_max_5km_mm_h": 3.5,
+            "season": "summer",
+            "hour_utc": 6,
+            "station_radar_km": 33.0,
+            "p_post_30": 0.62,
+        }
+
+    path = tmp_path / "09.parquet"
+    append_rows(path, [row("06180", RADAR_TS)], leads_min=(30,))
+    later = RADAR_TS + timedelta(minutes=10)
+    append_rows(path, [row("06120", later)], leads_min=(30,))
+
+    rows = {r["station_id"]: r for r in pq.read_table(path).to_pylist()}
+    for station in ("06180", "06120"):
+        assert rows[station]["raw_frac_30"] == pytest.approx(0.81)
+        assert rows[station]["obs_max_5km_mm_h"] == pytest.approx(3.5)
+        assert rows[station]["season"] == "summer"
+        assert rows[station]["hour_utc"] == 6
+        assert rows[station]["station_radar_km"] == pytest.approx(33.0)
+        assert rows[station]["p_post_30"] == pytest.approx(0.62)
+
+
+async def test_the_nightly_loaders_see_the_live_features_and_p_post(
+    config: Config, tmp_path: Path,
+) -> None:
+    """Both loaders the nightly fit reads through must see the values.
+
+    ``load_decisions`` aligns every file to the shared schema, which drops
+    the additive columns unless they are asked for by name; the sweep asks
+    for ``p_post_<lead>``. ``load_probabilities`` is the Arrow path Layer B
+    and the refit use. A row that survives the writer and dies in a loader
+    is the same outage with a different file:line.
+    """
+    from dmi_nowcast_core import postprocess as core_pp
+    from dmi_nowcast_sidecar.decision_rows import load_probabilities
+    from dmi_nowcast_sidecar.threshold_sweep import load_decisions
+
+    table = _postprocess_table(tmp_path)
+    service = StationEvalService(
+        config, _engine(_products(), postprocess=_cycle_postprocess(table)),
+    )
+    await service.after_cycle(_cycle_result())
+    later = RADAR_TS + timedelta(minutes=10)
+    service.engine = _engine(
+        _products(), radar_ts=later,
+        postprocess=_cycle_postprocess(table, radar_ts=later),
+    )
+    await service.after_cycle(_cycle_result(later))
+
+    rows, leads, counts = load_decisions(
+        [_eval_dir(config)], leads_min=FEATURE_LEADS,
+        extra_columns=["p_post_30"],
+    )
+    assert counts["rows"] == 4 and leads == FEATURE_LEADS
+    assert all(row["p_post_30"] is not None for row in rows)
+
+    loaded = load_probabilities(
+        [_eval_dir(config)], (30,),
+        column_for=core_pp.post_column,
+        extra_columns=["raw_frac_30", "obs_max_5km_mm_h", "station_radar_km"],
+    )
+    assert loaded["rows"] == 4
+    assert np.isfinite(loaded["p"][30]).all()
+    for name in ("raw_frac_30", "obs_max_5km_mm_h", "station_radar_km"):
+        assert np.isfinite(loaded["extra"][name]).all(), name
+
+
+class TestTheLogSaysWhenAFeatureRowIsMissing:
+    """A row without features is written, counted, and given a reason.
+
+    The contract is unchanged — the scoreboard never costs a cycle, so a
+    missing feature table still produces a decision row. What changed is
+    that it can no longer be silent: eight days of null columns went
+    unnoticed because nothing in the cycle's own log line mentioned them.
+    """
+
+    async def test_no_model_writes_rows_and_counts_them_as_featureless(
+        self, config: Config,
+    ) -> None:
+        import structlog.testing
+
+        service = StationEvalService(config, _engine(_products()))
+        with structlog.testing.capture_logs() as logs:
+            await service.after_cycle(_cycle_result())
+
+        assert len(_read_partition(config)) == 2      # still written
+        summary = service.last_summary
+        assert summary["rows_with_features"] == 0
+        assert summary["rows_without_features"] == 2
+        reasons = [
+            e["reason"] for e in logs if e["event"] == "station_eval_no_features"
+        ]
+        assert reasons == ["no_postprocess_object"]
+
+    async def test_a_stamp_from_another_frame_is_refused_and_named(
+        self, config: Config, tmp_path: Path,
+    ) -> None:
+        """One frame's features must never be stamped with another's."""
+        import structlog.testing
+
+        stale = _cycle_postprocess(
+            _postprocess_table(tmp_path), radar_ts=RADAR_TS - timedelta(minutes=10),
+        )
+        service = StationEvalService(
+            config, _engine(_products(), postprocess=stale),
+        )
+        with structlog.testing.capture_logs() as logs:
+            await service.after_cycle(_cycle_result())
+
+        rows = _read_partition(config)
+        assert len(rows) == 2
+        assert all(row["raw_frac_30"] is None for row in rows)
+        assert service.last_summary["rows_without_features"] == 2
+        mismatch = [
+            e for e in logs if e["event"] == "station_eval_no_features"
+        ]
+        assert [e["reason"] for e in mismatch] == [
+            "postprocess_radar_ts_mismatch",
+        ]
+        assert mismatch[0]["radar_ts"] == RADAR_TS.isoformat()
+
+    async def test_a_point_the_cycle_never_scored_is_named(
+        self, config: Config, tmp_path: Path,
+    ) -> None:
+        """A station missing from the cycle's point list is reported, not hidden."""
+        import structlog.testing
+
+        from dmi_nowcast_sidecar.push.postprocess import CyclePostprocess
+
+        full = _cycle_postprocess(_postprocess_table(tmp_path))
+        # Home and 06180 only: 06120 asked for features the cycle never built.
+        partial = CyclePostprocess(
+            radar_ts_utc=full.radar_ts_utc,
+            generated_at_utc=full.generated_at_utc,
+            keys=full.keys[:2],
+            rows=full.rows[:2],
+            p_post={
+                lead: values[:2] for lead, values in full.p_post.items()
+            },
+            fitted_at_utc=full.fitted_at_utc,
+        )
+        service = StationEvalService(
+            config, _engine(_products(), postprocess=partial),
+        )
+        with structlog.testing.capture_logs() as logs:
+            await service.after_cycle(_cycle_result())
+
+        rows = {r["station_id"]: r for r in _read_partition(config)}
+        assert rows["06180"]["raw_frac_30"] is not None
+        assert rows["06120"]["raw_frac_30"] is None
+        assert service.last_summary["rows_with_features"] == 1
+        assert service.last_summary["rows_without_features"] == 1
+        unserved = [
+            e for e in logs if e["event"] == "station_eval_no_features"
+        ]
+        assert [e["reason"] for e in unserved] == ["point_not_scored"]
+        assert unserved[0]["stations"] == 1
+        assert unserved[0]["examples"] == ["06120"]

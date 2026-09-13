@@ -199,28 +199,39 @@ def extra_schema(leads_min=None):
     )
 
 
-def _with_extras(table, rows: Sequence[dict] | None, schema) -> Any:
-    """Append every field of ``schema``, from ``rows`` or from ``table``.
+def _with_extras(
+    table, rows: Sequence[dict] | None, schema, *, source=None,
+) -> Any:
+    """Append every field of ``schema``, from ``rows`` or from ``source``.
 
     Two callers, one rule about what "missing" means. Building this
-    cycle's table the values come from the row dicts; conforming a month
-    partition written before a column existed they come from the file, and
-    a column the file does not have becomes nulls — never zeros, which
-    would claim the feature was computed and came out dry.
+    cycle's table the values come from the row dicts; conforming a table
+    that already has the columns they come from ``source``, and a column
+    ``source`` does not have becomes nulls — never zeros, which would
+    claim the feature was computed and came out dry.
+
+    ``source`` defaults to ``table`` because one caller has nothing else
+    to offer, but :func:`_conform` MUST pass the table as it was BEFORE
+    ``align_decision_table``: align drops every column it does not know,
+    so reading the extras back out of its output finds exactly the columns
+    that were just stripped, and every one of them comes back null. That
+    was the bug that emptied eight days of live rows — see
+    ``test_append_rows_keeps_the_features_of_a_month_already_on_disk``.
     """
     import pyarrow as pa
 
-    present = set(table.schema.names)
+    source = table if source is None else source
+    available = set(source.schema.names)
     for field_ in schema:
         if rows is not None:
             values = pa.array(
                 [row.get(field_.name) for row in rows], type=field_.type,
             )
-        elif field_.name in present:
-            values = table.column(field_.name).cast(field_.type)
+        elif field_.name in available:
+            values = source.column(field_.name).cast(field_.type)
         else:
             values = pa.nulls(table.num_rows, field_.type)
-        if field_.name in present:
+        if field_.name in table.schema.names:
             table = table.drop_columns([field_.name])
         table = table.append_column(field_, values)
     return table
@@ -231,10 +242,13 @@ def _conform(table, leads, schema) -> Any:
 
     ``align_decision_table`` deliberately drops everything it does not
     know, which is what keeps every other reader unaffected by these
-    columns — and is exactly why a merge has to put them back, or the
-    first rewrite of a month would silently delete the features in it.
+    columns — and is exactly why a merge has to put them back, from the
+    table as it was before the align, or the first rewrite of a month
+    would silently delete the features in it.
     """
-    return _with_extras(align_decision_table(table, leads), None, schema)
+    return _with_extras(
+        align_decision_table(table, leads), None, schema, source=table,
+    )
 
 
 def append_rows(path: Path, rows: Sequence[dict], leads_min=None) -> int:
@@ -443,14 +457,35 @@ class StationEvalService:
             self._last_summary = summary
 
     def _postprocess_for(self, radar_ts: datetime) -> Any:
-        """The cycle's ``CyclePostprocess`` for this frame, or None."""
+        """The cycle's ``CyclePostprocess`` for this frame, or None.
+
+        Says WHY when it is None. A row without features is still written
+        — that is the contract, the scoreboard never costs a cycle — but
+        it is worthless to the nightly refit, and the only thing that kept
+        eight days of them from being noticed was that nothing said so.
+        Both reasons are ``info``: on a deployment with no fitted model the
+        first one is the steady state, not a fault.
+        """
         latest = getattr(self.engine, "postprocess_latest", None)
         if latest is None:
+            _log.info(
+                "station_eval_no_features",
+                reason="no_postprocess_object",
+                radar_ts=radar_ts.isoformat(),
+            )
             return None
         stamp = getattr(latest, "radar_ts_utc", None)
         if stamp is not None and stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
-        return latest if stamp == radar_ts else None
+        if stamp != radar_ts:
+            _log.info(
+                "station_eval_no_features",
+                reason="postprocess_radar_ts_mismatch",
+                postprocess_ts=stamp.isoformat() if stamp else None,
+                radar_ts=radar_ts.isoformat(),
+            )
+            return None
+        return latest
 
     # -- the work (runs in a worker thread) ---------------------------------
 
@@ -557,6 +592,12 @@ class StationEvalService:
         rows: list[dict] = []
         actions: dict[str, int] = {}
         errors = 0
+        with_features = 0
+        #: Stations the cycle DID publish a feature table for and still had
+        #: nothing to say about — a point missing from its list. Collected
+        #: rather than logged per station: at ~100 stations a per-row line
+        #: would be the cycle's loudest output.
+        unscored: list[str] = []
         for point in self._points:
             station = point["id"]
             try:
@@ -603,6 +644,10 @@ class StationEvalService:
                 continue
             self._states[station] = decision.state
             actions[decision.action] = actions.get(decision.action, 0) + 1
+            if extras:
+                with_features += 1
+            elif postprocess is not None:
+                unscored.append(station)
             rows.append({
                 "radar_ts": radar_ts,
                 "generated_at": generated_at,
@@ -634,6 +679,17 @@ class StationEvalService:
         if not rows:
             _log.info("station_eval_empty", radar_ts=radar_ts.isoformat())
             return None
+        if unscored:
+            # The cycle answered for its point list and these were not on
+            # it: a points file the engine was registered with before it
+            # changed, or a truncated list (``_MAX_POSTPROCESS_POINTS``).
+            _log.warning(
+                "station_eval_no_features",
+                reason="point_not_scored",
+                radar_ts=radar_ts.isoformat(),
+                stations=len(unscored),
+                examples=sorted(unscored)[:5],
+            )
 
         # State first, rows second: a crash between the two costs one
         # cycle's rows, never a double-counted streak.
@@ -648,6 +704,12 @@ class StationEvalService:
             "eval_errors": errors,
             "actions": actions,
             "partition_rows": n_rows,
+            # How many of this cycle's rows are usable by the nightly
+            # refit. On a fitted deployment the second number is 0, and
+            # any other value is the eight-day outage starting again —
+            # which is the whole reason it is on this line.
+            "rows_with_features": with_features,
+            "rows_without_features": len(rows) - with_features,
             # Which rule this cycle ran, on the line that says what it
             # did: "table" is the fitted pick for the scoreboard's lead,
             # "fallback" the table's own default for a lead it cannot
