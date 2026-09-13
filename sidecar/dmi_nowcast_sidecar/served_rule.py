@@ -35,6 +35,14 @@ Every piece of this is the same call the nightly threshold fit and
 * :func:`~dmi_nowcast_sidecar.threshold_sweep.replay_station` runs
   ``push.engine.evaluate`` itself.
 
+The rule's timing is borrowed too: persistence is ONE observation and the
+re-arm 60 minutes, read from ``push.persistence_obs`` /
+``push.rearm_after_min`` by ``quality_report._served_rule_options`` and
+defaulted in :mod:`dmi_nowcast_core.push_rules`. Nothing here is allowed
+to have its own opinion about either — the page scoring two observations
+while the service fired on one is exactly the divergence DECIDE-14 closed
+on 2026-09-13.
+
 Two things are this module's own, and both exist to make the page's two
 halves one measurement:
 
@@ -68,6 +76,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from dmi_nowcast_core.push_rules import (
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 from dmi_nowcast_core.push_thresholds import (
     effective_threshold,
     lead_pick,
@@ -127,11 +139,14 @@ class ServedRuleOptions:
     postprocess_model: Path | None = None
     #: The leads the model's design reads. Must match the model's own.
     design_leads: tuple[int, ...] = DEFAULT_PRODUCT_LEADS_MIN
-    #: The rest of the live subscriber row (``station_eval.rules`` and
-    #: ``forecast.rain_threshold_mm_h``), so the replay is the service's
-    #: rule and not the sweep's defaults.
-    persistence_obs: int = 1
-    rearm_after_min: int = 60
+    #: The rest of the live subscriber row — the rule's timing from
+    #: ``push.persistence_obs`` / ``push.rearm_after_min`` and the
+    #: detection threshold from ``forecast.rain_threshold_mm_h`` — so the
+    #: replay is the service's rule and not this module's idea of it. The
+    #: defaults are the shipped numbers, in one place
+    #: (:mod:`dmi_nowcast_core.push_rules`).
+    persistence_obs: int = DEFAULT_PERSISTENCE_OBS
+    rearm_after_min: int = DEFAULT_REARM_AFTER_MIN
     raining_now_mm_h: float = 0.5
     raining_now_eta_min: float = 1.5
     #: The same coverage-gap the report scores inside, so the state

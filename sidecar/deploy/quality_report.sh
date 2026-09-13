@@ -101,6 +101,17 @@
 #                             threshold table, matching
 #                             station_eval.rules.threshold_pct (default 40)
 #
+# The rule's TIMING is not an option of this script. Persistence is ONE
+# observation and the re-arm 60 minutes (dmi_nowcast_core.push_rules,
+# decided 2026-09-13), and both are read out of the sidecar's own config
+# file inside the container — push.persistence_obs / push.rearm_after_min
+# at $DMI_NOWCAST_CONFIG — then passed explicitly into BOTH the threshold
+# fit and the served-rule scoreboard. A manual fit and the nightly one
+# therefore fit the same rule the fan-out fires on; before this they could
+# differ (the nightly fit took push.*, this script took the sweep's own
+# defaults). If the config cannot be read the core defaults are used and
+# the script says so on stderr.
+#
 # Usage:
 #   sidecar/deploy/quality_report.sh
 #   QUALITY_GAUGE_RELIABILITY=0 sidecar/deploy/quality_report.sh
@@ -157,9 +168,10 @@ gauge_reliability=${QUALITY_GAUGE_RELIABILITY:-1}
 gauge_out_of_fold=${QUALITY_GAUGE_OUT_OF_FOLD:-1}
 
 # The warning scoreboard, re-decided under the rule the service runs.
-# Defaults mirror station_eval.rules, which is what the live scoreboard
-# itself decides with — so the first manual build and every nightly one
-# after it measure the same rule.
+# Defaults mirror station_eval.rules — the horizon and the fallback
+# percent the live scoreboard itself decides with — so the first manual
+# build and every nightly one after it measure the same rule. The rule's
+# timing is resolved below, out of push.*, and is not an option here.
 served_rule=${QUALITY_SERVED_RULE:-1}
 served_lead=${QUALITY_SERVED_LEAD:-30}
 served_fallback=${QUALITY_SERVED_FALLBACK:-40}
@@ -174,6 +186,39 @@ run_in_repo() {
         sidecar \
         "$@"
 }
+
+# The push rule's timing, from the SERVICE's own config — the container
+# carries it at $DMI_NOWCAST_CONFIG (the compose mount), which is the same
+# file the running sidecar loads, so this cannot be a second set of
+# defaults. Both numbers are then passed explicitly into the fit and the
+# served-rule scoreboard below. A config that will not load costs the
+# override, not the run: the core defaults stand and the reason is printed
+# on stderr (stdout is the value this captures).
+rule_timing=$(run_in_repo python - <<'PY' | tr -d '\r' | tail -n 1
+import sys
+
+from dmi_nowcast_core.push_rules import (
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
+
+persistence, rearm = DEFAULT_PERSISTENCE_OBS, DEFAULT_REARM_AFTER_MIN
+try:
+    from dmi_nowcast_sidecar.config import load_config
+
+    push = load_config().push
+    persistence, rearm = int(push.persistence_obs), int(push.rearm_after_min)
+except Exception as exc:                      # any failure: keep the defaults
+    print(
+        f"    (could not read push.* from the sidecar config: {exc!r}; "
+        f"using the shipped defaults {persistence} / {rearm} min)",
+        file=sys.stderr,
+    )
+print(f"{persistence} {rearm}")
+PY
+)
+persistence_obs=${rule_timing%% *}
+rearm_after_min=${rule_timing##* }
 
 # The calibration corpus is stamped per run; default to the newest one so
 # the common case needs no argument at all.
@@ -230,6 +275,8 @@ if [[ "$fit_thresholds" == "1" ]]; then
     echo "    leads $fit_leads over grid $fit_grid, $fit_workers worker(s)"
     echo "    out → $thresholds_out"
     echo "    full sweep record → $sweep_json"
+    echo "    rule: persistence $persistence_obs observation(s), re-arm" \
+         "$rearm_after_min min (push.* — the rule the fan-out fires on)"
     fit_on=true
     if run_in_repo python -c "import sys,os; sys.exit(0 if os.path.isfile(sys.argv[1]) else 1)" "$thresholds_out"; then
         echo "    guarding against the table in service"
@@ -267,7 +314,8 @@ config_json=$(run_in_repo python - \
     "$radar_decisions" "$decisions_dirs" \
     "$post_on" "$postprocess_out" "$fit_l2" "$fit_design_leads" \
     "$fit_probability" "$gauge_reliability" "$gauge_out_of_fold" \
-    "$served_rule" "$served_lead" "$served_fallback" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
+    "$served_rule" "$served_lead" "$served_fallback" \
+    "$persistence_obs" "$rearm_after_min" ${inputs[@]+"${inputs[@]}"} <<'CFG' | tr -d '\r' | tail -n 1
 import json
 import sys
 
@@ -278,7 +326,8 @@ from dmi_nowcast_sidecar.threshold_sweep import parse_thresholds
  leads, grid, workers, min_warnings, min_delta, radar_decisions,
  decisions_dirs, post_on, postprocess_out, l2, design_leads,
  probability, gauge_reliability, gauge_out_of_fold,
- served_rule, served_lead, served_fallback, *pairs) = sys.argv[1:]
+ served_rule, served_lead, served_fallback,
+ persistence_obs, rearm_after_min, *pairs) = sys.argv[1:]
 
 inputs = {"corpus_dir": corpus_dir, "live_days": int(live_days)}
 for pair in pairs:
@@ -314,6 +363,10 @@ if served_rule == "1":
             ),
             "design_leads": design_list,
             "fallback_threshold_pct": int(served_fallback),
+            # The engine's timing, read out of push.* above. The page's
+            # scoreboard and the fit below replay ONE rule.
+            "persistence_obs": int(persistence_obs),
+            "rearm_after_min": int(rearm_after_min),
         },
     }
 if gauge_reliability == "1":
@@ -371,6 +424,13 @@ if fit_on == "true":
             "thresholds": list(parse_thresholds(grid)),
             "workers": int(workers),
             "min_warnings": int(min_warnings),
+            # The live rule's timing, from push.* — NOT SweepOptions'
+            # defaults. A table fitted at a persistence the fan-out does
+            # not use warns at the wrong percent on every horizon, and
+            # until 2026-09-13 the manual fit and the nightly one differed
+            # in exactly this way.
+            "persistence_obs": int(persistence_obs),
+            "rearm_after_min": int(rearm_after_min),
             # Fitted on the probability the engine decides with, or the
             # served one — never a third answer.
             "probability_column": (

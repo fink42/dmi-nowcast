@@ -17,7 +17,21 @@ from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
 import yaml
+from dmi_nowcast_core.dense_flow import (
+    DEFAULT_CONFIDENCE_PERCENTILE,
+    DEFAULT_CONFIDENCE_WINDOW_PX,
+    DEFAULT_FLOW_VARIANT,
+    DEFAULT_TEXTURE_PERCENTILE,
+)
 from dmi_nowcast_core.metobs import DEFAULT_BASE_URL as METOBS_DEFAULT_BASE_URL
+from dmi_nowcast_core.push_rules import (
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
+from dmi_nowcast_core.variants import (
+    SUPPORT_THRESHOLD_MM_H,
+    check_forecast_variant,
+)
 from dmi_nowcast_core.warning_score import (
     DEFAULT_DRY_MIN,
     DEFAULT_ONSET_MIN_MM,
@@ -158,6 +172,82 @@ class ForecastConfig(BaseModel):
     # Percentile of on-echo energy a pixel must reach to vote in the
     # robust (median) bulk vector.
     flow_texture_percentile: Annotated[float, Field(ge=0.0, le=100.0)] = 60.0
+
+    # H4 (2026-09-13). WHICH motion estimator the cycle runs, by name in
+    # ``dmi_nowcast_core.variants`` — the registry the Layer A harness
+    # (``scripts/persistence_vs_advection.py --variant``) screens candidates
+    # on. ``production`` is the served Farnebäck path and is byte-identical
+    # to the pre-H4 cycle; any other registered name hands the whole
+    # estimate → complete → sanitise sequence to that entry, and the field
+    # is bit-for-bit the one Layer A scored, which is what makes a Layer A
+    # result transferable to the service at all.
+    #
+    # Cost, measured on the native 1728x1984 grid: the ``lucaskanade``
+    # estimate adds ~3.5 s and ~390 MB per cycle (``flow_ms`` in the
+    # cycle_ok log goes from ~2.0 s to ~5.6 s, that being the whole
+    # estimate → complete → sanitise sequence). Affordable beside STEPS,
+    # which is seconds; not affordable twice over, so nothing else in the
+    # cycle may estimate a second field.
+    #
+    # Refused: ``oracle`` (it reads the frame AFTER the one being forecast)
+    # and ``median3`` (it needs four frames the cycle does not keep). The
+    # validator lists what is usable.
+    #
+    # ROLLBACK: set this back to ``production``. It is independent of
+    # ``flow_completion``, which stays the H-F rollback knob.
+    flow_variant: str = DEFAULT_FLOW_VARIANT
+
+    @field_validator("flow_variant")
+    @classmethod
+    def _flow_variant_registered(cls, v: str) -> str:
+        """Fail at load, not at the first cycle.
+
+        The registry is the authority on the spelling AND on which entries
+        can produce a forecast at all; ``check_forecast_variant``'s message
+        lists the usable names. A typo here would otherwise surface as a
+        cycle exception every five minutes.
+        """
+        return check_forecast_variant(v)
+
+    @model_validator(mode="after")
+    def _flow_variant_owns_its_completion(self) -> "ForecastConfig":
+        """A variant completes its own field, so the knobs must not conflict.
+
+        A registry entry hardcodes the served completion settings (see
+        ``variants.SUPPORT_THRESHOLD_MM_H`` and
+        ``flow_variants._completed``) precisely so that two Layer A
+        candidates differ in the estimator and in nothing else. That makes
+        ``flow_variant: lucaskanade`` + ``flow_completion: bulk`` an
+        unsatisfiable request rather than a combination — and
+        ``dense_flow.estimate_motion`` refuses it. Catching it here turns a
+        five-minutely cycle failure into a startup failure with a fix in it.
+        """
+        if self.flow_variant == DEFAULT_FLOW_VARIANT:
+            return self
+        conflicts = [
+            f"{name}={asked!r} (the variant applies {fixed!r})"
+            for name, asked, fixed in (
+                ("flow_completion", self.flow_completion, "confidence"),
+                ("rain_threshold_mm_h", self.rain_threshold_mm_h,
+                 SUPPORT_THRESHOLD_MM_H),
+                ("flow_confidence_window_px", self.flow_confidence_window_px,
+                 DEFAULT_CONFIDENCE_WINDOW_PX),
+                ("flow_confidence_percentile", self.flow_confidence_percentile,
+                 DEFAULT_CONFIDENCE_PERCENTILE),
+                ("flow_texture_percentile", self.flow_texture_percentile,
+                 DEFAULT_TEXTURE_PERCENTILE),
+            )
+            if asked != fixed
+        ]
+        if conflicts:
+            raise ValueError(
+                f"forecast.flow_variant={self.flow_variant!r} completes its "
+                "own field, so these cannot be overridden: "
+                + "; ".join(conflicts)
+                + f". Leave them at their defaults, or set flow_variant to "
+                f"{DEFAULT_FLOW_VARIANT!r}."
+            )
+        return self
 
     @field_validator("leads_min")
     @classmethod
@@ -414,8 +504,15 @@ class PushConfig(BaseModel):
     # Decision-engine rules (see ``push.engine``): how long a notified
     # subscription stays disarmed, and how many consecutive observations
     # above threshold are required before firing.
-    rearm_after_min: Annotated[int, Field(ge=0, le=1440)] = 60
-    persistence_obs: Annotated[int, Field(ge=1, le=10)] = 2
+    #
+    # THE ONLY place either number may be overridden. Every consumer that
+    # replays the rule — the station scoreboard, the quality page's
+    # served-rule hook, the nightly threshold fit, the manual fit script —
+    # reads it from here rather than carrying its own, and the defaults
+    # come from ``dmi_nowcast_core.push_rules`` (one observation since
+    # DECIDE-14, 2026-09-13; the F1 evidence is in that module).
+    rearm_after_min: Annotated[int, Field(ge=0, le=1440)] = DEFAULT_REARM_AFTER_MIN
+    persistence_obs: Annotated[int, Field(ge=1, le=10)] = DEFAULT_PERSISTENCE_OBS
 
     @field_validator("threshold_options_pct")
     @classmethod
@@ -490,15 +587,45 @@ class PushConfig(BaseModel):
 class StationEvalRules(BaseModel):
     """The virtual subscriber every gauge station gets (Phase F).
 
-    Defaults are the live subscriber row the historical replay
-    reproduces: warn at 40 % probability of rain within 30 minutes, one
-    observation of persistence, 60 minutes disarmed after a warning.
+    Two fields, and both are about WHAT is being asked rather than about
+    the timing of the answer: warn at 40 % probability of rain within 30
+    minutes. ``threshold_pct`` is only the fallback — once a fitted table
+    is in service the horizon's own pick decides.
+
+    The rule's *timing* — the persistence streak and the re-arm — is NOT
+    here. It lives in ``push.persistence_obs`` / ``push.rearm_after_min``
+    (defaults from ``dmi_nowcast_core.push_rules``), which the scoreboard
+    reads directly. Until 2026-09-13 this model carried its own pair, and
+    they disagreed with the push engine's: the service required two
+    observations and every measurement of it required one. A yaml that
+    still sets either key here is refused below rather than silently
+    ignored, because an ignored field is how the two drifted apart.
     """
 
     threshold_pct: Annotated[int, Field(ge=1, le=99)] = 40
     lead_min: Annotated[int, Field(ge=1, le=180)] = 30
-    rearm_after_min: Annotated[int, Field(ge=0, le=1440)] = 60
-    persistence_obs: Annotated[int, Field(ge=1, le=10)] = 1
+
+    @model_validator(mode="before")
+    @classmethod
+    def _timing_lives_under_push(cls, data: object) -> object:
+        if isinstance(data, dict):
+            moved = [
+                key for key in ("persistence_obs", "rearm_after_min")
+                if key in data
+            ]
+            if moved:
+                raise ValueError(
+                    "station_eval.rules."
+                    + "/".join(moved)
+                    + " moved to push."
+                    + "/push.".join(moved)
+                    + " (2026-09-13): the scoreboard and the push service "
+                    "must replay one rule, so the persistence streak and "
+                    "the re-arm window are configured once, under push. "
+                    "Delete the key here; set it under push if the "
+                    "default is not what you want.",
+                )
+        return data
 
 
 class StationEvalConfig(BaseModel):

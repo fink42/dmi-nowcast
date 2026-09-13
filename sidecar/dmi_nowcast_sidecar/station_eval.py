@@ -37,6 +37,13 @@ Design constraints, in the order they bite:
   load (``Config._station_eval_is_private``); this module checks again
   before it does anything, because a guard that exists in one place is a
   guard that gets removed by a refactor.
+- **The service's rule, not a copy of it.** The persistence streak (ONE
+  observation) and the 60-minute re-arm come from ``push.*``, whose
+  defaults are ``dmi_nowcast_core.push_rules`` — so a change to what the
+  subscribers get changes what this measures, in the same commit.
+  ``station_eval.rules`` carries only the horizon and the fallback
+  percent; it had its own timing pair until 2026-09-13, and for months it
+  scored one observation while the service required two.
 
 Since Phase H each row also carries the post-processing feature columns
 and the model's own ``p_post_<lead>``, written through the same schema
@@ -448,10 +455,18 @@ class StationEvalService:
     # -- the work (runs in a worker thread) ---------------------------------
 
     def _rules(self) -> Rules:
-        rules = self.config.station_eval.rules
+        """The virtual subscriber's rule — the real subscribers' rule.
+
+        Timing from ``push.*``, not from ``station_eval.rules``: the point
+        of this job is to measure what the service does, so it cannot have
+        its own persistence streak or re-arm window. It had one until
+        2026-09-13 and the two numbers disagreed (see
+        ``dmi_nowcast_core.push_rules``). ``station_eval.rules`` still owns
+        the question — which horizon, and the fallback percent.
+        """
         return Rules(
-            persistence_obs=rules.persistence_obs,
-            rearm_after_min=rules.rearm_after_min,
+            persistence_obs=self.config.push.persistence_obs,
+            rearm_after_min=self.config.push.rearm_after_min,
             # One detection threshold for the whole pipeline, exactly as
             # the push service does it.
             raining_now_mm_h=self.config.forecast.rain_threshold_mm_h,

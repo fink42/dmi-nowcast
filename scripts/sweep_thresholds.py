@@ -47,6 +47,10 @@ _SIDECAR = _REPO_ROOT / "sidecar"
 if str(_SIDECAR) not in sys.path:
     sys.path.insert(0, str(_SIDECAR))
 
+from dmi_nowcast_core.push_rules import (  # noqa: E402
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 from dmi_nowcast_core.push_thresholds import (  # noqa: E402
     DEFAULT_FALLBACK_THRESHOLD_PCT,
     DEFAULT_MIN_DELTA_PCT,
@@ -107,8 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated lead times; leads with no column are skipped")
     p.add_argument("--thresholds", default="20:80:5",
                    help="lo:hi[:step] (inclusive) or a comma-separated list")
-    p.add_argument("--rearm-after-min", type=int, default=60)
-    p.add_argument("--persistence-obs", type=int, default=1)
+    # The engine's own timing (dmi_nowcast_core.push_rules): a table
+    # fitted under a persistence the service does not use is a table for
+    # a different service.
+    p.add_argument("--rearm-after-min", type=int,
+                   default=DEFAULT_REARM_AFTER_MIN)
+    p.add_argument("--persistence-obs", type=int,
+                   default=DEFAULT_PERSISTENCE_OBS)
     p.add_argument("--tolerance-min", type=int, default=DEFAULT_TOLERANCE_MIN)
     p.add_argument("--dry-min", type=int, default=DEFAULT_DRY_MIN,
                    help="minutes of known-dry gauge slots before a wet slot "

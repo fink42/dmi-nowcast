@@ -57,6 +57,23 @@ module that defines them, or straight into ``_VARIANTS`` here when they
 belong to the core library. The Phase H candidates live in
 :mod:`dmi_nowcast_core.flow_variants`, imported at the bottom of this
 file so ``list_variants()`` is complete however the registry was reached.
+
+**Beyond Layer A (H4, 2026-09-13).** The registry is no longer the
+harness's alone: ``dense_flow.estimate_motion(flow_variant=NAME)``
+resolves it too, which is how a Layer A winner reaches the gauge replay
+(``replay_warnings.py --flow-variant``) and the live cycle
+(``forecast.flow_variant``) on the *identical* field — the only thing
+that makes a Layer A screening result transferable. Two consequences for
+anyone adding an entry:
+
+* the field an entry returns is what gets served. ``estimate_motion``
+  wraps it without re-completing anything, so an entry that skipped the
+  shared completion would ship an incomparable field, not just score as
+  one;
+* :func:`forecast_variants` / :func:`check_forecast_variant` gate that
+  path on the declared frame needs. ``oracle`` and ``median3`` are
+  refused there — the harness still scores both, because it alone can
+  feed them.
 """
 from __future__ import annotations
 
@@ -67,6 +84,7 @@ import numpy as np
 from .dense_flow import complete_flow, dense_flow, estimate_motion
 
 __all__ = [
+    "COMPLETION_ATTR",
     "FlowVariant",
     "MAX_PX_PER_FRAME",
     "NEEDS_FUTURE_ATTR",
@@ -74,6 +92,8 @@ __all__ = [
     "PRODUCTION_VARIANT",
     "SUPPORT_THRESHOLD_MM_H",
     "VariantRequirements",
+    "check_forecast_variant",
+    "forecast_variants",
     "get_variant",
     "list_variants",
     "bulk_flow",
@@ -81,6 +101,7 @@ __all__ = [
     "persistence_flow",
     "production_flow",
     "register_variant",
+    "variant_completion",
     "variant_requirements",
 ]
 
@@ -99,6 +120,16 @@ NEEDS_HISTORY_ATTR = "needs_history"
 
 #: Attribute a variant sets to ask for the frame after ``curr`` (a bool).
 NEEDS_FUTURE_ATTR = "needs_future"
+
+#: Attribute a variant sets to declare WHICH ``complete_flow`` policy its
+#: returned field already went through (``"bulk"`` or ``"confidence"``).
+#: Only :func:`~dmi_nowcast_core.dense_flow.estimate_motion`'s
+#: ``flow_variant=`` dispatch reads it, to fill
+#: ``MotionEstimate.completion`` with the truth rather than with whatever
+#: the caller asked for. Default ``"confidence"``, which is what
+#: ``flow_variants._completed`` — the one helper every H4 candidate routes
+#: through — applies.
+COMPLETION_ATTR = "completion_policy"
 
 
 class FlowVariant(Protocol):
@@ -161,6 +192,30 @@ def variant_requirements(make_flow: FlowVariant) -> VariantRequirements:
         history=history,
         future=bool(getattr(make_flow, NEEDS_FUTURE_ATTR, False)),
     )
+
+
+def variant_completion(make_flow: FlowVariant) -> str:
+    """Which ``complete_flow`` policy the entry's returned field went through.
+
+    Read off :data:`COMPLETION_ATTR`, defaulting to ``"confidence"``: every
+    H4 candidate goes through ``flow_variants._completed``, which is the
+    served policy. Only :func:`bulk_flow` (the pre-H-F field) and
+    :func:`persistence_flow` (which completes nothing at all — a zero field
+    has nothing to relax) declare ``"bulk"``.
+
+    It exists so ``MotionEstimate.completion`` can report what actually
+    ran when the estimate came from the registry rather than from
+    ``estimate_motion``'s own sequence. Labelling a variant's field with
+    the caller's requested policy would be the one lie the whole
+    single-entry-point design exists to prevent.
+    """
+    value = str(getattr(make_flow, COMPLETION_ATTR, "confidence"))
+    if value not in ("bulk", "confidence"):
+        raise ValueError(
+            f"{make_flow!r}.{COMPLETION_ATTR} must be 'bulk' or "
+            f"'confidence', got {value!r}"
+        )
+    return value
 
 
 def bulk_flow(
@@ -246,6 +301,15 @@ def persistence_flow(
     return zeros, zeros.copy()
 
 
+#: ``bulk_flow`` IS the legacy completion, and ``persistence_flow``
+#: completes nothing at all (a zero field has nothing to relax toward a
+#: bulk of zero), so neither went through the confidence gate. Declared so
+#: ``MotionEstimate.completion`` reports the policy that ran rather than
+#: the one the caller asked for. See :func:`variant_completion`.
+bulk_flow.completion_policy = "bulk"  # type: ignore[attr-defined]
+persistence_flow.completion_policy = "bulk"  # type: ignore[attr-defined]
+
+
 #: The registry name the sidecar's default ``forecast.flow_completion``
 #: corresponds to. ``production`` is an alias of this entry; a sidecar test
 #: pins the two together so the harness's "production" can never quietly
@@ -287,6 +351,67 @@ def get_variant(name: str) -> FlowVariant:
 def list_variants() -> tuple[str, ...]:
     """Registered variant names, sorted, for CLI help and reports."""
     return tuple(sorted(_VARIANTS))
+
+
+def forecast_variants() -> tuple[str, ...]:
+    """Names a FORECAST can be made with, sorted.
+
+    Every entry that needs nothing but the frame pair a live cycle and the
+    warning replay actually hold: no frames older than ``prev`` and, above
+    all, no frame after ``curr``. So ``median3`` (four frames) and
+    ``oracle`` (the future) are absent, and everything else is present.
+
+    The Layer A harness deliberately does NOT use this — it fetches the
+    extra frames and scores those two entries on purpose. This is the list
+    for callers that cannot.
+    """
+    return tuple(
+        name for name in list_variants()
+        if variant_requirements(_VARIANTS[name]) == VariantRequirements(0, False)
+    )
+
+
+def check_forecast_variant(name: str) -> str:
+    """Validate a ``--flow-variant`` / ``forecast.flow_variant`` name.
+
+    Returns ``name`` unchanged, or raises :class:`ValueError` naming the
+    usable entries. Three distinct refusals, each with its own message,
+    because the three have different fixes:
+
+    * an unknown name is a typo;
+    * ``oracle`` reads the frame AFTER the one being forecast. It is the
+      Layer A ceiling, not a forecast, and a run that quietly served or
+      replayed it would report skill nothing could deliver — the single
+      most misleading outcome in this whole registry;
+    * ``median3`` and any future multi-frame entry need frames neither the
+      cycle nor the replay carries, so they would have to degrade
+      silently, and a silent degradation is how a candidate gets shipped
+      on a baseline's score.
+
+    ``ValueError`` rather than ``KeyError`` throughout, so an argparse
+    ``p.error`` and a pydantic validator can both surface the message
+    as-is.
+    """
+    try:
+        make_flow = get_variant(name)
+    except KeyError as exc:
+        raise ValueError(str(exc.args[0])) from None
+    req = variant_requirements(make_flow)
+    usable = ", ".join(forecast_variants())
+    if req.future:
+        raise ValueError(
+            f"flow variant {name!r} reads the frame AFTER the one being "
+            "forecast — it is a Layer A ceiling, not a forecast, and cannot "
+            f"be served or replayed. Usable variants: {usable}"
+        )
+    if req.history:
+        raise ValueError(
+            f"flow variant {name!r} needs {req.history} frame(s) older than "
+            "the pair a cycle holds; neither the sidecar nor the warning "
+            "replay carries them, and degrading silently would score a "
+            f"candidate as its baseline. Usable variants: {usable}"
+        )
+    return name
 
 
 # The Phase H candidates register themselves on import. This sits at the

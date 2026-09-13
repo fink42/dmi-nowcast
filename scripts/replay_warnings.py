@@ -219,6 +219,7 @@ from dmi_nowcast_core.corpus import (  # noqa: E402
 from dmi_nowcast_core.dense_flow import (  # noqa: E402
     DEFAULT_CONFIDENCE_PERCENTILE,
     DEFAULT_CONFIDENCE_WINDOW_PX,
+    DEFAULT_FLOW_VARIANT,
     DEFAULT_TEXTURE_PERCENTILE,
 )
 from dmi_nowcast_core.geo import CompositeGeo  # noqa: E402
@@ -230,7 +231,12 @@ from dmi_nowcast_core.parse import RadarComposite, parse_composite  # noqa: E402
 from dmi_nowcast_core import postprocess  # noqa: E402
 from dmi_nowcast_core.probabilistic import run_ensemble  # noqa: E402
 from dmi_nowcast_core.product_pairs import nearest_radar_km  # noqa: E402
+from dmi_nowcast_core.push_rules import (  # noqa: E402
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 from dmi_nowcast_core.transform import dbz_to_rain_rate  # noqa: E402
+from dmi_nowcast_core.variants import check_forecast_variant  # noqa: E402
 from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_DRY_MIN,
     DEFAULT_ONSET_MIN_MM,
@@ -278,11 +284,15 @@ FRAME_TOLERANCE_S = 60         # a frame is "on the grid" within a minute
 #: alone) to generate a tree under the rule the service is actually on;
 #: the 40 here is what the run falls back to, and what every tree written
 #: before ``--thresholds`` existed was generated with.
+#:
+#: The timing pair is imported rather than spelled: the replay writes the
+#: rows the nightly fit and the quality page are scored on, so it has to
+#: fire where the service fires (``dmi_nowcast_core.push_rules``).
 DEFAULT_RULES: dict[str, float] = {
     "threshold_pct": 40,
     "lead_min": 30,
-    "rearm_after_min": 60,
-    "persistence_obs": 1,
+    "rearm_after_min": DEFAULT_REARM_AFTER_MIN,
+    "persistence_obs": DEFAULT_PERSISTENCE_OBS,
     "raining_now_eta_min": 1.5,
     "raining_now_mm_h": RAIN_THRESHOLD_MM_H,
 }
@@ -572,6 +582,14 @@ class FrameSettings:
     flow_confidence_window_px: int = DEFAULT_CONFIDENCE_WINDOW_PX
     flow_confidence_percentile: float = DEFAULT_CONFIDENCE_PERCENTILE
     flow_texture_percentile: float = DEFAULT_TEXTURE_PERCENTILE
+    # H4 (2026-09-13): WHICH estimator produced the field, by name in
+    # ``dmi_nowcast_core.variants``. ``production`` is the served
+    # Farnebäck-based one and is byte-identical to the pre-H4 replay; any
+    # other name is a Layer A candidate being taken to Layers B/C, with the
+    # field bit-for-bit the one Layer A screened. Joins the summary's
+    # ``flow`` block, so ``benchmark_report.py`` fails parity between two
+    # arms that differ here unless told ``--allow-differing flow_variant``.
+    flow_variant: str = DEFAULT_FLOW_VARIANT
     # L3 (2026-09-09): which frame each cycle stands on. See AnchorSettings.
     anchor: AnchorSettings = field(default_factory=AnchorSettings)
     # H-P (2026-09-09): write the per-station post-processing features
@@ -605,6 +623,13 @@ def production_motion(
     Falls back to a uniform phase-correlation shift when OpenCV is absent,
     exactly as ``build_calibration_corpus._process_event`` does, so the
     replay still runs (with a cruder motion field) on a box without cv2.
+
+    **Under ``--flow-variant NAME`` (H4)** the named registry entry owns the
+    estimate instead, so this function does not pre-compute one and there is
+    no cv2 fallback: a variant arm is an experiment, and a cruder field
+    silently substituted for the candidate's would make its score
+    meaningless. The completion, sanitising and clip are the registry's and
+    are identical to the ones Layer A scored.
     """
     from dmi_nowcast_core.dense_flow import (
         DenseFlowUnavailable,
@@ -613,6 +638,13 @@ def production_motion(
     )
 
     cfg = settings if settings is not None else FrameSettings()
+    if cfg.flow_variant != DEFAULT_FLOW_VARIANT:
+        return estimate_motion(
+            prev.reflectivity_dbz, now.reflectivity_dbz, rain_now,
+            pixel_km=float(now.xscale_m) / 1000.0,
+            dt_min=dt_min,
+            flow_variant=cfg.flow_variant,
+        )
     raw_flow: tuple[np.ndarray, np.ndarray]
     try:
         raw_flow = dense_flow(prev.reflectivity_dbz, now.reflectivity_dbz)
@@ -1598,6 +1630,20 @@ def main(argv: Sequence[str] | None = None) -> int:
              "of the A/B. Recorded in the run summary.",
     )
     p.add_argument(
+        "--flow-variant", default=DEFAULT_FLOW_VARIANT, metavar="NAME",
+        help="WHICH motion estimator the cycle runs, by name in "
+             "dmi_nowcast_core.variants — the same registry "
+             "persistence_vs_advection.py --variant screens on Layer A, so a "
+             "Layer A winner is replayed on the identical field. "
+             f"Default {DEFAULT_FLOW_VARIANT!r} (the served Farnebäck path, "
+             "byte-identical to the pre-H4 replay); 'lucaskanade' is the "
+             "H4 candidate. 'oracle' and 'median3' are refused: one reads "
+             "the future, the other needs frames a cycle does not carry. "
+             "Recorded in the run summary's flow block, so two runs that "
+             "differ here fail benchmark_report.py's parity check unless "
+             "given --allow-differing flow_variant.",
+    )
+    p.add_argument(
         "--features", action=argparse.BooleanOptionalAction, default=True,
         help="write the H-P post-processing features beside each decision "
              "(scripts/fit_postprocess.py trains on them). Additive "
@@ -1609,6 +1655,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--no-score", action="store_true",
                    help="replay only; skip the gauge scoring pass")
     args = p.parse_args(argv)
+
+    # Fail on the flag, not 4,000 frames in. The registry is the authority
+    # on both the spelling and on which entries a forecast can be made with
+    # at all (``oracle`` reads the future, ``median3`` wants four frames).
+    try:
+        check_forecast_variant(args.flow_variant)
+    except ValueError as exc:
+        p.error(f"--flow-variant: {exc}")
 
     rules, threshold_source = apply_thresholds(
         parse_rules(args.rules), args.thresholds,
@@ -1665,6 +1719,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(args.national_curves) if args.national_curves else None
         ),
         flow_completion=args.flow_completion,
+        flow_variant=args.flow_variant,
         features=bool(args.features),
     )
     out_dir = Path(args.out_dir)
@@ -1764,11 +1819,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             # completion changes the STEPS velocity and therefore every
             # probability in the table, so a replay's numbers mean nothing
             # without it.
+            #
+            # H4 adds ``flow_variant`` — WHICH estimator, not just how its
+            # output was completed. ``benchmark_report.py`` compares this
+            # whole block between two runs, and reads a summary written
+            # before the field existed as ``production``, so an old
+            # baseline still pairs with a new production candidate while a
+            # variant arm has to be declared with
+            # ``--allow-differing flow_variant``.
             "flow": {
                 "completion": settings.flow_completion,
                 "confidence_window_px": settings.flow_confidence_window_px,
                 "confidence_percentile": settings.flow_confidence_percentile,
                 "texture_percentile": settings.flow_texture_percentile,
+                "flow_variant": settings.flow_variant,
             },
             "national_curves": settings.national_curves_path,
             # H-P: what the extra columns in decisions/*.parquet mean.

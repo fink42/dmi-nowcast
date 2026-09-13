@@ -3,6 +3,15 @@
 Every sequence below is written on the radar clock at the 10-minute
 fullRange cadence, because that is the clock the machine actually
 advances on.
+
+``_drive`` pins ``persistence_obs=2`` deliberately, and it is the one
+place in this file where the number is not the shipped one. The streak is
+the mechanism under test here — a rule that fires on the first
+observation has no streak to reset, defer or carry across a re-arm, and
+half of these sequences would collapse into a single step. The SHIPPED
+rule is one observation (``push_rules.DEFAULT_PERSISTENCE_OBS``, decided
+2026-09-13); ``test_the_shipped_rule_is_one_observation`` below pins that,
+and the service-level behaviour lives in ``test_push_backend.py``.
 """
 from __future__ import annotations
 
@@ -11,6 +20,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+from dmi_nowcast_core.push_rules import (
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 
 from dmi_nowcast_sidecar.push.engine import (
     INITIAL_STATE,
@@ -55,7 +68,9 @@ def _drive(
     state: SubState = INITIAL_STATE,
     quiet: QuietHours | None = None,
     tz: str = CPH,
-    rules: Rules = Rules(),
+    # Two observations, so every sequence has a streak to observe. See the
+    # module docstring — this is not the shipped persistence.
+    rules: Rules = Rules(persistence_obs=2),
     eta: float | None = None,
     observed: float | None = None,
     base: datetime = T0,
@@ -148,6 +163,21 @@ def test_none_probability_breaks_a_streak() -> None:
 
 def test_persistence_one_fires_on_the_first_wet_observation() -> None:
     actions, _, _ = _drive([0.9, 0.9], rules=Rules(persistence_obs=1))
+    assert actions == ["notify", "none"]
+
+
+def test_the_shipped_rule_is_one_observation() -> None:
+    """``Rules()`` is the product contract, and it comes from one module.
+
+    DECIDE-14, 2026-09-13: the fan-out required two observations while the
+    scoreboard, the threshold fit's replay, the page and the benchmark all
+    required one, so the table in service was fitted for a rule nobody
+    was on. One observation now, everywhere, and the constant lives in
+    ``dmi_nowcast_core.push_rules`` so it cannot be forked again.
+    """
+    assert Rules().persistence_obs == DEFAULT_PERSISTENCE_OBS == 1
+    assert Rules().rearm_after_min == DEFAULT_REARM_AFTER_MIN == 60
+    actions, _, _ = _drive([0.9, 0.9], rules=Rules())
     assert actions == ["notify", "none"]
 
 
@@ -390,7 +420,9 @@ def test_observed_none_leaves_the_old_behaviour_exactly() -> None:
 
 
 def test_observed_threshold_is_configurable() -> None:
-    rules = Rules(raining_now_mm_h=2.0)
+    # persistence 2 like ``_drive``'s default, so the assertion below is
+    # about the observed threshold and not about which step fires.
+    rules = Rules(raining_now_mm_h=2.0, persistence_obs=2)
     assert _drive([0.9, 0.9], eta=16.0, observed=1.5, rules=rules)[0][-1] == "notify"
     assert _drive([0.9, 0.9], eta=16.0, observed=2.0, rules=rules)[0][-1] == "already_raining"
 
@@ -603,7 +635,8 @@ def test_replayed_observation_leaves_the_state_untouched() -> None:
 
 def test_a_repeated_observation_cannot_complete_a_streak() -> None:
     # The no-new-frame fast path, replayed: the same wet frame twice must
-    # not look like two consecutive observations.
+    # not look like two consecutive observations. Persistence 2 so there is
+    # a streak to complete at all.
     state = INITIAL_STATE
     for _ in range(5):
         state = evaluate(
@@ -613,6 +646,7 @@ def test_a_repeated_observation_cannot_complete_a_streak() -> None:
             quiet=None,
             tz=CPH,
             now_utc=T0,
+            rules=Rules(persistence_obs=2),
         ).state
     assert state.streak == 1
     assert state.armed is True

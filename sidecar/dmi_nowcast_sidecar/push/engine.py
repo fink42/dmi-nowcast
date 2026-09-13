@@ -9,8 +9,14 @@ so the whole spam-or-silence surface is unit-testable in isolation.
 The contract mirrors the Home Assistant integration:
 
 - **persistence** — the calibrated probability must sit at or above the
-  threshold for two consecutive observations before anything fires, so a
-  single frame of clutter can never push.
+  threshold for ``rules.persistence_obs`` consecutive observations before
+  anything fires. That is ONE observation as shipped (decided 2026-09-13,
+  DECIDE-14: a second observation costs ~10 minutes of radar cadence on
+  top of a 13–18 minute composite age, and lost F1 at three of the four
+  served horizons). The number itself lives in
+  ``dmi_nowcast_core.push_rules.DEFAULT_PERSISTENCE_OBS``, overridable
+  once, under ``push.persistence_obs``; at two or more, a single frame of
+  clutter cannot push.
 - **hysteresis** — a push *disarms* the subscription. It re-arms only
   after 60 consecutive minutes below threshold, measured on the radar
   clock (not on wall time, and not on the poll cadence). The arm is
@@ -54,6 +60,10 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 import structlog
+from dmi_nowcast_core.push_rules import (
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 
 _log = structlog.get_logger(__name__)
 
@@ -156,12 +166,19 @@ class Observation:
 
 @dataclass(frozen=True)
 class Rules:
-    """Tuning constants. Defaults are the shipped product contract."""
+    """Tuning constants. Defaults are the shipped product contract.
+
+    The two timing constants are imported, not restated: every replay of
+    this rule (the station scoreboard, the quality page's served-rule
+    hook, the threshold sweep, the historical replay, the benchmark) has
+    to agree with the engine, and one number in one module is the only way
+    that holds. See :mod:`dmi_nowcast_core.push_rules`.
+    """
 
     #: Consecutive over-threshold observations required to fire.
-    persistence_obs: int = 2
+    persistence_obs: int = DEFAULT_PERSISTENCE_OBS
     #: Minutes of continuous below-threshold radar time before re-arming.
-    rearm_after_min: int = 60
+    rearm_after_min: int = DEFAULT_REARM_AFTER_MIN
     #: An ETA at or below this means the rain is already at the point.
     raining_now_eta_min: float = 1.5
     #: An OBSERVED rain rate at or above this means the same thing, and

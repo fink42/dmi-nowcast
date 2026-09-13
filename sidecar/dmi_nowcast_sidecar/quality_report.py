@@ -371,8 +371,11 @@ class QualityReportTask:
         it is assembled from the running service's own settings rather
         than from anything the report owns: the fitted table the push
         fan-out reads, the probability source the fan-out decides with,
-        the model that fills it, and the live subscriber row
-        ``station_eval`` runs. Shares the threshold fit's decision rows
+        the model that fills it, the horizon and fallback percent
+        ``station_eval`` runs, and the rule's timing — one observation of
+        persistence and the 60-minute re-arm — straight from ``push.*``,
+        the same numbers the fan-out and the nightly fit take. Shares the
+        threshold fit's decision rows
         for the same reason every other step here does — the scoreboard,
         the gauge curve and the fitted thresholds have to stand on one
         set of rows.
@@ -397,8 +400,13 @@ class QualityReportTask:
             design_leads=tuple(
                 int(lead) for lead in self.config.forecast.national.leads_min
             ),
-            persistence_obs=int(rules.persistence_obs),
-            rearm_after_min=int(rules.rearm_after_min),
+            # The timing from ``push.*``, exactly as ``station_eval._rules``
+            # and the fit's ``SweepOptions`` take it. One source, so the
+            # page's scoreboard, the table in service and the live job
+            # cannot each be about a different rule (they were until
+            # 2026-09-13 — see ``dmi_nowcast_core.push_rules``).
+            persistence_obs=int(self.config.push.persistence_obs),
+            rearm_after_min=int(self.config.push.rearm_after_min),
             # One detection threshold for the whole pipeline, exactly as
             # ``station_eval._rules`` takes it.
             raining_now_mm_h=float(self.config.forecast.rain_threshold_mm_h),

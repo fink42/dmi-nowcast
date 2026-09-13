@@ -387,3 +387,97 @@ def test_calibration_stations_zero_drops_both_halves() -> None:
     assert "points_args+=" in gate
     tail = text.split("--- the gauge half")[1]
     assert '"$want_stations" == 0' in tail
+
+
+# --- 8. the manual fit runs the SERVICE's push rule -------------------
+
+def test_quality_report_reads_the_push_rule_from_the_sidecar_config() -> None:
+    """DECIDE-14: the manual fit may not have its own persistence.
+
+    It reads push.persistence_obs / push.rearm_after_min out of the config
+    the running service loads (the compose mount, via DMI_NOWCAST_CONFIG)
+    and falls back to the core constants — never to SweepOptions' own
+    defaults, which is how the manual and the nightly fit came to produce
+    different tables from the same rows.
+    """
+    text = (DEPLOY_DIR / "quality_report.sh").read_text()
+    resolve = text.split("rule_timing=$(run_in_repo python -")[1][:1200]
+    assert "from dmi_nowcast_sidecar.config import load_config" in resolve
+    assert "push.persistence_obs" in resolve
+    assert "push.rearm_after_min" in resolve
+    # The fallback is the shared constant, and it is announced.
+    assert "from dmi_nowcast_core.push_rules import" in resolve
+    assert "file=sys.stderr" in resolve
+    # Parsed into the two variables the config block below is handed.
+    assert 'persistence_obs=${rule_timing%% *}' in text
+    assert 'rearm_after_min=${rule_timing##* }' in text
+
+
+def test_quality_report_passes_the_rule_into_both_blocks() -> None:
+    """The fit and the page's scoreboard get the same two numbers.
+
+    A table fitted at one persistence and a scoreboard scored at another
+    are two claims about two services, printed side by side as one.
+    """
+    text = (DEPLOY_DIR / "quality_report.sh").read_text()
+    assert '"$persistence_obs" "$rearm_after_min"' in text
+    assert " persistence_obs, rearm_after_min, *pairs) = sys.argv[1:]" in text
+    served = text.split('config["served_rule"] = {')[1].split("if gauge_")[0]
+    fit = text.split('config["fit"] = {')[1]
+    for block, name in [(served, "served_rule"), (fit, "fit")]:
+        assert '"persistence_obs": int(persistence_obs),' in block, name
+        assert '"rearm_after_min": int(rearm_after_min),' in block, name
+
+
+# --- 4. replay.sh: the flow-variant arm (H4, 2026-09-13) ---------------
+
+
+def _replay_out_dir(**env_extra: str) -> str:
+    """Run replay.sh's OWN output-path derivation and report ``out_dir``.
+
+    The block between the two literal assignments is lifted out and
+    executed, rather than reimplemented here: a test that reimplemented it
+    would pass while the script overwrote the production tree.
+    """
+    text = (DEPLOY_DIR / "replay.sh").read_text()
+    start = text.index("corpus_dir=${REPLAY_CORPUS_DIR")
+    end = text.index("points=${REPLAY_POINTS")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/home/x"}
+    env.update(env_extra)
+    proc = subprocess.run(
+        ["bash", "-c", f'set -u\n{text[start:end]}\nprintf "%s" "$out_dir"'],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def test_a_variant_replay_does_not_land_in_the_production_tree() -> None:
+    """The default tree is ``quality_report.replay_dir``.
+
+    Its rows are scored beside the live station_eval rows as if they were
+    the service. A candidate arm written there would put a field nobody
+    serves into the nightly report, so the default output path depends on
+    the variant — and on nothing else.
+    """
+    default = _replay_out_dir()
+    assert default.endswith("/stations/replay")
+    lk = _replay_out_dir(REPLAY_FLOW_VARIANT="lucaskanade")
+    assert lk.endswith("/stations/replay_flow_lucaskanade")
+    assert lk != default
+    # An explicit choice still wins, for both arms.
+    assert _replay_out_dir(
+        REPLAY_FLOW_VARIANT="lucaskanade", REPLAY_OUT_DIR="/tmp/elsewhere",
+    ) == "/tmp/elsewhere"
+    assert _replay_out_dir(REPLAY_OUT_DIR="/tmp/elsewhere") == "/tmp/elsewhere"
+    # ...and the production default is byte-for-byte what it always was.
+    assert _replay_out_dir(REPLAY_FLOW_VARIANT="production") == default
+
+
+def test_replay_passes_the_variant_through_to_the_script() -> None:
+    """A knob the banner prints but the run ignores is worse than none."""
+    text = (DEPLOY_DIR / "replay.sh").read_text()
+    assert '--flow-variant "$flow_variant"' in text
+    assert "flow_variant=${REPLAY_FLOW_VARIANT:-production}" in text
+    # Echoed, so the log of a finished run says which estimator produced it.
+    assert "flow variant ${flow_variant}" in text

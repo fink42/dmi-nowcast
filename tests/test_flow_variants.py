@@ -517,3 +517,183 @@ def test_oracle_rejects_a_mismatched_future_shape(moving_blobs):
             prev, curr, rain, pixel_km=PIXEL_KM,
             future_dbz=np.zeros((4, 4), dtype=np.float32),
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. The runtime dispatch: estimate_motion(flow_variant=...)
+# ---------------------------------------------------------------------------
+# H4 (2026-09-13). The registry stopped being the Layer A harness's alone:
+# the gauge replay and the live cycle reach it through
+# ``dense_flow.estimate_motion``. Three things have to hold or a Layer A
+# result cannot be carried to Layer B at all —
+#
+#   1. ``production`` is byte-identical to not passing the argument, so the
+#      knob's existence cannot move the served forecast;
+#   2. a candidate's field through ``estimate_motion`` is bit-for-bit the
+#      field the harness scored (the parity below is the whole point);
+#   3. an entry that needs frames the caller does not have, or that reads
+#      the future, fails loudly instead of degrading into its baseline.
+def test_production_flow_variant_is_byte_identical_to_the_default(moving_blobs):
+    """The dispatch must be invisible on the path the service runs."""
+    from dmi_nowcast_core.dense_flow import DEFAULT_FLOW_VARIANT, estimate_motion
+
+    _history, prev, curr, _future, rain, _echo = moving_blobs
+    kwargs = dict(
+        pixel_km=PIXEL_KM, dt_min=10.0,
+        support_threshold_mm_h=SUPPORT_THRESHOLD_MM_H,
+        max_px_per_frame=MAX_PX_PER_FRAME,
+    )
+    ref = estimate_motion(prev, curr, rain, **kwargs)
+    got = estimate_motion(
+        prev, curr, rain, flow_variant=DEFAULT_FLOW_VARIANT, **kwargs,
+    )
+    np.testing.assert_array_equal(got.vy, ref.vy)
+    np.testing.assert_array_equal(got.vx, ref.vx)
+    np.testing.assert_array_equal(got.vy_raw, ref.vy_raw)
+    np.testing.assert_array_equal(got.vx_raw, ref.vx_raw)
+    assert (got.bulk_vy, got.bulk_vx) == (ref.bulk_vy, ref.bulk_vx)
+    assert got.stalled_share == ref.stalled_share
+    assert got.stalled_share_completed == ref.stalled_share_completed
+    assert got.completion == ref.completion
+
+
+def test_the_dispatch_field_is_the_registry_field(moving_blobs):
+    """``estimate_motion(flow_variant=X)`` returns exactly ``X``'s field.
+
+    Not "close to": identical. Layer A screened the registry's output, so
+    anything the dispatch did to it — a second completion, a different
+    clip — would make the screening result untransferable, and no gauge
+    score would say which of the two changes moved it.
+    """
+    from dmi_nowcast_core.dense_flow import estimate_motion
+
+    _history, prev, curr, _future, rain, _echo = moving_blobs
+    for name in ("lucaskanade", "farneback_w51_l4_p5", "persistence"):
+        ref_vy, ref_vx = get_variant(name)(
+            prev, curr, rain, pixel_km=PIXEL_KM,
+        )
+        got = estimate_motion(
+            prev, curr, rain,
+            pixel_km=PIXEL_KM, dt_min=10.0,
+            support_threshold_mm_h=SUPPORT_THRESHOLD_MM_H,
+            max_px_per_frame=MAX_PX_PER_FRAME,
+            completion="bulk" if name in ("bulk", "persistence") else "confidence",
+            flow_variant=name,
+        )
+        np.testing.assert_array_equal(got.vy, ref_vy, err_msg=name)
+        np.testing.assert_array_equal(got.vx, ref_vx, err_msg=name)
+        # Diagnostics the replay features and state.json read must exist and
+        # be finite whichever entry produced the field.
+        assert np.isfinite(got.bulk_vy) and np.isfinite(got.bulk_vx)
+        assert 0.0 <= got.stalled_share <= 1.0
+        # The registry hands back only the completed field, so these alias
+        # it and the two stall shares agree. Documented, and depended on by
+        # compute.py's "drop the raw grids" memory note.
+        assert got.vy_raw is got.vy and got.vx_raw is got.vx
+        assert got.stalled_share == got.stalled_share_completed
+
+
+def test_the_dispatch_agrees_with_the_layer_a_harness(moving_blobs):
+    """The parity that makes the Layer A result transferable.
+
+    ``persistence_vs_advection.py --variant lucaskanade`` is the call that
+    produced the +0.023/+0.029/+0.030/+0.025 CSI screening; this is the
+    call the replay and the sidecar make. If the two fields ever diverge,
+    the replay is measuring something Layer A never scored.
+    """
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from dmi_nowcast_core.dense_flow import estimate_motion
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import persistence_vs_advection as pva  # noqa: PLC0415
+
+    _history, prev, curr, _future, rain, _echo = moving_blobs
+    # ``variant_flow`` reads only these three attributes off a composite.
+    harness_vy, harness_vx = pva.variant_flow(
+        SimpleNamespace(reflectivity_dbz=prev, xscale_m=PIXEL_KM * 1000.0),
+        SimpleNamespace(reflectivity_dbz=curr, xscale_m=PIXEL_KM * 1000.0),
+        rain,
+        "lucaskanade",
+    )
+    got = estimate_motion(
+        prev, curr, rain,
+        pixel_km=PIXEL_KM, dt_min=10.0,
+        support_threshold_mm_h=SUPPORT_THRESHOLD_MM_H,
+        max_px_per_frame=MAX_PX_PER_FRAME,
+        flow_variant="lucaskanade",
+    )
+    np.testing.assert_array_equal(got.vy, harness_vy)
+    np.testing.assert_array_equal(got.vx, harness_vx)
+
+
+def test_the_dispatch_reports_the_completion_that_actually_ran(moving_blobs):
+    """``MotionEstimate.completion`` is the registry's, not the caller's."""
+    from dmi_nowcast_core.dense_flow import estimate_motion
+
+    _history, prev, curr, _future, rain, _echo = moving_blobs
+    base = dict(
+        pixel_km=PIXEL_KM, dt_min=10.0,
+        support_threshold_mm_h=SUPPORT_THRESHOLD_MM_H,
+        max_px_per_frame=MAX_PX_PER_FRAME,
+    )
+    assert estimate_motion(
+        prev, curr, rain, flow_variant="lucaskanade", **base,
+    ).completion == "confidence"
+    # ``bulk`` IS the legacy completion, and it reproduces the production
+    # path's own ``completion="bulk"`` field exactly.
+    got = estimate_motion(
+        prev, curr, rain, flow_variant="bulk", completion="bulk", **base,
+    )
+    ref = estimate_motion(prev, curr, rain, completion="bulk", **base)
+    assert got.completion == "bulk"
+    np.testing.assert_array_equal(got.vy, ref.vy)
+
+
+def test_the_dispatch_refuses_the_oracle_and_the_unfed_multi_frame(moving_blobs):
+    from dmi_nowcast_core.dense_flow import estimate_motion
+
+    history, prev, curr, _future, rain, _echo = moving_blobs
+    base = dict(
+        pixel_km=PIXEL_KM, dt_min=10.0,
+        support_threshold_mm_h=SUPPORT_THRESHOLD_MM_H,
+        max_px_per_frame=MAX_PX_PER_FRAME,
+    )
+    with pytest.raises(ValueError, match="frame AFTER"):
+        estimate_motion(prev, curr, rain, flow_variant="oracle", **base)
+    with pytest.raises(ValueError, match="older than prev_dbz"):
+        estimate_motion(prev, curr, rain, flow_variant="median3", **base)
+    with pytest.raises(ValueError, match="unknown flow variant"):
+        estimate_motion(prev, curr, rain, flow_variant="farneback_w99", **base)
+    # ...and honours the need when the caller DOES pass the frames.
+    got = estimate_motion(
+        prev, curr, rain, flow_variant="median3", history_dbz=history, **base,
+    )
+    ref_vy, ref_vx = get_variant("median3")(
+        prev, curr, rain, pixel_km=PIXEL_KM, history_dbz=history,
+    )
+    np.testing.assert_array_equal(got.vy, ref_vy)
+    # history_dbz on the production path is a caller bug, not a no-op.
+    with pytest.raises(ValueError, match="history_dbz belongs to"):
+        estimate_motion(prev, curr, rain, history_dbz=history, **base)
+
+
+def test_the_dispatch_refuses_settings_the_variant_cannot_honour(moving_blobs):
+    """Silently ignoring ``flow_completion: bulk`` is the failure to avoid."""
+    from dmi_nowcast_core.dense_flow import estimate_motion
+
+    _history, prev, curr, _future, rain, _echo = moving_blobs
+    base = dict(pixel_km=PIXEL_KM, dt_min=10.0, flow_variant="lucaskanade")
+    with pytest.raises(ValueError, match="completion='bulk'"):
+        estimate_motion(prev, curr, rain, completion="bulk", **base)
+    with pytest.raises(ValueError, match="support_threshold_mm_h"):
+        estimate_motion(prev, curr, rain, support_threshold_mm_h=2.0, **base)
+    with pytest.raises(ValueError, match="texture_percentile"):
+        estimate_motion(prev, curr, rain, texture_percentile=90.0, **base)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        estimate_motion(
+            prev, curr, rain, flow=(rain, rain),
+            pixel_km=PIXEL_KM, dt_min=10.0, flow_variant="lucaskanade",
+        )

@@ -5,6 +5,10 @@ import os
 from pathlib import Path
 
 import pytest
+from dmi_nowcast_core.push_rules import (
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 
 from dmi_nowcast_sidecar.config import Config, load_config
 
@@ -196,8 +200,13 @@ def test_push_defaults_are_off(config_yaml: Path) -> None:
     assert cfg.push.default_threshold_pct == 60
     assert cfg.push.default_lead_min == 30
     assert cfg.push.max_subscriptions == 200
-    assert cfg.push.persistence_obs == 2
+    # One observation since 2026-09-13 (DECIDE-14), and the number is the
+    # core constant rather than a literal here — this is THE place an
+    # operator can override the rule, and every replay of it follows.
+    assert cfg.push.persistence_obs == 1
+    assert cfg.push.persistence_obs == DEFAULT_PERSISTENCE_OBS
     assert cfg.push.rearm_after_min == 60
+    assert cfg.push.rearm_after_min == DEFAULT_REARM_AFTER_MIN
     assert "fcm.googleapis.com" in cfg.push.allowed_endpoint_host_suffixes
 
 
@@ -340,3 +349,66 @@ def test_flow_completion_default_matches_the_variant_registry(config_yaml: Path)
 
     cfg = load_config(config_yaml)
     assert cfg.forecast.flow_completion == PRODUCTION_VARIANT
+
+
+# ---------------------------------------------------------------------------
+# H4: forecast.flow_variant
+# ---------------------------------------------------------------------------
+def test_flow_variant_defaults_to_the_served_estimator(config_yaml: Path) -> None:
+    """``production``, and the registry knows the name.
+
+    The default is the one number in this whole feature that must not move:
+    it is what every live cycle and every archived replay ran.
+    """
+    from dmi_nowcast_core.dense_flow import DEFAULT_FLOW_VARIANT
+    from dmi_nowcast_core.variants import list_variants
+
+    cfg = load_config(config_yaml)
+    assert cfg.forecast.flow_variant == DEFAULT_FLOW_VARIANT == "production"
+    assert cfg.forecast.flow_variant in list_variants()
+
+
+def test_flow_variant_accepts_a_registered_candidate(tmp_path: Path) -> None:
+    p = tmp_path / "config.yaml"
+    p.write_text(
+        "home:\n  lat: 55.33\n  lon: 10.32\n"
+        f"storage:\n  data_dir: {tmp_path / 'data'}\n"
+        "forecast:\n  flow_variant: lucaskanade\n"
+    )
+    assert load_config(p).forecast.flow_variant == "lucaskanade"
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        # A typo must not boot. The message carries the usable names.
+        ("forecast:\n  flow_variant: lucas_kanade\n", "unknown flow variant"),
+        # The ceiling reads the frame AFTER the one being forecast. A service
+        # that served it would report skill nothing can deliver.
+        ("forecast:\n  flow_variant: oracle\n", "frame AFTER"),
+        # Four frames; the cycle keeps two.
+        ("forecast:\n  flow_variant: median3\n", "older than"),
+        # A variant completes its own field, so a conflicting completion
+        # setting is an unsatisfiable request rather than a combination —
+        # caught at load instead of failing every cycle five minutes apart.
+        (
+            "forecast:\n  flow_variant: lucaskanade\n  flow_completion: bulk\n",
+            "cannot be overridden",
+        ),
+        (
+            "forecast:\n  flow_variant: lucaskanade\n  rain_threshold_mm_h: 1.0\n",
+            "cannot be overridden",
+        ),
+    ],
+)
+def test_flow_variant_refuses_what_the_cycle_cannot_run(
+    tmp_path: Path, block: str, expected: str,
+) -> None:
+    p = tmp_path / "config.yaml"
+    p.write_text(
+        "home:\n  lat: 55.33\n  lon: 10.32\n"
+        f"storage:\n  data_dir: {tmp_path / 'data'}\n"
+        + block
+    )
+    with pytest.raises(Exception, match=expected):
+        load_config(p)

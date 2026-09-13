@@ -170,7 +170,11 @@ def _anchor_block(
 
 def _write_summary(
     directory: Path, *, ensemble_size: int = 16, anchor: dict | None = None,
+    flow: dict | None = None,
 ) -> None:
+    # ``flow`` defaults to a block with NO ``flow_variant`` key, i.e. a
+    # summary written before H4 (2026-09-13) — which is the common case in
+    # the archive and has to keep comparing equal to a production run.
     (directory / "summary.json").write_text(json.dumps({
         "run": {
             "n_days": len(DAYS),
@@ -187,7 +191,7 @@ def _write_summary(
                 "leads_min": list(LEADS),
                 "threshold_mm_h": 0.5,
             },
-            "flow": {"completion": "gated"},
+            "flow": flow if flow is not None else {"completion": "gated"},
             "rules": {"lead_min": 30, "threshold_pct": 40},
         },
     }))
@@ -650,6 +654,96 @@ class TestProvenance:
             report_module.parse_allow_differing("anchr")
         assert report_module.parse_allow_differing("") == ()
         assert report_module.parse_allow_differing("anchor") == ("anchor",)
+        assert report_module.parse_allow_differing("flow_variant") == (
+            "flow_variant",
+        )
+
+    def test_a_different_flow_variant_fails_parity_unless_it_is_allowed(
+        self, tmp_path: Path,
+    ) -> None:
+        """H4: the motion estimator is the experiment — say so, or it is a bug.
+
+        A different estimator moves every probability in the table, exactly
+        as the anchor policy does, so it gets the same treatment: an
+        unexplained parity failure by default, the declared change under
+        ``--allow-differing flow_variant``.
+        """
+        _write_gauge(tmp_path / "corpus")
+        _write_summary(
+            _write_decisions(tmp_path / "replay"),
+            flow={"completion": "gated", "flow_variant": "production"},
+        )
+        _write_summary(
+            _write_decisions(tmp_path / "other"),
+            flow={"completion": "gated", "flow_variant": "lucaskanade"},
+        )
+        payload = _run(
+            tmp_path, "--layers", "b", "--candidate", str(tmp_path / "other"),
+        )
+        assert payload["parity_problems"] == [
+            "flow: baseline {'completion': 'gated', 'flow_variant': "
+            "'production'} vs candidate {'completion': 'gated', "
+            "'flow_variant': 'lucaskanade'}",
+        ]
+
+        allowed = _run(
+            tmp_path, "--layers", "b", "--candidate", str(tmp_path / "other"),
+            "--allow-differing", "flow_variant",
+        )
+        assert allowed["parity_problems"] == []
+        assert allowed["deliberate_differences"] == [
+            "flow.flow_variant: baseline 'production' vs candidate "
+            "'lucaskanade'",
+        ]
+        markdown = (tmp_path / "out" / "benchmark.md").read_text()
+        assert "The candidate difference under test" in markdown
+        assert "The two runs are not at parity" not in markdown
+        # The runs table names the estimator each arm ran.
+        assert "| lucaskanade |" in markdown
+
+    def test_a_summary_from_before_the_field_existed_reads_as_production(
+        self, tmp_path: Path,
+    ) -> None:
+        """Every replay written before H4 ran the served estimator.
+
+        So an archived baseline still pairs with a freshly generated
+        production candidate: the missing key must not read as a difference.
+        """
+        _write_gauge(tmp_path / "corpus")
+        _write_summary(
+            _write_decisions(tmp_path / "replay"),
+            flow={"completion": "gated"},            # pre-H4 summary
+        )
+        _write_summary(
+            _write_decisions(tmp_path / "other"),
+            flow={"completion": "gated", "flow_variant": "production"},
+        )
+        payload = _run(
+            tmp_path, "--layers", "b", "--candidate", str(tmp_path / "other"),
+        )
+        assert payload["parity_problems"] == []
+
+    def test_allowing_the_flow_variant_does_not_excuse_the_completion(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two changes at once are attributable to neither."""
+        _write_gauge(tmp_path / "corpus")
+        _write_summary(
+            _write_decisions(tmp_path / "replay"),
+            flow={"completion": "gated", "flow_variant": "production"},
+        )
+        _write_summary(
+            _write_decisions(tmp_path / "other"),
+            flow={"completion": "bulk", "flow_variant": "lucaskanade"},
+        )
+        payload = _run(
+            tmp_path, "--layers", "b", "--candidate", str(tmp_path / "other"),
+            "--allow-differing", "flow_variant",
+        )
+        assert payload["parity_problems"] == [
+            "flow: baseline {'completion': 'gated'} vs candidate "
+            "{'completion': 'bulk'}",
+        ]
 
     def test_rows_with_no_summary_beside_them_are_not_assumed_at_parity(
         self, tmp_path: Path,

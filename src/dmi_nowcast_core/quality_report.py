@@ -118,6 +118,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from .push_rules import DEFAULT_PERSISTENCE_OBS, DEFAULT_REARM_AFTER_MIN
 from .push_thresholds import (
     OBJECTIVE_SPEC as THRESHOLDS_OBJECTIVE_SPEC,
     load_thresholds,
@@ -1669,8 +1670,15 @@ def _subscriber_rule(
     out: dict[str, Any] = {
         "threshold_pct": float(rules.get("threshold_pct", 40)),
         "lead_min": float(rules.get("lead_min", inputs.lead_min)),
-        "rearm_after_min": float(rules.get("rearm_after_min", 60)),
-        "persistence_obs": float(rules.get("persistence_obs", 1)),
+        # A summary that names neither is read as the shipped rule, which
+        # is one number in one place (``push_rules``) rather than a literal
+        # here that a change to the rule would leave behind.
+        "rearm_after_min": float(
+            rules.get("rearm_after_min", DEFAULT_REARM_AFTER_MIN),
+        ),
+        "persistence_obs": float(
+            rules.get("persistence_obs", DEFAULT_PERSISTENCE_OBS),
+        ),
         "scored": SCORED_AS_RECORDED,
     }
     return _merge_served_rule(out, inputs.served_rule)

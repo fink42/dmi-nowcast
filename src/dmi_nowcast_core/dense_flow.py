@@ -23,6 +23,7 @@ expansion in Farnebäck and the LK gradient estimate both handle poorly.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -218,6 +219,18 @@ STALL_SPEED_KMH = 5.0
 #: Mirrors ``compute._MAX_PX_PER_FRAME``; a dense-flow backend that
 #: extrapolates wildly over dry pixels must not turn STEPS into noise.
 DEFAULT_MAX_PX_PER_FRAME = 30.0
+
+#: :func:`estimate_motion`'s ``flow_variant`` default: the alias in
+#: :mod:`dmi_nowcast_core.variants` for the field the service serves. This
+#: value alone takes the function down the sequence it has always run — the
+#: estimator swap is opt-in, and ``flow_variant="production"`` is
+#: byte-identical to omitting the argument (pinned by
+#: ``tests/test_flow_variants.py``).
+#:
+#: Spelled here rather than imported from ``variants`` because that module
+#: imports THIS one at module scope; the registry is resolved lazily inside
+#: :func:`estimate_motion` for the same reason.
+DEFAULT_FLOW_VARIANT = "production"
 
 
 def flow_confidence(
@@ -772,6 +785,11 @@ class MotionEstimate:
     was filled in. They are two extra native-grid float32 arrays (~14 MB
     each on the DMI composite); callers under a memory cap should drop the
     ``MotionEstimate`` once they have taken what they need.
+
+    **Under a non-default** :func:`estimate_motion` **``flow_variant``** the
+    registry hands back only the completed field, so ``vy_raw``/``vx_raw``
+    ARE ``vy``/``vx`` and ``stalled_share`` equals
+    ``stalled_share_completed``. See :func:`_estimate_motion_variant`.
     """
 
     vy: np.ndarray
@@ -796,6 +814,160 @@ class MotionEstimate:
     completion: Literal["bulk", "confidence"]
 
 
+def _estimate_motion_variant(
+    prev_dbz: np.ndarray,
+    curr_dbz: np.ndarray,
+    rain_now_mm_h: np.ndarray,
+    *,
+    flow_variant: str,
+    pixel_km: float,
+    dt_min: float,
+    support_threshold_mm_h: float,
+    completion: str,
+    confidence_window_px: int,
+    confidence_percentile: float,
+    texture_percentile: float,
+    max_px_per_frame: float,
+    history_dbz: Sequence[np.ndarray] | None,
+) -> MotionEstimate:
+    """One registry entry's field, wrapped in a :class:`MotionEstimate`.
+
+    :func:`estimate_motion`'s ``flow_variant`` branch. The point is that a
+    Layer A winner can be put in front of the gauge replay and the live
+    cycle *without* either of them learning a second code path, and without
+    the candidate's field differing by one bit from the field Layer A
+    scored — which is the only thing that makes a Layer A result
+    transferable at all. ``tests/test_flow_variants.py`` pins that parity
+    against ``persistence_vs_advection.variant_flow``, the harness's own
+    call.
+
+    **The registry owns the whole sequence.** A
+    :class:`~dmi_nowcast_core.variants.FlowVariant` returns a field that is
+    already completed, sanitised and clipped — that is its contract, and it
+    is what makes two Layer A candidates differ in the estimator and in
+    nothing else. So this function does not (and must not) re-complete
+    anything, and the completion arguments it is handed have to *match* the
+    settings the registry applies; a mismatch raises rather than being
+    quietly ignored, because "I set flow_completion: bulk and got a
+    confidence-gated field" is precisely the silent lie the single entry
+    point exists to prevent.
+
+    **What the diagnostics can and cannot be.** The registry exposes the
+    completed field only, never the raw estimate behind it, so:
+
+    * ``vy_raw``/``vx_raw`` are the completed field (no second array is
+      allocated — they are the same objects);
+    * ``stalled_share`` is measured on the completed field, so it equals
+      ``stalled_share_completed``. Under ``production`` the raw share is
+      the H-F health signal *because* the defect is invisible after
+      completion; under a candidate the completed share is the honest
+      number the advection actually ran on;
+    * ``bulk_vy``/``bulk_vx`` are :func:`robust_bulk` over the high-texture
+      wet pixels of the completed field. Where the estimate was trusted the
+      completion left it alone, so this is the same population and
+      (measurably, to within float noise) the same vector the entry itself
+      relaxed toward.
+
+    ``future_dbz`` is deliberately not a parameter: a variant that declares
+    ``needs_future`` is refused outright. Reading the frame after the one
+    being forecast is meaningful only as a Layer A ceiling, and
+    :func:`~dmi_nowcast_core.variants.check_forecast_variant` refuses it one
+    layer earlier, at the CLI flag and at config load.
+    """
+    from .variants import (
+        MAX_PX_PER_FRAME,
+        SUPPORT_THRESHOLD_MM_H,
+        get_variant,
+        variant_completion,
+        variant_requirements,
+    )
+
+    try:
+        make_flow = get_variant(flow_variant)
+    except KeyError as exc:
+        raise ValueError(str(exc.args[0])) from None
+
+    req = variant_requirements(make_flow)
+    if req.future:
+        raise ValueError(
+            f"flow variant {flow_variant!r} reads the frame AFTER curr_dbz; "
+            "it is a Layer A ceiling and cannot produce a forecast"
+        )
+    extra: dict[str, object] = {}
+    if req.history:
+        frames = list(history_dbz or ())
+        if len(frames) < req.history:
+            raise ValueError(
+                f"flow variant {flow_variant!r} needs {req.history} frame(s) "
+                "older than prev_dbz, passed as history_dbz=[oldest, ..., "
+                f"before_prev]; got {len(frames)}"
+            )
+        extra["history_dbz"] = frames[-req.history:]
+
+    # The registry's own fixed settings. A variant hardcodes these (see
+    # ``variants.SUPPORT_THRESHOLD_MM_H`` / ``MAX_PX_PER_FRAME`` and
+    # ``flow_variants._completed``) so that every Layer A candidate is
+    # completed identically; a caller asking for something else would
+    # silently get the registry's values, so it is refused instead.
+    fixed = (
+        ("completion", completion, variant_completion(make_flow)),
+        ("support_threshold_mm_h", support_threshold_mm_h, SUPPORT_THRESHOLD_MM_H),
+        ("confidence_window_px", confidence_window_px, DEFAULT_CONFIDENCE_WINDOW_PX),
+        ("confidence_percentile", confidence_percentile, DEFAULT_CONFIDENCE_PERCENTILE),
+        ("texture_percentile", texture_percentile, DEFAULT_TEXTURE_PERCENTILE),
+        ("max_px_per_frame", max_px_per_frame, MAX_PX_PER_FRAME),
+    )
+    wrong = [
+        f"{name}={asked!r} (the registry applies {fixed_value!r})"
+        for name, asked, fixed_value in fixed
+        if asked != fixed_value
+    ]
+    if wrong:
+        raise ValueError(
+            f"flow_variant={flow_variant!r} completes its own field, so the "
+            "completion settings cannot be overridden: "
+            + "; ".join(wrong)
+            + ". Leave them at their defaults, or use "
+            f"flow_variant={DEFAULT_FLOW_VARIANT!r} to configure the "
+            "completion yourself."
+        )
+
+    vy, vx = make_flow(
+        prev_dbz, curr_dbz, rain_now_mm_h, pixel_km=pixel_km, **extra,
+    )
+    out_vy = np.ascontiguousarray(vy, dtype=np.float32)
+    out_vx = np.ascontiguousarray(vx, dtype=np.float32)
+    del vy, vx
+
+    rain = np.asarray(rain_now_mm_h, dtype=np.float32)
+    energy = flow_confidence(curr_dbz, window_px=confidence_window_px)
+    bulk = robust_bulk(
+        out_vy, out_vx, rain, energy,
+        support_threshold_mm_h=support_threshold_mm_h,
+        texture_percentile=texture_percentile,
+    )
+    del energy
+    share = stalled_share(
+        out_vy, out_vx, rain,
+        pixel_km=pixel_km, dt_min=dt_min,
+        support_threshold_mm_h=support_threshold_mm_h,
+    )
+    return MotionEstimate(
+        vy=out_vy,
+        vx=out_vx,
+        # Not copies: the registry never produced a pre-completion field for
+        # this caller to keep, and aliasing says so honestly at zero cost
+        # (two 14 MB grids on the native composite).
+        vy_raw=out_vy,
+        vx_raw=out_vx,
+        bulk_vy=float(bulk[0]),
+        bulk_vx=float(bulk[1]),
+        stalled_share=share,
+        stalled_share_completed=share,
+        completion=variant_completion(make_flow),  # type: ignore[arg-type]
+    )
+
+
 def estimate_motion(
     prev_dbz: np.ndarray,
     curr_dbz: np.ndarray,
@@ -810,6 +982,8 @@ def estimate_motion(
     texture_percentile: float = DEFAULT_TEXTURE_PERCENTILE,
     max_px_per_frame: float = DEFAULT_MAX_PX_PER_FRAME,
     flow: tuple[np.ndarray, np.ndarray] | None = None,
+    flow_variant: str = DEFAULT_FLOW_VARIANT,
+    history_dbz: Sequence[np.ndarray] | None = None,
 ) -> MotionEstimate:
     """Estimate → complete → sanitise, once, for every consumer.
 
@@ -842,14 +1016,69 @@ def estimate_motion(
         Pre-computed ``(vy, vx)`` raw estimate. Callers with their own
         fallback (a uniform phase-correlation shift when no dense-flow
         backend is installed) pass it here so the completion, sanitising
-        and diagnostics still go through one code path.
+        and diagnostics still go through one code path. Mutually exclusive
+        with a non-default ``flow_variant``, which brings its own estimator.
+    flow_variant:
+        Which entry of :mod:`dmi_nowcast_core.variants` produces the field.
+        ``"production"`` (the default) is the sequence documented above and
+        is byte-identical to omitting the argument. Any other registered
+        name — ``"lucaskanade"``, an ``"farneback_w*_l*_p*"`` grid cell,
+        ``"persistence"`` — hands the whole estimate→complete→sanitise
+        sequence to that entry and wraps its field in the same
+        :class:`MotionEstimate`, so advection, STEPS, ``state.json`` and the
+        replay's features cannot tell the difference. That is what lets a
+        Phase H Layer A winner be scored on Layers B/C and then served,
+        with the field bit-for-bit the one Layer A screened. Two caveats,
+        both in :func:`_estimate_motion_variant`: the registry owns the
+        completion settings (a conflicting argument raises), and the raw
+        pre-completion estimate is not available, so ``vy_raw``/``vx_raw``
+        are the completed field and ``stalled_share`` is measured on it.
+    history_dbz:
+        Frames OLDER than ``prev_dbz``, chronological (``[oldest, ...,
+        before_prev]``), for a variant that declares ``needs_history`` —
+        ``"median3"`` is the only one today. Never used on the
+        ``production`` path, which is why passing it there is an error
+        rather than a no-op.
 
     Raises
     ------
     DenseFlowUnavailable
         From :func:`dense_flow`, when ``flow`` is None and no backend is
         installed. Callers catch it and retry with a ``flow=`` fallback.
+        A non-default ``flow_variant`` may raise it — or its own
+        ``ImportError`` — from inside the registry entry instead; the
+        variant knob is opt-in, so the cycle fails loudly rather than
+        silently serving a different field.
+    ValueError
+        On an unknown ``flow_variant``, on one that needs frames the caller
+        did not pass, on ``oracle`` (it reads the future), and on a
+        completion setting the chosen variant cannot honour.
     """
+    if flow_variant != DEFAULT_FLOW_VARIANT:
+        if flow is not None:
+            raise ValueError(
+                f"flow= and flow_variant={flow_variant!r} are mutually "
+                "exclusive: the registry entry estimates the field itself"
+            )
+        return _estimate_motion_variant(
+            prev_dbz, curr_dbz, rain_now_mm_h,
+            flow_variant=flow_variant,
+            pixel_km=pixel_km,
+            dt_min=dt_min,
+            support_threshold_mm_h=support_threshold_mm_h,
+            completion=completion,
+            confidence_window_px=confidence_window_px,
+            confidence_percentile=confidence_percentile,
+            texture_percentile=texture_percentile,
+            max_px_per_frame=max_px_per_frame,
+            history_dbz=history_dbz,
+        )
+    if history_dbz is not None:
+        raise ValueError(
+            "history_dbz belongs to a flow_variant that declares "
+            f"needs_history; flow_variant={DEFAULT_FLOW_VARIANT!r} reads only "
+            "the frame pair"
+        )
     if completion not in ("bulk", "confidence"):
         raise ValueError(f"completion must be 'bulk' or 'confidence', got {completion!r}")
     if pixel_km <= 0:

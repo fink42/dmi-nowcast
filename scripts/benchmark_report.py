@@ -132,6 +132,10 @@ from dmi_nowcast_core.benchmark import (  # noqa: E402
     reliability_bins,
     roc_auc,
 )
+from dmi_nowcast_core.push_rules import (  # noqa: E402
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 from dmi_nowcast_core.push_thresholds import (  # noqa: E402
     DEFAULT_FALLBACK_THRESHOLD_PCT,
 )
@@ -294,7 +298,13 @@ ANCHOR_PARITY_KEYS: tuple[str, ...] = (
 
 #: Differences ``--allow-differing`` will accept as the candidate's whole
 #: point rather than as a broken comparison.
-ALLOWED_DIFFERENCES: tuple[str, ...] = ("anchor",)
+ALLOWED_DIFFERENCES: tuple[str, ...] = ("anchor", "flow_variant")
+
+#: What a run's ``flow.flow_variant`` reads as when the summary predates the
+#: field (H4, 2026-09-13). Every replay written before it ran the served
+#: Farnebäck path, so an old baseline still pairs with a new production
+#: candidate instead of failing parity on a missing key.
+DEFAULT_FLOW_VARIANT = "production"
 
 
 def find_summary(directory: Path) -> Path | None:
@@ -353,6 +363,43 @@ def run_settings(directories: Sequence[Path]) -> dict:
     return {"available": False, "error": "no summary.json beside the rows"}
 
 
+def _flow_settings(run: Mapping[str, Any]) -> Any:
+    """A run's ``flow`` block with the H4 default filled in.
+
+    Returned as-is when there is no block at all (a pre-H-F run records
+    none, and "one run has a flow block and the other does not" is itself
+    the difference worth printing). Otherwise ``flow_variant`` is defaulted
+    to :data:`DEFAULT_FLOW_VARIANT`, so a baseline written before the field
+    existed compares equal to a production run written after it.
+    """
+    flow = run.get("flow")
+    if not isinstance(flow, Mapping):
+        return flow
+    return {
+        **flow,
+        "flow_variant": flow.get("flow_variant", DEFAULT_FLOW_VARIANT),
+    }
+
+
+def flow_variant_differences(
+    baseline: Mapping[str, Any], candidate: Mapping[str, Any],
+) -> list[str]:
+    """How the two runs' motion ESTIMATORS differ, in the report's words.
+
+    The H4 counterpart of :func:`anchor_differences`: with
+    ``--allow-differing flow_variant`` the estimator swap is the experiment,
+    so it belongs in the report's "deliberate difference" sentence rather
+    than in its parity complaint. Everything else in the ``flow`` block
+    still has to match — a candidate that changed the estimator *and* the
+    completion would be two changes, attributable to neither.
+    """
+    a = (baseline.get("flow") or {}).get("flow_variant", DEFAULT_FLOW_VARIANT)
+    b = (candidate.get("flow") or {}).get("flow_variant", DEFAULT_FLOW_VARIANT)
+    if a == b:
+        return []
+    return [f"flow.flow_variant: baseline {a!r} vs candidate {b!r}"]
+
+
 def _harmonisation_id(anchor: Mapping[str, Any] | None) -> Any:
     """The harmonisation map's identity: its digest, not its path.
 
@@ -403,7 +450,8 @@ def parity_problems(
 
     ``allow`` names differences that are the candidate's whole point —
     ``"anchor"`` for an L3 run, where the fresher frame IS the change
-    under test. Anything not named is still a parity failure: a
+    under test, ``"flow_variant"`` for an H4 run, where the motion
+    estimator is. Anything not named is still a parity failure: a
     difference measured across two changes is attributable to neither.
     """
     if not baseline.get("available") or not candidate.get("available"):
@@ -416,11 +464,16 @@ def parity_problems(
         a, b = baseline.get(key), candidate.get(key)
         if a != b:
             problems.append(f"{key}: baseline {a!r} vs candidate {b!r}")
-    if baseline.get("flow") != candidate.get("flow"):
-        problems.append(
-            f"flow: baseline {baseline.get('flow')!r} vs "
-            f"candidate {candidate.get('flow')!r}"
-        )
+    flow_a, flow_b = _flow_settings(baseline), _flow_settings(candidate)
+    if "flow_variant" in allow and isinstance(flow_a, Mapping) and isinstance(
+        flow_b, Mapping
+    ):
+        # The estimator is the experiment; the rest of the block still has
+        # to match, and flow_variant_differences() reports the swap itself.
+        flow_a = {k: v for k, v in flow_a.items() if k != "flow_variant"}
+        flow_b = {k: v for k, v in flow_b.items() if k != "flow_variant"}
+    if flow_a != flow_b:
+        problems.append(f"flow: baseline {flow_a!r} vs candidate {flow_b!r}")
     if "anchor" not in allow:
         problems += anchor_differences(baseline, candidate)
     return problems
@@ -1170,14 +1223,20 @@ def _runs_table(report: Mapping[str, Any]) -> str:
         rows.append(("candidate", report["candidate"]))
     header = (
         "| run | rows | days | stations | ensemble | cascade | downsample "
-        "| frame age | flow completion | anchor | lags (fR/dop) | history "
-        "| harmonisation |"
+        "| frame age | flow variant | flow completion | anchor "
+        "| lags (fR/dop) | history | harmonisation |"
     )
-    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|"
+    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|---|"
     lines = [header, sep]
     for name, block in rows:
         settings = block["settings"]
         flow = (settings.get("flow") or {}).get("completion")
+        # Absent from every summary written before H4, and those all ran the
+        # served estimator — the same default parity_problems() applies.
+        variant = (
+            (settings.get("flow") or {}).get("flow_variant", DEFAULT_FLOW_VARIANT)
+            if settings.get("flow") else None
+        )
         anchor = settings.get("anchor") or {}
         lag = anchor.get("lag_min") or {}
         observed = (anchor.get("frame_age_min") or {}).get("p50")
@@ -1199,7 +1258,7 @@ def _runs_table(report: Mapping[str, Any]) -> str:
             f"{settings.get('ensemble_size', '–')} | "
             f"{settings.get('n_cascade_levels', '–')} | "
             f"{settings.get('downsample_factor', '–')} | "
-            f"{age_cell} | {flow or '–'} | "
+            f"{age_cell} | {variant or '–'} | {flow or '–'} | "
             f"{anchor.get('policy', '–')} | {lags} | "
             f"{anchor.get('history_mode', '–')} | {stamp or '–'} |"
         )
@@ -1457,8 +1516,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--far-cap", type=float, default=DEFAULT_FAR_CAP)
     p.add_argument("--fallback-threshold-pct", type=int,
                    default=DEFAULT_FALLBACK_THRESHOLD_PCT)
-    p.add_argument("--persistence-obs", type=int, default=1)
-    p.add_argument("--rearm-after-min", type=int, default=60)
+    # The live rule's timing, from the one module that holds it. A
+    # benchmark run under a different persistence than the service fires
+    # on measures a service nobody is subscribed to.
+    p.add_argument("--persistence-obs", type=int,
+                   default=DEFAULT_PERSISTENCE_OBS)
+    p.add_argument("--rearm-after-min", type=int,
+                   default=DEFAULT_REARM_AFTER_MIN)
     p.add_argument("--resamples", type=int, default=DEFAULT_RESAMPLES,
                    help="day-block bootstrap resamples; 0 skips every CI")
     p.add_argument("--ci", type=float, default=DEFAULT_CI)
@@ -1471,7 +1535,10 @@ def build_parser() -> argparse.ArgumentParser:
              f"on, from {{{', '.join(ALLOWED_DIFFERENCES)}}}. 'anchor' is "
              "the L3 case: the candidate stands on a fresher frame, and "
              "that difference is the experiment rather than a parity "
-             "failure. Everything not named here still fails parity.",
+             "failure. 'flow_variant' is the H4 case: the candidate ran a "
+             "different motion estimator (replay_warnings.py "
+             "--flow-variant), and the rest of the flow block still has to "
+             "match. Everything not named here still fails parity.",
     )
     return p
 
@@ -1550,11 +1617,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             report["baseline"]["settings"], report["candidate"]["settings"],
             allow=allow_differing,
         )
-        report["deliberate_differences"] = (
-            anchor_differences(
+        deliberate: list[str] = []
+        if "anchor" in allow_differing:
+            deliberate += anchor_differences(
                 report["baseline"]["settings"], report["candidate"]["settings"],
-            ) if "anchor" in allow_differing else []
-        )
+            )
+        if "flow_variant" in allow_differing:
+            deliberate += flow_variant_differences(
+                report["baseline"]["settings"], report["candidate"]["settings"],
+            )
+        report["deliberate_differences"] = deliberate
 
     try:
         if "b" in args.layers:

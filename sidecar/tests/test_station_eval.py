@@ -144,12 +144,40 @@ def test_defaults_are_off_and_carry_the_live_rule(tmp_path: Path) -> None:
     cfg = Config(home={"lat": 55.33, "lon": 10.32})  # type: ignore[arg-type]
     assert cfg.station_eval.enabled is False
     assert cfg.station_eval.points_file is None
+    # The QUESTION only. The rule's timing moved to push.* on 2026-09-13,
+    # so there is nothing here for the scoreboard and the service to
+    # disagree about.
     assert cfg.station_eval.rules.model_dump() == {
         "threshold_pct": 40,
         "lead_min": 30,
-        "rearm_after_min": 60,
-        "persistence_obs": 1,
     }
+
+
+@pytest.mark.parametrize("key", ["persistence_obs", "rearm_after_min"])
+def test_the_moved_timing_keys_are_refused_loudly(key: str) -> None:
+    """An old yaml must fail, not be quietly ignored.
+
+    Nested models ignore unknown keys by default, which is exactly how a
+    scoreboard scoring one observation and a service firing on two went
+    unnoticed for months. The message names the replacement.
+    """
+    with pytest.raises(ValueError, match=rf"station_eval\.rules\.{key}"):
+        Config(
+            home={"lat": 55.33, "lon": 10.32},  # type: ignore[arg-type]
+            station_eval={"rules": {key: 3 if key == "persistence_obs" else 90}},  # type: ignore[arg-type]
+        )
+
+
+def test_the_scoreboard_replays_the_push_rule(config: Config) -> None:
+    """``_rules()`` is ``push.*``, not a copy of it."""
+    config.push.persistence_obs = 3
+    config.push.rearm_after_min = 90
+    rules = StationEvalService(config, _engine(_products()))._rules()
+    assert (rules.persistence_obs, rules.rearm_after_min) == (3, 90)
+    # ...and the detection threshold is still the pipeline's one.
+    config.forecast.rain_threshold_mm_h = 1.25
+    later = StationEvalService(config, _engine(_products()))._rules()
+    assert later.raining_now_mm_h == pytest.approx(1.25)
 
 
 def test_enabled_requires_a_points_file() -> None:

@@ -41,6 +41,14 @@ forecast:
   # leads: those are ``national.leads_min`` below and stay 10/20/30/45/60.
   leads_min: [10, 20, 30, 40, 50, 60]
   method: farneback
+  # WHICH motion estimator the cycle runs (H4, 2026-09-13), by name in
+  # dmi_nowcast_core.variants — see sidecar/config.example.yaml for the full
+  # note. `production` is the served Farnebäck path and the default;
+  # `lucaskanade` is the H4 candidate: its estimate adds ~3.5 s and ~390 MB,
+  # which on this instance competes with the national product reduction.
+  # Served in state.json as motion.flow_variant.
+  # ROLLBACK: back to `production` (or delete the line) and restart.
+  # flow_variant: production
   steps:
     ensemble_size: 16
     n_cascade_levels: 6
@@ -149,10 +157,17 @@ push:
   max_subscriptions: 200
   fanout_budget_s: 20.0
   ttl_s: 900
+  # The rule's timing, configured once here and read by everything that
+  # replays it. Both values are the defaults from
+  # dmi_nowcast_core.push_rules and are spelled out only because this
+  # file documents the served stack.
   rearm_after_min: 60
   # One observation, not two: the calibrated ensemble probability
   # already aggregates 16 members, and a second 10 min observation on
-  # top of the radar age left no lead time (2026-09-02 event).
+  # top of the radar age left no lead time (2026-09-02 event). Made the
+  # rule for subscribers too on 2026-09-13 (DECIDE-14) — until then the
+  # fan-out required two while every measurement of it required one, and
+  # F1 at the fitted threshold was better at one for 20/30/45 min.
   persistence_obs: 1
 
 station_obs:

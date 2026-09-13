@@ -310,3 +310,78 @@ def test_every_registered_variant_declares_something_readable():
         req = variant_requirements(get_variant(name))
         assert isinstance(req.history, int) and req.history >= 0
         assert isinstance(req.future, bool)
+
+
+# ---------------------------------------------------------------------------
+# Which entries a FORECAST can be made with (H4, 2026-09-13)
+# ---------------------------------------------------------------------------
+# The registry now feeds three callers, not one: the Layer A harness (which
+# can fetch any frame it likes), the gauge replay and the live cycle (which
+# hold exactly ``prev`` and ``curr``). These two functions are the gate
+# between them, and the gate is what stops a candidate from being scored as
+# its own baseline.
+def test_forecast_variants_is_the_registry_minus_the_unfeedable():
+    from dmi_nowcast_core.variants import forecast_variants
+
+    usable = forecast_variants()
+    assert set(list_variants()) - set(usable) == {"median3", "oracle"}
+    # Sorted and complete, so a CLI help string and an error message read
+    # the same however they got the list.
+    assert usable == tuple(sorted(usable))
+    assert "production" in usable and "lucaskanade" in usable
+
+
+def test_check_forecast_variant_passes_a_usable_name_through():
+    from dmi_nowcast_core.variants import check_forecast_variant, forecast_variants
+
+    for name in forecast_variants():
+        assert check_forecast_variant(name) == name
+
+
+@pytest.mark.parametrize(
+    ("name", "match"),
+    [
+        ("oracle", "frame AFTER"),
+        ("median3", "older than"),
+        ("lucas-kanade", "unknown flow variant"),
+    ],
+)
+def test_check_forecast_variant_refuses_with_the_reason_and_the_options(
+    name: str, match: str,
+):
+    """ValueError, not KeyError: argparse and pydantic both surface it as-is."""
+    from dmi_nowcast_core.variants import check_forecast_variant
+
+    with pytest.raises(ValueError, match=match) as excinfo:
+        check_forecast_variant(name)
+    # Every refusal has to leave the operator with a next step.
+    assert "production" in str(excinfo.value)
+
+
+def test_the_declared_completion_policy_matches_what_each_entry_does():
+    """``MotionEstimate.completion`` must not be able to lie.
+
+    ``bulk`` IS the pre-H-F completion and ``persistence`` completes
+    nothing; everything else goes through ``flow_variants._completed``,
+    which is the served confidence gate.
+    """
+    from dmi_nowcast_core.variants import variant_completion
+
+    assert variant_completion(get_variant("bulk")) == "bulk"
+    assert variant_completion(get_variant("persistence")) == "bulk"
+    assert variant_completion(get_variant("production")) == "confidence"
+    assert variant_completion(get_variant("lucaskanade")) == "confidence"
+    assert variant_completion(get_variant("median3")) == "confidence"
+    for name in list_variants():
+        assert variant_completion(get_variant(name)) in ("bulk", "confidence")
+
+
+def test_an_unreadable_completion_declaration_is_a_bug_not_a_shrug():
+    from dmi_nowcast_core.variants import COMPLETION_ATTR, variant_completion
+
+    def entry(prev_dbz, curr_dbz, rain_now_mm_h, *, pixel_km):
+        return persistence_flow(prev_dbz, curr_dbz, rain_now_mm_h, pixel_km=pixel_km)
+
+    setattr(entry, COMPLETION_ATTR, "smoothing")
+    with pytest.raises(ValueError, match="must be 'bulk' or 'confidence'"):
+        variant_completion(entry)

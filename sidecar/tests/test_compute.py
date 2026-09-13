@@ -375,3 +375,101 @@ async def test_bulk_completion_reproduces_the_pre_hotfix_field(
 
     assert set(fields) == {"bulk", "confidence"}
     assert not np.array_equal(fields["bulk"], fields["confidence"])
+
+
+# ---------------------------------------------------------------------------
+# H4: forecast.flow_variant (which motion estimator the cycle runs)
+#
+# The registry the Layer A harness screens candidates on is now reachable
+# from the cycle, so a Layer A winner that also wins Layer B can be served
+# on the identical field. The knob is opt-in and the default must not have
+# moved: everything below is about that.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_cycle_defaults_to_the_served_estimator(
+    engine: CycleEngine,
+) -> None:
+    """``production`` everywhere — config, log line, served state."""
+    from dmi_nowcast_core.dense_flow import DEFAULT_FLOW_VARIANT
+
+    assert engine.config.forecast.flow_variant == DEFAULT_FLOW_VARIANT
+    result = await engine.run_cycle()
+    assert result.state is not None
+    assert result.state.motion.flow_variant == DEFAULT_FLOW_VARIANT
+    diag = engine._last_motion_diag
+    assert diag["flow_variant"] == DEFAULT_FLOW_VARIANT
+    # The flow's own wall time, in the existing cycle_ok line. A variant left
+    # on by accident is a 3.5 s per-cycle cost, and this is where it shows.
+    assert diag["flow_ms"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_the_cycle_passes_the_configured_variant_to_estimate_motion(
+    minimal_config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """And computes no second field: no ``flow=`` beside the variant.
+
+    The candidate estimates its own field — handing it a pre-computed
+    Farnebäck one would either be ignored (a wasted 150 ms every cycle) or
+    quietly override the candidate, so ``estimate_motion`` refuses the
+    combination and this pins the call site to honour that.
+    """
+    import numpy as np
+
+    from dmi_nowcast_core.variants import get_variant
+    from dmi_nowcast_sidecar import compute as compute_mod
+
+    cfg = minimal_config.model_copy(deep=True)
+    cfg.forecast.leads_min = [5, 10]
+    cfg.forecast.flow_variant = "lucaskanade"
+    engine = CycleEngine(cfg)
+    engine._client.list_latest = AsyncMock(  # type: ignore[method-assign]
+        return_value=[_feature(FRAME_PREV), _feature(FRAME_CURR)],
+    )
+
+    async def _download(feature: RadarFeature, dest_dir: Path) -> Path:
+        return ARCHIVE / feature.filename
+
+    engine._client.download = AsyncMock(side_effect=_download)  # type: ignore[method-assign]
+
+    calls: list[dict] = []
+    fields: dict[str, np.ndarray] = {}
+    real_estimate = compute_mod.estimate_motion
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        out = real_estimate(*args, **kwargs)
+        fields["vy"] = out.vy.copy()
+        return out
+
+    monkeypatch.setattr(compute_mod, "estimate_motion", spy)
+
+    result = await engine.run_cycle()
+    assert result.error is None, f"cycle errored: {result.error}"
+    assert len(calls) == 1
+    assert calls[0]["flow_variant"] == "lucaskanade"
+    assert calls[0]["flow"] is None
+    assert result.state is not None
+    assert result.state.motion.flow_variant == "lucaskanade"
+    assert engine._last_motion_diag["flow_variant"] == "lucaskanade"
+
+    # And the field the cycle advected with is the registry's, bit for bit —
+    # the property that makes the Layer A screening result transferable.
+    prev, curr, rain = _fixture_frames()
+    ref_vy, _ref_vx = get_variant("lucaskanade")(prev, curr, rain, pixel_km=0.5)
+    np.testing.assert_array_equal(fields["vy"], ref_vy)
+
+
+def _fixture_frames():
+    """``(prev_dbz, curr_dbz, rain_now)`` for the fixture's two frames."""
+    from dmi_nowcast_core.parse import parse_composite
+    from dmi_nowcast_core.transform import dbz_to_rain_rate
+
+    prev = parse_composite(FRAME_PREV)
+    curr = parse_composite(FRAME_CURR)
+    rain = dbz_to_rain_rate(
+        curr.reflectivity_dbz, zr_a=curr.zr_a, zr_b=curr.zr_b,
+    )
+    return prev.reflectivity_dbz, curr.reflectivity_dbz, rain

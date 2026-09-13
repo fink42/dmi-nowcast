@@ -73,6 +73,12 @@ class PerLeadEntry(BaseModel):
 
 
 class ForecastBlock(BaseModel):
+    # The ``forecast.method`` BACKEND family, and whether the cycle had to
+    # fall back to mean motion. Since H4 it is no longer the whole story:
+    # ``forecast.flow_variant`` can hand the estimate to a registry entry
+    # (``lucaskanade``) while this still reads ``farneback``. The authority
+    # on which estimator ran is ``motion.flow_variant``, and this Literal
+    # stays as it is because it is an HA-facing contract.
     method: Literal["farneback", "tvl1", "mean-motion"]
     rain_incoming: bool
     # Minutes from generated_at; null if no rain expected within horizon.
@@ -140,6 +146,16 @@ class MotionBlock(BaseModel):
     # prompted the fix, ~0.11 on a textured convective band. Null on a
     # state written before the field existed.
     stalled_share: float | None = None
+    # H4 estimator provenance (additive, 2026-09-13): WHICH entry of
+    # ``dmi_nowcast_core.variants`` produced this field —
+    # ``forecast.flow_variant``, ``production`` by default and on any cycle
+    # that fell back to mean motion. A reader comparing two days of served
+    # probabilities needs it, because an estimator swap moves every one of
+    # them. Null on a state written before the field existed (all
+    # ``production``). Under a non-default variant the registry exposes only
+    # the completed field, so ``stalled_share`` above is then measured on
+    # THAT rather than on the raw estimate.
+    flow_variant: str | None = None
 
 
 class CalibrationBlock(BaseModel):

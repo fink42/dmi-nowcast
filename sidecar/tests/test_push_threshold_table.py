@@ -629,8 +629,11 @@ class TestServiceUsesTheTable:
         assert (entry["threshold_pct"], entry["threshold_source"]) == (
             40, "override",
         )
-        # 0.50 >= 0.40, and persistence_obs defaults to 2 → a streak, no push.
+        # 0.50 >= 0.40, so the override's own threshold decided it: one
+        # observation is the shipped persistence, and the streak that
+        # fired is recorded on the (now disarmed) row.
         assert service.store.get(ENDPOINT_A).streak == 1
+        assert entry["action"] == "notify"
 
     def test_a_migrated_row_still_evaluates(
         self, push_config: Config, service: PushService,
@@ -644,7 +647,7 @@ class TestServiceUsesTheTable:
         )
         entry = _evaluate(service)[0]
         assert entry["threshold_pct"] == 45
-        assert entry["action"] == "notify"       # streak 1 + this one = 2
+        assert entry["action"] == "notify"       # 0.50 >= 0.45, one observation
 
     def test_a_refit_between_cycles_is_picked_up(
         self, push_config: Config, service: PushService,

@@ -1186,3 +1186,83 @@ def test_no_features_is_recorded_as_such(
     assert summary["run"]["features"]["enabled"] is False
     # Documented anyway, so a reader of an old run can see what is missing.
     assert summary["run"]["features"]["columns"]
+
+
+# ---------------------------------------------------------------------------
+# H4: --flow-variant (which motion estimator the replay runs)
+# ---------------------------------------------------------------------------
+# The Layer A harness screens candidates on ``dmi_nowcast_core.variants``;
+# the plan ships one only on a Layer B win, which means the gauge replay has
+# to be able to run the candidate's field. What matters here is that the
+# default did not move, that the summary says which estimator ran, and that
+# an entry the replay cannot feed is refused at the flag rather than three
+# hours into a run.
+def test_the_flow_variant_default_is_the_served_estimator() -> None:
+    from dmi_nowcast_core.dense_flow import DEFAULT_FLOW_VARIANT
+
+    assert rw.FrameSettings().flow_variant == DEFAULT_FLOW_VARIANT == "production"
+
+
+def test_the_summary_records_which_estimator_ran(
+    archive_dir: Path, points_file: Path, tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "variant_summary"
+    assert rw.main(_cli(
+        archive_dir, out_dir, points_file,
+        "--start-utc", "06:20", "--end-utc", "06:20",
+    )) == 0
+    flow = json.loads((out_dir / "summary.json").read_text())["run"]["flow"]
+    # In the ``flow`` block, which is what benchmark_report.py compares
+    # between two runs — so two arms on different estimators cannot be
+    # scored against each other by accident.
+    assert flow["flow_variant"] == "production"
+    assert flow["completion"] == "confidence"
+
+
+@pytest.mark.parametrize("bad", ["oracle", "median3", "farneback_w99_l9_p9"])
+def test_a_variant_the_replay_cannot_run_is_refused_at_the_flag(
+    dual_archive: Path, points_file: Path, tmp_path: Path, bad: str,
+) -> None:
+    """``oracle`` reads the future; ``median3`` needs frames; the third is a typo.
+
+    All three have to fail before the first frame is parsed. A run that
+    silently degraded ``median3`` to its baseline would report the
+    baseline's score under the candidate's name.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        rw.main(_cli(
+            dual_archive, tmp_path / "nope", points_file,
+            "--flow-variant", bad,
+        ))
+    assert excinfo.value.code == 2
+
+
+def test_production_motion_under_a_variant_is_the_registry_field(
+    archive_dir: Path,
+) -> None:
+    """The replay's motion IS the field Layer A scored — not a rebuild of it.
+
+    Taken on one real archived frame pair rather than on a synthetic,
+    because the thing under test is the whole call the day worker makes.
+    """
+    import numpy as np
+    from dmi_nowcast_core.variants import get_variant
+
+    prev = rw.parse_composite(
+        rw.frame_path(archive_dir, T_ANCHOR - timedelta(minutes=10)),
+    )
+    now = rw.parse_composite(rw.frame_path(archive_dir, T_ANCHOR))
+    rain_now = rw.dbz_to_rain_rate(
+        now.reflectivity_dbz, zr_a=now.zr_a, zr_b=now.zr_b,
+    )
+    settings = rw.FrameSettings(flow_variant="lucaskanade")
+    motion = rw.production_motion(prev, now, rain_now, settings)
+    ref_vy, ref_vx = get_variant("lucaskanade")(
+        prev.reflectivity_dbz, now.reflectivity_dbz, rain_now,
+        pixel_km=float(now.xscale_m) / 1000.0,
+    )
+    np.testing.assert_array_equal(motion.vy, ref_vy)
+    np.testing.assert_array_equal(motion.vx, ref_vx)
+    # And the H-P feature block's inputs are all there.
+    assert np.isfinite(motion.bulk_vy) and np.isfinite(motion.bulk_vx)
+    assert 0.0 <= motion.stalled_share <= 1.0

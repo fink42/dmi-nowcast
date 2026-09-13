@@ -110,6 +110,10 @@ _SIDECAR = _REPO_ROOT / "sidecar"
 if str(_SIDECAR) not in sys.path:
     sys.path.insert(0, str(_SIDECAR))
 
+from dmi_nowcast_core.push_rules import (  # noqa: E402
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 from dmi_nowcast_core.push_thresholds import (  # noqa: E402
     effective_threshold,
     load_thresholds,
@@ -461,7 +465,7 @@ def gauge_truth_variants(
 def shadowed_misses(
     result: ScoreResult,
     *,
-    rearm_after_min: int = 60,
+    rearm_after_min: int = DEFAULT_REARM_AFTER_MIN,
     outcomes: Sequence[str] = ("hit",),
 ) -> int:
     """Missed onsets that fell inside a warning's disarmed hour.
@@ -515,7 +519,7 @@ def score_variant_lead(
     warnings_by_station: Mapping[str, Sequence[tuple[datetime, float | None]]],
     onsets_by_station: Mapping[str, Mapping[datetime, float]],
     *,
-    rearm_after_min: int = 60,
+    rearm_after_min: int = DEFAULT_REARM_AFTER_MIN,
 ) -> dict:
     """Score one fixed warning set against one onset definition.
 
@@ -692,8 +696,8 @@ def run(
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
     min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN,
-    persistence_obs: int = 1,
-    rearm_after_min: int = 60,
+    persistence_obs: int = DEFAULT_PERSISTENCE_OBS,
+    rearm_after_min: int = DEFAULT_REARM_AFTER_MIN,
     variants: Sequence[Variant] = VARIANTS,
     workers: int = 1,
     log=None,
@@ -1145,8 +1149,11 @@ def build_parser() -> argparse.ArgumentParser:
                    default=DEFAULT_COVERAGE_GAP_MIN)
     p.add_argument("--min-useful-lead-min", type=float,
                    default=FIT_MIN_USEFUL_LEAD_MIN)
-    p.add_argument("--persistence-obs", type=int, default=1)
-    p.add_argument("--rearm-after-min", type=int, default=60,
+    p.add_argument("--persistence-obs", type=int,
+                   default=DEFAULT_PERSISTENCE_OBS,
+                   help="the engine's persistence streak (push_rules)")
+    p.add_argument("--rearm-after-min", type=int,
+                   default=DEFAULT_REARM_AFTER_MIN,
                    help="the engine's re-arm, and therefore the width of the "
                         "shadow window a hit casts over later onsets")
     p.add_argument("--out-md", type=Path, default=None)

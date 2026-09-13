@@ -33,6 +33,14 @@ catchable. A row whose ``p_rain_<lead>`` is null is skipped for that lead
 alone: it is off coverage or an unserved lead, which is not "dry", so it
 neither warns nor advances the machine.
 
+``persistence_obs`` and ``rearm_after_min`` are the SERVICE's, never this
+module's: ONE observation and 60 minutes as shipped, defaulted in
+:mod:`dmi_nowcast_core.push_rules` and passed in from ``push.*`` by the
+nightly fit. A threshold fitted under a different persistence than the
+engine fires on is a table for a service nobody is running — which is
+what the system had until 2026-09-13, when the fit required two
+observations and every other replay required one.
+
 Quiet hours are off throughout. A virtual subscriber at a rain gauge has
 no time zone and no bedtime, and a suppressed notification would be scored
 as silence the rule never intended.
@@ -154,6 +162,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from dmi_nowcast_core.push_rules import (
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 from dmi_nowcast_core.push_thresholds import (
     DEFAULT_FALLBACK_THRESHOLD_PCT,
     SCHEMA_VERSION as THRESHOLDS_SCHEMA_VERSION,
@@ -949,8 +961,8 @@ def build_shared(
     dry_min: int = DEFAULT_DRY_MIN,
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
     min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN,
-    persistence_obs: int = 1,
-    rearm_after_min: int = 60,
+    persistence_obs: int = DEFAULT_PERSISTENCE_OBS,
+    rearm_after_min: int = DEFAULT_REARM_AFTER_MIN,
     raining_now_mm_h: float = RAIN_THRESHOLD_MM_H,
     n_days: int | None = None,
     n_rows: int | None = None,
@@ -1212,8 +1224,8 @@ def radar_sweep(
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
-    persistence_obs: int = 1,
-    rearm_after_min: int = 60,
+    persistence_obs: int = DEFAULT_PERSISTENCE_OBS,
+    rearm_after_min: int = DEFAULT_REARM_AFTER_MIN,
     min_useful_lead_min: float = FIT_MIN_USEFUL_LEAD_MIN,
     raining_now_mm_h: float = RAIN_THRESHOLD_MM_H,
     workers: int = 1,
@@ -2020,8 +2032,12 @@ class SweepOptions:
     radar_decisions_dirs: Sequence[Path] | None = None
     leads: Sequence[int] = DEFAULT_PRODUCT_LEADS_MIN
     thresholds: Sequence[int] = (20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80)
-    rearm_after_min: int = 60
-    persistence_obs: int = 1
+    #: The live rule's timing. The nightly fit passes ``push.*``; the
+    #: defaults are the shipped numbers from
+    #: :mod:`dmi_nowcast_core.push_rules`, so a manual fit that names
+    #: neither still fits the rule the service runs.
+    rearm_after_min: int = DEFAULT_REARM_AFTER_MIN
+    persistence_obs: int = DEFAULT_PERSISTENCE_OBS
     tolerance_min: int = DEFAULT_TOLERANCE_MIN
     dry_min: int = DEFAULT_DRY_MIN
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM

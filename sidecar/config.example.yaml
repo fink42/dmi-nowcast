@@ -38,6 +38,23 @@ forecast:
   # flow_confidence_window_px: 31
   # flow_confidence_percentile: 40.0
   # flow_texture_percentile: 60.0
+  #
+  # WHICH motion estimator the cycle runs (H4, 2026-09-13), by name in
+  # dmi_nowcast_core.variants — the same registry the Layer A harness
+  # (scripts/persistence_vs_advection.py --variant) screens candidates on,
+  # so a Layer A winner is served on the identical field. `production` is
+  # the Farnebäck path above and is byte-identical to the pre-H4 cycle.
+  # `lucaskanade` is pysteps' dense_lucaskanade: Layer A scored it
+  # +0.023/+0.029/+0.030/+0.025 CSI at +10/20/30/45 min over 30 days, and
+  # its estimate adds ~3.5 s and ~390 MB per cycle (`flow_ms` in the
+  # cycle_ok log goes from ~2.0 s to ~5.6 s). `oracle` and `median3`
+  # are refused — one reads the future, the other needs frames the cycle
+  # does not keep. The four settings above are the registry's own, so a
+  # variant cannot be combined with a non-default value for any of them.
+  # Served in state.json as motion.flow_variant.
+  #
+  # ROLLBACK: set it back to `production` (or delete the line) and restart.
+  # flow_variant: production
   steps:
     ensemble_size: 16
     n_cascade_levels: 6
@@ -172,8 +189,17 @@ lightning:
 #     - notify.windows.com
 #   ttl_s: 900              # push service holds an undelivered message this long
 #   fanout_budget_s: 20.0   # per-cycle wall-clock budget for the fan-out
+#   # The rule's timing, and the ONLY place either number is configured:
+#   # the station scoreboard, the quality page's scoreboard, the nightly
+#   # threshold fit and the manual fit script all read these two rather
+#   # than carrying their own. Defaults live in
+#   # dmi_nowcast_core.push_rules (one observation, 60 minutes), so
+#   # leaving both out is the shipped rule.
 #   rearm_after_min: 60     # dry minutes before a notified subscription re-arms
-#   persistence_obs: 2      # consecutive over-threshold observations to fire
+#   persistence_obs: 1      # consecutive over-threshold observations to fire
+#                           # (1 since 2026-09-13: a second observation
+#                           #  costs ~10 min of radar cadence and lost F1
+#                           #  at three of the four served horizons)
 
 # --- Rain-gauge polling (Phase F) -------------------------------------
 # Mirrors DMI metObs station observations into
@@ -222,14 +248,19 @@ station_obs:
 #   # {"version": 2, "points": [{"id": "06180", "lat": ..., "lon": ...}]}
 #   # from scripts/build_station_points.py.
 #   points_file: /var/lib/dmi-nowcast-corpus/stations/station_points.json
-#   # The live subscriber row: warn at 40 % of rain within 30 min, one
-#   # observation of persistence, 60 min disarmed after a warning.
-#   # lead_min must be one of forecast.national.leads_min.
+#   # The virtual subscriber's QUESTION: warn at 40 % of rain within
+#   # 30 min. threshold_pct is only the fallback — a served threshold
+#   # table's pick for lead_min wins. lead_min must be one of
+#   # forecast.national.leads_min.
+#   #
+#   # The rule's TIMING is not here: persistence and the re-arm come from
+#   # push.persistence_obs / push.rearm_after_min, so the scoreboard
+#   # measures the rule the subscribers get. Setting either key under
+#   # rules: is refused at config load (they lived here until
+#   # 2026-09-13 and disagreed with the engine's own).
 #   rules:
 #     threshold_pct: 40
 #     lead_min: 30
-#     rearm_after_min: 60
-#     persistence_obs: 1
 
 # --- The quality report (Phase F, F4) ---------------------------------
 # The document behind the website's /quality page ("How good are we?"):

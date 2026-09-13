@@ -35,6 +35,21 @@
 #   REPLAY_CORPUS_DIR  corpus root (default /var/lib/dmi-nowcast-corpus)
 #   REPLAY_HORIZON_MIN forecast horizon (default 90)
 #   REPLAY_CURVES      served national curves (default the live ones)
+#   REPLAY_FLOW_VARIANT
+#                      WHICH motion estimator every cycle runs, by name in
+#                      dmi_nowcast_core.variants — the registry the Layer A
+#                      harness screens on, so a Layer A winner is replayed
+#                      on the identical field. Default `production` (the
+#                      served Farnebäck path; byte-identical to every
+#                      replay before 2026-09-13). `lucaskanade` is the H4
+#                      candidate: Layer A scored it +0.023/+0.029/+0.030/
+#                      +0.025 CSI at +10/20/30/45 min over 30 days.
+#                      A non-default variant costs ~3.5 s and ~390 MB per
+#                      frame on top of the cycle and — unless REPLAY_OUT_DIR
+#                      is set explicitly — lands in
+#                      <corpus>/stations/replay_flow_<variant>, NOT in the
+#                      default tree, which the nightly quality report scores
+#                      as if it were the service.
 #   BATCH_WORKERS      parallel workers (default 2)
 #   BATCH_MEM_CAP      hard cap on the batch container (default 5000m)
 #   BATCH_FORCE        1 to run beside another batch job (don't)
@@ -73,6 +88,11 @@
 #   REPLAY_ANCHOR=freshest \
 #   REPLAY_OUT_DIR=/var/lib/dmi-nowcast-corpus/stations/replay_freshest \
 #       sidecar/deploy/replay.sh
+#
+#   # H4: the Lucas-Kanade arm (lands in stations/replay_flow_lucaskanade).
+#   # Score it against the production tree with
+#   #   scripts/benchmark_report.py --allow-differing flow_variant
+#   REPLAY_FLOW_VARIANT=lucaskanade sidecar/deploy/replay.sh
 set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,7 +102,17 @@ require_no_batch_running || exit 1
 
 corpus_dir=${REPLAY_CORPUS_DIR:-/var/lib/dmi-nowcast-corpus}
 days_file=${REPLAY_DAYS_FILE:-$HOME/replay_days.txt}
-out_dir=${REPLAY_OUT_DIR:-$corpus_dir/stations/replay}
+flow_variant=${REPLAY_FLOW_VARIANT:-production}
+# A variant arm must not land in the default tree: that one is
+# `quality_report.replay_dir`, scored beside the live rows as if it were the
+# service. So the default output path depends on the variant — and only on
+# the variant; an explicit REPLAY_OUT_DIR always wins, and the production
+# default is unchanged.
+if [[ "$flow_variant" == "production" ]]; then
+    out_dir=${REPLAY_OUT_DIR:-$corpus_dir/stations/replay}
+else
+    out_dir=${REPLAY_OUT_DIR:-$corpus_dir/stations/replay_flow_$flow_variant}
+fi
 points=${REPLAY_POINTS:-$corpus_dir/stations/station_points.json}
 frame_age=${REPLAY_FRAME_AGE:-}
 horizon=${REPLAY_HORIZON_MIN:-90}
@@ -156,6 +186,15 @@ echo "    ensemble ${ensemble_size} members, ${cascades} cascade levels, ds ${do
 flow_settings=$(batch_live_flow_settings)
 read -r flow_completion _flow_window _flow_conf_pct _flow_texture_pct <<< "$flow_settings"
 echo "    flow completion ${flow_completion}"
+# H4: WHICH estimator. From the env, not from the live config — a variant arm
+# is a candidate being screened, and reading it off the service would make the
+# baseline arm impossible to run once the service moved.
+if [[ "$flow_variant" == "production" ]]; then
+    echo "    flow variant ${flow_variant} (the served estimator)"
+else
+    echo "    flow variant ${flow_variant}  <-- CANDIDATE, not the served field"
+    echo "      score it with: benchmark_report.py --allow-differing flow_variant"
+fi
 
 BATCH_RUN_ARGS=(-v "$days_file:/tmp/replay_days.txt:ro")
 
@@ -171,6 +210,7 @@ run_in_repo_capped python scripts/replay_warnings.py \
         --downsample-factor "$downsample" \
         --horizon-min "$horizon" \
         --flow-completion "$flow_completion" \
+        --flow-variant "$flow_variant" \
         --national-curves "$curves" \
         --out-dir "$out_dir" \
         --progress "$out_dir/progress.json"

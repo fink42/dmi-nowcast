@@ -643,19 +643,23 @@ class TestTheFanOutUsesTheModel:
         assert line["p_source"] == "postprocess"
         assert line["p_rain"] == pytest.approx(0.30)
         assert line["p_post"] == pytest.approx(0.71)
-        assert line["action"] == "none"     # persistence is 2 by default
+        # One observation is the shipped persistence (DECIDE-14), so this
+        # fires now. The curve never crosses 45 %: the notification is the
+        # model's and could not have come from p_rain.
+        assert line["action"] == "notify"
+        assert summary["notified"] == 1
         assert summary["probability_source"] == "postprocess"
         assert summary["postprocess_active"] is True
         assert summary["postprocess_fitted_at"] == "2026-09-11T03:40:00+00:00"
         assert summary["postprocess_curve_fallbacks"] == 0
 
-        # Second observation: the streak completes and the push goes out.
-        # The curve never crosses 45 %, so the notification is the model's.
+        # Second observation, still over threshold: the push disarmed the
+        # subscription, so the model's number cannot spam it either.
         later = RADAR_TS + timedelta(minutes=10)
         engine.postprocess_latest = _pinned(base, answer, radar_ts=later)
         lines, summary = _run(service, later)
-        assert lines[0]["action"] == "notify"
-        assert summary["notified"] == 1
+        assert lines[0]["action"] == "none"
+        assert summary["notified"] == 0
 
     def test_a_point_the_model_cannot_speak_for_falls_back_and_is_counted(
         self, push_config: Config, tmp_path: Path, monkeypatch,

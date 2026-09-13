@@ -39,6 +39,10 @@ from pyproj import CRS, Transformer
 from dmi_nowcast_core.geo import CompositeGeo
 from dmi_nowcast_core.national import NationalProducts
 from dmi_nowcast_core.parse import parse_composite
+from dmi_nowcast_core.push_rules import (
+    DEFAULT_PERSISTENCE_OBS,
+    DEFAULT_REARM_AFTER_MIN,
+)
 from dmi_nowcast_sidecar.app import (
     _safe_frame_name,
     _safe_nowcast_name,
@@ -164,8 +168,19 @@ def push_config(minimal_config: Config) -> Config:
 
     Public mode with a key is the interesting shape: the three subscriber
     routes must stay anonymous while ``/test`` and ``/stats`` disappear.
+
+    ``persistence_obs=2`` is deliberate and NOT the shipped rule (one
+    observation since 2026-09-13, ``push_rules``): the fan-out tests below
+    are about the wiring — what the store records, what is delivered, what
+    a dead push service costs — and a two-observation streak gives each of
+    them a cycle that sends nothing followed by a cycle that sends, which
+    is what makes those transitions observable in one test. The shipped
+    rule's own end-to-end behaviour is
+    ``test_the_shipped_persistence_fires_on_the_first_observation``.
     """
-    minimal_config.push = PushConfig(enabled=True, vapid_subject=SUBJECT)
+    minimal_config.push = PushConfig(
+        enabled=True, vapid_subject=SUBJECT, persistence_obs=2,
+    )
     minimal_config.server.public_mode = True
     minimal_config.server.api_key = API_KEY
     return minimal_config
@@ -913,7 +928,7 @@ def sends(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
 async def test_service_persistence_then_one_notification(
     service: PushService, seeded_engine: CycleEngine, sends: list[dict],
 ) -> None:
-    # First observation: over threshold, but persistence is 2.
+    # First observation: over threshold, but this fixture asks for two.
     await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
     assert sends == []
     wet = service.store.get(ENDPOINT_A)
@@ -951,6 +966,31 @@ async def test_service_persistence_then_one_notification(
     assert service.last_fanout["sent"] == 1
     assert service.last_fanout["notified"] == 1
     assert service.last_fanout["subscriptions"] == 2
+
+
+async def test_the_shipped_persistence_fires_on_the_first_observation(
+    service: PushService, sends: list[dict],
+) -> None:
+    """The rule a real subscriber is on: one observation (DECIDE-14).
+
+    Every other fan-out test here pins two so the streak is visible; this
+    one asserts what the deployed default actually does, and that the
+    default is the core constant rather than anything this module chose.
+    """
+    assert PushConfig().persistence_obs == DEFAULT_PERSISTENCE_OBS == 1
+    assert PushConfig().rearm_after_min == DEFAULT_REARM_AFTER_MIN == 60
+    service.config.push.persistence_obs = DEFAULT_PERSISTENCE_OBS
+
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+
+    assert len(sends) == 1
+    assert sends[0]["endpoint"] == ENDPOINT_A
+    wet = service.store.get(ENDPOINT_A)
+    assert wet is not None
+    assert wet.armed is False            # the first push disarms it
+    assert wet.streak == 1
+    assert service.last_fanout is not None
+    assert service.last_fanout["notified"] == 1
 
 
 async def test_service_does_not_push_into_rain_already_at_the_point(

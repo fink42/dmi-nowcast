@@ -41,6 +41,7 @@ from dmi_nowcast_core.confidence import (
 )
 from dmi_nowcast_core.corpus import CorpusArchiver
 from dmi_nowcast_core.dense_flow import (
+    DEFAULT_FLOW_VARIANT,
     DenseFlowUnavailable,
     dense_flow,
     estimate_motion,
@@ -909,16 +910,29 @@ class CycleEngine:
         if dt_min <= 0:
             dt_min = _EXPECTED_FRAME_INTERVAL_MIN
         method_used: str = self.config.forecast.method
-        raw_flow: tuple[np.ndarray, np.ndarray]
+        # H4 (2026-09-13): WHICH estimator. ``production`` is the Farnebäck
+        # path below, with its mean-motion fallback; any other registry name
+        # (``forecast.flow_variant``) owns the estimate itself, so nothing is
+        # pre-computed and ``flow=`` must not be passed. Runs in this
+        # executor thread, where the flow has always been computed — never on
+        # the event loop.
+        flow_variant: str = self.config.forecast.flow_variant
+        t_flow = time.perf_counter()
+        raw_flow: tuple[np.ndarray, np.ndarray] | None = None
         try:
             if self.config.forecast.method == "mean-motion":
                 raise DenseFlowUnavailable("forced via config")
-            raw_flow = dense_flow(
-                composite_prev.reflectivity_dbz,
-                composite_now.reflectivity_dbz,
-            )
+            if flow_variant == DEFAULT_FLOW_VARIANT:
+                raw_flow = dense_flow(
+                    composite_prev.reflectivity_dbz,
+                    composite_now.reflectivity_dbz,
+                )
         except DenseFlowUnavailable:
             method_used = "mean-motion"
+            # A uniform phase-correlation shift is nobody's candidate field,
+            # so the cycle falls all the way back to the production path
+            # rather than serving a fallback under a variant's name.
+            flow_variant = DEFAULT_FLOW_VARIANT
             dy, dx = phase_correlation_shift(rain_prev, rain_now)
             shape = rain_now.shape
             raw_flow = (
@@ -937,6 +951,11 @@ class CycleEngine:
         # into the advection and into STEPS. See
         # ``dense_flow.complete_flow`` and
         # ``archive/flow_stall_20260908/README.md``.
+        #
+        # Under a non-default ``flow_variant`` the registry entry applies the
+        # same completion with these same values — ``ForecastConfig`` refuses
+        # any combination where it could not — so the call is one call either
+        # way and the served field is bit-for-bit the one Layer A screened.
         pixel_km = float(composite_now.xscale_m) / 1000.0
         motion = estimate_motion(
             composite_prev.reflectivity_dbz,
@@ -951,13 +970,22 @@ class CycleEngine:
             texture_percentile=self.config.forecast.flow_texture_percentile,
             max_px_per_frame=_MAX_PX_PER_FRAME,
             flow=raw_flow,
+            flow_variant=flow_variant,
         )
+        flow_ms = (time.perf_counter() - t_flow) * 1000
         del raw_flow
         vy, vx = motion.vy, motion.vx
-        # Cycle diagnostics, logged with ``cycle_ok`` and (the raw stalled
-        # share) served in ``state.motion``.
+        # Cycle diagnostics, logged with ``cycle_ok`` and (the variant and
+        # the raw stalled share) served in ``state.motion``. ``flow_ms`` is
+        # the WHOLE estimate→complete→sanitise sequence, not just the
+        # estimator — on one native-grid pair it measured 2.0 s under
+        # ``production`` and 5.6 s under ``lucaskanade``, the ~3.5 s
+        # difference being the LK estimate itself. It is the number to watch
+        # if a variant is ever left on by accident.
         self._last_motion_diag = {
+            "flow_variant": flow_variant,
             "flow_completion": motion.completion,
+            "flow_ms": round(flow_ms, 1),
             "stalled_share": round(motion.stalled_share, 3),
             "stalled_share_completed": round(motion.stalled_share_completed, 3),
             "bulk_kmh": round(
@@ -965,6 +993,9 @@ class CycleEngine:
                 1,
             ),
         }
+        # Kept past ``del motion``: the served MotionBlock says which
+        # estimator produced the arrows and the stall share it reports.
+        motion_flow_variant = flow_variant
         motion_stalled_share = motion.stalled_share
         # Kept as scalars past ``del motion`` below: a feature row assembled
         # later in the cycle — or later still, for a point ``/forecast`` is
@@ -1390,6 +1421,7 @@ class CycleEngine:
                 speed_km_per_h=disc_speed_kmh,
                 bearing_deg_from=bearing_from,
                 stalled_share=round(motion_stalled_share, 3),
+                flow_variant=motion_flow_variant,
             ),
             confidence=float(conf.score),
             calibration=CalibrationBlock(
