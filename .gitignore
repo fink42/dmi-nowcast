@@ -46,3 +46,12 @@ data/*
 
 # Editor / OS noise
 .DS_Store
+
+# Event-review bundles: a few hundred megabytes of radar PNGs plus the
+# decision/gauge extracts they are reviewed against. Rebuilt from the VM
+# corpus by scripts/build_review_bundle.py, never committed. The annotation
+# database is already covered by the *.sqlite rule above.
+# Root-anchored on purpose: an unanchored ``review/`` also swallows
+# frontend/src/lib/review, which is source.
+/review/
+/review-bundle-*/

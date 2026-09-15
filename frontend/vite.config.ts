@@ -10,13 +10,25 @@ import { defineConfig } from 'vitest/config';
 // files itself. With no proxy configured the endpoints 404 and the UI shows
 // its "no data yet" state.
 const sidecar = process.env.VITE_SIDECAR_URL;
-const proxy = sidecar
-	? {
-			'/nowcast': { target: sidecar, changeOrigin: true },
-			'/forecast': { target: sidecar, changeOrigin: true },
-			'/api': { target: sidecar, changeOrigin: true }
-		}
-	: undefined;
+
+// The dev-only event-review tool (src/routes/review) reads its bundle and
+// stores its annotations through scripts/review_server.py, which binds to
+// loopback. These two prefixes are always proxied: they exist nowhere else
+// in the app, nothing is listening unless the reviewer started the server,
+// and /review/ 404s in a production build, so an unconditional entry costs
+// nothing and saves setting a second env var to use the tool.
+const review = process.env.VITE_REVIEW_URL ?? 'http://127.0.0.1:8770';
+const proxy = {
+	...(sidecar
+		? {
+				'/nowcast': { target: sidecar, changeOrigin: true },
+				'/forecast': { target: sidecar, changeOrigin: true },
+				'/api': { target: sidecar, changeOrigin: true }
+			}
+		: {}),
+	'/review-api': { target: review, changeOrigin: true },
+	'/review-data': { target: review, changeOrigin: true }
+};
 
 export default defineConfig({
 	plugins: [
