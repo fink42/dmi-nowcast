@@ -197,23 +197,67 @@ export interface SamplingBlock {
 	cells: SamplingCell[];
 }
 
+/**
+ * How to read a `<stamp>.observed.png`. The quantisation is the whole
+ * contract: `value = level * scale + offset`, and `nodata` (255) is null,
+ * not zero. A reader that guesses these produces a plausible wrong number
+ * with nothing to notice it by, so a parser must refuse the block rather
+ * than default them.
+ */
+export interface ObservedEncoding {
+	suffix: string;
+	encoding: string;
+	units: string;
+	scale: number;
+	offset: number;
+	nodata: number;
+	/** e.g. "block p90 over 4x4 native 500 m pixels" — not "a 2 km pixel". */
+	reduction: string;
+	source: string;
+	/** Column-max reflectivity reads HIGH: an upper bound on surface rain. */
+	caveat: string;
+}
+
+/**
+ * How the display PNG was coloured. Light rain is deliberately faded
+ * because the composite over-reads faint echo, so opacity must never be
+ * read as intensity — sample the grayscale grid for a number.
+ */
+export interface OverlayEncoding {
+	suffix: string;
+	encoding: string;
+	colormap: string;
+	colormap_stops: Array<{ mm_h: number; rgb: [number, number, number] }>;
+	interpolation: string;
+	alpha_ramp: string;
+	floor_mm_h: number;
+	solid_mm_h: number;
+	min_alpha: number;
+}
+
 export interface FramesBlock {
-	product: string;
+	/** A list because `--include-doppler` can mix fullRange and doppler. */
+	products: string[];
+	include_doppler: boolean;
 	cadence_min: number;
+	downsample_factor: number;
 	count: number;
+	/** Pre-dedup slots vs distinct stamps — the bundle's whole economy. */
+	stamps_total: number;
+	stamps_unique: number;
+	dedup_saving_pct: number;
 	bytes: number;
-	/** The DECISION window; the frame window starts earlier. See `before_pad`. */
-	window_min: { before: number; after: number };
-	overlay: { encoding: string; colormap: string; alpha: string };
-	observed: {
-		encoding: string;
-		scale: number;
-		offset: number;
-		nodata: number;
-		units: string;
-		reduction: string;
-	};
+	mean_bytes_per_frame: number | null;
+	/** The DECISION half-window, in minutes. */
+	window_min: number;
+	/** Extra minutes of frames BEFORE it, for the composite's own age. */
+	frame_pad_min: number;
+	from_utc: string | null;
+	to_utc: string | null;
+	encodings: { observed: ObservedEncoding; overlay: OverlayEncoding };
 	missing: string[];
+	/** stamp → one-line reason, so a gap in the loop is explicable. */
+	missing_reasons: Record<string, string>;
 }
 
 /** A reason a reviewer's reading could be wrong if they did not know. */
@@ -226,19 +270,20 @@ export interface Caveat {
 export interface Manifest {
 	schema_version: number;
 	bundle_id: string;
-	built_at_utc: string;
-	builder: BuilderBlock;
-	corpus: CorpusBlock;
-	window: { from_utc: string; to_utc: string };
-	rule: RuleBlock;
-	truth: TruthBlock;
-	sampling: SamplingBlock;
-	grid: GridBlock;
-	frames: FramesBlock;
-	events: { count: number };
+	built_at_utc: string | null;
+	builder: BuilderBlock | null;
+	corpus: CorpusBlock | null;
+	window: { from_utc: string; to_utc: string } | null;
+	rule: RuleBlock | null;
+	truth: TruthBlock | null;
+	sampling: SamplingBlock | null;
+	/** Null when the bundle was built with --no-frames: no imagery, no grid. */
+	grid: GridBlock | null;
+	frames: FramesBlock | null;
+	events: { count: number } | null;
 	/** Column → prose definition, for the feature panel's tooltips. */
-	feature_doc: Record<string, string>;
-	caveats: Caveat[];
+	feature_doc: Record<string, string> | null;
+	caveats: Caveat[] | null;
 }
 
 /**
@@ -265,8 +310,9 @@ export interface IndexRow {
 	p_decision_source: ProbabilitySource | null;
 	threshold_pct: number | null;
 	lead_error_min: number | null;
-	dual_truth: DualTruthClass;
-	gauge_wet_in_window: boolean;
+	/** Null when neither truth could speak — never guess a quadrant. */
+	dual_truth: DualTruthClass | null;
+	gauge_wet_in_window: boolean | null;
 	radar_wet_in_window: boolean | null;
 	neighbour_wet_in_window: boolean | null;
 	neighbour_n_known: number;
@@ -310,7 +356,7 @@ export interface StationBlock {
 	region: string;
 	station_radar_km: number | null;
 	/** Fractional product-grid position, so the marker is not pixel-snapped. */
-	grid: { row: number; col: number };
+	grid: { row: number | null; col: number | null };
 	neighbours: NeighbourRef[];
 }
 
@@ -368,7 +414,8 @@ export interface Decision {
 	p_decision_source: ProbabilitySource | null;
 	p_decision_lead_min: number;
 	threshold_pct: number | null;
-	over_threshold: boolean;
+	/** Null on a row the engine passed over: it was never compared. */
+	over_threshold: boolean | null;
 	eta_min: number | null;
 	eta_arrival_utc: string | null;
 	intensity_mm_h: number | null;
@@ -377,8 +424,8 @@ export interface Decision {
 	features: Record<string, number | string | null>;
 	/** False when the Phase-H feature columns were null on this row. */
 	features_present: boolean;
-	replay: ReplayTrace;
-	stored: StoredRow;
+	replay: ReplayTrace | null;
+	stored: StoredRow | null;
 }
 
 export interface DecisionGap {
@@ -414,6 +461,18 @@ export interface Prologue {
 		action: EngineAction;
 		p_decision: number | null;
 	}>;
+	/** The rule's own re-arm constant, so the countdown needs no constant here. */
+	rearm_after_min: number;
+	/** Arm state at the anchor instant, for the list row's badge. */
+	at_anchor: { armed: boolean; streak: number; minutes_to_rearm: number | null };
+	/**
+	 * Instants where the replay reset state at a coverage-run boundary,
+	 * handing the station a re-arm the live service never had. Drawn on the
+	 * track so an otherwise impossible notify is not read as a tool bug.
+	 */
+	run_boundary_rearms_utc: string[];
+	/** Prose the builder wants shown beside the arm band, or null. */
+	note: string | null;
 }
 
 /**
@@ -451,8 +510,8 @@ export interface RadarDiscBlock {
 		p90_mm_h: number | null;
 		max_mm_h: number | null;
 		mean_mm_h: number | null;
-		n_pixels: number;
-		n_valid: number;
+		n_pixels: number | null;
+		n_valid: number | null;
 	}>;
 	slots: Slot[];
 	wet_in_window: boolean | null;
@@ -475,8 +534,8 @@ export interface NeighboursBlock {
 }
 
 export interface DualTruthBlock {
-	class: DualTruthClass;
-	gauge_wet: boolean;
+	class: DualTruthClass | null;
+	gauge_wet: boolean | null;
 	radar_wet: boolean | null;
 	neighbour_wet: boolean | null;
 	/**
@@ -505,10 +564,10 @@ export interface NotificationMarker {
 export interface FrameRef {
 	radar_ts_utc: string;
 	stamp: string;
-	product: string;
+	product: string | null;
 	overlay: string;
 	observed: string;
-	present: boolean;
+	present: boolean | null;
 }
 
 export interface EventDetail {
@@ -517,7 +576,7 @@ export interface EventDetail {
 	event_id: string;
 	/** The index row repeated, so a detail file is meaningful on its own. */
 	index: IndexRow;
-	station: StationBlock;
+	station: StationBlock | null;
 	window: WindowBlock;
 	decisions: Decision[];
 	decision_gaps: DecisionGap[];
@@ -525,7 +584,7 @@ export interface EventDetail {
 	gauge: GaugeBlock | null;
 	radar_disc: RadarDiscBlock | null;
 	neighbours: NeighboursBlock | null;
-	dual_truth: DualTruthBlock;
+	dual_truth: DualTruthBlock | null;
 	notifications: NotificationMarker[];
 	frames: FrameRef[];
 	flags: string[];
@@ -550,9 +609,22 @@ export interface Vocabulary {
 export interface Annotation {
 	bundle_id: string;
 	event_id: string;
+	/**
+	 * The event's identity, denormalised by the server. Redundant with the
+	 * bundle while it exists, and the only thing that makes a year of
+	 * judgements readable once it does not.
+	 */
+	station_id: string;
+	anchor_utc: string;
+	event_class: OutcomeClass;
+	dual_truth: DualTruthClass | null;
+	season: string;
+	region: string;
+	reviewer: string;
 	verdict: Verdict | null;
 	tags: string[];
 	vocab_version: number;
+	/** An INTEGER 1-3, not a fraction — the server rejects anything else. */
 	confidence: number | null;
 	needs_second_look: boolean;
 	note: string;
