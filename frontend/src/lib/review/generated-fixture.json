@@ -1,19 +1,22 @@
 {
- "_comment": "Verbatim producer output. Bundle documents from `scripts/build_review_bundle.py --fixture --seed 424242`; `annotations` and `health` from a live `scripts/review_server.py` against that bundle. Do not hand-edit: regenerate it. See generated.test.ts for why.",
+ "_comment": "Verbatim producer output. Bundle documents from `scripts/build_review_bundle.py --fixture --fixture-stress --seed 424242`; `annotations` and `health` from a live `scripts/review_server.py` against that bundle. --fixture-stress forces a missing composite and a feature-gap day, so the failure shapes are exercised and not only the happy path. Do not hand-edit: regenerate it. See generated.test.ts for why.",
  "manifest": {
   "schema_version": 1,
   "bundle_id": "review-20260915-bd1bb9",
-  "built_at_utc": "2026-09-15T14:08:18.063019+00:00",
+  "built_at_utc": "2026-09-15T14:22:58.197634+00:00",
   "builder": {
    "script": "scripts/build_review_bundle.py",
-   "git_commit": "9fffea61e0d8cdb44addcf920f79b41ba13e4870",
+   "git_commit": "f94f873a9c8fa4818d0ae00dd55c3e911bc7dde5",
    "git_dirty": true,
    "argv": [
     "--fixture",
+    "--fixture-stress",
     "--seed",
     "424242",
     "--out-dir",
-    "/tmp/genfx"
+    "/tmp/genfx",
+    "--fixture-corpus",
+    "/tmp/genfx-corpus"
    ],
    "host": "SDU-57914",
    "python": "3.12.11"
@@ -67,11 +70,11 @@
    "probe_column": "obs_max_5km_mm_h",
    "gap_share": 0.5,
    "gap_days": [],
-   "allowed": false,
+   "allowed": true,
    "rows_by_day": {
     "2026-06-01": {
      "rows": 840,
-     "with_features": 840
+     "with_features": 708
     }
    },
    "documentation": {
@@ -284,16 +287,20 @@
    "frame_pad_min": 20,
    "from_utc": "2026-06-01T01:14:00+00:00",
    "to_utc": "2026-06-01T13:30:00+00:00",
-   "count": 66,
+   "count": 65,
    "stamps_total": 128,
    "stamps_unique": 66,
    "dedup_saving_pct": 48.4,
-   "bytes": 10560,
-   "bytes_written_this_run": 10560,
+   "bytes": 10400,
+   "bytes_written_this_run": 10400,
    "mean_bytes_per_frame": 160.0,
    "downsample_factor": 4,
-   "missing": [],
-   "missing_reasons": {},
+   "missing": [
+    "202606010650"
+   ],
+   "missing_reasons": {
+    "202606010650": "absent from the corpus archive"
+   },
    "encodings": {
     "observed": {
      "suffix": ".observed.png",
@@ -423,7 +430,9 @@
     "minutes_to_rearm_at_anchor": null,
     "frames": 21,
     "frames_missing": 0,
-    "flags": [],
+    "flags": [
+     "feature_gap"
+    ],
     "stratum": {
      "outcome_class": "false_alarm",
      "season": "summer",
@@ -465,7 +474,9 @@
     "minutes_to_rearm_at_anchor": null,
     "frames": 21,
     "frames_missing": 0,
-    "flags": [],
+    "flags": [
+     "feature_gap"
+    ],
     "stratum": {
      "outcome_class": "hit",
      "season": "summer",
@@ -549,7 +560,9 @@
     "minutes_to_rearm_at_anchor": null,
     "frames": 21,
     "frames_missing": 0,
-    "flags": [],
+    "flags": [
+     "feature_gap"
+    ],
     "stratum": {
      "outcome_class": "late",
      "season": "summer",
@@ -590,9 +603,10 @@
     "arm_state_at_anchor": "armed",
     "minutes_to_rearm_at_anchor": null,
     "frames": 22,
-    "frames_missing": 0,
+    "frames_missing": 1,
     "flags": [
-     "coverage_gap"
+     "coverage_gap",
+     "feature_gap"
     ],
     "stratum": {
      "outcome_class": "uncovered",
@@ -635,7 +649,9 @@
     "minutes_to_rearm_at_anchor": null,
     "frames": 21,
     "frames_missing": 0,
-    "flags": [],
+    "flags": [
+     "feature_gap"
+    ],
     "stratum": {
      "outcome_class": "hit",
      "season": "summer",
@@ -980,7 +996,9 @@
     "minutes_to_rearm_at_anchor": null,
     "frames": 21,
     "frames_missing": 0,
-    "flags": [],
+    "flags": [
+     "feature_gap"
+    ],
     "stratum": {
      "outcome_class": "false_alarm",
      "season": "summer",
@@ -2100,8 +2118,8 @@
      "radar_ts_utc": "2026-06-01T04:00:00+00:00",
      "generated_at_utc": "2026-06-01T04:14:00+00:00",
      "frame_age_min": 14.0,
-     "frame_age_source": "feature",
-     "frame_age_min_stored": 14.0,
+     "frame_age_source": "derived",
+     "frame_age_min_stored": null,
      "frame_ref": "202606010400",
      "row_source": null,
      "p_rain": {
@@ -2134,21 +2152,21 @@
       "raw_frac_30": null,
       "raw_frac_45": null,
       "raw_frac_60": null,
-      "obs_max_5km_mm_h": 0.11512805076795303,
-      "up_max_20km_mm_h": 0.17269207615192955,
-      "up_max_40km_mm_h": 0.23025610153590606,
-      "up_dist_km": 28.273079238480705,
-      "up_wet_frac_40km": 0.057564025383976515,
-      "bulk_kmh": 32.0,
-      "bulk_dir_deg": 250.0,
-      "local_speed_kmh": 28.0,
-      "stalled_share": 0.07,
-      "frame_age_min": 14.0,
-      "station_radar_km": 45.0,
+      "obs_max_5km_mm_h": null,
+      "up_max_20km_mm_h": null,
+      "up_max_40km_mm_h": null,
+      "up_dist_km": null,
+      "up_wet_frac_40km": null,
+      "bulk_kmh": null,
+      "bulk_dir_deg": null,
+      "local_speed_kmh": null,
+      "stalled_share": null,
+      "frame_age_min": null,
+      "station_radar_km": null,
       "season": "summer",
       "hour_utc": 4
      },
-     "features_present": true,
+     "features_present": false,
      "replay": {
       "action": "none",
       "skipped_reason": null,
@@ -2182,8 +2200,8 @@
      "radar_ts_utc": "2026-06-01T04:10:00+00:00",
      "generated_at_utc": "2026-06-01T04:24:00+00:00",
      "frame_age_min": 14.0,
-     "frame_age_source": "feature",
-     "frame_age_min_stored": 14.0,
+     "frame_age_source": "derived",
+     "frame_age_min_stored": null,
      "frame_ref": "202606010410",
      "row_source": null,
      "p_rain": {
@@ -2216,21 +2234,21 @@
       "raw_frac_30": null,
       "raw_frac_45": null,
       "raw_frac_60": null,
-      "obs_max_5km_mm_h": 0.11762387125950673,
-      "up_max_20km_mm_h": 0.17643580688926008,
-      "up_max_40km_mm_h": 0.23524774251901345,
-      "up_dist_km": 28.2356419311074,
-      "up_wet_frac_40km": 0.05881193562975336,
-      "bulk_kmh": 32.0,
-      "bulk_dir_deg": 250.0,
-      "local_speed_kmh": 28.0,
-      "stalled_share": 0.07,
-      "frame_age_min": 14.0,
-      "station_radar_km": 45.0,
+      "obs_max_5km_mm_h": null,
+      "up_max_20km_mm_h": null,
+      "up_max_40km_mm_h": null,
+      "up_dist_km": null,
+      "up_wet_frac_40km": null,
+      "bulk_kmh": null,
+      "bulk_dir_deg": null,
+      "local_speed_kmh": null,
+      "stalled_share": null,
+      "frame_age_min": null,
+      "station_radar_km": null,
       "season": "summer",
       "hour_utc": 4
      },
-     "features_present": true,
+     "features_present": false,
      "replay": {
       "action": "none",
       "skipped_reason": null,
@@ -2264,8 +2282,8 @@
      "radar_ts_utc": "2026-06-01T04:20:00+00:00",
      "generated_at_utc": "2026-06-01T04:34:00+00:00",
      "frame_age_min": 14.0,
-     "frame_age_source": "feature",
-     "frame_age_min_stored": 14.0,
+     "frame_age_source": "derived",
+     "frame_age_min_stored": null,
      "frame_ref": "202606010420",
      "row_source": null,
      "p_rain": {
@@ -2298,21 +2316,21 @@
       "raw_frac_30": null,
       "raw_frac_45": null,
       "raw_frac_60": null,
-      "obs_max_5km_mm_h": 0.09025663745214552,
-      "up_max_20km_mm_h": 0.13538495617821827,
-      "up_max_40km_mm_h": 0.18051327490429103,
-      "up_dist_km": 28.64615043821782,
-      "up_wet_frac_40km": 0.04512831872607276,
-      "bulk_kmh": 32.0,
-      "bulk_dir_deg": 250.0,
-      "local_speed_kmh": 28.0,
-      "stalled_share": 0.07,
-      "frame_age_min": 14.0,
-      "station_radar_km": 45.0,
+      "obs_max_5km_mm_h": null,
+      "up_max_20km_mm_h": null,
+      "up_max_40km_mm_h": null,
+      "up_dist_km": null,
+      "up_wet_frac_40km": null,
+      "bulk_kmh": null,
+      "bulk_dir_deg": null,
+      "local_speed_kmh": null,
+      "stalled_share": null,
+      "frame_age_min": null,
+      "station_radar_km": null,
       "season": "summer",
       "hour_utc": 4
      },
-     "features_present": true,
+     "features_present": false,
      "replay": {
       "action": "none",
       "skipped_reason": null,
@@ -2346,8 +2364,8 @@
      "radar_ts_utc": "2026-06-01T04:30:00+00:00",
      "generated_at_utc": "2026-06-01T04:44:00+00:00",
      "frame_age_min": 14.0,
-     "frame_age_source": "feature",
-     "frame_age_min_stored": 14.0,
+     "frame_age_source": "derived",
+     "frame_age_min_stored": null,
      "frame_ref": "202606010430",
      "row_source": null,
      "p_rain": {
@@ -2380,21 +2398,21 @@
       "raw_frac_30": null,
       "raw_frac_45": null,
       "raw_frac_60": null,
-      "obs_max_5km_mm_h": 0.11265642948598172,
-      "up_max_20km_mm_h": 0.16898464422897258,
-      "up_max_40km_mm_h": 0.22531285897196343,
-      "up_dist_km": 28.310153557710272,
-      "up_wet_frac_40km": 0.05632821474299086,
-      "bulk_kmh": 32.0,
-      "bulk_dir_deg": 250.0,
-      "local_speed_kmh": 28.0,
-      "stalled_share": 0.07,
-      "frame_age_min": 14.0,
-      "station_radar_km": 45.0,
+      "obs_max_5km_mm_h": null,
+      "up_max_20km_mm_h": null,
+      "up_max_40km_mm_h": null,
+      "up_dist_km": null,
+      "up_wet_frac_40km": null,
+      "bulk_kmh": null,
+      "bulk_dir_deg": null,
+      "local_speed_kmh": null,
+      "stalled_share": null,
+      "frame_age_min": null,
+      "station_radar_km": null,
       "season": "summer",
       "hour_utc": 4
      },
-     "features_present": true,
+     "features_present": false,
      "replay": {
       "action": "none",
       "skipped_reason": null,
@@ -2428,8 +2446,8 @@
      "radar_ts_utc": "2026-06-01T04:40:00+00:00",
      "generated_at_utc": "2026-06-01T04:54:00+00:00",
      "frame_age_min": 14.0,
-     "frame_age_source": "feature",
-     "frame_age_min_stored": 14.0,
+     "frame_age_source": "derived",
+     "frame_age_min_stored": null,
      "frame_ref": "202606010440",
      "row_source": null,
      "p_rain": {
@@ -2462,21 +2480,21 @@
       "raw_frac_30": null,
       "raw_frac_45": null,
       "raw_frac_60": null,
-      "obs_max_5km_mm_h": 0.10757526858957717,
-      "up_max_20km_mm_h": 0.16136290288436575,
-      "up_max_40km_mm_h": 0.21515053717915433,
-      "up_dist_km": 28.386370971156342,
-      "up_wet_frac_40km": 0.05378763429478858,
-      "bulk_kmh": 32.0,
-      "bulk_dir_deg": 250.0,
-      "local_speed_kmh": 28.0,
-      "stalled_share": 0.07,
-      "frame_age_min": 14.0,
-      "station_radar_km": 45.0,
+      "obs_max_5km_mm_h": null,
+      "up_max_20km_mm_h": null,
+      "up_max_40km_mm_h": null,
+      "up_dist_km": null,
+      "up_wet_frac_40km": null,
+      "bulk_kmh": null,
+      "bulk_dir_deg": null,
+      "local_speed_kmh": null,
+      "stalled_share": null,
+      "frame_age_min": null,
+      "station_radar_km": null,
       "season": "summer",
       "hour_utc": 4
      },
-     "features_present": true,
+     "features_present": false,
      "replay": {
       "action": "none",
       "skipped_reason": null,
@@ -3572,7 +3590,9 @@
      "present_source": "frame writer"
     }
    ],
-   "flags": [],
+   "flags": [
+    "feature_gap"
+   ],
    "builder_notes": [
     "The radar verdict comes from the same instrument the forecast was made from, so agreement is a consistency check and not an independent opinion.",
     "The composite is column-max reflectivity, which biases the rate high: virga and bright band read as rain the gauge never sees.",
@@ -6130,8 +6150,8 @@
     "cursor_utc": "2026-06-01T03:20:00+00:00",
     "review_seq": 1,
     "reviewer": "local",
-    "created_utc": "2026-09-15T14:08:45.530671+00:00",
-    "updated_utc": "2026-09-15T14:08:45.530671+00:00",
+    "created_utc": "2026-09-15T14:23:05.121938+00:00",
+    "updated_utc": "2026-09-15T14:23:05.121938+00:00",
     "revision": 1
    }
   ]
@@ -6145,6 +6165,6 @@
   "annotated": 1,
   "schema_version": 1,
   "vocab_version": 1,
-  "db_path": "/tmp/ann.sqlite"
+  "db_path": "/tmp/ann2.sqlite"
  }
 }

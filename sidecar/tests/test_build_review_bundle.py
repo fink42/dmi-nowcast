@@ -319,3 +319,57 @@ def test_naive_datetimes_are_refused_rather_than_assumed_utc() -> None:
     assert brb._json_default(
         datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
     ) == "2026-06-01T12:00:00+00:00"
+
+# ---------------------------------------------------------------------------
+# The awkward shapes
+# ---------------------------------------------------------------------------
+
+def test_fixture_stress_forces_the_shapes_a_good_day_never_produces(
+    tmp_path: Path,
+) -> None:
+    """A happy-path bundle proves nothing about the failure shapes.
+
+    The frontend's drift alarm parses real producer output, so it can only
+    cover shapes the producer actually emitted. Missing frames, their
+    reasons, `present: false` and the event flags only appear when
+    something went wrong — and those are precisely the ones a reviewer most
+    needs rendered correctly, because a frozen repeat of the previous frame
+    across a gap reads as "nothing changed" rather than "no picture".
+
+    This also caught a real interface bug: `write_frames` reports missing
+    frames as stamp STRINGS while `build_event` wants instants, which the
+    happy path could never reveal.
+    """
+    out = tmp_path / "b"
+    brb.main([
+        "--fixture", "--fixture-stress", "--seed", "424242",
+        "--out-dir", str(out), "--fixture-corpus", str(tmp_path / "c"),
+    ])
+    frames = _read(out / "manifest.json")["frames"]
+    assert frames["missing"], "no frame went missing"
+    assert frames["missing_reasons"], "a missing frame with no reason is a mystery"
+    for stamp in frames["missing"]:
+        assert stamp in frames["missing_reasons"]
+
+    absent = 0
+    flags: set[str] = set()
+    for detail in _details(out):
+        flags |= set(detail.get("flags") or [])
+        absent += sum(1 for f in detail["frames"] if f["present"] is False)
+    assert absent, "a missing composite must show as a frame absent, not present"
+    assert flags, "the stress bundle should raise at least one event flag"
+
+
+def test_every_event_flag_is_one_the_schema_documents(tmp_path: Path) -> None:
+    """An undocumented flag is a badge the reviewer cannot interpret."""
+    from dmi_nowcast_core import review_schema
+
+    out = tmp_path / "b"
+    brb.main([
+        "--fixture", "--fixture-stress", "--seed", "424242",
+        "--out-dir", str(out), "--fixture-corpus", str(tmp_path / "c"),
+        "--no-frames",
+    ])
+    for detail in _details(out):
+        for flag in detail.get("flags") or []:
+            assert flag in review_schema.EVENT_FLAGS, flag

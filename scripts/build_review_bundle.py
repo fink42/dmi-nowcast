@@ -314,7 +314,18 @@ def build(args: argparse.Namespace) -> dict:
     # -- population --------------------------------------------------------
     if args.fixture:
         _log("fixture mode: synthesising a population (no corpus, no HDF5)")
-        population = review.synthetic_population(seed=args.seed)
+        population = review.synthetic_population(
+            seed=args.seed,
+            # --fixture-stress exists for the frontend's drift alarm. A
+            # happy-path bundle proves the producer writes the shapes it
+            # writes on a good day, and says nothing about the shapes that
+            # only appear when something went wrong — which are exactly the
+            # ones a reviewer most needs rendered correctly.
+            **(
+                {"feature_gap_hours": (4, 8), "allow_feature_gap": True}
+                if args.fixture_stress else {}
+            ),
+        )
         stations = list(population.stations.values())
         corpus_dir = Path(
             args.fixture_corpus
@@ -398,7 +409,18 @@ def build(args: argparse.Namespace) -> dict:
     )
     if args.fixture:
         corpus_dir.mkdir(parents=True, exist_ok=True)
-        review_frames.write_fixture_archive(corpus_dir, plan.stamp_strings())
+        written = review_frames.write_fixture_archive(
+            corpus_dir, plan.stamp_strings(),
+        )
+        if args.fixture_stress and len(written) > 2:
+            # Delete a composite from the middle of the run so the renderer
+            # meets a real hole: `missing`, a `missing_reasons` entry and a
+            # frame with `present: false`. A reviewer scrubbing across a gap
+            # must see that the picture is absent, not a frozen repeat of the
+            # previous one.
+            victim = written[len(written) // 2]
+            victim.unlink()
+            _log(f"--fixture-stress: removed {victim.name} to force a gap")
 
     if args.no_frames:
         _log("--no-frames: skipping rendering")
@@ -424,7 +446,15 @@ def build(args: argparse.Namespace) -> dict:
     # renderer ran and nothing was missing", so every frame is present;
     # None is "nobody rendered", so presence is unknown and stays null.
     # Collapsing them would claim imagery a --no-frames bundle has not got.
-    missing_stamps = sorted(frame_result.missing) if frame_result else None
+    # `write_frames` reports missing frames as STAMP STRINGS; `build_event`
+    # wants instants. Converting here rather than passing the strings through
+    # is the difference between a frame marked absent and a TypeError that
+    # only appears on the day a composite is actually missing.
+    missing_stamps = (
+        [review_frames.stamp_to_datetime(stamp)
+         for stamp in sorted(frame_result.missing)]
+        if frame_result else None
+    )
     station_by_id = {station.station_id: station for station in stations}
 
     planned_stamps = {stamp.stamp: stamp for stamp in plan.stamps}
@@ -805,6 +835,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--allow-feature-gap", action="store_true")
     p.add_argument("--no-frames", action="store_true", help="documents only, no imagery")
     p.add_argument("--fixture", action="store_true", help="synthetic bundle, no corpus")
+    p.add_argument(
+        "--fixture-stress", action="store_true",
+        help="with --fixture: force a feature-gap day and a missing "
+             "composite, so the awkward shapes are exercised too",
+    )
     p.add_argument(
         "--fixture-corpus",
         help="where --fixture writes its synthetic archive (default: a temp dir). "
