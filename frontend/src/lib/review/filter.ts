@@ -64,10 +64,17 @@ export type FilterDimension =
 /**
  * What the list is filtered to.
  *
- * A plain class with array fields rather than `Set`s: Svelte 5's `$state`
- * proxies arrays but not `Set`s, so a Set here would quietly stop the list
- * updating when a facet is toggled. Arrays of a dozen strings are also
- * faster to scan than a Set is to build, at this size.
+ * Array fields rather than `Set`s, because arrays of a dozen strings are
+ * faster to scan than a Set is to build at this size.
+ *
+ * **Mutating an instance in place is not reactive, and callers must not do
+ * it.** Svelte 5's `$state` proxies plain objects and arrays, not class
+ * instances, so this whole object is held unwrapped: `filter.toggle(...)`
+ * or `bind:value={filter.text}` changes the value and notifies nobody, and
+ * the list silently stops responding to its own chips — a failure with no
+ * error to notice it by. Callers go through `clone()` and reassign, which
+ * is why `clone` exists and why every mutator returns a new instance
+ * rather than `this`.
  *
  * Every dimension is a union — a row passes when it matches ANY selected
  * value — and the dimensions intersect. That is the behaviour every facet
