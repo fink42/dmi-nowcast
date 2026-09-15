@@ -446,6 +446,7 @@ def build(args: argparse.Namespace) -> dict:
             missing_stamps=missing_stamps,
             station_pixel=station_pixel,
         )
+        _place_neighbours(detail, station_by_id)
         detail_bytes += _write_json_atomic(
             events_dir / f"{record.event_id}.json", detail,
         )
@@ -522,15 +523,18 @@ def _resolve_rule(args: argparse.Namespace):
             Path(args.thresholds).expanduser().read_text(encoding="utf-8"),
         )
         thresholds = document
-    folds = _load_fold_thresholds(args.fold_thresholds)
-    if args.rule_source == review.RULE_LOMO and folds is None:
+    # The COMBINATION is checked before the file is read, so a wrong pairing
+    # reports the pairing rather than a missing-file traceback for a file
+    # that should not have been named in the first place.
+    if args.rule_source == review.RULE_LOMO and not args.fold_thresholds:
         raise SystemExit(
             "--rule-source lomo needs --fold-thresholds: one threshold per "
             "(year, month), each fitted WITHOUT that month. Fitting them is a "
             "full sweep per fold, so it is an input here, not a side effect."
         )
-    if args.rule_source != review.RULE_LOMO and folds is not None:
+    if args.rule_source != review.RULE_LOMO and args.fold_thresholds:
         raise SystemExit("--fold-thresholds only applies to --rule-source lomo")
+    folds = _load_fold_thresholds(args.fold_thresholds)
 
     return review.ReviewRule(
         lead_min=args.lead_min,
@@ -702,6 +706,40 @@ def _station_pixel_mapper(grid: dict | None):
         return ((y_ul - y) / sy, (x - x_ul) / sx)
 
     return mapper
+
+
+def _place_neighbours(detail: dict, by_id: dict) -> None:
+    """Give each neighbour a position, in place.
+
+    ``review.build_event`` knows a neighbour by id, name and distance — it
+    has no business holding coordinates. But the map has to put a dot
+    somewhere, and a dot at (0, 0) or stacked on the station would be worse
+    than no dot at all.
+
+    Inlined rather than joined against ``stations.json`` in the browser
+    because the contract says a detail document is meaningful on its own,
+    and that is worth more than the ~36 KB the duplication costs across a
+    whole bundle. ``bearing_deg`` is the honest reason it matters: a WET
+    neighbour UPWIND is a cell that diverted around this gauge, and a wet
+    neighbour downwind is one that had already passed — two different tags
+    and two different fixes.
+    """
+    block = detail.get("neighbours") or {}
+    station = detail.get("station") or {}
+    lat, lon = station.get("lat"), station.get("lon")
+    for entry in block.get("stations") or []:
+        other = by_id.get(entry.get("station_id"))
+        if other is None:
+            entry.setdefault("lat", None)
+            entry.setdefault("lon", None)
+            entry.setdefault("bearing_deg", None)
+            continue
+        entry["lat"] = other.lat
+        entry["lon"] = other.lon
+        entry["bearing_deg"] = (
+            _bearing_deg(lat, lon, other.lat, other.lon)
+            if lat is not None and lon is not None else None
+        )
 
 
 def _feature_doc(population) -> dict:
