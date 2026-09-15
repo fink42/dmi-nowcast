@@ -95,6 +95,18 @@ describe('trackBounds', () => {
 		expect(trackBounds(late)!.toMs).toBe(at('2026-06-12T23:00:00Z'));
 	});
 
+	it('is bounded by the stated frame window, not by the frames it received', () => {
+		// A bundle whose last composites are missing would otherwise draw a
+		// track that stops early and hides the hole.
+		const event = eventWithFrames(['2026-06-12T12:00:00Z', '2026-06-12T12:30:00Z']);
+		const stated = {
+			...event,
+			window: { ...event.window, frames_to_utc: '2026-06-12T13:00:00Z' }
+		};
+		expect(trackBounds(stated)!.toMs).toBe(at('2026-06-12T13:00:00Z'));
+		expect(trackBounds(event)!.toMs).toBe(at('2026-06-12T12:30:00Z'));
+	});
+
 	it('is null on a track with no width to divide by', () => {
 		const instant = eventWithFrames(['2026-06-12T13:00:00Z']);
 		expect(trackBounds(instant)).toBeNull();
@@ -164,6 +176,20 @@ describe('frameTicks', () => {
 		expect(missing.length).toBeGreaterThan(0);
 	});
 
+	it('says whether a decision stood on each frame', () => {
+		// A composite with no decision behind it is a hole in the engine's
+		// attention rather than in the imagery — a different failure, and a
+		// different tag.
+		const ticks = frameTicks(event);
+		const withRow = ticks.filter((tick) => tick.hasDecisionRow === true);
+		const withoutRow = ticks.filter((tick) => tick.hasDecisionRow === false);
+		expect(withRow.length).toBeGreaterThan(0);
+		expect(withoutRow.length).toBeGreaterThan(0);
+		for (const tick of ticks) {
+			expect(tick.hasDecisionRow).toBe(event.frames[tick.index].has_decision_row);
+		}
+	});
+
 	it('carries the index the scrubber needs to seek by', () => {
 		frameTicks(event).forEach((tick) => {
 			expect(event.frames[tick.index].stamp).toBe(tick.stamp);
@@ -172,19 +198,59 @@ describe('frameTicks', () => {
 });
 
 describe('markers', () => {
-	it('marks the anchor, the warning, the onset and the gauge horizon', () => {
+	it('marks the anchor, the warning and the onset', () => {
 		const event = parsed('hit-06181-20260805T1715Z');
 		const { points } = markers(event);
 		const kinds = points.map((point) => point.kind);
 		expect(kinds).toContain('anchor');
 		expect(kinds).toContain('warning');
 		expect(kinds).toContain('onset');
-		expect(kinds).toContain('known_until');
 
 		const anchor = points.find((point) => point.kind === 'anchor')!;
 		expect(anchor.utc).toBe(event.window.anchor_utc);
 		const warning = points.find((point) => point.kind === 'warning')!;
 		expect(warning.isEventWarning).toBe(true);
+	});
+
+	it('marks the gauge horizon only when it falls inside the track', () => {
+		// Inside: the station stopped reporting during the window, so there is
+		// really something to hatch.
+		const inside = parsed('fa-06104-20260421T0255Z');
+		const insideBounds = trackBounds(inside)!;
+		const horizon = Date.parse(inside.window.known_until_utc!);
+		expect(horizon).toBeGreaterThan(insideBounds.fromMs);
+		expect(horizon).toBeLessThan(insideBounds.toMs);
+		expect(markers(inside).points.map((p) => p.kind)).toContain('known_until');
+
+		// Outside: this station reported for hours past the window. Clamped to
+		// the right edge the marker would read "the gauge record ends here" on
+		// an event where the gauge in fact reported throughout — the exact
+		// inverse of the truth, and the known-versus-dry confusion this tool
+		// exists to expose.
+		const outside = parsed('hit-06181-20260805T1715Z');
+		const outsideBounds = trackBounds(outside)!;
+		expect(Date.parse(outside.window.known_until_utc!)).toBeGreaterThan(outsideBounds.toMs);
+		const { points, bands } = markers(outside);
+		expect(points.map((p) => p.kind)).not.toContain('known_until');
+		expect(bands.map((b) => b.kind)).not.toContain('beyond_known');
+	});
+
+	it('draws no horizon at or before the start of the track either', () => {
+		// Everything would be beyond it, so a band covering the whole track
+		// says nothing and a marker clamped to 0 claims the record ends where
+		// it begins.
+		const event = parsed('fa-06104-20260421T0255Z');
+		const bounds = trackBounds(event)!;
+		for (const known_until_utc of [
+			new Date(bounds.fromMs).toISOString(),
+			new Date(bounds.fromMs - 60_000).toISOString(),
+			new Date(bounds.toMs).toISOString()
+		]) {
+			const shifted = { ...event, window: { ...event.window, known_until_utc } };
+			const { points, bands } = markers(shifted);
+			expect(points.map((p) => p.kind), known_until_utc).not.toContain('known_until');
+			expect(bands.map((b) => b.kind), known_until_utc).not.toContain('beyond_known');
+		}
 	});
 
 	it('sorts points by time and lands each on its own instant', () => {
@@ -202,6 +268,11 @@ describe('markers', () => {
 		const { bands } = markers(event);
 		const gap = bands.find((band) => band.kind === 'coverage_gap')!;
 		expect(gap.minutes).toBe(event.decision_gaps[0].minutes);
+		// A break, not a hiccup: past coverage_gap_min the coverage rule stops
+		// counting and the replay hands out a free re-arm, so the two must not
+		// be drawn alike.
+		expect(gap.coverageBreak).toBe(event.decision_gaps[0].coverage_break);
+		expect(gap.coverageBreak).toBe(true);
 		const bounds = trackBounds(event)!;
 		const width = gap.to - gap.from;
 		expect(width).toBeCloseTo((gap.minutes * 60_000) / bounds.spanMs, 12);

@@ -107,14 +107,34 @@ export interface BuilderBlock {
 	python: string;
 }
 
+/**
+ * Where the decision rows came from. `{}` in a `--fixture` bundle, which
+ * has no corpus behind it at all, and the parser reads that as null.
+ *
+ * `decisions_dirs` is in CALLER order, least authoritative first, because
+ * `threshold_sweep.load_decisions` lets the LAST directory win a
+ * `(radar_ts, station_id)` tie — the opposite of the quality page's order,
+ * so that a live row from the feature-gap window cannot beat an
+ * out-of-fold replay row that actually carries `p_post`.
+ *
+ * The corpus is also where the bundle's DATE RANGE lives
+ * (`window_from_utc` / `window_to_utc`); `Manifest.window` is geometry.
+ */
 export interface CorpusBlock {
-	root: string;
-	/** In EFFECTIVE precedence order — the later directory won a tie. */
 	decisions_dirs: string[];
-	decision_rows_loaded: number;
-	decision_row_duplicates: number;
-	/** sha256 over the sorted (station, anchor, class) list. */
-	population_hash: string;
+	decisions_labels: string[];
+	decisions_precedence: string;
+	corpus_dir: string;
+	files: number;
+	files_skipped: number;
+	rows_read: number;
+	rows_kept: number;
+	duplicates_dropped: number;
+	leads: number[];
+	window_from_utc: string | null;
+	window_to_utc: string | null;
+	/** Only when a probability filler ran; absent on the honest path. */
+	probability_fill: Record<string, number> | null;
 }
 
 /**
@@ -128,19 +148,18 @@ export interface CorpusBlock {
  * stranger than they are. The UI surfaces this.
  */
 export interface RuleBlock {
-	source: 'served_rule' | 'lomo' | 'stored_action';
+	/** `ReviewRule.rule_source`: the served table, or leave-one-month-out. */
+	source: 'served' | 'lomo';
+	/** False when the thresholds were fitted over the months they score. */
+	held_out: boolean;
+	lead_min: number;
+	threshold_pct: number;
+	threshold_source: string;
+	/** `[[year, month], pct]` pairs under `lomo`, null under `served`. */
+	fold_thresholds: Array<[[number, number], number]> | null;
 	probability: ProbabilitySource;
 	probability_column: string;
 	probability_provenance: 'out_of_fold' | 'in_sample_fill' | 'stored' | 'mixed';
-	thresholds: {
-		by_lead_pct: Record<string, number>;
-		source: string;
-		fallback_threshold_pct: number;
-		fitted_on_months: string[];
-		/** False when the table was fitted over the same months it scores. */
-		held_out: boolean;
-	};
-	lead_min: number;
 	persistence_obs: number;
 	rearm_after_min: number;
 	raining_now_mm_h: number;
@@ -148,52 +167,91 @@ export interface RuleBlock {
 	coverage_gap_min: number;
 	tolerance_min: number;
 	min_useful_lead_min: number;
-	/** Rows where p_post was absent and the engine fell back to the curve. */
-	rows_fallback_to_curve: number;
 }
 
+/**
+ * The window the events were drawn over, as GEOMETRY. Minutes, not
+ * instants: `decision_min` either side of the anchor, and `frame_pad_min`
+ * of extra imagery before that because a composite is 13-24 minutes old by
+ * the time a cycle stands on it. The bundle's date range is in
+ * `CorpusBlock`.
+ */
+export interface WindowGeometry {
+	decision_min: number;
+	frame_pad_min: number;
+}
+
+/**
+ * The feature-gap audit — plan §4.3, and the reason it is mandatory:
+ * between 2026-09-05 and the fix on 2026-09-13 the live rows lost their
+ * Phase-H feature columns, so `p_post` was absent and the engine fell back
+ * to the curve-calibrated `p_rain`. Those rows were judged on the curve
+ * scale against thresholds fitted on the `p_post` scale — a different rule
+ * wearing the same number. `allowed: false` means the affected days were
+ * excluded; `true` means they are in the sample and the reviewer must know.
+ */
+export interface FeaturesBlock {
+	probe_column: string;
+	/** A day is a gap day when more than this share of rows lack features. */
+	gap_share: number;
+	gap_days: string[];
+	allowed: boolean;
+	rows_by_day: Record<string, { rows: number; with_features: number }>;
+	/** Column → prose, the same map `Manifest.feature_doc` carries. */
+	documentation: Record<string, string>;
+}
+
+/**
+ * The truth rule, flat, exactly as `review.build_population` writes it.
+ */
 export interface TruthBlock {
-	onset_rule: {
-		dry_min: number;
-		onset_min_mm: number;
-		slot_min: number;
-		wet_precip_mm: number;
-		wet_dur_min: number;
-	};
-	radar_verdict: {
-		disc_radius_m: number;
-		statistic: string;
-		threshold_mm_h: number;
-	};
-	neighbour: { radius_km: number; rule: string };
-	dead_gauges_excluded: string[];
+	dry_min: number;
+	onset_min_mm: number;
+	tolerance_min: number;
+	lead_min: number;
+	min_useful_lead_min: number;
+	radar_disc_radius_m: number;
+	radar_threshold_mm_h: number;
+	radar_source: string;
+	neighbour_radius_km: number;
+	dead_gauges: string[];
+	min_known_slots: number;
 	/**
 	 * Pinned per station on purpose: the gauge archive grows, so a later
 	 * rebuild would otherwise silently re-label events that were `pending`
 	 * when this bundle was drawn.
 	 */
-	known_until_utc_by_station: Record<string, string>;
+	known_until: Record<string, string>;
+	/** `"06074:2026-07"` — a station-month that reported but never wet. */
+	suspect_gauge_months: string[];
 }
 
 export interface SamplingCell {
-	outcome_class: string;
-	season: string;
-	region: string;
-	intensity_band: string;
+	/** `"false_alarm|summer|Fyn|moderate"` — the stratum as one key. */
+	stratum: string;
+	/** The same key split, in `SamplingBlock.strata` order. */
+	keys: string[];
+	/** Which allocation group the cell belongs to — its outcome class. */
+	group: string;
 	population: number;
 	drawn: number;
 }
 
 export interface SamplingBlock {
 	seed: number;
-	target_n: number;
-	drawn_n: number;
-	strata_keys: string[];
-	allocation: string;
+	strata: string[];
 	floor_per_cell: number;
-	excluded: Record<string, number>;
-	population: Record<string, number>;
+	/** Events wanted per outcome class, before the population ran out. */
+	targets: Record<string, number>;
 	drawn: Record<string, number>;
+	population: Record<string, number>;
+	total_drawn: number;
+	/** sha256 over the sorted `station|anchor|class` lines. */
+	population_hash: string;
+	/** `late` events folded into the warning they belong to. */
+	collapsed_late_pairs: number;
+	/** Classes drawn as a blinded base rate rather than as failures. */
+	control_groups: string[];
 	cells: SamplingCell[];
 }
 
@@ -273,10 +331,12 @@ export interface Manifest {
 	built_at_utc: string | null;
 	builder: BuilderBlock | null;
 	corpus: CorpusBlock | null;
-	window: { from_utc: string; to_utc: string } | null;
+	window: WindowGeometry | null;
 	rule: RuleBlock | null;
 	truth: TruthBlock | null;
 	sampling: SamplingBlock | null;
+	/** The feature-gap audit. Null on a producer that did not run it. */
+	features: FeaturesBlock | null;
 	/** Null when the bundle was built with --no-frames: no imagery, no grid. */
 	grid: GridBlock | null;
 	frames: FramesBlock | null;
@@ -339,13 +399,35 @@ export interface EventIndex {
 	events: IndexRow[];
 }
 
+/**
+ * A neighbouring gauge, as `station.neighbours[]` names it: an id, a name
+ * and a distance, and nothing else.
+ *
+ * The COORDINATES are not here, because the builder does not write them
+ * here — they are on the `neighbours.stations[]` entries, which is the
+ * block that also carries the slots and is therefore the one the map is
+ * drawn from. Putting them on this type would make this list claim data it
+ * does not have.
+ */
 export interface NeighbourRef {
 	station_id: string;
-	name: string;
-	lat: number;
-	lon: number;
+	station_name: string;
 	distance_km: number;
-	bearing_deg: number;
+}
+
+/** A neighbour the map can place, if the producer gave it coordinates. */
+export interface PlacedNeighbour extends NeighbourRef {
+	lat: number | null;
+	lon: number | null;
+	/**
+	 * Compass bearing FROM the event's station TOWARD this neighbour.
+	 *
+	 * The field that makes the neighbour panel worth reading: a wet
+	 * neighbour UPWIND is a cell that diverted around this gauge, and a wet
+	 * neighbour DOWNWIND is one that had already passed over it. Different
+	 * mechanisms, different tags, different fixes.
+	 */
+	bearing_deg: number | null;
 }
 
 export interface StationBlock {
@@ -367,6 +449,8 @@ export interface WindowBlock {
 	to_utc: string;
 	/** The FRAME window — starts earlier, because composites are 13–24 min old. */
 	frames_from_utc: string;
+	/** Its right edge. The track is bounded by this, not by the last frame. */
+	frames_to_utc: string | null;
 	slot_from_utc: string;
 	slot_to_utc: string;
 	known_until_utc: string | null;
@@ -428,10 +512,25 @@ export interface Decision {
 	stored: StoredRow | null;
 }
 
+/**
+ * A hole in the decision sequence. Two sizes, and they mean different
+ * things: a missed cycle is a hiccup, while a gap longer than
+ * `rule.coverage_gap_min` is where the coverage rule stops counting and the
+ * replay hands the station a free re-arm. Drawn alike they would read
+ * alike, so the distinction travels.
+ */
 export interface DecisionGap {
 	from_utc: string;
 	to_utc: string;
 	minutes: number;
+	/** True when the gap is long enough for the coverage rule to give up. */
+	coverage_break: boolean;
+	/**
+	 * Which edge of the window the gap runs to, or null for one between two
+	 * decisions. `whole_window` means there was NO decision row in the window
+	 * at all — which a reviewer must not read as "nothing was over threshold".
+	 */
+	edge: 'leading' | 'trailing' | 'whole_window' | null;
 	reason: string;
 }
 
@@ -482,7 +581,16 @@ export interface Prologue {
  */
 export interface Slot {
 	slot_end_utc: string;
+	/** Depth over the slot. A gauge measures this; a radar disc does not. */
 	mm: number | null;
+	/**
+	 * Rate over the slot, mm/h — what the RADAR disc is judged on, since
+	 * `truth.radar_threshold_mm_h` is a rate. The builder writes it on the
+	 * disc's slots and not on the gauge's, and the two must not be printed
+	 * through one field: 0.5 mm in ten minutes and 0.5 mm/h are different
+	 * claims an order of magnitude apart.
+	 */
+	mm_h?: number | null;
 	dur_min?: number | null;
 	known: boolean;
 	wet: boolean;
@@ -524,10 +632,11 @@ export interface NeighboursBlock {
 	n_known: number;
 	n_wet: number;
 	stations: Array<
-		NeighbourRef & {
+		PlacedNeighbour & {
 			wet_in_window: boolean | null;
 			first_wet_utc: string | null;
 			known_slots: number;
+			onsets_in_window_utc: string[];
 			slots: Slot[];
 		}
 	>;
@@ -544,7 +653,13 @@ export interface DualTruthBlock {
 	 * windows, so this travels with every event or the class is
 	 * uninterpretable.
 	 */
-	window_used: { from_utc: string; to_utc: string; definition: string };
+	window_used: {
+		/** Which side the window is anchored on — a warning, or an onset. */
+		kind: 'warning' | 'onset' | null;
+		from_utc: string;
+		to_utc: string;
+		definition: string;
+	};
 	rule: string;
 }
 
@@ -568,6 +683,13 @@ export interface FrameRef {
 	overlay: string;
 	observed: string;
 	present: boolean | null;
+	/**
+	 * Whether a decision row stands on this composite. Distinguishes "no
+	 * composite" from "composite, no decision" — a hole in the imagery and a
+	 * hole in the engine's attention are different failures with different
+	 * tags, and the track draws them differently.
+	 */
+	has_decision_row: boolean | null;
 }
 
 export interface EventDetail {

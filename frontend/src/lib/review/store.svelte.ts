@@ -254,19 +254,30 @@ class ReviewStore {
 		return neighbourStatesAt(this.detail.neighbours, this.cursorMs);
 	}
 
-	/** Station + neighbours as one GeoJSON source, coloured by the cursor. */
+	/**
+	 * Station + neighbours as one GeoJSON source, coloured by the cursor and
+	 * labelled against the flow.
+	 *
+	 * Fed from `neighbours.stations[]`, not from `station.neighbours[]`: the
+	 * builder inlines the coordinates on the former, and the latter carries
+	 * ids and distances only. The upwind bearing rides along so each dot
+	 * knows whether it is upwind or downwind of the cell — which is the
+	 * difference between a shower that went round this gauge and one that
+	 * had already crossed it.
+	 */
 	get stationFeatures() {
 		return neighbourFeatures(
 			this.detail?.station ?? null,
-			this.detail?.station?.neighbours ?? [],
-			this.neighbourStates
+			this.detail?.neighbours?.stations ?? [],
+			this.neighbourStates,
+			this.upwind?.bearingFromDeg ?? null
 		);
 	}
 
 	/** The 1 km verdict disc, so the reviewer sees what was sampled. */
 	get discFeature() {
 		const station = this.detail?.station;
-		const radius = this.manifest?.truth?.radar_verdict.disc_radius_m;
+		const radius = this.manifest?.truth?.radar_disc_radius_m;
 		if (!station || radius === undefined) return null;
 		return discPolygon(station.lat, station.lon, radius);
 	}
@@ -332,7 +343,7 @@ class ReviewStore {
 		const frame = this.cursorFrame?.frame ?? null;
 		const grid = this.observedGrid;
 		const manifest = this.manifest;
-		const radius = manifest?.truth?.radar_verdict.disc_radius_m ?? null;
+		const radius = manifest?.truth?.radar_disc_radius_m ?? null;
 		if (grid === null || manifest === null) {
 			return {
 				stamp: frame?.stamp ?? null,

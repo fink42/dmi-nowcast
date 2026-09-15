@@ -16,7 +16,14 @@
  */
 import { describe, expect, it } from 'vitest';
 import fixture from './fixture.json';
-import { discPolygon, distanceM, neighbourFeatures, upwindVector } from './geometry';
+import {
+	compassPoint,
+	discPolygon,
+	distanceM,
+	neighbourFeatures,
+	upwindVector,
+	windRelation
+} from './geometry';
 import { parseEvent } from './load';
 import type { EventDetail } from './schema';
 import { neighbourStatesAt } from './truth';
@@ -77,34 +84,94 @@ describe('neighbourFeatures', () => {
 	const states = neighbourStatesAt(event.neighbours, cursor);
 	const collection = neighbourFeatures(event.station, event.station!.neighbours, states);
 
-	it('carries the station and every neighbour', () => {
-		expect(collection.features).toHaveLength(1 + event.station!.neighbours.length);
+	it('carries the station, and every neighbour it can place', () => {
 		expect(collection.features[0].properties.role).toBe('station');
 		expect(collection.features.slice(1).every((f) => f.properties.role === 'neighbour')).toBe(
 			true
 		);
+		// The builder inlines coordinates on the neighbours block, and the
+		// cursor states carry them through, so even the bare
+		// `station.neighbours[]` list places its dots.
+		expect(collection.features).toHaveLength(1 + event.station!.neighbours.length);
 	});
 
-	it('places each dot at its own coordinates', () => {
+	it('places the station at its own coordinates', () => {
 		const station = collection.features[0];
 		expect(station.geometry.coordinates).toEqual([event.station!.lon, event.station!.lat]);
-		for (const neighbour of event.station!.neighbours) {
-			const feature = collection.features.find(
+	});
+
+	it('draws no neighbour that nothing can place', () => {
+		// A dot at (0, 0) — or on top of the event's own station — is a wet
+		// gauge in the wrong place, which is worse than a panel row with no
+		// dot. With neither coordinates on the list nor a cursor state
+		// carrying them, nothing is drawn.
+		expect(event.station!.neighbours.length).toBeGreaterThan(0);
+		const unplaceable = neighbourFeatures(event.station, event.station!.neighbours, []);
+		expect(unplaceable.features).toHaveLength(1);
+		expect(unplaceable.features[0].properties.role).toBe('station');
+	});
+
+	it('places the half it can and leaves the rest off the map', () => {
+		const halfPlaced = [
+			{ ...event.station!.neighbours[0], lat: 55.3, lon: 10.28, bearing_deg: 183 },
+			{ ...event.station!.neighbours[1], lat: null, lon: null, bearing_deg: null }
+		];
+		const features = neighbourFeatures(event.station, halfPlaced, []);
+		expect(features.features).toHaveLength(2);
+		expect(features.features[1].properties.station_id).toBe(halfPlaced[0].station_id);
+	});
+
+	it('labels each dot with its compass bearing and its side of the flow', () => {
+		const placed = [
+			{ ...event.station!.neighbours[0], lat: 55.3, lon: 10.28, bearing_deg: 250 },
+			{ ...event.station!.neighbours[1], lat: 55.45, lon: 10.66, bearing_deg: 70 }
+		];
+		// Rain coming FROM 250° (a westerly): the neighbour at 250° is upwind,
+		// the one at 70° is downwind.
+		const features = neighbourFeatures(event.station, placed, states, 250).features;
+		const upwindDot = features.find((f) => f.properties.station_id === placed[0].station_id)!;
+		const downwindDot = features.find((f) => f.properties.station_id === placed[1].station_id)!;
+		expect(upwindDot.properties.wind_relation).toBe('upwind');
+		expect(upwindDot.properties.bearing_compass).toBe('WSW');
+		expect(downwindDot.properties.wind_relation).toBe('downwind');
+		expect(downwindDot.properties.bearing_compass).toBe('ENE');
+
+		// With no flow there is no relation to state.
+		const unlabelled = neighbourFeatures(event.station, placed, states).features;
+		expect(unlabelled[1].properties.wind_relation).toBeNull();
+		expect(unlabelled[1].properties.bearing_compass).toBe('WSW');
+		// The station has no bearing to itself.
+		expect(unlabelled[0].properties.bearing_deg).toBeNull();
+	});
+
+	it('draws the ones a caller CAN place, at the coordinates it supplied', () => {
+		const placed = event.station!.neighbours.map((neighbour, i) => ({
+			...neighbour,
+			lat: 55.4 + i * 0.1,
+			lon: 10.3 + i * 0.1,
+			bearing_deg: 90 * i
+		}));
+		const features = neighbourFeatures(event.station, placed, states);
+		expect(features.features).toHaveLength(1 + placed.length);
+		for (const neighbour of placed) {
+			const feature = features.features.find(
 				(f) => f.properties.station_id === neighbour.station_id
 			)!;
 			expect(feature.geometry.coordinates).toEqual([neighbour.lon, neighbour.lat]);
 			expect(feature.properties.distance_km).toBe(neighbour.distance_km);
+			expect(feature.properties.name).toBe(neighbour.station_name);
 		}
 	});
 
 	it('paints the reading at the cursor, with unknown as its own state', () => {
 		const silent = parsed('fa-06104-20260421T0255Z');
 		const silentStates = neighbourStatesAt(silent.neighbours, Date.parse(silent.window.anchor_utc));
-		const features = neighbourFeatures(
-			silent.station,
-			silent.station!.neighbours,
-			silentStates
-		);
+		const placed = silent.station!.neighbours.map((neighbour) => ({
+			...neighbour,
+			lat: 55.8,
+			lon: 9.2
+		}));
+		const features = neighbourFeatures(silent.station, placed, silentStates);
 		for (const feature of features.features.slice(1)) {
 			// A neighbour that did not report is not a dry neighbour.
 			expect(feature.properties.state).toBe('unknown');
@@ -114,8 +181,13 @@ describe('neighbourFeatures', () => {
 	});
 
 	it('keeps a neighbour with no state at all rather than dropping the dot', () => {
-		const features = neighbourFeatures(event.station, event.station!.neighbours, []);
-		expect(features.features).toHaveLength(1 + event.station!.neighbours.length);
+		const placed = event.station!.neighbours.map((neighbour) => ({
+			...neighbour,
+			lat: 55.5,
+			lon: 10.4
+		}));
+		const features = neighbourFeatures(event.station, placed, []);
+		expect(features.features).toHaveLength(1 + placed.length);
 		expect(features.features[1].properties.state).toBe('unknown');
 		expect(features.features[1].properties.unknown_reason).toBe('no_series');
 	});
@@ -170,5 +242,55 @@ describe('upwindVector', () => {
 		const event = parsed('fa-06104-20260421T0255Z');
 		const decision = event.decisions.find((d) => !d.features_present)!;
 		expect(upwindVector(decision.features)).toBeNull();
+	});
+});
+
+describe('compassPoint', () => {
+	it('names the sixteen points, rounding to the nearest', () => {
+		expect(compassPoint(0)).toBe('N');
+		expect(compassPoint(11)).toBe('N');
+		expect(compassPoint(12)).toBe('NNE');
+		expect(compassPoint(90)).toBe('E');
+		expect(compassPoint(247.5)).toBe('WSW');
+		expect(compassPoint(359)).toBe('N');
+	});
+
+	it('wraps a bearing outside 0–360 rather than failing', () => {
+		expect(compassPoint(450)).toBe('E');
+		expect(compassPoint(-90)).toBe('W');
+	});
+
+	it('says nothing about a bearing it does not have', () => {
+		// Never "N" for a missing bearing: that would claim a direction.
+		expect(compassPoint(null)).toBeNull();
+		expect(compassPoint(undefined)).toBeNull();
+		expect(compassPoint(Number.NaN)).toBeNull();
+	});
+});
+
+describe('windRelation', () => {
+	it('puts a neighbour toward the rain upwind, and the opposite one downwind', () => {
+		// Rain from 250°: a diverted cell is upstream of us, a passed one is
+		// downstream, and they lead to different tags.
+		expect(windRelation(250, 250)).toBe('upwind');
+		expect(windRelation(300, 250)).toBe('upwind');
+		expect(windRelation(70, 250)).toBe('downwind');
+		expect(windRelation(20, 250)).toBe('downwind');
+	});
+
+	it('calls the sides crosswind rather than forcing a story onto them', () => {
+		expect(windRelation(340, 250)).toBe('crosswind');
+		expect(windRelation(160, 250)).toBe('crosswind');
+	});
+
+	it('wraps across north', () => {
+		expect(windRelation(350, 10)).toBe('upwind');
+		expect(windRelation(190, 10)).toBe('downwind');
+	});
+
+	it('states no relation without a flow or without a bearing', () => {
+		expect(windRelation(250, null)).toBeNull();
+		expect(windRelation(null, 250)).toBeNull();
+		expect(windRelation(Number.NaN, 250)).toBeNull();
 	});
 });

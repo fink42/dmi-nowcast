@@ -19,95 +19,156 @@
 			"python": "3.12.3"
 		},
 		"corpus": {
-			"root": "/srv/dmi/stations",
 			"decisions_dirs": [
-				"stations/replay_postprocess",
-				"stations/eval"
+				"/srv/dmi/stations/eval",
+				"/srv/dmi/stations/replay_postprocess"
 			],
-			"decision_rows_loaded": 1204,
-			"decision_row_duplicates": 37,
-			"population_hash": "sha256:5f2d1c0a9b8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a392817060fix"
+			"decisions_labels": [
+				"eval",
+				"replay_postprocess"
+			],
+			"decisions_precedence": "caller order, least authoritative first; the LAST directory wins a (radar_ts, station_id) tie",
+			"corpus_dir": "/srv/dmi/stations",
+			"files": 284,
+			"files_skipped": 2,
+			"rows_read": 1204,
+			"rows_kept": 1167,
+			"duplicates_dropped": 37,
+			"leads": [
+				10,
+				20,
+				30,
+				45,
+				60
+			],
+			"window_from_utc": "2025-12-07T00:00:00Z",
+			"window_to_utc": "2026-09-01T00:00:00Z"
 		},
 		"window": {
-			"from_utc": "2025-12-07T00:00:00Z",
-			"to_utc": "2026-09-01T00:00:00Z"
+			"decision_min": 40,
+			"frame_pad_min": 20
 		},
 		"rule": {
 			"source": "lomo",
+			"held_out": false,
+			"lead_min": 30,
+			"threshold_pct": 45,
+			"threshold_source": "one_knob_v2 table",
+			"fold_thresholds": [
+				[
+					[
+						2026,
+						2
+					],
+					45
+				],
+				[
+					[
+						2026,
+						4
+					],
+					45
+				],
+				[
+					[
+						2026,
+						6
+					],
+					45
+				],
+				[
+					[
+						2026,
+						8
+					],
+					40
+				]
+			],
 			"probability": "postprocess",
 			"probability_column": "p_post_30",
 			"probability_provenance": "out_of_fold",
-			"thresholds": {
-				"by_lead_pct": {
-					"20": 50,
-					"30": 45,
-					"45": 40,
-					"60": 35
-				},
-				"source": "one_knob_v2 table",
-				"fallback_threshold_pct": 40,
-				"fitted_on_months": [
-					"2026-01",
-					"2026-02",
-					"2026-03",
-					"2026-04",
-					"2026-05",
-					"2026-06"
-				],
-				"held_out": false
-			},
-			"lead_min": 30,
 			"persistence_obs": 2,
 			"rearm_after_min": 60,
 			"raining_now_mm_h": 0.5,
-			"raining_now_eta_min": 5,
-			"coverage_gap_min": 30,
+			"raining_now_eta_min": 1.5,
+			"coverage_gap_min": 20,
 			"tolerance_min": 15,
-			"min_useful_lead_min": 5,
-			"rows_fallback_to_curve": 6
+			"min_useful_lead_min": 5
 		},
 		"truth": {
-			"onset_rule": {
-				"dry_min": 60,
-				"onset_min_mm": 0.2,
-				"slot_min": 10,
-				"wet_precip_mm": 0.1,
-				"wet_dur_min": 1
-			},
-			"radar_verdict": {
-				"disc_radius_m": 1000,
-				"statistic": "p90 over the disc",
-				"threshold_mm_h": 0.5
-			},
-			"neighbour": {
-				"radius_km": 20,
-				"rule": "any neighbour wet in the verdict window"
-			},
-			"dead_gauges_excluded": [
+			"dry_min": 60,
+			"onset_min_mm": 0.2,
+			"tolerance_min": 15,
+			"lead_min": 30,
+			"min_useful_lead_min": 5,
+			"radar_disc_radius_m": 1000,
+			"radar_threshold_mm_h": 0.5,
+			"radar_source": "observed_mm_h in the decision rows",
+			"neighbour_radius_km": 20,
+			"dead_gauges": [
 				"06080"
 			],
-			"known_until_utc_by_station": {
+			"min_known_slots": 500,
+			"known_until": {
 				"06052": "2026-02-03T09:00:00Z",
 				"06104": "2026-04-21T03:05:00Z",
 				"06126": "2026-06-12T15:00:00Z",
 				"06181": "2026-08-05T19:00:00Z"
+			},
+			"suspect_gauge_months": [
+				"06104:2026-04"
+			]
+		},
+		"features": {
+			"probe_column": "obs_max_5km_mm_h",
+			"gap_share": 0.5,
+			"gap_days": [
+				"2026-04-21"
+			],
+			"allowed": true,
+			"rows_by_day": {
+				"2026-02-03": {
+					"rows": 288,
+					"with_features": 288
+				},
+				"2026-04-21": {
+					"rows": 288,
+					"with_features": 61
+				},
+				"2026-06-12": {
+					"rows": 288,
+					"with_features": 288
+				},
+				"2026-08-05": {
+					"rows": 288,
+					"with_features": 288
+				}
+			},
+			"documentation": {
+				"obs_max_5km_mm_h": "Max observed rain rate within 5 km of the station, native grid.",
+				"up_dist_km": "Distance to the nearest pixel at or above 0.5 mm/h in the 40 km upwind corridor. NaN means no echo upwind at all."
 			}
 		},
 		"sampling": {
 			"seed": 20260915,
-			"target_n": 4,
-			"drawn_n": 4,
-			"strata_keys": [
+			"strata": [
 				"outcome_class",
 				"season",
 				"region",
 				"intensity_band"
 			],
-			"allocation": "proportional with a floor per cell",
 			"floor_per_cell": 1,
-			"excluded": {
-				"pending": 61,
-				"dead_gauge": 4
+			"targets": {
+				"false_alarm": 120,
+				"miss": 100,
+				"late": 20,
+				"hit": 50,
+				"uncovered": 10
+			},
+			"drawn": {
+				"false_alarm": 2,
+				"miss": 1,
+				"hit": 1
 			},
 			"population": {
 				"false_alarm": 412,
@@ -115,41 +176,59 @@
 				"hit": 96,
 				"uncovered": 11
 			},
-			"drawn": {
-				"false_alarm": 2,
-				"miss": 1,
-				"hit": 1
-			},
+			"total_drawn": 4,
+			"population_hash": "352b2d40bfd9c44924422822268a751e781bc9eeb034acf0639409c7563050c6",
+			"collapsed_late_pairs": 1,
+			"control_groups": [
+				"hit",
+				"uncovered"
+			],
 			"cells": [
 				{
-					"outcome_class": "false_alarm",
-					"season": "summer",
-					"region": "Funen",
-					"intensity_band": "moderate",
+					"stratum": "false_alarm|summer|Funen|moderate",
+					"keys": [
+						"false_alarm",
+						"summer",
+						"Funen",
+						"moderate"
+					],
+					"group": "false_alarm",
 					"population": 61,
 					"drawn": 1
 				},
 				{
-					"outcome_class": "false_alarm",
-					"season": "shoulder",
-					"region": "South Jutland",
-					"intensity_band": "light",
+					"stratum": "false_alarm|shoulder|South Jutland|light",
+					"keys": [
+						"false_alarm",
+						"shoulder",
+						"South Jutland",
+						"light"
+					],
+					"group": "false_alarm",
 					"population": 48,
 					"drawn": 1
 				},
 				{
-					"outcome_class": "miss",
-					"season": "winter",
-					"region": "North Jutland",
-					"intensity_band": "light",
+					"stratum": "miss|winter|North Jutland|light",
+					"keys": [
+						"miss",
+						"winter",
+						"North Jutland",
+						"light"
+					],
+					"group": "miss",
 					"population": 74,
 					"drawn": 1
 				},
 				{
-					"outcome_class": "hit",
-					"season": "summer",
-					"region": "Zealand",
-					"intensity_band": "heavy",
+					"stratum": "hit|summer|Zealand|heavy",
+					"keys": [
+						"hit",
+						"summer",
+						"Zealand",
+						"heavy"
+					],
+					"group": "hit",
 					"population": 33,
 					"drawn": 1
 				}
@@ -820,19 +899,13 @@
 				"neighbours": [
 					{
 						"station_id": "06120",
-						"name": "Odense Syd",
-						"lat": 55.3,
-						"lon": 10.28,
-						"distance_km": 19.6,
-						"bearing_deg": 183
+						"station_name": "Odense Syd",
+						"distance_km": 19.6
 					},
 					{
 						"station_id": "06119",
-						"name": "Kerteminde",
-						"lat": 55.45,
-						"lon": 10.66,
-						"distance_km": 14.1,
-						"bearing_deg": 92
+						"station_name": "Kerteminde",
+						"distance_km": 14.1
 					}
 				]
 			},
@@ -841,6 +914,7 @@
 				"from_utc": "2026-06-12T13:05:00Z",
 				"to_utc": "2026-06-12T14:25:00Z",
 				"frames_from_utc": "2026-06-12T12:30:00Z",
+				"frames_to_utc": "2026-06-12T14:30:00Z",
 				"slot_from_utc": "2026-06-12T13:00:00Z",
 				"slot_to_utc": "2026-06-12T14:30:00Z",
 				"known_until_utc": "2026-06-12T15:00:00Z"
@@ -1636,63 +1710,72 @@
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					},
 					{
 						"slot_end_utc": "2026-06-12T13:20:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					},
 					{
 						"slot_end_utc": "2026-06-12T13:30:00Z",
 						"mm": 1.2,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 1.2
 					},
 					{
 						"slot_end_utc": "2026-06-12T13:40:00Z",
 						"mm": 1.2,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 1.2
 					},
 					{
 						"slot_end_utc": "2026-06-12T13:50:00Z",
 						"mm": 1.2,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 1.2
 					},
 					{
 						"slot_end_utc": "2026-06-12T14:00:00Z",
 						"mm": 1.2,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 1.2
 					},
 					{
 						"slot_end_utc": "2026-06-12T14:10:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					},
 					{
 						"slot_end_utc": "2026-06-12T14:20:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					},
 					{
 						"slot_end_utc": "2026-06-12T14:30:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					}
 				],
 				"wet_in_window": true,
@@ -1706,14 +1789,17 @@
 				"stations": [
 					{
 						"station_id": "06120",
-						"name": "Odense Syd",
+						"station_name": "Odense Syd",
+						"distance_km": 19.6,
 						"lat": 55.3,
 						"lon": 10.28,
-						"distance_km": 19.6,
 						"bearing_deg": 183,
 						"wet_in_window": true,
 						"first_wet_utc": "2026-06-12T13:40:00Z",
 						"known_slots": 9,
+						"onsets_in_window_utc": [
+							"2026-06-12T13:40:00Z"
+						],
 						"slots": [
 							{
 								"slot_end_utc": "2026-06-12T13:10:00Z",
@@ -1782,14 +1868,15 @@
 					},
 					{
 						"station_id": "06119",
-						"name": "Kerteminde",
+						"station_name": "Kerteminde",
+						"distance_km": 14.1,
 						"lat": 55.45,
 						"lon": 10.66,
-						"distance_km": 14.1,
 						"bearing_deg": 92,
 						"wet_in_window": false,
 						"first_wet_utc": null,
 						"known_slots": 9,
+						"onsets_in_window_utc": [],
 						"slots": [
 							{
 								"slot_end_utc": "2026-06-12T13:10:00Z",
@@ -1864,6 +1951,7 @@
 				"radar_wet": true,
 				"neighbour_wet": true,
 				"window_used": {
+					"kind": "warning",
 					"from_utc": "2026-06-12T13:45:00Z",
 					"to_utc": "2026-06-12T14:30:00Z",
 					"definition": "warning-side: (sent, sent + lead + tolerance]"
@@ -1890,7 +1978,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121230.overlay.png",
 					"observed": "frames/202606121230.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-06-12T12:40:00Z",
@@ -1898,7 +1987,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121240.overlay.png",
 					"observed": "frames/202606121240.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-06-12T12:50:00Z",
@@ -1906,7 +1996,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121250.overlay.png",
 					"observed": "frames/202606121250.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T13:00:00Z",
@@ -1914,7 +2005,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121300.overlay.png",
 					"observed": "frames/202606121300.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T13:10:00Z",
@@ -1922,7 +2014,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121310.overlay.png",
 					"observed": "frames/202606121310.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T13:20:00Z",
@@ -1930,7 +2023,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121320.overlay.png",
 					"observed": "frames/202606121320.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T13:30:00Z",
@@ -1938,7 +2032,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121330.overlay.png",
 					"observed": "frames/202606121330.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T13:40:00Z",
@@ -1946,7 +2041,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121340.overlay.png",
 					"observed": "frames/202606121340.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T13:50:00Z",
@@ -1954,7 +2050,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121350.overlay.png",
 					"observed": "frames/202606121350.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T14:00:00Z",
@@ -1962,7 +2059,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121400.overlay.png",
 					"observed": "frames/202606121400.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T14:10:00Z",
@@ -1970,7 +2068,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121410.overlay.png",
 					"observed": "frames/202606121410.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-06-12T14:20:00Z",
@@ -1978,7 +2077,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121420.overlay.png",
 					"observed": "frames/202606121420.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-06-12T14:30:00Z",
@@ -1986,7 +2086,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202606121430.overlay.png",
 					"observed": "frames/202606121430.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				}
 			],
 			"flags": [],
@@ -2054,19 +2155,13 @@
 				"neighbours": [
 					{
 						"station_id": "06058",
-						"name": "Hvide Sande",
-						"lat": 56,
-						"lon": 8.13,
-						"distance_km": 18.4,
-						"bearing_deg": 192
+						"station_name": "Hvide Sande",
+						"distance_km": 18.4
 					},
 					{
 						"station_id": "06060",
-						"name": "Nissum Fjord",
-						"lat": 56.5,
-						"lon": 8.31,
-						"distance_km": 11.7,
-						"bearing_deg": 150
+						"station_name": "Nissum Fjord",
+						"distance_km": 11.7
 					}
 				]
 			},
@@ -2075,6 +2170,7 @@
 				"from_utc": "2026-02-03T05:40:00Z",
 				"to_utc": "2026-02-03T07:00:00Z",
 				"frames_from_utc": "2026-02-03T05:10:00Z",
+				"frames_to_utc": "2026-02-03T07:00:00Z",
 				"slot_from_utc": "2026-02-03T05:40:00Z",
 				"slot_to_utc": "2026-02-03T07:00:00Z",
 				"known_until_utc": "2026-02-03T09:00:00Z"
@@ -2867,56 +2963,64 @@
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-02-03T06:00:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.9
 					},
 					{
 						"slot_end_utc": "2026-02-03T06:10:00Z",
 						"mm": 0.9,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 0.9
 					},
 					{
 						"slot_end_utc": "2026-02-03T06:20:00Z",
 						"mm": 0.9,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 0.9
 					},
 					{
 						"slot_end_utc": "2026-02-03T06:30:00Z",
 						"mm": 0.9,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 0.9
 					},
 					{
 						"slot_end_utc": "2026-02-03T06:40:00Z",
 						"mm": 0.9,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 0.9
 					},
 					{
 						"slot_end_utc": "2026-02-03T06:50:00Z",
 						"mm": 0.9,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 0.9
 					},
 					{
 						"slot_end_utc": "2026-02-03T07:00:00Z",
 						"mm": 0.9,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 0.9
 					}
 				],
 				"wet_in_window": true,
@@ -2930,14 +3034,17 @@
 				"stations": [
 					{
 						"station_id": "06058",
-						"name": "Hvide Sande",
+						"station_name": "Hvide Sande",
+						"distance_km": 18.4,
 						"lat": 56,
 						"lon": 8.13,
-						"distance_km": 18.4,
 						"bearing_deg": 192,
 						"wet_in_window": true,
 						"first_wet_utc": "2026-02-03T06:10:00Z",
 						"known_slots": 8,
+						"onsets_in_window_utc": [
+							"2026-02-03T06:10:00Z"
+						],
 						"slots": [
 							{
 								"slot_end_utc": "2026-02-03T05:50:00Z",
@@ -2999,14 +3106,15 @@
 					},
 					{
 						"station_id": "06060",
-						"name": "Nissum Fjord",
+						"station_name": "Nissum Fjord",
+						"distance_km": 11.7,
 						"lat": 56.5,
 						"lon": 8.31,
-						"distance_km": 11.7,
 						"bearing_deg": 150,
 						"wet_in_window": null,
 						"first_wet_utc": null,
 						"known_slots": 0,
+						"onsets_in_window_utc": [],
 						"slots": [
 							{
 								"slot_end_utc": "2026-02-03T05:50:00Z",
@@ -3074,6 +3182,7 @@
 				"radar_wet": true,
 				"neighbour_wet": true,
 				"window_used": {
+					"kind": "onset",
 					"from_utc": "2026-02-03T06:05:00Z",
 					"to_utc": "2026-02-03T06:30:00Z",
 					"definition": "onset-side: [onset - tolerance, onset + slot]"
@@ -3088,7 +3197,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030510.overlay.png",
 					"observed": "frames/202602030510.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-02-03T05:20:00Z",
@@ -3096,7 +3206,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030520.overlay.png",
 					"observed": "frames/202602030520.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-02-03T05:30:00Z",
@@ -3104,7 +3215,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030530.overlay.png",
 					"observed": "frames/202602030530.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T05:40:00Z",
@@ -3112,7 +3224,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030540.overlay.png",
 					"observed": "frames/202602030540.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T05:50:00Z",
@@ -3120,7 +3233,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030550.overlay.png",
 					"observed": "frames/202602030550.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T06:00:00Z",
@@ -3128,7 +3242,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030600.overlay.png",
 					"observed": "frames/202602030600.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T06:10:00Z",
@@ -3136,7 +3251,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030610.overlay.png",
 					"observed": "frames/202602030610.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T06:20:00Z",
@@ -3144,7 +3260,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030620.overlay.png",
 					"observed": "frames/202602030620.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T06:30:00Z",
@@ -3152,7 +3269,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030630.overlay.png",
 					"observed": "frames/202602030630.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T06:40:00Z",
@@ -3160,7 +3278,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030640.overlay.png",
 					"observed": "frames/202602030640.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T06:50:00Z",
@@ -3168,7 +3287,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030650.overlay.png",
 					"observed": "frames/202602030650.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-02-03T07:00:00Z",
@@ -3176,7 +3296,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202602030700.overlay.png",
 					"observed": "frames/202602030700.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				}
 			],
 			"flags": [],
@@ -3244,19 +3365,13 @@
 				"neighbours": [
 					{
 						"station_id": "06186",
-						"name": "Landbohøjskolen",
-						"lat": 55.68,
-						"lon": 12.53,
-						"distance_km": 10.8,
-						"bearing_deg": 310
+						"station_name": "Landbohøjskolen",
+						"distance_km": 10.8
 					},
 					{
 						"station_id": "06188",
-						"name": "Sjælsmark",
-						"lat": 55.88,
-						"lon": 12.41,
-						"distance_km": 33.2,
-						"bearing_deg": 325
+						"station_name": "Sjælsmark",
+						"distance_km": 33.2
 					}
 				]
 			},
@@ -3265,6 +3380,7 @@
 				"from_utc": "2026-08-05T16:35:00Z",
 				"to_utc": "2026-08-05T17:55:00Z",
 				"frames_from_utc": "2026-08-05T16:00:00Z",
+				"frames_to_utc": "2026-08-05T18:00:00Z",
 				"slot_from_utc": "2026-08-05T16:30:00Z",
 				"slot_to_utc": "2026-08-05T18:00:00Z",
 				"known_until_utc": "2026-08-05T19:00:00Z"
@@ -4061,63 +4177,72 @@
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					},
 					{
 						"slot_end_utc": "2026-08-05T16:50:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					},
 					{
 						"slot_end_utc": "2026-08-05T17:00:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					},
 					{
 						"slot_end_utc": "2026-08-05T17:10:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0
 					},
 					{
 						"slot_end_utc": "2026-08-05T17:20:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 4.5
 					},
 					{
 						"slot_end_utc": "2026-08-05T17:30:00Z",
 						"mm": 4.5,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 4.5
 					},
 					{
 						"slot_end_utc": "2026-08-05T17:40:00Z",
 						"mm": 4.5,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 4.5
 					},
 					{
 						"slot_end_utc": "2026-08-05T17:50:00Z",
 						"mm": 4.5,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 4.5
 					},
 					{
 						"slot_end_utc": "2026-08-05T18:00:00Z",
 						"mm": 4.5,
 						"dur_min": 10,
 						"known": true,
-						"wet": true
+						"wet": true,
+						"mm_h": 4.5
 					}
 				],
 				"wet_in_window": true,
@@ -4131,14 +4256,17 @@
 				"stations": [
 					{
 						"station_id": "06186",
-						"name": "Landbohøjskolen",
+						"station_name": "Landbohøjskolen",
+						"distance_km": 10.8,
 						"lat": 55.68,
 						"lon": 12.53,
-						"distance_km": 10.8,
 						"bearing_deg": 310,
 						"wet_in_window": true,
 						"first_wet_utc": "2026-08-05T17:30:00Z",
 						"known_slots": 9,
+						"onsets_in_window_utc": [
+							"2026-08-05T17:30:00Z"
+						],
 						"slots": [
 							{
 								"slot_end_utc": "2026-08-05T16:40:00Z",
@@ -4207,14 +4335,17 @@
 					},
 					{
 						"station_id": "06188",
-						"name": "Sjælsmark",
+						"station_name": "Sjælsmark",
+						"distance_km": 33.2,
 						"lat": 55.88,
 						"lon": 12.41,
-						"distance_km": 33.2,
 						"bearing_deg": 325,
 						"wet_in_window": true,
 						"first_wet_utc": "2026-08-05T17:20:00Z",
 						"known_slots": 9,
+						"onsets_in_window_utc": [
+							"2026-08-05T17:20:00Z"
+						],
 						"slots": [
 							{
 								"slot_end_utc": "2026-08-05T16:40:00Z",
@@ -4289,6 +4420,7 @@
 				"radar_wet": true,
 				"neighbour_wet": true,
 				"window_used": {
+					"kind": "warning",
 					"from_utc": "2026-08-05T17:15:00Z",
 					"to_utc": "2026-08-05T18:00:00Z",
 					"definition": "warning-side: (sent, sent + lead + tolerance]"
@@ -4315,7 +4447,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051600.overlay.png",
 					"observed": "frames/202608051600.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-08-05T16:10:00Z",
@@ -4323,7 +4456,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051610.overlay.png",
 					"observed": "frames/202608051610.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-08-05T16:20:00Z",
@@ -4331,7 +4465,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051620.overlay.png",
 					"observed": "frames/202608051620.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T16:30:00Z",
@@ -4339,7 +4474,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051630.overlay.png",
 					"observed": "frames/202608051630.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T16:40:00Z",
@@ -4347,7 +4483,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051640.overlay.png",
 					"observed": "frames/202608051640.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T16:50:00Z",
@@ -4355,7 +4492,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051650.overlay.png",
 					"observed": "frames/202608051650.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T17:00:00Z",
@@ -4363,7 +4501,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051700.overlay.png",
 					"observed": "frames/202608051700.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T17:10:00Z",
@@ -4371,7 +4510,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051710.overlay.png",
 					"observed": "frames/202608051710.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T17:20:00Z",
@@ -4379,7 +4519,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051720.overlay.png",
 					"observed": "frames/202608051720.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T17:30:00Z",
@@ -4387,7 +4528,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051730.overlay.png",
 					"observed": "frames/202608051730.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T17:40:00Z",
@@ -4395,7 +4537,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051740.overlay.png",
 					"observed": "frames/202608051740.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-08-05T17:50:00Z",
@@ -4403,7 +4546,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051750.overlay.png",
 					"observed": "frames/202608051750.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-08-05T18:00:00Z",
@@ -4411,7 +4555,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202608051800.overlay.png",
 					"observed": "frames/202608051800.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				}
 			],
 			"flags": [],
@@ -4484,11 +4629,8 @@
 				"neighbours": [
 					{
 						"station_id": "06102",
-						"name": "Vandel",
-						"lat": 55.77,
-						"lon": 9.28,
-						"distance_km": 8.6,
-						"bearing_deg": 72
+						"station_name": "Vandel",
+						"distance_km": 8.6
 					}
 				]
 			},
@@ -4497,6 +4639,7 @@
 				"from_utc": "2026-04-21T01:55:00Z",
 				"to_utc": "2026-04-21T03:55:00Z",
 				"frames_from_utc": "2026-04-21T01:20:00Z",
+				"frames_to_utc": "2026-04-21T04:00:00Z",
 				"slot_from_utc": "2026-04-21T01:50:00Z",
 				"slot_to_utc": "2026-04-21T04:00:00Z",
 				"known_until_utc": "2026-04-21T03:05:00Z"
@@ -5084,7 +5227,9 @@
 					"from_utc": "2026-04-21T02:55:00Z",
 					"to_utc": "2026-04-21T03:35:00Z",
 					"minutes": 40,
-					"reason": "no composite written for four consecutive stamps"
+					"coverage_break": true,
+					"edge": null,
+					"reason": "coverage break (40 min, between two decisions)"
 				}
 			],
 			"prologue": {
@@ -5361,91 +5506,104 @@
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-04-21T02:10:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-04-21T02:20:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-04-21T02:30:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-04-21T02:40:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-04-21T02:50:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-04-21T03:00:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-04-21T03:10:00Z",
 						"mm": null,
 						"dur_min": null,
 						"known": false,
-						"wet": false
+						"wet": false,
+						"mm_h": null
 					},
 					{
 						"slot_end_utc": "2026-04-21T03:20:00Z",
 						"mm": null,
 						"dur_min": null,
 						"known": false,
-						"wet": false
+						"wet": false,
+						"mm_h": null
 					},
 					{
 						"slot_end_utc": "2026-04-21T03:30:00Z",
 						"mm": null,
 						"dur_min": null,
 						"known": false,
-						"wet": false
+						"wet": false,
+						"mm_h": null
 					},
 					{
 						"slot_end_utc": "2026-04-21T03:40:00Z",
 						"mm": null,
 						"dur_min": null,
 						"known": false,
-						"wet": false
+						"wet": false,
+						"mm_h": null
 					},
 					{
 						"slot_end_utc": "2026-04-21T03:50:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					},
 					{
 						"slot_end_utc": "2026-04-21T04:00:00Z",
 						"mm": 0,
 						"dur_min": 0,
 						"known": true,
-						"wet": false
+						"wet": false,
+						"mm_h": 0.1
 					}
 				],
 				"wet_in_window": null,
@@ -5459,14 +5617,15 @@
 				"stations": [
 					{
 						"station_id": "06102",
-						"name": "Vandel",
+						"station_name": "Vandel",
+						"distance_km": 8.6,
 						"lat": 55.77,
 						"lon": 9.28,
-						"distance_km": 8.6,
 						"bearing_deg": 72,
 						"wet_in_window": null,
 						"first_wet_utc": null,
 						"known_slots": 0,
+						"onsets_in_window_utc": [],
 						"slots": [
 							{
 								"slot_end_utc": "2026-04-21T02:00:00Z",
@@ -5569,6 +5728,7 @@
 				"radar_wet": null,
 				"neighbour_wet": null,
 				"window_used": {
+					"kind": "warning",
 					"from_utc": "2026-04-21T02:55:00Z",
 					"to_utc": "2026-04-21T03:40:00Z",
 					"definition": "warning-side: (sent, sent + lead + tolerance]"
@@ -5595,7 +5755,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210120.overlay.png",
 					"observed": "frames/202604210120.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-04-21T01:30:00Z",
@@ -5603,7 +5764,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210130.overlay.png",
 					"observed": "frames/202604210130.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-04-21T01:40:00Z",
@@ -5611,7 +5773,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210140.overlay.png",
 					"observed": "frames/202604210140.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T01:50:00Z",
@@ -5619,7 +5782,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210150.overlay.png",
 					"observed": "frames/202604210150.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T02:00:00Z",
@@ -5627,7 +5791,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210200.overlay.png",
 					"observed": "frames/202604210200.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T02:10:00Z",
@@ -5635,7 +5800,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210210.overlay.png",
 					"observed": "frames/202604210210.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T02:20:00Z",
@@ -5643,7 +5809,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210220.overlay.png",
 					"observed": "frames/202604210220.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T02:30:00Z",
@@ -5651,7 +5818,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210230.overlay.png",
 					"observed": "frames/202604210230.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T02:40:00Z",
@@ -5659,7 +5827,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210240.overlay.png",
 					"observed": "frames/202604210240.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T02:50:00Z",
@@ -5667,7 +5836,8 @@
 					"product": "fullRange",
 					"overlay": "",
 					"observed": "",
-					"present": false
+					"present": false,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-04-21T03:00:00Z",
@@ -5675,7 +5845,8 @@
 					"product": "fullRange",
 					"overlay": "",
 					"observed": "",
-					"present": false
+					"present": false,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-04-21T03:10:00Z",
@@ -5683,7 +5854,8 @@
 					"product": "fullRange",
 					"overlay": "",
 					"observed": "",
-					"present": false
+					"present": false,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-04-21T03:20:00Z",
@@ -5691,7 +5863,8 @@
 					"product": "fullRange",
 					"overlay": "",
 					"observed": "",
-					"present": false
+					"present": false,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-04-21T03:30:00Z",
@@ -5699,7 +5872,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210330.overlay.png",
 					"observed": "frames/202604210330.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T03:40:00Z",
@@ -5707,7 +5881,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210340.overlay.png",
 					"observed": "frames/202604210340.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": true
 				},
 				{
 					"radar_ts_utc": "2026-04-21T03:50:00Z",
@@ -5715,7 +5890,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210350.overlay.png",
 					"observed": "frames/202604210350.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				},
 				{
 					"radar_ts_utc": "2026-04-21T04:00:00Z",
@@ -5723,7 +5899,8 @@
 					"product": "fullRange",
 					"overlay": "frames/202604210400.overlay.png",
 					"observed": "frames/202604210400.observed.png",
-					"present": true
+					"present": true,
+					"has_decision_row": false
 				}
 			],
 			"flags": [
@@ -5862,6 +6039,7 @@
 				"from_utc": "2026-06-12T13:05:00Z",
 				"to_utc": "2026-06-12T14:25:00Z",
 				"frames_from_utc": "2026-06-12T12:30:00Z",
+				"frames_to_utc": "2026-06-12T14:30:00Z",
 				"slot_from_utc": "2026-06-12T13:00:00Z",
 				"slot_to_utc": "2026-06-12T14:30:00Z",
 				"known_until_utc": "2026-06-12T15:00:00Z"
@@ -5886,95 +6064,156 @@
 				"python": "3.12.3"
 			},
 			"corpus": {
-				"root": "/srv/dmi/stations",
 				"decisions_dirs": [
-					"stations/replay_postprocess",
-					"stations/eval"
+					"/srv/dmi/stations/eval",
+					"/srv/dmi/stations/replay_postprocess"
 				],
-				"decision_rows_loaded": 1204,
-				"decision_row_duplicates": 37,
-				"population_hash": "sha256:5f2d1c0a9b8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a392817060fix"
+				"decisions_labels": [
+					"eval",
+					"replay_postprocess"
+				],
+				"decisions_precedence": "caller order, least authoritative first; the LAST directory wins a (radar_ts, station_id) tie",
+				"corpus_dir": "/srv/dmi/stations",
+				"files": 284,
+				"files_skipped": 2,
+				"rows_read": 1204,
+				"rows_kept": 1167,
+				"duplicates_dropped": 37,
+				"leads": [
+					10,
+					20,
+					30,
+					45,
+					60
+				],
+				"window_from_utc": "2025-12-07T00:00:00Z",
+				"window_to_utc": "2026-09-01T00:00:00Z"
 			},
 			"window": {
-				"from_utc": "2025-12-07T00:00:00Z",
-				"to_utc": "2026-09-01T00:00:00Z"
+				"decision_min": 40,
+				"frame_pad_min": 20
 			},
 			"rule": {
 				"source": "lomo",
+				"held_out": false,
+				"lead_min": 30,
+				"threshold_pct": 45,
+				"threshold_source": "one_knob_v2 table",
+				"fold_thresholds": [
+					[
+						[
+							2026,
+							2
+						],
+						45
+					],
+					[
+						[
+							2026,
+							4
+						],
+						45
+					],
+					[
+						[
+							2026,
+							6
+						],
+						45
+					],
+					[
+						[
+							2026,
+							8
+						],
+						40
+					]
+				],
 				"probability": "postprocess",
 				"probability_column": "p_post_30",
 				"probability_provenance": "out_of_fold",
-				"thresholds": {
-					"by_lead_pct": {
-						"20": 50,
-						"30": 45,
-						"45": 40,
-						"60": 35
-					},
-					"source": "one_knob_v2 table",
-					"fallback_threshold_pct": 40,
-					"fitted_on_months": [
-						"2026-01",
-						"2026-02",
-						"2026-03",
-						"2026-04",
-						"2026-05",
-						"2026-06"
-					],
-					"held_out": false
-				},
-				"lead_min": 30,
 				"persistence_obs": 2,
 				"rearm_after_min": 60,
 				"raining_now_mm_h": 0.5,
-				"raining_now_eta_min": 5,
-				"coverage_gap_min": 30,
+				"raining_now_eta_min": 1.5,
+				"coverage_gap_min": 20,
 				"tolerance_min": 15,
-				"min_useful_lead_min": 5,
-				"rows_fallback_to_curve": 6
+				"min_useful_lead_min": 5
 			},
 			"truth": {
-				"onset_rule": {
-					"dry_min": 60,
-					"onset_min_mm": 0.2,
-					"slot_min": 10,
-					"wet_precip_mm": 0.1,
-					"wet_dur_min": 1
-				},
-				"radar_verdict": {
-					"disc_radius_m": 1000,
-					"statistic": "p90 over the disc",
-					"threshold_mm_h": 0.5
-				},
-				"neighbour": {
-					"radius_km": 20,
-					"rule": "any neighbour wet in the verdict window"
-				},
-				"dead_gauges_excluded": [
+				"dry_min": 60,
+				"onset_min_mm": 0.2,
+				"tolerance_min": 15,
+				"lead_min": 30,
+				"min_useful_lead_min": 5,
+				"radar_disc_radius_m": 1000,
+				"radar_threshold_mm_h": 0.5,
+				"radar_source": "observed_mm_h in the decision rows",
+				"neighbour_radius_km": 20,
+				"dead_gauges": [
 					"06080"
 				],
-				"known_until_utc_by_station": {
+				"min_known_slots": 500,
+				"known_until": {
 					"06052": "2026-02-03T09:00:00Z",
 					"06104": "2026-04-21T03:05:00Z",
 					"06126": "2026-06-12T15:00:00Z",
 					"06181": "2026-08-05T19:00:00Z"
+				},
+				"suspect_gauge_months": [
+					"06104:2026-04"
+				]
+			},
+			"features": {
+				"probe_column": "obs_max_5km_mm_h",
+				"gap_share": 0.5,
+				"gap_days": [
+					"2026-04-21"
+				],
+				"allowed": true,
+				"rows_by_day": {
+					"2026-02-03": {
+						"rows": 288,
+						"with_features": 288
+					},
+					"2026-04-21": {
+						"rows": 288,
+						"with_features": 61
+					},
+					"2026-06-12": {
+						"rows": 288,
+						"with_features": 288
+					},
+					"2026-08-05": {
+						"rows": 288,
+						"with_features": 288
+					}
+				},
+				"documentation": {
+					"obs_max_5km_mm_h": "Max observed rain rate within 5 km of the station, native grid.",
+					"up_dist_km": "Distance to the nearest pixel at or above 0.5 mm/h in the 40 km upwind corridor. NaN means no echo upwind at all."
 				}
 			},
 			"sampling": {
 				"seed": 20260915,
-				"target_n": 4,
-				"drawn_n": 4,
-				"strata_keys": [
+				"strata": [
 					"outcome_class",
 					"season",
 					"region",
 					"intensity_band"
 				],
-				"allocation": "proportional with a floor per cell",
 				"floor_per_cell": 1,
-				"excluded": {
-					"pending": 61,
-					"dead_gauge": 4
+				"targets": {
+					"false_alarm": 120,
+					"miss": 100,
+					"late": 20,
+					"hit": 50,
+					"uncovered": 10
+				},
+				"drawn": {
+					"false_alarm": 2,
+					"miss": 1,
+					"hit": 1
 				},
 				"population": {
 					"false_alarm": 412,
@@ -5982,41 +6221,59 @@
 					"hit": 96,
 					"uncovered": 11
 				},
-				"drawn": {
-					"false_alarm": 2,
-					"miss": 1,
-					"hit": 1
-				},
+				"total_drawn": 4,
+				"population_hash": "352b2d40bfd9c44924422822268a751e781bc9eeb034acf0639409c7563050c6",
+				"collapsed_late_pairs": 1,
+				"control_groups": [
+					"hit",
+					"uncovered"
+				],
 				"cells": [
 					{
-						"outcome_class": "false_alarm",
-						"season": "summer",
-						"region": "Funen",
-						"intensity_band": "moderate",
+						"stratum": "false_alarm|summer|Funen|moderate",
+						"keys": [
+							"false_alarm",
+							"summer",
+							"Funen",
+							"moderate"
+						],
+						"group": "false_alarm",
 						"population": 61,
 						"drawn": 1
 					},
 					{
-						"outcome_class": "false_alarm",
-						"season": "shoulder",
-						"region": "South Jutland",
-						"intensity_band": "light",
+						"stratum": "false_alarm|shoulder|South Jutland|light",
+						"keys": [
+							"false_alarm",
+							"shoulder",
+							"South Jutland",
+							"light"
+						],
+						"group": "false_alarm",
 						"population": 48,
 						"drawn": 1
 					},
 					{
-						"outcome_class": "miss",
-						"season": "winter",
-						"region": "North Jutland",
-						"intensity_band": "light",
+						"stratum": "miss|winter|North Jutland|light",
+						"keys": [
+							"miss",
+							"winter",
+							"North Jutland",
+							"light"
+						],
+						"group": "miss",
 						"population": 74,
 						"drawn": 1
 					},
 					{
-						"outcome_class": "hit",
-						"season": "summer",
-						"region": "Zealand",
-						"intensity_band": "heavy",
+						"stratum": "hit|summer|Zealand|heavy",
+						"keys": [
+							"hit",
+							"summer",
+							"Zealand",
+							"heavy"
+						],
+						"group": "hit",
 						"population": 33,
 						"drawn": 1
 					}

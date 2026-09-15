@@ -24,8 +24,8 @@
 import type {
 	DualTruthClass,
 	GaugeBlock,
-	NeighbourRef,
 	NeighboursBlock,
+	PlacedNeighbour,
 	RadarDiscBlock,
 	Slot
 } from './schema';
@@ -50,8 +50,8 @@ export type UnknownReason =
  * reason and no slot value to be mistaken for zero.
  */
 export type SlotState =
-	| { state: 'wet'; slot: Slot; slotEndUtc: string; mm: number | null }
-	| { state: 'dry'; slot: Slot; slotEndUtc: string; mm: number | null }
+	| { state: 'wet'; slot: Slot; slotEndUtc: string; mm: number | null; mmH: number | null }
+	| { state: 'dry'; slot: Slot; slotEndUtc: string; mm: number | null; mmH: number | null }
 	| { state: 'unknown'; slot: Slot | null; slotEndUtc: string | null; reason: UnknownReason };
 
 const unknown = (reason: UnknownReason, slot: Slot | null = null): SlotState => ({
@@ -91,7 +91,12 @@ export function slotAt(
 				state: slot.wet ? 'wet' : 'dry',
 				slot,
 				slotEndUtc: slot.slot_end_utc,
-				mm: slot.mm
+				// Depth and rate are carried apart, and each is null where the
+				// instrument does not measure it. A gauge reports mm over ten
+				// minutes; the radar disc reports mm/h, which is what its
+				// threshold is stated in.
+				mm: slot.mm,
+				mmH: slot.mm_h ?? null
 			};
 		}
 	}
@@ -150,16 +155,25 @@ export function radarStateAt(
 	// A synthetic slot, so the caller handles both paths identically.
 	const slot: Slot = {
 		slot_end_utc: newest.entry.radar_ts_utc,
-		mm: value,
+		// The series is a rate series; putting it in `mm` would call a
+		// millimetre per hour a millimetre.
+		mm: null,
+		mm_h: value,
 		known: value !== null,
 		wet: value !== null && value >= disc.threshold_mm_h
 	};
 	if (value === null) return unknown('no_value', slot);
-	return { state: slot.wet ? 'wet' : 'dry', slot, slotEndUtc: slot.slot_end_utc, mm: value };
+	return {
+		state: slot.wet ? 'wet' : 'dry',
+		slot,
+		slotEndUtc: slot.slot_end_utc,
+		mm: null,
+		mmH: value
+	};
 }
 
 export interface NeighbourState {
-	station: NeighbourRef;
+	station: PlacedNeighbour;
 	state: SlotState;
 	/** The neighbour's verdict over the whole window, for the map legend. */
 	wetInWindow: boolean | null;
@@ -185,10 +199,10 @@ export function neighbourStatesAt(
 		.map((station) => ({
 			station: {
 				station_id: station.station_id,
-				name: station.name,
+				station_name: station.station_name,
+				distance_km: station.distance_km,
 				lat: station.lat,
 				lon: station.lon,
-				distance_km: station.distance_km,
 				bearing_deg: station.bearing_deg
 			},
 			state: slotAt(station.slots, cursorMs, slotMin),
@@ -299,7 +313,8 @@ export interface WetRun {
 
 /**
  * A slot series collapsed into contiguous runs, for the strip under the
- * track.
+ * track. `mm` sums the depths, so it is meaningful for a gauge series and
+ * null for a rate series, which has none.
  *
  * Three states, never two: an unknown run is drawn hatched and must never
  * merge with the dry runs on either side of it. Runs are bounded by slot

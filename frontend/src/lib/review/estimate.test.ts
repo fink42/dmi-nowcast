@@ -313,7 +313,8 @@ const frame = (iso: string, present = true): FrameRef => ({
 	product: 'fullRange',
 	overlay: '',
 	observed: '',
-	present
+	present,
+	has_decision_row: true
 });
 
 const FRAMES = [

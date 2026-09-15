@@ -15,7 +15,7 @@
 import { destinationPoint } from '$lib/map/arrow';
 import type { Feature, FeatureCollection, Point, Polygon } from 'geojson';
 import type { NeighbourState, SlotState } from './truth';
-import type { NeighbourRef, StationBlock } from './schema';
+import type { NeighbourRef, PlacedNeighbour, StationBlock } from './schema';
 
 /** Metres per degree of latitude — the mean-Earth sphere `arrow.ts` uses. */
 const EARTH_RADIUS_M = 6371008.8;
@@ -56,6 +56,58 @@ export function discPolygon(
 	};
 }
 
+/** The sixteen points, clockwise from north. */
+const COMPASS = [
+	'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+	'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'
+] as const;
+
+/**
+ * A bearing as a compass point.
+ *
+ * "NNE" is what a person reading a map can check against the arrow in front
+ * of them; "23°" is a number they have to convert first, and converting it
+ * wrong is how a diverted cell gets tagged as one that had already passed.
+ * Null in, null out — never "N", which would claim a direction.
+ */
+export function compassPoint(bearingDeg: number | null | undefined): string | null {
+	if (typeof bearingDeg !== 'number' || !Number.isFinite(bearingDeg)) return null;
+	const normalised = ((bearingDeg % 360) + 360) % 360;
+	return COMPASS[Math.round(normalised / 22.5) % 16];
+}
+
+/** Where a neighbour sits relative to the flow. */
+export type WindRelation = 'upwind' | 'downwind' | 'crosswind';
+
+/**
+ * Is this neighbour upwind, downwind or off to one side?
+ *
+ * The question the neighbour panel exists to answer. A WET neighbour
+ * UPWIND is rain that was on its way here and went round — `fa_cell_diverted`,
+ * a motion problem. A wet neighbour DOWNWIND is rain that has already
+ * crossed this gauge — which, with a dry gauge, is `fa_gauge_missed_it` or
+ * a representativeness artefact. Same observation, opposite conclusions.
+ *
+ * `bearingFromDeg` is the arrow's own convention: the direction the rain
+ * comes FROM. A neighbour within ±67.5° of it is upwind (a 135° sector, so
+ * the four quadrant labels partition the compass); within ±67.5° of the
+ * reciprocal is downwind; the rest is crosswind. Null whenever either
+ * bearing is missing — there is no relation to state without a flow.
+ */
+export function windRelation(
+	bearingDeg: number | null | undefined,
+	bearingFromDeg: number | null | undefined
+): WindRelation | null {
+	if (typeof bearingDeg !== 'number' || !Number.isFinite(bearingDeg)) return null;
+	if (typeof bearingFromDeg !== 'number' || !Number.isFinite(bearingFromDeg)) return null;
+	// The smaller of the two ways round the compass, 0 … 180.
+	const turn = (((bearingDeg - bearingFromDeg) % 360) + 360) % 360;
+	const delta = turn > 180 ? 360 - turn : turn;
+	if (delta <= 67.5) return 'upwind';
+	if (delta >= 112.5) return 'downwind';
+	return 'crosswind';
+}
+
 export type StationRole = 'station' | 'neighbour';
 
 /**
@@ -68,7 +120,15 @@ export type StationProperties = {
 	name: string;
 	/** Kilometres from the event's station; zero for the station itself. */
 	distance_km: number;
-	bearing_deg: number;
+	/** Bearing from the event's station toward this one, and in words. */
+	bearing_deg: number | null;
+	bearing_compass: string | null;
+	/**
+	 * Upwind, downwind or crosswind of the flow at the cursor. Null when the
+	 * cycle had no motion, or for the station itself — a point has no
+	 * bearing to itself.
+	 */
+	wind_relation: WindRelation | null;
 	/**
 	 * The reading at the cursor. `unknown` is its own value and must be
 	 * styled as its own thing — a neighbour that did not report is not a dry
@@ -80,7 +140,9 @@ export type StationProperties = {
 	unknown_reason: string | null;
 	/** The neighbour's verdict over the whole window, or null when unknown. */
 	wet_in_window: boolean | null;
+	/** Depth at the cursor (a gauge measures this), and rate (the radar does). */
 	mm: number | null;
+	mm_h: number | null;
 };
 
 export type StationCollection = FeatureCollection<Point, StationProperties>;
@@ -105,11 +167,25 @@ const pointFeature = (
  * `unknown` rather than dropped: a dot that disappears while scrubbing
  * reads as a station that does not exist, and the absence of a reading is
  * itself the thing a reviewer is judging.
+ *
+ * **A neighbour is only drawn when it says where it is.** The builder
+ * inlines `lat`/`lon` on the `neighbours.stations[]` entries, which is the
+ * list to pass here; `station.neighbours[]` carries ids and distances only
+ * and places nothing. Either way an entry whose coordinates did not parse
+ * is kept in the panel and left off the map, because a dot at (0, 0) — or
+ * on top of the event's own station — is a wet gauge in the wrong place,
+ * which is worse than a missing one.
+ *
+ * `bearingFromDeg` is the flow at the cursor (`upwindVector`), and it is
+ * what turns a ring of dots into an argument: it labels each neighbour
+ * upwind or downwind, which is the difference between a cell that went
+ * round this gauge and one that had already crossed it.
  */
 export function neighbourFeatures(
 	station: StationBlock | null,
-	neighbours: readonly NeighbourRef[],
-	statesAtCursor: readonly NeighbourState[]
+	neighbours: readonly (NeighbourRef & Partial<PlacedNeighbour>)[],
+	statesAtCursor: readonly NeighbourState[],
+	bearingFromDeg: number | null = null
 ): StationCollection {
 	const byId = new Map(statesAtCursor.map((entry) => [entry.station.station_id, entry]));
 	const features: Feature<Point, StationProperties>[] = [];
@@ -122,24 +198,36 @@ export function neighbourFeatures(
 				station_id: station.station_id,
 				name: station.name,
 				distance_km: 0,
-				bearing_deg: 0,
+				bearing_deg: null,
+				bearing_compass: null,
+				wind_relation: null,
 				state: own?.state.state ?? 'unknown',
 				unknown_reason: own?.state.state === 'unknown' ? own.state.reason : null,
 				wet_in_window: own?.wetInWindow ?? null,
-				mm: own !== undefined && own.state.state !== 'unknown' ? own.state.mm : null
+				mm: own !== undefined && own.state.state !== 'unknown' ? own.state.mm : null,
+				mm_h: own !== undefined && own.state.state !== 'unknown' ? own.state.mmH : null
 			})
 		);
 	}
 
 	for (const neighbour of neighbours) {
+		const entryFor = byId.get(neighbour.station_id);
+		const lat = neighbour.lat ?? entryFor?.station.lat ?? null;
+		const lon = neighbour.lon ?? entryFor?.station.lon ?? null;
+		// No coordinates, no dot. See the note above.
+		if (typeof lat !== 'number' || typeof lon !== 'number') continue;
+		if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
 		const entry = byId.get(neighbour.station_id);
+		const bearing = neighbour.bearing_deg ?? entry?.station.bearing_deg ?? null;
 		features.push(
-			pointFeature(neighbour.lon, neighbour.lat, {
+			pointFeature(lon, lat, {
 				role: 'neighbour',
 				station_id: neighbour.station_id,
-				name: neighbour.name,
+				name: neighbour.station_name,
 				distance_km: neighbour.distance_km,
-				bearing_deg: neighbour.bearing_deg,
+				bearing_deg: bearing,
+				bearing_compass: compassPoint(bearing),
+				wind_relation: windRelation(bearing, bearingFromDeg),
 				state: entry?.state.state ?? 'unknown',
 				unknown_reason:
 					entry === undefined
@@ -148,7 +236,8 @@ export function neighbourFeatures(
 							? entry.state.reason
 							: null,
 				wet_in_window: entry?.wetInWindow ?? null,
-				mm: entry !== undefined && entry.state.state !== 'unknown' ? entry.state.mm : null
+				mm: entry !== undefined && entry.state.state !== 'unknown' ? entry.state.mm : null,
+				mm_h: entry !== undefined && entry.state.state !== 'unknown' ? entry.state.mmH : null
 			})
 		);
 	}

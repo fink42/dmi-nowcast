@@ -1,0 +1,6150 @@
+{
+ "_comment": "Verbatim producer output. Bundle documents from `scripts/build_review_bundle.py --fixture --seed 424242`; `annotations` and `health` from a live `scripts/review_server.py` against that bundle. Do not hand-edit: regenerate it. See generated.test.ts for why.",
+ "manifest": {
+  "schema_version": 1,
+  "bundle_id": "review-20260915-bd1bb9",
+  "built_at_utc": "2026-09-15T14:08:18.063019+00:00",
+  "builder": {
+   "script": "scripts/build_review_bundle.py",
+   "git_commit": "9fffea61e0d8cdb44addcf920f79b41ba13e4870",
+   "git_dirty": true,
+   "argv": [
+    "--fixture",
+    "--seed",
+    "424242",
+    "--out-dir",
+    "/tmp/genfx"
+   ],
+   "host": "SDU-57914",
+   "python": "3.12.11"
+  },
+  "corpus": {},
+  "window": {
+   "decision_min": 90,
+   "frame_pad_min": 20
+  },
+  "rule": {
+   "source": "served",
+   "held_out": false,
+   "lead_min": 30,
+   "threshold_pct": 50,
+   "threshold_source": "config",
+   "fold_thresholds": null,
+   "probability": "curve",
+   "probability_column": "p_rain_30",
+   "probability_provenance": "stored",
+   "persistence_obs": 1,
+   "rearm_after_min": 60,
+   "raining_now_mm_h": 0.5,
+   "raining_now_eta_min": 1.5,
+   "coverage_gap_min": 20,
+   "tolerance_min": 10,
+   "min_useful_lead_min": 5.0
+  },
+  "truth": {
+   "dry_min": 60,
+   "onset_min_mm": 0.2,
+   "tolerance_min": 10,
+   "lead_min": 30,
+   "min_useful_lead_min": 5.0,
+   "radar_disc_radius_m": 1000.0,
+   "radar_threshold_mm_h": 0.5,
+   "radar_source": "observed_mm_h in the decision rows",
+   "neighbour_radius_km": 20.0,
+   "dead_gauges": [],
+   "min_known_slots": 500,
+   "known_until": {
+    "06180": "2026-06-02T00:00:00+00:00",
+    "06181": "2026-06-02T00:00:00+00:00",
+    "06182": "2026-06-02T00:00:00+00:00",
+    "06183": "2026-06-02T00:00:00+00:00",
+    "06184": "2026-06-02T00:00:00+00:00",
+    "06185": "2026-06-02T00:00:00+00:00"
+   },
+   "suspect_gauge_months": []
+  },
+  "features": {
+   "probe_column": "obs_max_5km_mm_h",
+   "gap_share": 0.5,
+   "gap_days": [],
+   "allowed": false,
+   "rows_by_day": {
+    "2026-06-01": {
+     "rows": 840,
+     "with_features": 840
+    }
+   },
+   "documentation": {
+    "raw_frac_10": "UNcalibrated ensemble fraction at 10 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+    "raw_frac_20": "UNcalibrated ensemble fraction at 20 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+    "raw_frac_30": "UNcalibrated ensemble fraction at 30 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+    "raw_frac_45": "UNcalibrated ensemble fraction at 45 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+    "raw_frac_60": "UNcalibrated ensemble fraction at 60 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+    "obs_max_5km_mm_h": "Maximum observed rain rate (mm/h) over the native-grid disc of radius 5 km centred on the station, from the same anchor field the cycle forecast from. NaN when no pixel of the disc is inside the composite.",
+    "up_max_20km_mm_h": "Maximum observed rain rate (mm/h) in the upwind corridor 6 km wide and 0-20 km long, laid along the LOCAL completed flow at the station (upwind = opposite the direction the cells move). NaN when the corridor has no pixel inside the composite or the flow gives no usable direction.",
+    "up_max_40km_mm_h": "The same maximum over the 0-40 km corridor.",
+    "up_dist_km": "Distance along the corridor to the nearest pixel at or above 0.5 mm/h, in km, 0 when the station itself is wet. NaN when the 40 km corridor holds no such pixel ('no echo upwind') \u2014 the model turns that into an indicator plus a capped value rather than a large number.",
+    "up_wet_frac_40km": "Share of the 40 km corridor's in-composite pixels at or above 0.5 mm/h. Separates a solid band from a ragged edge at the same maximum intensity.",
+    "bulk_kmh": "Speed of the cycle's bulk storm motion (km/h) \u2014 the target the flow completion relaxes toward (dense_flow.MotionEstimate.bulk_vy/bulk_vx), converted with the frame's own pixel size and spacing.",
+    "bulk_dir_deg": "Compass bearing the bulk motion is heading TOWARD: 0 = north, 90 = east. NaN when the bulk motion is below the usable-speed floor.",
+    "local_speed_kmh": "Speed (km/h) of the COMPLETED flow at the station's own pixel \u2014 the field the forecast is advected with there, which off the echo is the completion's fill rather than a measurement.",
+    "stalled_share": "Share of wet pixels whose RAW flow estimate is below 5 km/h (dense_flow.MotionEstimate.stalled_share). A per-cycle health signal for the H-F stall defect, constant across the cycle's stations.",
+    "season": "'summer' (May-Sep), 'winter' (Dec-Mar) or 'shoulder' (Apr, Oct, Nov), from the decision instant. The same split the threshold sweep and the Layer B strata use.",
+    "hour_utc": "Hour of the decision instant in UTC, 0-23. The model uses it as sin/cos so 23 and 0 are adjacent.",
+    "frame_age_min": "Minutes between the anchor frame's nominal time and the decision instant \u2014 the cycle's own simulated latency under the anchor policy, not a constant.",
+    "station_radar_km": "Great-circle km from the station to the nearest DMI radar (product_pairs.nearest_radar_km). Constant per station; the composite under-detects close to a radar and over-reads column max far from one."
+   }
+  },
+  "sampling": {
+   "seed": 424242,
+   "strata": [
+    "outcome_class",
+    "season",
+    "region",
+    "intensity_band"
+   ],
+   "floor_per_cell": 1,
+   "targets": {
+    "false_alarm": 120,
+    "miss": 100,
+    "late": 20,
+    "hit": 50,
+    "uncovered": 10
+   },
+   "drawn": {
+    "false_alarm": 1,
+    "hit": 2,
+    "late": 1,
+    "miss": 1,
+    "uncovered": 1
+   },
+   "population": {
+    "false_alarm": 1,
+    "hit": 2,
+    "late": 1,
+    "miss": 1,
+    "uncovered": 1
+   },
+   "total_drawn": 6,
+   "population_hash": "352b2d40bfd9c44924422822268a751e781bc9eeb034acf0639409c7563050c6",
+   "collapsed_late_pairs": 1,
+   "control_groups": [
+    "hit",
+    "uncovered"
+   ],
+   "cells": [
+    {
+     "stratum": "false_alarm|summer|Fyn|moderate",
+     "keys": [
+      "false_alarm",
+      "summer",
+      "Fyn",
+      "moderate"
+     ],
+     "group": "false_alarm",
+     "population": 1,
+     "drawn": 1
+    },
+    {
+     "stratum": "hit|summer|Fyn|moderate",
+     "keys": [
+      "hit",
+      "summer",
+      "Fyn",
+      "moderate"
+     ],
+     "group": "hit",
+     "population": 1,
+     "drawn": 1
+    },
+    {
+     "stratum": "hit|summer|Sj\u00e6lland|moderate",
+     "keys": [
+      "hit",
+      "summer",
+      "Sj\u00e6lland",
+      "moderate"
+     ],
+     "group": "hit",
+     "population": 1,
+     "drawn": 1
+    },
+    {
+     "stratum": "late|summer|S\u00f8nderjylland|moderate",
+     "keys": [
+      "late",
+      "summer",
+      "S\u00f8nderjylland",
+      "moderate"
+     ],
+     "group": "late",
+     "population": 1,
+     "drawn": 1
+    },
+    {
+     "stratum": "miss|summer|Nordjylland|heavy",
+     "keys": [
+      "miss",
+      "summer",
+      "Nordjylland",
+      "heavy"
+     ],
+     "group": "miss",
+     "population": 1,
+     "drawn": 1
+    },
+    {
+     "stratum": "uncovered|summer|Sydjylland|heavy",
+     "keys": [
+      "uncovered",
+      "summer",
+      "Sydjylland",
+      "heavy"
+     ],
+     "group": "uncovered",
+     "population": 1,
+     "drawn": 1
+    }
+   ]
+  },
+  "events": {
+   "count": 6
+  },
+  "feature_doc": {
+   "raw_frac_10": "UNcalibrated ensemble fraction at 10 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+   "raw_frac_20": "UNcalibrated ensemble fraction at 20 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+   "raw_frac_30": "UNcalibrated ensemble fraction at 30 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+   "raw_frac_45": "UNcalibrated ensemble fraction at 45 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+   "raw_frac_60": "UNcalibrated ensemble fraction at 60 min \u2014 the share of members whose cumulative max crosses the detection threshold by then, before the served isotonic curve. NaN off coverage.",
+   "obs_max_5km_mm_h": "Maximum observed rain rate (mm/h) over the native-grid disc of radius 5 km centred on the station, from the same anchor field the cycle forecast from. NaN when no pixel of the disc is inside the composite.",
+   "up_max_20km_mm_h": "Maximum observed rain rate (mm/h) in the upwind corridor 6 km wide and 0-20 km long, laid along the LOCAL completed flow at the station (upwind = opposite the direction the cells move). NaN when the corridor has no pixel inside the composite or the flow gives no usable direction.",
+   "up_max_40km_mm_h": "The same maximum over the 0-40 km corridor.",
+   "up_dist_km": "Distance along the corridor to the nearest pixel at or above 0.5 mm/h, in km, 0 when the station itself is wet. NaN when the 40 km corridor holds no such pixel ('no echo upwind') \u2014 the model turns that into an indicator plus a capped value rather than a large number.",
+   "up_wet_frac_40km": "Share of the 40 km corridor's in-composite pixels at or above 0.5 mm/h. Separates a solid band from a ragged edge at the same maximum intensity.",
+   "bulk_kmh": "Speed of the cycle's bulk storm motion (km/h) \u2014 the target the flow completion relaxes toward (dense_flow.MotionEstimate.bulk_vy/bulk_vx), converted with the frame's own pixel size and spacing.",
+   "bulk_dir_deg": "Compass bearing the bulk motion is heading TOWARD: 0 = north, 90 = east. NaN when the bulk motion is below the usable-speed floor.",
+   "local_speed_kmh": "Speed (km/h) of the COMPLETED flow at the station's own pixel \u2014 the field the forecast is advected with there, which off the echo is the completion's fill rather than a measurement.",
+   "stalled_share": "Share of wet pixels whose RAW flow estimate is below 5 km/h (dense_flow.MotionEstimate.stalled_share). A per-cycle health signal for the H-F stall defect, constant across the cycle's stations.",
+   "season": "'summer' (May-Sep), 'winter' (Dec-Mar) or 'shoulder' (Apr, Oct, Nov), from the decision instant. The same split the threshold sweep and the Layer B strata use.",
+   "hour_utc": "Hour of the decision instant in UTC, 0-23. The model uses it as sin/cos so 23 and 0 are adjacent.",
+   "frame_age_min": "Minutes between the anchor frame's nominal time and the decision instant \u2014 the cycle's own simulated latency under the anchor policy, not a constant.",
+   "station_radar_km": "Great-circle km from the station to the nearest DMI radar (product_pairs.nearest_radar_km). Constant per station; the composite under-detects close to a radar and over-reads column max far from one."
+  },
+  "caveats": [
+   {
+    "code": "method_note",
+    "severity": "low",
+    "detail": "The radar verdict comes from the same instrument the forecast was made from, so agreement is a consistency check and not an independent opinion."
+   },
+   {
+    "code": "method_note",
+    "severity": "low",
+    "detail": "The composite is column-max reflectivity, which biases the rate high: virga and bright band read as rain the gauge never sees."
+   },
+   {
+    "code": "method_note",
+    "severity": "low",
+    "detail": "A wet neighbour says rain existed in the area, not at this gauge."
+   },
+   {
+    "code": "method_note",
+    "severity": "low",
+    "detail": "An onset instant is a slot END, so the first drop fell in the preceding 10 minutes and every measured lead is biased that far negative."
+   },
+   {
+    "code": "method_note",
+    "severity": "low",
+    "detail": "The replay resets the engine at every coverage-run boundary, which hands out a re-arm the live service never had; those rows carry run_boundary_rearm."
+   },
+   {
+    "code": "method_note",
+    "severity": "low",
+    "detail": "The threshold table was fitted on these same months: the thresholds are in-sample (held_out=false)."
+   }
+  ],
+  "grid": {
+   "proj4": "+proj=stere +lat_0=56 +lon_0=10.5666 +lat_ts=56 +ellps=WGS84 +units=m +no_defs",
+   "x_ul_m": -31651.108288850006,
+   "y_ul_m": -58566.67081176195,
+   "pixel_scale_x_m": 2000.0,
+   "pixel_scale_y_m": 2000.0,
+   "shape": [
+    16,
+    16
+   ],
+   "downsample_factor": 4
+  },
+  "frames": {
+   "products": [
+    "fullRange"
+   ],
+   "include_doppler": false,
+   "cadence_min": 10,
+   "window_min": 90,
+   "frame_pad_min": 20,
+   "from_utc": "2026-06-01T01:14:00+00:00",
+   "to_utc": "2026-06-01T13:30:00+00:00",
+   "count": 66,
+   "stamps_total": 128,
+   "stamps_unique": 66,
+   "dedup_saving_pct": 48.4,
+   "bytes": 10560,
+   "bytes_written_this_run": 10560,
+   "mean_bytes_per_frame": 160.0,
+   "downsample_factor": 4,
+   "missing": [],
+   "missing_reasons": {},
+   "encodings": {
+    "observed": {
+     "suffix": ".observed.png",
+     "encoding": "grayscale8",
+     "product": "observed_mm_h",
+     "units": "mm/h",
+     "scale": 0.3937007874015748,
+     "offset": 0.0,
+     "nodata": 255,
+     "reduction": "block p90 over 4x4 native 500 m pixels (national.observed_rain_grid); a block is nodata only when every native pixel in it is",
+     "source": "DMI column-max composite, Marshall-Palmer Z-R with the file's own zr-a/zr-b, capped at 53 dBZ and 100 mm/h (transform.dbz_to_rain_rate)",
+     "caveat": "column-max reflectivity biases the rate HIGH (tall cores, virga, bright band) \u2014 an upper-bound proxy for surface rain"
+    },
+    "overlay": {
+     "suffix": ".overlay.png",
+     "encoding": "rgba8",
+     "colormap": "dmi_nowcast_core.render._COLORMAP_STOPS",
+     "colormap_stops": [
+      {
+       "mm_h": 0.05000000074505806,
+       "rgb": [
+        0,
+        0,
+        255
+       ]
+      },
+      {
+       "mm_h": 0.20000000298023224,
+       "rgb": [
+        0,
+        150,
+        255
+       ]
+      },
+      {
+       "mm_h": 0.5,
+       "rgb": [
+        0,
+        220,
+        220
+       ]
+      },
+      {
+       "mm_h": 1.0,
+       "rgb": [
+        0,
+        200,
+        60
+       ]
+      },
+      {
+       "mm_h": 2.5,
+       "rgb": [
+        220,
+        220,
+        0
+       ]
+      },
+      {
+       "mm_h": 5.0,
+       "rgb": [
+        255,
+        140,
+        0
+       ]
+      },
+      {
+       "mm_h": 15.0,
+       "rgb": [
+        230,
+        30,
+        30
+       ]
+      },
+      {
+       "mm_h": 50.0,
+       "rgb": [
+        200,
+        20,
+        220
+       ]
+      }
+     ],
+     "interpolation": "linear in log10(mm/h) per channel",
+     "alpha_ramp": "transparent below 0.3 mm/h; alpha 70 -> 255 linear in log10(mm/h) from 0.3 to 2.0 mm/h; opaque above",
+     "floor_mm_h": 0.3,
+     "solid_mm_h": 2.0,
+     "min_alpha": 70
+    }
+   }
+  }
+ },
+ "index": {
+  "schema_version": 1,
+  "bundle_id": "review-20260915-bd1bb9",
+  "events": [
+   {
+    "event_id": "fa-06181-20260601T0314Z",
+    "class": "false_alarm",
+    "control": false,
+    "station_id": "06181",
+    "station_name": "Fixture Odense",
+    "region": "Fyn",
+    "lat": 55.33,
+    "lon": 10.32,
+    "anchor_utc": "2026-06-01T03:14:00+00:00",
+    "sent_utc": "2026-06-01T03:14:00+00:00",
+    "onset_utc": null,
+    "eta_min": 20.0,
+    "eta_arrival_utc": "2026-06-01T03:34:00+00:00",
+    "p_decision": 0.9006414588891635,
+    "p_decision_source": "curve",
+    "threshold_pct": 50,
+    "lead_error_min": null,
+    "dual_truth": "both_dry",
+    "gauge_wet_in_window": false,
+    "radar_wet_in_window": false,
+    "neighbour_wet_in_window": true,
+    "neighbour_n_known": 1,
+    "season": "summer",
+    "hour_utc": 3,
+    "intensity_band": "moderate",
+    "intensity_mm_h": 3.1019243766674904,
+    "intensity_band_source": "forecast_intensity_mm_h",
+    "onset_two_slot_mm": null,
+    "arm_state_at_anchor": "armed",
+    "minutes_to_rearm_at_anchor": null,
+    "frames": 21,
+    "frames_missing": 0,
+    "flags": [],
+    "stratum": {
+     "outcome_class": "false_alarm",
+     "season": "summer",
+     "region": "Fyn",
+     "intensity_band": "moderate"
+    },
+    "detail": "events/fa-06181-20260601T0314Z.json"
+   },
+   {
+    "event_id": "hit-06185-20260601T0314Z",
+    "class": "hit",
+    "control": true,
+    "station_id": "06185",
+    "station_name": "Fixture Ringe",
+    "region": "Fyn",
+    "lat": 55.24,
+    "lon": 10.4,
+    "anchor_utc": "2026-06-01T03:14:00+00:00",
+    "sent_utc": "2026-06-01T03:14:00+00:00",
+    "onset_utc": "2026-06-01T03:40:00+00:00",
+    "eta_min": 20.0,
+    "eta_arrival_utc": "2026-06-01T03:34:00+00:00",
+    "p_decision": 0.8569006866103809,
+    "p_decision_source": "curve",
+    "threshold_pct": 50,
+    "lead_error_min": -6.0,
+    "dual_truth": "both_wet",
+    "gauge_wet_in_window": true,
+    "radar_wet_in_window": true,
+    "neighbour_wet_in_window": false,
+    "neighbour_n_known": 1,
+    "season": "summer",
+    "hour_utc": 3,
+    "intensity_band": "moderate",
+    "intensity_mm_h": 2.9707020598311424,
+    "intensity_band_source": "forecast_intensity_mm_h",
+    "onset_two_slot_mm": 2.0,
+    "arm_state_at_anchor": "armed",
+    "minutes_to_rearm_at_anchor": null,
+    "frames": 21,
+    "frames_missing": 0,
+    "flags": [],
+    "stratum": {
+     "outcome_class": "hit",
+     "season": "summer",
+     "region": "Fyn",
+     "intensity_band": "moderate"
+    },
+    "detail": "events/hit-06185-20260601T0314Z.json"
+   },
+   {
+    "event_id": "miss-06182-20260601T1200Z",
+    "class": "miss",
+    "control": false,
+    "station_id": "06182",
+    "station_name": "Fixture Aalborg",
+    "region": "Nordjylland",
+    "lat": 57.05,
+    "lon": 9.9,
+    "anchor_utc": "2026-06-01T12:00:00+00:00",
+    "sent_utc": null,
+    "onset_utc": "2026-06-01T12:00:00+00:00",
+    "eta_min": null,
+    "eta_arrival_utc": null,
+    "p_decision": 0.02931909457769833,
+    "p_decision_source": "curve",
+    "threshold_pct": 50,
+    "lead_error_min": null,
+    "dual_truth": "both_wet",
+    "gauge_wet_in_window": true,
+    "radar_wet_in_window": true,
+    "neighbour_wet_in_window": null,
+    "neighbour_n_known": 0,
+    "season": "summer",
+    "hour_utc": 12,
+    "intensity_band": "heavy",
+    "intensity_mm_h": null,
+    "intensity_band_source": "onset_two_slot_mm",
+    "onset_two_slot_mm": 2.0,
+    "arm_state_at_anchor": "armed",
+    "minutes_to_rearm_at_anchor": null,
+    "frames": 22,
+    "frames_missing": 0,
+    "flags": [],
+    "stratum": {
+     "outcome_class": "miss",
+     "season": "summer",
+     "region": "Nordjylland",
+     "intensity_band": "heavy"
+    },
+    "detail": "events/miss-06182-20260601T1200Z.json"
+   },
+   {
+    "event_id": "late-06184-20260601T0516Z",
+    "class": "late",
+    "control": false,
+    "station_id": "06184",
+    "station_name": "Fixture T\u00f8nder",
+    "region": "S\u00f8nderjylland",
+    "lat": 54.95,
+    "lon": 8.87,
+    "anchor_utc": "2026-06-01T05:16:00+00:00",
+    "sent_utc": "2026-06-01T05:16:00+00:00",
+    "onset_utc": "2026-06-01T05:20:00+00:00",
+    "eta_min": 20.0,
+    "eta_arrival_utc": "2026-06-01T05:36:00+00:00",
+    "p_decision": 0.8915225894090625,
+    "p_decision_source": "curve",
+    "threshold_pct": 50,
+    "lead_error_min": 16.0,
+    "dual_truth": "both_wet",
+    "gauge_wet_in_window": true,
+    "radar_wet_in_window": true,
+    "neighbour_wet_in_window": null,
+    "neighbour_n_known": 0,
+    "season": "summer",
+    "hour_utc": 5,
+    "intensity_band": "moderate",
+    "intensity_mm_h": 3.0745677682271872,
+    "intensity_band_source": "forecast_intensity_mm_h",
+    "onset_two_slot_mm": 2.0,
+    "arm_state_at_anchor": "armed",
+    "minutes_to_rearm_at_anchor": null,
+    "frames": 21,
+    "frames_missing": 0,
+    "flags": [],
+    "stratum": {
+     "outcome_class": "late",
+     "season": "summer",
+     "region": "S\u00f8nderjylland",
+     "intensity_band": "moderate"
+    },
+    "detail": "events/late-06184-20260601T0516Z.json"
+   },
+   {
+    "event_id": "unc-06183-20260601T0700Z",
+    "class": "uncovered",
+    "control": true,
+    "station_id": "06183",
+    "station_name": "Fixture Esbjerg",
+    "region": "Sydjylland",
+    "lat": 55.53,
+    "lon": 8.55,
+    "anchor_utc": "2026-06-01T07:00:00+00:00",
+    "sent_utc": null,
+    "onset_utc": "2026-06-01T07:00:00+00:00",
+    "eta_min": null,
+    "eta_arrival_utc": null,
+    "p_decision": 0.039125747758542245,
+    "p_decision_source": "curve",
+    "threshold_pct": 50,
+    "lead_error_min": null,
+    "dual_truth": null,
+    "gauge_wet_in_window": true,
+    "radar_wet_in_window": null,
+    "neighbour_wet_in_window": null,
+    "neighbour_n_known": 0,
+    "season": "summer",
+    "hour_utc": 7,
+    "intensity_band": "heavy",
+    "intensity_mm_h": null,
+    "intensity_band_source": "onset_two_slot_mm",
+    "onset_two_slot_mm": 2.0,
+    "arm_state_at_anchor": "armed",
+    "minutes_to_rearm_at_anchor": null,
+    "frames": 22,
+    "frames_missing": 0,
+    "flags": [
+     "coverage_gap"
+    ],
+    "stratum": {
+     "outcome_class": "uncovered",
+     "season": "summer",
+     "region": "Sydjylland",
+     "intensity_band": "heavy"
+    },
+    "detail": "events/unc-06183-20260601T0700Z.json"
+   },
+   {
+    "event_id": "hit-06180-20260601T0314Z",
+    "class": "hit",
+    "control": true,
+    "station_id": "06180",
+    "station_name": "Fixture K\u00f8ge",
+    "region": "Sj\u00e6lland",
+    "lat": 55.45,
+    "lon": 12.1,
+    "anchor_utc": "2026-06-01T03:14:00+00:00",
+    "sent_utc": "2026-06-01T03:14:00+00:00",
+    "onset_utc": "2026-06-01T03:40:00+00:00",
+    "eta_min": 20.0,
+    "eta_arrival_utc": "2026-06-01T03:34:00+00:00",
+    "p_decision": 0.8512330811539286,
+    "p_decision_source": "curve",
+    "threshold_pct": 50,
+    "lead_error_min": -6.0,
+    "dual_truth": "both_wet",
+    "gauge_wet_in_window": true,
+    "radar_wet_in_window": true,
+    "neighbour_wet_in_window": null,
+    "neighbour_n_known": 0,
+    "season": "summer",
+    "hour_utc": 3,
+    "intensity_band": "moderate",
+    "intensity_mm_h": 2.9536992434617857,
+    "intensity_band_source": "forecast_intensity_mm_h",
+    "onset_two_slot_mm": 2.0,
+    "arm_state_at_anchor": "armed",
+    "minutes_to_rearm_at_anchor": null,
+    "frames": 21,
+    "frames_missing": 0,
+    "flags": [],
+    "stratum": {
+     "outcome_class": "hit",
+     "season": "summer",
+     "region": "Sj\u00e6lland",
+     "intensity_band": "moderate"
+    },
+    "detail": "events/hit-06180-20260601T0314Z.json"
+   }
+  ]
+ },
+ "vocabulary": {
+  "vocab_version": 1,
+  "verdicts": [
+   {
+    "code": "real_failure",
+    "description": "The forecast was wrong in a way a better model or rule could fix."
+   },
+   {
+    "code": "metric_artefact",
+    "description": "The forecast was defensible; the label came from the scoring rule \u2014 the onset definition, the matching window, the re-arm, a low-catch gauge, or coverage."
+   },
+   {
+    "code": "unclear",
+    "description": "The evidence in the bundle does not settle it."
+   }
+  ],
+  "tag_groups": [
+   {
+    "group": "false_alarm",
+    "label": "Why did it warn with no rain?",
+    "tags": [
+     {
+      "code": "fa_cell_died",
+      "description": "Echo existed upstream (up_max_20/40km_mm_h > 0) and decayed before arrival. STEPS advects; it carries no deterministic growth or decay."
+     },
+     {
+      "code": "fa_cell_diverted",
+      "description": "The echo passed to one side: the completed flow at the station (local_speed_kmh, bulk_dir_deg) differed from the cell's own motion."
+     },
+     {
+      "code": "fa_arrived_late",
+      "description": "The rain did come, but after sent + lead + tolerance, so the greedy matching window would not let this warning claim the onset."
+     },
+     {
+      "code": "fa_arrived_early",
+      "description": "The rain came before the warning could be useful; a neighbouring claim carries a large positive lead_error_min."
+     },
+     {
+      "code": "fa_virga_or_aloft",
+      "description": "Column-max reflectivity over a dry gauge \u2014 the documented composite bias. Radar wet, gauge dry, neighbours dry."
+     },
+     {
+      "code": "fa_clutter_or_bright_band",
+      "description": "Stationary echo across frames, or a high stalled_share; small station_radar_km (near-radar clutter) or large (melting layer)."
+     },
+     {
+      "code": "fa_drizzle_below_gauge_floor",
+      "description": "Radar 0.5-1 mm/h; the gauge stayed below 0.1 mm per slot or below the 0.2 mm two-slot onset floor. Real rain, not a countable onset."
+     },
+     {
+      "code": "fa_gauge_missed_it",
+      "description": "Neighbours wet, this gauge dry with known=true: wind loss, low catch, or a gauge not yet dead by the dead_gauges rule."
+     },
+     {
+      "code": "fa_gauge_unreported",
+      "description": "The window's slots are known=false. There is no truth here, and known_until / pending did not catch it."
+     },
+     {
+      "code": "fa_already_raining",
+      "description": "Rain was already falling before the warning, so the onset rule's 60 dry minutes was never satisfied. The engine's already-raining test reads only the current row."
+     },
+     {
+      "code": "fa_probability_saturated",
+      "description": "raw_frac_<lead> pinned at 1.0 \u2014 ensemble saturation; visible as p_rain much greater than p_post, or both pinned."
+     },
+     {
+      "code": "fa_threshold_marginal",
+      "description": "p_decision within 5 points of the threshold: a coin flip, not a mechanism. Tag it so it does not pollute the mechanism counts."
+     },
+     {
+      "code": "fa_stale_frame",
+      "description": "frame_age_min >= 20, or a coverage gap immediately before: the decision stood on an old composite."
+     },
+     {
+      "code": "fa_edge_of_coverage",
+      "description": "observed_mm_h null, few valid pixels in the disc, or the station near a composite or radar edge."
+     },
+     {
+      "code": "fa_other",
+      "description": "Something else. Requires a note."
+     }
+    ]
+   },
+   {
+    "group": "miss",
+    "label": "Why was there no warning?",
+    "tags": [
+     {
+      "code": "miss_disarmed_rearm",
+      "description": "Disarmed at the onset with the 60-minute re-arm unexpired: structurally unreachable. If this is a large share of misses, the finding is a rule change, not a model change."
+     },
+     {
+      "code": "miss_arm_consumed_already_raining",
+      "description": "The arm was consumed silently by the already-raining branch before the onset \u2014 no push, still disarmed."
+     },
+     {
+      "code": "miss_below_threshold",
+      "description": "p_decision peaked below the threshold across the whole pre-onset window: sharpness or calibration, not plumbing."
+     },
+     {
+      "code": "miss_no_probability",
+      "description": "Both p_post and p_rain were null at the rule's lead, so the engine passed over those rows (off coverage, unserved lead, feature gap)."
+     },
+     {
+      "code": "miss_convective_initiation",
+      "description": "Nothing upstream at -30 min (up_max_40km_mm_h near zero, up_dist_km NaN): the rain grew in place, which advection cannot see."
+     },
+     {
+      "code": "miss_too_fast",
+      "description": "Rain was upstream but arrived sooner than the lead could cover: small up_dist_km with high bulk_kmh."
+     },
+     {
+      "code": "miss_frame_age_ate_the_lead",
+      "description": "frame_age_min plus the arrival time exceeded the lead. A fresher anchor would have warned."
+     },
+     {
+      "code": "miss_coverage_gap",
+      "description": "Decision rows are missing around the onset even though the coverage rule did not call it uncovered."
+     },
+     {
+      "code": "miss_radar_saw_nothing",
+      "description": "The disc stayed dry through the onset: beam overshoot or shallow rain, typically at large station_radar_km."
+     },
+     {
+      "code": "miss_gauge_spurious_onset",
+      "description": "An isolated 0.2 mm with no radar and no neighbour: a suspect onset (heated gauge, dew, a bumped bucket)."
+     },
+     {
+      "code": "miss_snow_or_sleet",
+      "description": "Winter, long precip duration with tiny depth, weak radar: the Z-R relation is rain-tuned."
+     },
+     {
+      "code": "miss_onset_definition_artefact",
+      "description": "The 'new' onset is a continuation whose dry run was reset by an UNKNOWN slot rather than a dry one."
+     },
+     {
+      "code": "miss_threshold_marginal",
+      "description": "Peak p_decision within 5 points below the threshold."
+     },
+     {
+      "code": "miss_other",
+      "description": "Something else. Requires a note."
+     }
+    ]
+   },
+   {
+    "group": "common",
+    "label": "Either way",
+    "tags": [
+     {
+      "code": "needs_better_imagery",
+      "description": "The +/-90 minute window or the 2 km product grid was not enough to judge this one. Candidate for a --deepen re-run."
+     },
+     {
+      "code": "interesting",
+      "description": "Worth coming back to, or worth showing someone."
+     }
+    ]
+   }
+  ],
+  "non_mechanism": [
+   "fa_other",
+   "fa_threshold_marginal",
+   "interesting",
+   "miss_other",
+   "miss_threshold_marginal",
+   "needs_better_imagery"
+  ],
+  "classes": {
+   "false_alarm": [
+    "fa_already_raining",
+    "fa_arrived_early",
+    "fa_arrived_late",
+    "fa_cell_died",
+    "fa_cell_diverted",
+    "fa_clutter_or_bright_band",
+    "fa_drizzle_below_gauge_floor",
+    "fa_edge_of_coverage",
+    "fa_gauge_missed_it",
+    "fa_gauge_unreported",
+    "fa_other",
+    "fa_probability_saturated",
+    "fa_stale_frame",
+    "fa_threshold_marginal",
+    "fa_virga_or_aloft",
+    "interesting",
+    "needs_better_imagery"
+   ],
+   "miss": [
+    "interesting",
+    "miss_arm_consumed_already_raining",
+    "miss_below_threshold",
+    "miss_convective_initiation",
+    "miss_coverage_gap",
+    "miss_disarmed_rearm",
+    "miss_frame_age_ate_the_lead",
+    "miss_gauge_spurious_onset",
+    "miss_no_probability",
+    "miss_onset_definition_artefact",
+    "miss_other",
+    "miss_radar_saw_nothing",
+    "miss_snow_or_sleet",
+    "miss_threshold_marginal",
+    "miss_too_fast",
+    "needs_better_imagery"
+   ],
+   "miss_late": [
+    "interesting",
+    "miss_arm_consumed_already_raining",
+    "miss_below_threshold",
+    "miss_convective_initiation",
+    "miss_coverage_gap",
+    "miss_disarmed_rearm",
+    "miss_frame_age_ate_the_lead",
+    "miss_gauge_spurious_onset",
+    "miss_no_probability",
+    "miss_onset_definition_artefact",
+    "miss_other",
+    "miss_radar_saw_nothing",
+    "miss_snow_or_sleet",
+    "miss_threshold_marginal",
+    "miss_too_fast",
+    "needs_better_imagery"
+   ],
+   "late": [
+    "fa_already_raining",
+    "fa_arrived_early",
+    "fa_arrived_late",
+    "fa_cell_died",
+    "fa_cell_diverted",
+    "fa_clutter_or_bright_band",
+    "fa_drizzle_below_gauge_floor",
+    "fa_edge_of_coverage",
+    "fa_gauge_missed_it",
+    "fa_gauge_unreported",
+    "fa_other",
+    "fa_probability_saturated",
+    "fa_stale_frame",
+    "fa_threshold_marginal",
+    "fa_virga_or_aloft",
+    "interesting",
+    "needs_better_imagery"
+   ],
+   "hit": [
+    "fa_already_raining",
+    "fa_arrived_early",
+    "fa_arrived_late",
+    "fa_cell_died",
+    "fa_cell_diverted",
+    "fa_clutter_or_bright_band",
+    "fa_drizzle_below_gauge_floor",
+    "fa_edge_of_coverage",
+    "fa_gauge_missed_it",
+    "fa_gauge_unreported",
+    "fa_other",
+    "fa_probability_saturated",
+    "fa_stale_frame",
+    "fa_threshold_marginal",
+    "fa_virga_or_aloft",
+    "interesting",
+    "miss_arm_consumed_already_raining",
+    "miss_below_threshold",
+    "miss_convective_initiation",
+    "miss_coverage_gap",
+    "miss_disarmed_rearm",
+    "miss_frame_age_ate_the_lead",
+    "miss_gauge_spurious_onset",
+    "miss_no_probability",
+    "miss_onset_definition_artefact",
+    "miss_other",
+    "miss_radar_saw_nothing",
+    "miss_snow_or_sleet",
+    "miss_threshold_marginal",
+    "miss_too_fast",
+    "needs_better_imagery"
+   ],
+   "uncovered": [
+    "interesting",
+    "miss_arm_consumed_already_raining",
+    "miss_below_threshold",
+    "miss_convective_initiation",
+    "miss_coverage_gap",
+    "miss_disarmed_rearm",
+    "miss_frame_age_ate_the_lead",
+    "miss_gauge_spurious_onset",
+    "miss_no_probability",
+    "miss_onset_definition_artefact",
+    "miss_other",
+    "miss_radar_saw_nothing",
+    "miss_snow_or_sleet",
+    "miss_threshold_marginal",
+    "miss_too_fast",
+    "needs_better_imagery"
+   ]
+  }
+ },
+ "details": {
+  "fa-06181-20260601T0314Z": {
+   "schema_version": 1,
+   "bundle_id": "review-20260915-bd1bb9",
+   "event_id": "fa-06181-20260601T0314Z",
+   "index": {
+    "event_id": "fa-06181-20260601T0314Z",
+    "class": "false_alarm",
+    "control": false,
+    "station_id": "06181",
+    "station_name": "Fixture Odense",
+    "region": "Fyn",
+    "lat": 55.33,
+    "lon": 10.32,
+    "anchor_utc": "2026-06-01T03:14:00+00:00",
+    "sent_utc": "2026-06-01T03:14:00+00:00",
+    "onset_utc": null,
+    "eta_min": 20.0,
+    "eta_arrival_utc": "2026-06-01T03:34:00+00:00",
+    "p_decision": 0.9006414588891635,
+    "p_decision_source": "curve",
+    "threshold_pct": 50,
+    "lead_error_min": null,
+    "dual_truth": "both_dry",
+    "gauge_wet_in_window": false,
+    "radar_wet_in_window": false,
+    "neighbour_wet_in_window": true,
+    "neighbour_n_known": 1,
+    "season": "summer",
+    "hour_utc": 3,
+    "intensity_band": "moderate",
+    "intensity_mm_h": 3.1019243766674904,
+    "intensity_band_source": "forecast_intensity_mm_h",
+    "onset_two_slot_mm": null,
+    "arm_state_at_anchor": "armed",
+    "minutes_to_rearm_at_anchor": null,
+    "frames": 21,
+    "frames_missing": 0,
+    "flags": [],
+    "stratum": {
+     "outcome_class": "false_alarm",
+     "season": "summer",
+     "region": "Fyn",
+     "intensity_band": "moderate"
+    },
+    "detail": "events/fa-06181-20260601T0314Z.json"
+   },
+   "station": {
+    "station_id": "06181",
+    "name": "Fixture Odense",
+    "lat": 55.33,
+    "lon": 10.32,
+    "region": "Fyn",
+    "station_radar_km": 45.0,
+    "grid": {
+     "row": 7.999999999780015,
+     "col": 8.000000000001608
+    },
+    "known_until_utc": "2026-06-02T00:00:00+00:00",
+    "dead_gauge": false,
+    "neighbours": [
+     {
+      "station_id": "06185",
+      "station_name": "Fixture Ringe",
+      "distance_km": 11.217
+     }
+    ]
+   },
+   "window": {
+    "anchor_utc": "2026-06-01T03:14:00+00:00",
+    "from_utc": "2026-06-01T01:44:00+00:00",
+    "to_utc": "2026-06-01T04:44:00+00:00",
+    "decision_min": 90,
+    "frames_from_utc": "2026-06-01T01:14:00+00:00",
+    "frames_to_utc": "2026-06-01T04:44:00+00:00",
+    "frame_pad_min": 20,
+    "frame_cadence_min": 10,
+    "slot_from_utc": "2026-06-01T01:14:00+00:00",
+    "slot_to_utc": "2026-06-01T05:24:00+00:00",
+    "known_until_utc": "2026-06-02T00:00:00+00:00",
+    "verdict": {
+     "kind": "warning",
+     "from_utc": "2026-06-01T03:14:00+00:00",
+     "to_utc": "2026-06-01T03:54:00+00:00",
+     "rule": "(sent, sent + 30 min lead + 10 min tolerance]"
+    }
+   },
+   "decisions": [
+    {
+     "radar_ts_utc": "2026-06-01T01:50:00+00:00",
+     "generated_at_utc": "2026-06-01T02:04:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010150",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05161135917525027,
+      "20": 0.05161135917525027,
+      "30": 0.05161135917525027,
+      "45": 0.05161135917525027,
+      "60": 0.05161135917525027
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05161135917525027,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T02:24:00+00:00",
+     "intensity_mm_h": 0.5548340775257508,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.10322271835050054,
+      "up_max_20km_mm_h": 0.1548340775257508,
+      "up_max_40km_mm_h": 0.20644543670100107,
+      "up_dist_km": 28.451659224742492,
+      "up_wet_frac_40km": 0.05161135917525027,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 2
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05161135917525027
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T01:30:00+00:00",
+      "generated_at_utc": "2026-06-01T01:44:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.04209601141760602,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5262880342528181,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:00:00+00:00",
+     "generated_at_utc": "2026-06-01T02:14:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010200",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.04105573568512663,
+      "20": 0.04105573568512663,
+      "30": 0.04105573568512663,
+      "45": 0.04105573568512663,
+      "60": 0.04105573568512663
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.04105573568512663,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T02:34:00+00:00",
+     "intensity_mm_h": 0.5231672070553799,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.08211147137025326,
+      "up_max_20km_mm_h": 0.1231672070553799,
+      "up_max_40km_mm_h": 0.16422294274050653,
+      "up_dist_km": 28.7683279294462,
+      "up_wet_frac_40km": 0.04105573568512663,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 2
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.04105573568512663
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T01:40:00+00:00",
+      "generated_at_utc": "2026-06-01T01:54:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.04970121824155903,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.549103654724677,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:10:00+00:00",
+     "generated_at_utc": "2026-06-01T02:24:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010210",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05499218534126301,
+      "20": 0.05499218534126301,
+      "30": 0.05499218534126301,
+      "45": 0.05499218534126301,
+      "60": 0.05499218534126301
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05499218534126301,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T02:44:00+00:00",
+     "intensity_mm_h": 0.564976556023789,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.10998437068252602,
+      "up_max_20km_mm_h": 0.16497655602378902,
+      "up_max_40km_mm_h": 0.21996874136505204,
+      "up_dist_km": 28.350234439762108,
+      "up_wet_frac_40km": 0.05499218534126301,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 2
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05499218534126301
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T01:50:00+00:00",
+      "generated_at_utc": "2026-06-01T02:04:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.05161135917525027,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5548340775257508,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:20:00+00:00",
+     "generated_at_utc": "2026-06-01T02:34:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010220",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05387752339093189,
+      "20": 0.05387752339093189,
+      "30": 0.05387752339093189,
+      "45": 0.05387752339093189,
+      "60": 0.05387752339093189
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05387752339093189,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T02:54:00+00:00",
+     "intensity_mm_h": 0.5616325701727957,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.10775504678186378,
+      "up_max_20km_mm_h": 0.16163257017279567,
+      "up_max_40km_mm_h": 0.21551009356372755,
+      "up_dist_km": 28.383674298272044,
+      "up_wet_frac_40km": 0.05387752339093189,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 2
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05387752339093189
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T02:00:00+00:00",
+      "generated_at_utc": "2026-06-01T02:14:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.04105573568512663,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5231672070553799,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:30:00+00:00",
+     "generated_at_utc": "2026-06-01T02:44:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010230",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05065049719601371,
+      "20": 0.05065049719601371,
+      "30": 0.05065049719601371,
+      "45": 0.05065049719601371,
+      "60": 0.05065049719601371
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05065049719601371,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T03:04:00+00:00",
+     "intensity_mm_h": 0.5519514915880411,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.10130099439202742,
+      "up_max_20km_mm_h": 0.1519514915880411,
+      "up_max_40km_mm_h": 0.20260198878405483,
+      "up_dist_km": 28.48048508411959,
+      "up_wet_frac_40km": 0.05065049719601371,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 2
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05065049719601371
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T02:10:00+00:00",
+      "generated_at_utc": "2026-06-01T02:24:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.05499218534126301,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.564976556023789,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:40:00+00:00",
+     "generated_at_utc": "2026-06-01T02:54:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010240",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05749031922070874,
+      "20": 0.05749031922070874,
+      "30": 0.05749031922070874,
+      "45": 0.05749031922070874,
+      "60": 0.05749031922070874
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05749031922070874,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T03:14:00+00:00",
+     "intensity_mm_h": 0.5724709576621263,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.11498063844141748,
+      "up_max_20km_mm_h": 0.17247095766212622,
+      "up_max_40km_mm_h": 0.22996127688283496,
+      "up_dist_km": 28.275290423378735,
+      "up_wet_frac_40km": 0.05749031922070874,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 2
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05749031922070874
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T02:20:00+00:00",
+      "generated_at_utc": "2026-06-01T02:34:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.05387752339093189,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5616325701727957,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:50:00+00:00",
+     "generated_at_utc": "2026-06-01T03:04:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010250",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.0452506761957837,
+      "20": 0.0452506761957837,
+      "30": 0.0452506761957837,
+      "45": 0.0452506761957837,
+      "60": 0.0452506761957837
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.0452506761957837,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T03:24:00+00:00",
+     "intensity_mm_h": 0.5357520285873512,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.0905013523915674,
+      "up_max_20km_mm_h": 0.13575202858735108,
+      "up_max_40km_mm_h": 0.1810027047831348,
+      "up_dist_km": 28.642479714126488,
+      "up_wet_frac_40km": 0.0452506761957837,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 3
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.0452506761957837
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T02:30:00+00:00",
+      "generated_at_utc": "2026-06-01T02:44:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.05065049719601371,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5519514915880411,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:00:00+00:00",
+     "generated_at_utc": "2026-06-01T03:14:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010300",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.9006414588891635,
+      "20": 0.9006414588891635,
+      "30": 0.9006414588891635,
+      "45": 0.9006414588891635,
+      "60": 0.9006414588891635
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.9006414588891635,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": true,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T03:34:00+00:00",
+     "intensity_mm_h": 3.1019243766674904,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 1.801282917778327,
+      "up_max_20km_mm_h": 2.7019243766674905,
+      "up_max_40km_mm_h": 3.602565835556654,
+      "up_dist_km": 2.9807562333250956,
+      "up_wet_frac_40km": 0.9006414588891635,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 3
+     },
+     "features_present": true,
+     "replay": {
+      "action": "notify",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": false,
+      "streak_before": 0,
+      "streak_after": 1,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.9006414588891635
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T02:40:00+00:00",
+      "generated_at_utc": "2026-06-01T02:54:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.05749031922070874,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5724709576621263,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:10:00+00:00",
+     "generated_at_utc": "2026-06-01T03:24:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010310",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.9070790980313661,
+      "20": 0.9070790980313661,
+      "30": 0.9070790980313661,
+      "45": 0.9070790980313661,
+      "60": 0.9070790980313661
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.9070790980313661,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": true,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T03:44:00+00:00",
+     "intensity_mm_h": 3.1212372940940982,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 1.8141581960627322,
+      "up_max_20km_mm_h": 2.7212372940940983,
+      "up_max_40km_mm_h": 3.6283163921254644,
+      "up_dist_km": 2.787627059059017,
+      "up_wet_frac_40km": 0.9070790980313661,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 3
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 1,
+      "streak_after": 2,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.9070790980313661
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T02:50:00+00:00",
+      "generated_at_utc": "2026-06-01T03:04:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.0452506761957837,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5357520285873512,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:20:00+00:00",
+     "generated_at_utc": "2026-06-01T03:34:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010320",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.9099345209163096,
+      "20": 0.9099345209163096,
+      "30": 0.9099345209163096,
+      "45": 0.9099345209163096,
+      "60": 0.9099345209163096
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.9099345209163096,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": true,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T03:54:00+00:00",
+     "intensity_mm_h": 3.1298035627489287,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 1.819869041832619,
+      "up_max_20km_mm_h": 2.7298035627489288,
+      "up_max_40km_mm_h": 3.639738083665238,
+      "up_dist_km": 2.701964372510713,
+      "up_wet_frac_40km": 0.9099345209163096,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 3
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 2,
+      "streak_after": 3,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.9099345209163096
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T03:00:00+00:00",
+      "generated_at_utc": "2026-06-01T03:14:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.9006414588891635,
+      "eta_min": 20.0,
+      "intensity_mm_h": 3.1019243766674904,
+      "observed_mm_h": 0.0,
+      "action": "notify"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:30:00+00:00",
+     "generated_at_utc": "2026-06-01T03:44:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010330",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.9049087536739713,
+      "20": 0.9049087536739713,
+      "30": 0.9049087536739713,
+      "45": 0.9049087536739713,
+      "60": 0.9049087536739713
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.9049087536739713,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": true,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T04:04:00+00:00",
+     "intensity_mm_h": 3.114726261021914,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 1.8098175073479426,
+      "up_max_20km_mm_h": 2.714726261021914,
+      "up_max_40km_mm_h": 3.619635014695885,
+      "up_dist_km": 2.8527373897808617,
+      "up_wet_frac_40km": 0.9049087536739713,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 3
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 3,
+      "streak_after": 4,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.9049087536739713
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T03:10:00+00:00",
+      "generated_at_utc": "2026-06-01T03:24:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.9070790980313661,
+      "eta_min": 20.0,
+      "intensity_mm_h": 3.1212372940940982,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:40:00+00:00",
+     "generated_at_utc": "2026-06-01T03:54:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010340",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.04395260019979512,
+      "20": 0.04395260019979512,
+      "30": 0.04395260019979512,
+      "45": 0.04395260019979512,
+      "60": 0.04395260019979512
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.04395260019979512,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T04:14:00+00:00",
+     "intensity_mm_h": 0.5318578005993854,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.08790520039959024,
+      "up_max_20km_mm_h": 0.13185780059938534,
+      "up_max_40km_mm_h": 0.17581040079918048,
+      "up_dist_km": 28.681421994006147,
+      "up_wet_frac_40km": 0.04395260019979512,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 3
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 4,
+      "streak_after": 0,
+      "below_since_utc": "2026-06-01T03:40:00+00:00",
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.04395260019979512
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T03:20:00+00:00",
+      "generated_at_utc": "2026-06-01T03:34:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.9099345209163096,
+      "eta_min": 20.0,
+      "intensity_mm_h": 3.1298035627489287,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:50:00+00:00",
+     "generated_at_utc": "2026-06-01T04:04:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010350",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05393096816398188,
+      "20": 0.05393096816398188,
+      "30": 0.05393096816398188,
+      "45": 0.05393096816398188,
+      "60": 0.05393096816398188
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05393096816398188,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T04:24:00+00:00",
+     "intensity_mm_h": 0.5617929044919456,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.10786193632796376,
+      "up_max_20km_mm_h": 0.16179290449194564,
+      "up_max_40km_mm_h": 0.21572387265592752,
+      "up_dist_km": 28.382070955080543,
+      "up_wet_frac_40km": 0.05393096816398188,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 4
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": "2026-06-01T03:40:00+00:00",
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05393096816398188
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T03:30:00+00:00",
+      "generated_at_utc": "2026-06-01T03:44:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.9049087536739713,
+      "eta_min": 20.0,
+      "intensity_mm_h": 3.114726261021914,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:00:00+00:00",
+     "generated_at_utc": "2026-06-01T04:14:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010400",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.057564025383976515,
+      "20": 0.057564025383976515,
+      "30": 0.057564025383976515,
+      "45": 0.057564025383976515,
+      "60": 0.057564025383976515
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.057564025383976515,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T04:34:00+00:00",
+     "intensity_mm_h": 0.5726920761519296,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.11512805076795303,
+      "up_max_20km_mm_h": 0.17269207615192955,
+      "up_max_40km_mm_h": 0.23025610153590606,
+      "up_dist_km": 28.273079238480705,
+      "up_wet_frac_40km": 0.057564025383976515,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 4
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": "2026-06-01T03:40:00+00:00",
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.057564025383976515
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T03:40:00+00:00",
+      "generated_at_utc": "2026-06-01T03:54:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.04395260019979512,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5318578005993854,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:10:00+00:00",
+     "generated_at_utc": "2026-06-01T04:24:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010410",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05881193562975336,
+      "20": 0.05881193562975336,
+      "30": 0.05881193562975336,
+      "45": 0.05881193562975336,
+      "60": 0.05881193562975336
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05881193562975336,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T04:44:00+00:00",
+     "intensity_mm_h": 0.5764358068892601,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.11762387125950673,
+      "up_max_20km_mm_h": 0.17643580688926008,
+      "up_max_40km_mm_h": 0.23524774251901345,
+      "up_dist_km": 28.2356419311074,
+      "up_wet_frac_40km": 0.05881193562975336,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 4
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": "2026-06-01T03:40:00+00:00",
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05881193562975336
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T03:50:00+00:00",
+      "generated_at_utc": "2026-06-01T04:04:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.05393096816398188,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5617929044919456,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:20:00+00:00",
+     "generated_at_utc": "2026-06-01T04:34:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010420",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.04512831872607276,
+      "20": 0.04512831872607276,
+      "30": 0.04512831872607276,
+      "45": 0.04512831872607276,
+      "60": 0.04512831872607276
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.04512831872607276,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T04:54:00+00:00",
+     "intensity_mm_h": 0.5353849561782182,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.09025663745214552,
+      "up_max_20km_mm_h": 0.13538495617821827,
+      "up_max_40km_mm_h": 0.18051327490429103,
+      "up_dist_km": 28.64615043821782,
+      "up_wet_frac_40km": 0.04512831872607276,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 4
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": "2026-06-01T03:40:00+00:00",
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.04512831872607276
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T04:00:00+00:00",
+      "generated_at_utc": "2026-06-01T04:14:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.057564025383976515,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5726920761519296,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:30:00+00:00",
+     "generated_at_utc": "2026-06-01T04:44:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010430",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05632821474299086,
+      "20": 0.05632821474299086,
+      "30": 0.05632821474299086,
+      "45": 0.05632821474299086,
+      "60": 0.05632821474299086
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05632821474299086,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T05:04:00+00:00",
+     "intensity_mm_h": 0.5689846442289725,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.11265642948598172,
+      "up_max_20km_mm_h": 0.16898464422897258,
+      "up_max_40km_mm_h": 0.22531285897196343,
+      "up_dist_km": 28.310153557710272,
+      "up_wet_frac_40km": 0.05632821474299086,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 4
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": false,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": "2026-06-01T03:40:00+00:00",
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05632821474299086
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T04:10:00+00:00",
+      "generated_at_utc": "2026-06-01T04:24:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.05881193562975336,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5764358068892601,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:40:00+00:00",
+     "generated_at_utc": "2026-06-01T04:54:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606010440",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.05378763429478858,
+      "20": 0.05378763429478858,
+      "30": 0.05378763429478858,
+      "45": 0.05378763429478858,
+      "60": 0.05378763429478858
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.05378763429478858,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T05:14:00+00:00",
+     "intensity_mm_h": 0.5613629028843657,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.10757526858957717,
+      "up_max_20km_mm_h": 0.16136290288436575,
+      "up_max_40km_mm_h": 0.21515053717915433,
+      "up_dist_km": 28.386370971156342,
+      "up_wet_frac_40km": 0.05378763429478858,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 4
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": false,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.05378763429478858
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T04:20:00+00:00",
+      "generated_at_utc": "2026-06-01T04:34:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.04512831872607276,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.5353849561782182,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    }
+   ],
+   "decision_gaps": [],
+   "prologue": {
+    "run_id": 0,
+    "run_start_utc": "2026-06-01T00:00:00+00:00",
+    "armed_at_window_start": true,
+    "streak_at_window_start": 0,
+    "below_since_utc": null,
+    "minutes_to_rearm_at_window_start": null,
+    "last_notify_utc": "2026-06-01T03:14:00+00:00",
+    "last_already_raining_utc": null,
+    "recent_actions": [
+     {
+      "generated_at_utc": "2026-06-01T03:14:00+00:00",
+      "action": "notify",
+      "p_decision": 0.9006414588891635
+     }
+    ],
+    "rearm_after_min": 60,
+    "at_anchor": {
+     "armed": true,
+     "streak": 0,
+     "minutes_to_rearm": null
+    },
+    "run_boundary_rearms_utc": [],
+    "note": "A disarmed subscription re-arms only after 60 minutes of radar time below threshold, and any over-threshold row resets that clock while disarmed. minutes_to_rearm is null when the clock is not running at all."
+   },
+   "gauge": {
+    "station_id": "06181",
+    "slot_min": 10,
+    "wet_rule": "precip_past10min >= 0.1 mm OR precip_dur_past10min >= 1 min",
+    "onset_rule": "first wet slot after 60 min known dry, delivering 0.2 mm over it and the slot after it",
+    "known_until_utc": "2026-06-02T00:00:00+00:00",
+    "onset_utc": null,
+    "onset_two_slot_mm": null,
+    "wet_slots_in_window": 0,
+    "known_slots_in_window": 25,
+    "onsets": [],
+    "suspect_month": false,
+    "slots": [
+     {
+      "slot_end_utc": "2026-06-01T01:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T01:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T01:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T01:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T05:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T05:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T05:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     }
+    ]
+   },
+   "radar_disc": {
+    "disc_radius_m": 1000.0,
+    "statistic": "p90 over the disc, as the service samples it",
+    "source_column": "observed_mm_h",
+    "threshold_mm_h": 0.5,
+    "same_instrument_as_the_forecast": true,
+    "series": [
+     {
+      "radar_ts_utc": "2026-06-01T01:20:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T01:30:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T01:40:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T01:50:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T02:00:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T02:10:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T02:20:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T02:30:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T02:40:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T02:50:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T03:00:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T03:10:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T03:20:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T03:30:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T03:40:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T03:50:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T04:00:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T04:10:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T04:20:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T04:30:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T04:40:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T04:50:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T05:00:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T05:10:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T05:20:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     }
+    ],
+    "slots": [
+     {
+      "slot_end_utc": "2026-06-01T01:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T01:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T01:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T01:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T02:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T03:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T04:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T05:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T05:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T05:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     }
+    ],
+    "wet_in_window": false,
+    "first_wet_utc": null
+   },
+   "neighbours": {
+    "radius_km": 20.0,
+    "any_wet_in_window": true,
+    "n_known": 1,
+    "n_wet": 1,
+    "caveat": "A wet neighbour says rain existed in the area, not that it rained at this station.",
+    "stations": [
+     {
+      "station_id": "06185",
+      "station_name": "Fixture Ringe",
+      "distance_km": 11.217,
+      "wet_in_window": true,
+      "first_wet_utc": "2026-06-01T03:40:00+00:00",
+      "known_slots": 4,
+      "onsets_in_window_utc": [
+       "2026-06-01T03:40:00+00:00"
+      ],
+      "slots": [
+       {
+        "slot_end_utc": "2026-06-01T01:20:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T01:30:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T01:40:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T01:50:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T02:00:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T02:10:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T02:20:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T02:30:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T02:40:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T02:50:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T03:00:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T03:10:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T03:20:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T03:30:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T03:40:00+00:00",
+        "known": true,
+        "wet": true,
+        "mm": 1.0,
+        "dur_min": 10.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T03:50:00+00:00",
+        "known": true,
+        "wet": true,
+        "mm": 1.0,
+        "dur_min": 10.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T04:00:00+00:00",
+        "known": true,
+        "wet": true,
+        "mm": 1.0,
+        "dur_min": 10.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T04:10:00+00:00",
+        "known": true,
+        "wet": true,
+        "mm": 1.0,
+        "dur_min": 10.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T04:20:00+00:00",
+        "known": true,
+        "wet": true,
+        "mm": 1.0,
+        "dur_min": 10.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T04:30:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T04:40:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T04:50:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T05:00:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T05:10:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       },
+       {
+        "slot_end_utc": "2026-06-01T05:20:00+00:00",
+        "known": true,
+        "wet": false,
+        "mm": 0.0,
+        "dur_min": 0.0
+       }
+      ],
+      "lat": 55.24,
+      "lon": 10.4,
+      "bearing_deg": 153.117780864996
+     }
+    ]
+   },
+   "dual_truth": {
+    "class": "both_dry",
+    "gauge_wet": false,
+    "radar_wet": false,
+    "neighbour_wet": true,
+    "neighbour_n_known": 1,
+    "window_used": {
+     "kind": "warning",
+     "from_utc": "2026-06-01T03:14:00+00:00",
+     "to_utc": "2026-06-01T03:54:00+00:00",
+     "definition": "(sent, sent + 30 min lead + 10 min tolerance]"
+    },
+    "rule": "gauge: a wet slot in the window; radar: the disc at or above 0.5 mm/h in the window; neighbour: any gauge within 20 km wet in the window",
+    "caveat": "The radar verdict comes from the instrument that made the forecast; agreement is a consistency check, not a second opinion. A wet neighbour says rain existed in the area."
+   },
+   "notifications": [
+    {
+     "kind": "replayed",
+     "generated_at_utc": "2026-06-01T03:14:00+00:00",
+     "radar_ts_utc": "2026-06-01T03:00:00+00:00",
+     "action": "notify",
+     "p_decision": 0.9006414588891635,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T03:34:00+00:00",
+     "threshold_pct": 50,
+     "is_event_warning": true
+    }
+   ],
+   "frames": [
+    {
+     "radar_ts_utc": "2026-06-01T01:20:00+00:00",
+     "stamp": "202606010120",
+     "product": "fullRange",
+     "overlay": "frames/202606010120.overlay.png",
+     "observed": "frames/202606010120.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T01:30:00+00:00",
+     "stamp": "202606010130",
+     "product": "fullRange",
+     "overlay": "frames/202606010130.overlay.png",
+     "observed": "frames/202606010130.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T01:40:00+00:00",
+     "stamp": "202606010140",
+     "product": "fullRange",
+     "overlay": "frames/202606010140.overlay.png",
+     "observed": "frames/202606010140.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T01:50:00+00:00",
+     "stamp": "202606010150",
+     "product": "fullRange",
+     "overlay": "frames/202606010150.overlay.png",
+     "observed": "frames/202606010150.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:00:00+00:00",
+     "stamp": "202606010200",
+     "product": "fullRange",
+     "overlay": "frames/202606010200.overlay.png",
+     "observed": "frames/202606010200.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:10:00+00:00",
+     "stamp": "202606010210",
+     "product": "fullRange",
+     "overlay": "frames/202606010210.overlay.png",
+     "observed": "frames/202606010210.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:20:00+00:00",
+     "stamp": "202606010220",
+     "product": "fullRange",
+     "overlay": "frames/202606010220.overlay.png",
+     "observed": "frames/202606010220.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:30:00+00:00",
+     "stamp": "202606010230",
+     "product": "fullRange",
+     "overlay": "frames/202606010230.overlay.png",
+     "observed": "frames/202606010230.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:40:00+00:00",
+     "stamp": "202606010240",
+     "product": "fullRange",
+     "overlay": "frames/202606010240.overlay.png",
+     "observed": "frames/202606010240.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T02:50:00+00:00",
+     "stamp": "202606010250",
+     "product": "fullRange",
+     "overlay": "frames/202606010250.overlay.png",
+     "observed": "frames/202606010250.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:00:00+00:00",
+     "stamp": "202606010300",
+     "product": "fullRange",
+     "overlay": "frames/202606010300.overlay.png",
+     "observed": "frames/202606010300.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:10:00+00:00",
+     "stamp": "202606010310",
+     "product": "fullRange",
+     "overlay": "frames/202606010310.overlay.png",
+     "observed": "frames/202606010310.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:20:00+00:00",
+     "stamp": "202606010320",
+     "product": "fullRange",
+     "overlay": "frames/202606010320.overlay.png",
+     "observed": "frames/202606010320.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:30:00+00:00",
+     "stamp": "202606010330",
+     "product": "fullRange",
+     "overlay": "frames/202606010330.overlay.png",
+     "observed": "frames/202606010330.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:40:00+00:00",
+     "stamp": "202606010340",
+     "product": "fullRange",
+     "overlay": "frames/202606010340.overlay.png",
+     "observed": "frames/202606010340.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T03:50:00+00:00",
+     "stamp": "202606010350",
+     "product": "fullRange",
+     "overlay": "frames/202606010350.overlay.png",
+     "observed": "frames/202606010350.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:00:00+00:00",
+     "stamp": "202606010400",
+     "product": "fullRange",
+     "overlay": "frames/202606010400.overlay.png",
+     "observed": "frames/202606010400.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:10:00+00:00",
+     "stamp": "202606010410",
+     "product": "fullRange",
+     "overlay": "frames/202606010410.overlay.png",
+     "observed": "frames/202606010410.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:20:00+00:00",
+     "stamp": "202606010420",
+     "product": "fullRange",
+     "overlay": "frames/202606010420.overlay.png",
+     "observed": "frames/202606010420.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:30:00+00:00",
+     "stamp": "202606010430",
+     "product": "fullRange",
+     "overlay": "frames/202606010430.overlay.png",
+     "observed": "frames/202606010430.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T04:40:00+00:00",
+     "stamp": "202606010440",
+     "product": "fullRange",
+     "overlay": "frames/202606010440.overlay.png",
+     "observed": "frames/202606010440.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    }
+   ],
+   "flags": [],
+   "builder_notes": [
+    "The radar verdict comes from the same instrument the forecast was made from, so agreement is a consistency check and not an independent opinion.",
+    "The composite is column-max reflectivity, which biases the rate high: virga and bright band read as rain the gauge never sees.",
+    "A wet neighbour says rain existed in the area, not at this gauge.",
+    "An onset instant is a slot END, so the first drop fell in the preceding 10 minutes and every measured lead is biased that far negative.",
+    "The replay resets the engine at every coverage-run boundary, which hands out a re-arm the live service never had; those rows carry run_boundary_rearm.",
+    "The threshold table was fitted on these same months: the thresholds are in-sample (held_out=false)."
+   ]
+  },
+  "miss-06182-20260601T1200Z": {
+   "schema_version": 1,
+   "bundle_id": "review-20260915-bd1bb9",
+   "event_id": "miss-06182-20260601T1200Z",
+   "index": {
+    "event_id": "miss-06182-20260601T1200Z",
+    "class": "miss",
+    "control": false,
+    "station_id": "06182",
+    "station_name": "Fixture Aalborg",
+    "region": "Nordjylland",
+    "lat": 57.05,
+    "lon": 9.9,
+    "anchor_utc": "2026-06-01T12:00:00+00:00",
+    "sent_utc": null,
+    "onset_utc": "2026-06-01T12:00:00+00:00",
+    "eta_min": null,
+    "eta_arrival_utc": null,
+    "p_decision": 0.02931909457769833,
+    "p_decision_source": "curve",
+    "threshold_pct": 50,
+    "lead_error_min": null,
+    "dual_truth": "both_wet",
+    "gauge_wet_in_window": true,
+    "radar_wet_in_window": true,
+    "neighbour_wet_in_window": null,
+    "neighbour_n_known": 0,
+    "season": "summer",
+    "hour_utc": 12,
+    "intensity_band": "heavy",
+    "intensity_mm_h": null,
+    "intensity_band_source": "onset_two_slot_mm",
+    "onset_two_slot_mm": 2.0,
+    "arm_state_at_anchor": "armed",
+    "minutes_to_rearm_at_anchor": null,
+    "frames": 22,
+    "frames_missing": 0,
+    "flags": [],
+    "stratum": {
+     "outcome_class": "miss",
+     "season": "summer",
+     "region": "Nordjylland",
+     "intensity_band": "heavy"
+    },
+    "detail": "events/miss-06182-20260601T1200Z.json"
+   },
+   "station": {
+    "station_id": "06182",
+    "name": "Fixture Aalborg",
+    "lat": 57.05,
+    "lon": 9.9,
+    "region": "Nordjylland",
+    "station_radar_km": 45.0,
+    "grid": {
+     "row": -87.84405542778579,
+     "col": -4.405250553714589
+    },
+    "known_until_utc": "2026-06-02T00:00:00+00:00",
+    "dead_gauge": false,
+    "neighbours": []
+   },
+   "window": {
+    "anchor_utc": "2026-06-01T12:00:00+00:00",
+    "from_utc": "2026-06-01T10:30:00+00:00",
+    "to_utc": "2026-06-01T13:30:00+00:00",
+    "decision_min": 90,
+    "frames_from_utc": "2026-06-01T10:00:00+00:00",
+    "frames_to_utc": "2026-06-01T13:30:00+00:00",
+    "frame_pad_min": 20,
+    "frame_cadence_min": 10,
+    "slot_from_utc": "2026-06-01T10:00:00+00:00",
+    "slot_to_utc": "2026-06-01T14:10:00+00:00",
+    "known_until_utc": "2026-06-02T00:00:00+00:00",
+    "verdict": {
+     "kind": "onset",
+     "from_utc": "2026-06-01T11:40:00+00:00",
+     "to_utc": "2026-06-01T12:20:00+00:00",
+     "rule": "(onset -/+ 10 min slot + 10 min tolerance]"
+    }
+   },
+   "decisions": [
+    {
+     "radar_ts_utc": "2026-06-01T10:30:00+00:00",
+     "generated_at_utc": "2026-06-01T10:44:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011030",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.028463110698200095,
+      "20": 0.028463110698200095,
+      "30": 0.028463110698200095,
+      "45": 0.028463110698200095,
+      "60": 0.028463110698200095
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.028463110698200095,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T11:04:00+00:00",
+     "intensity_mm_h": 0.48538933209460033,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.05692622139640019,
+      "up_max_20km_mm_h": 0.08538933209460028,
+      "up_max_40km_mm_h": 0.11385244279280038,
+      "up_dist_km": 29.146106679053997,
+      "up_wet_frac_40km": 0.028463110698200095,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 10
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.028463110698200095
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T10:10:00+00:00",
+      "generated_at_utc": "2026-06-01T10:24:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.018966639022269135,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.45689991706680744,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T10:40:00+00:00",
+     "generated_at_utc": "2026-06-01T10:54:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011040",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.01881692048521323,
+      "20": 0.01881692048521323,
+      "30": 0.01881692048521323,
+      "45": 0.01881692048521323,
+      "60": 0.01881692048521323
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.01881692048521323,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T11:14:00+00:00",
+     "intensity_mm_h": 0.45645076145563973,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.03763384097042646,
+      "up_max_20km_mm_h": 0.056450761455639695,
+      "up_max_40km_mm_h": 0.07526768194085293,
+      "up_dist_km": 29.435492385443602,
+      "up_wet_frac_40km": 0.01881692048521323,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 10
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.01881692048521323
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T10:20:00+00:00",
+      "generated_at_utc": "2026-06-01T10:34:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.028843585768201334,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.48653075730460404,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T10:50:00+00:00",
+     "generated_at_utc": "2026-06-01T11:04:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011050",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.021462475343297597,
+      "20": 0.021462475343297597,
+      "30": 0.021462475343297597,
+      "45": 0.021462475343297597,
+      "60": 0.021462475343297597
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.021462475343297597,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T11:24:00+00:00",
+     "intensity_mm_h": 0.4643874260298928,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.042924950686595194,
+      "up_max_20km_mm_h": 0.0643874260298928,
+      "up_max_40km_mm_h": 0.08584990137319039,
+      "up_dist_km": 29.35612573970107,
+      "up_wet_frac_40km": 0.021462475343297597,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 11
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.021462475343297597
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T10:30:00+00:00",
+      "generated_at_utc": "2026-06-01T10:44:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.028463110698200095,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.48538933209460033,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:00:00+00:00",
+     "generated_at_utc": "2026-06-01T11:14:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011100",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.02931909457769833,
+      "20": 0.02931909457769833,
+      "30": 0.02931909457769833,
+      "45": 0.02931909457769833,
+      "60": 0.02931909457769833
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.02931909457769833,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T11:34:00+00:00",
+     "intensity_mm_h": 0.487957283733095,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.05863818915539666,
+      "up_max_20km_mm_h": 0.087957283733095,
+      "up_max_40km_mm_h": 0.11727637831079332,
+      "up_dist_km": 29.12042716266905,
+      "up_wet_frac_40km": 0.02931909457769833,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 11
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.02931909457769833
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T10:40:00+00:00",
+      "generated_at_utc": "2026-06-01T10:54:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.01881692048521323,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.45645076145563973,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:10:00+00:00",
+     "generated_at_utc": "2026-06-01T11:24:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011110",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.02032782854782516,
+      "20": 0.02032782854782516,
+      "30": 0.02032782854782516,
+      "45": 0.02032782854782516,
+      "60": 0.02032782854782516
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.02032782854782516,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T11:44:00+00:00",
+     "intensity_mm_h": 0.4609834856434755,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.04065565709565032,
+      "up_max_20km_mm_h": 0.06098348564347548,
+      "up_max_40km_mm_h": 0.08131131419130064,
+      "up_dist_km": 29.39016514356525,
+      "up_wet_frac_40km": 0.02032782854782516,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 11
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.02032782854782516
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T10:50:00+00:00",
+      "generated_at_utc": "2026-06-01T11:04:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.021462475343297597,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.4643874260298928,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:20:00+00:00",
+     "generated_at_utc": "2026-06-01T11:34:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011120",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.028209415414964897,
+      "20": 0.028209415414964897,
+      "30": 0.028209415414964897,
+      "45": 0.028209415414964897,
+      "60": 0.028209415414964897
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.028209415414964897,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T11:54:00+00:00",
+     "intensity_mm_h": 0.4846282462448947,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.056418830829929795,
+      "up_max_20km_mm_h": 0.08462824624489469,
+      "up_max_40km_mm_h": 0.11283766165985959,
+      "up_dist_km": 29.153717537551053,
+      "up_wet_frac_40km": 0.028209415414964897,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 11
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.028209415414964897
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T11:00:00+00:00",
+      "generated_at_utc": "2026-06-01T11:14:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.02931909457769833,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.487957283733095,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:30:00+00:00",
+     "generated_at_utc": "2026-06-01T11:44:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011130",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.02817799105982933,
+      "20": 0.02817799105982933,
+      "30": 0.02817799105982933,
+      "45": 0.02817799105982933,
+      "60": 0.02817799105982933
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.02817799105982933,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T12:04:00+00:00",
+     "intensity_mm_h": 0.484533973179488,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.05635598211965866,
+      "up_max_20km_mm_h": 0.08453397317948799,
+      "up_max_40km_mm_h": 0.11271196423931731,
+      "up_dist_km": 29.15466026820512,
+      "up_wet_frac_40km": 0.02817799105982933,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 11
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.02817799105982933
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T11:10:00+00:00",
+      "generated_at_utc": "2026-06-01T11:24:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.02032782854782516,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.4609834856434755,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:40:00+00:00",
+     "generated_at_utc": "2026-06-01T11:54:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011140",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.01636453658174482,
+      "20": 0.01636453658174482,
+      "30": 0.01636453658174482,
+      "45": 0.01636453658174482,
+      "60": 0.01636453658174482
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.01636453658174482,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T12:14:00+00:00",
+     "intensity_mm_h": 0.4490936097452345,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.03272907316348964,
+      "up_max_20km_mm_h": 0.04909360974523447,
+      "up_max_40km_mm_h": 0.06545814632697929,
+      "up_dist_km": 29.509063902547656,
+      "up_wet_frac_40km": 0.01636453658174482,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 11
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.01636453658174482
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T11:20:00+00:00",
+      "generated_at_utc": "2026-06-01T11:34:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.028209415414964897,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.4846282462448947,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:50:00+00:00",
+     "generated_at_utc": "2026-06-01T12:04:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011150",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.017799196147673432,
+      "20": 0.017799196147673432,
+      "30": 0.017799196147673432,
+      "45": 0.017799196147673432,
+      "60": 0.017799196147673432
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.017799196147673432,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T12:24:00+00:00",
+     "intensity_mm_h": 0.4533975884430203,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.035598392295346865,
+      "up_max_20km_mm_h": 0.0533975884430203,
+      "up_max_40km_mm_h": 0.07119678459069373,
+      "up_dist_km": 29.466024115569798,
+      "up_wet_frac_40km": 0.017799196147673432,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 12
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.017799196147673432
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T11:30:00+00:00",
+      "generated_at_utc": "2026-06-01T11:44:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.02817799105982933,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.484533973179488,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:00:00+00:00",
+     "generated_at_utc": "2026-06-01T12:14:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011200",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.10620683186430015,
+      "20": 0.10620683186430015,
+      "30": 0.10620683186430015,
+      "45": 0.10620683186430015,
+      "60": 0.10620683186430015
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.10620683186430015,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T12:34:00+00:00",
+     "intensity_mm_h": 0.7186204955929005,
+     "observed_mm_h": 1.5,
+     "forecast_now_mm_h": 1.5,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.2124136637286003,
+      "up_max_20km_mm_h": 0.31862049559290045,
+      "up_max_40km_mm_h": 0.4248273274572006,
+      "up_dist_km": 26.813795044070996,
+      "up_wet_frac_40km": 0.10620683186430015,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 12
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.10620683186430015
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T11:40:00+00:00",
+      "generated_at_utc": "2026-06-01T11:54:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.01636453658174482,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.4490936097452345,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:10:00+00:00",
+     "generated_at_utc": "2026-06-01T12:24:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011210",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.10513146563864977,
+      "20": 0.10513146563864977,
+      "30": 0.10513146563864977,
+      "45": 0.10513146563864977,
+      "60": 0.10513146563864977
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.10513146563864977,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T12:44:00+00:00",
+     "intensity_mm_h": 0.7153943969159493,
+     "observed_mm_h": 1.5,
+     "forecast_now_mm_h": 1.5,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.21026293127729953,
+      "up_max_20km_mm_h": 0.3153943969159493,
+      "up_max_40km_mm_h": 0.42052586255459906,
+      "up_dist_km": 26.846056030840508,
+      "up_wet_frac_40km": 0.10513146563864977,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 12
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.10513146563864977
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T11:50:00+00:00",
+      "generated_at_utc": "2026-06-01T12:04:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.017799196147673432,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.4533975884430203,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:20:00+00:00",
+     "generated_at_utc": "2026-06-01T12:34:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011220",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.0903880798826032,
+      "20": 0.0903880798826032,
+      "30": 0.0903880798826032,
+      "45": 0.0903880798826032,
+      "60": 0.0903880798826032
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.0903880798826032,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T12:54:00+00:00",
+     "intensity_mm_h": 0.6711642396478096,
+     "observed_mm_h": 1.5,
+     "forecast_now_mm_h": 1.5,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.1807761597652064,
+      "up_max_20km_mm_h": 0.27116423964780956,
+      "up_max_40km_mm_h": 0.3615523195304128,
+      "up_dist_km": 27.288357603521902,
+      "up_wet_frac_40km": 0.0903880798826032,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 12
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.0903880798826032
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T12:00:00+00:00",
+      "generated_at_utc": "2026-06-01T12:14:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.10620683186430015,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.7186204955929005,
+      "observed_mm_h": 1.5,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:30:00+00:00",
+     "generated_at_utc": "2026-06-01T12:44:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011230",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.09006166200856501,
+      "20": 0.09006166200856501,
+      "30": 0.09006166200856501,
+      "45": 0.09006166200856501,
+      "60": 0.09006166200856501
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.09006166200856501,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T13:04:00+00:00",
+     "intensity_mm_h": 0.670184986025695,
+     "observed_mm_h": 1.5,
+     "forecast_now_mm_h": 1.5,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.18012332401713002,
+      "up_max_20km_mm_h": 0.270184986025695,
+      "up_max_40km_mm_h": 0.36024664803426004,
+      "up_dist_km": 27.29815013974305,
+      "up_wet_frac_40km": 0.09006166200856501,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 12
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.09006166200856501
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T12:10:00+00:00",
+      "generated_at_utc": "2026-06-01T12:24:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.10513146563864977,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.7153943969159493,
+      "observed_mm_h": 1.5,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:40:00+00:00",
+     "generated_at_utc": "2026-06-01T12:54:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011240",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.015196099580533877,
+      "20": 0.015196099580533877,
+      "30": 0.015196099580533877,
+      "45": 0.015196099580533877,
+      "60": 0.015196099580533877
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.015196099580533877,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T13:14:00+00:00",
+     "intensity_mm_h": 0.44558829874160166,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.030392199161067755,
+      "up_max_20km_mm_h": 0.045588298741601634,
+      "up_max_40km_mm_h": 0.06078439832213551,
+      "up_dist_km": 29.544117012583982,
+      "up_wet_frac_40km": 0.015196099580533877,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 12
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.015196099580533877
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T12:20:00+00:00",
+      "generated_at_utc": "2026-06-01T12:34:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.0903880798826032,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.6711642396478096,
+      "observed_mm_h": 1.5,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:50:00+00:00",
+     "generated_at_utc": "2026-06-01T13:04:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011250",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.024421117139657497,
+      "20": 0.024421117139657497,
+      "30": 0.024421117139657497,
+      "45": 0.024421117139657497,
+      "60": 0.024421117139657497
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.024421117139657497,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T13:24:00+00:00",
+     "intensity_mm_h": 0.4732633514189725,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.04884223427931499,
+      "up_max_20km_mm_h": 0.07326335141897249,
+      "up_max_40km_mm_h": 0.09768446855862999,
+      "up_dist_km": 29.267366485810278,
+      "up_wet_frac_40km": 0.024421117139657497,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 13
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.024421117139657497
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T12:30:00+00:00",
+      "generated_at_utc": "2026-06-01T12:44:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.09006166200856501,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.670184986025695,
+      "observed_mm_h": 1.5,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T13:00:00+00:00",
+     "generated_at_utc": "2026-06-01T13:14:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011300",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.024661393455081747,
+      "20": 0.024661393455081747,
+      "30": 0.024661393455081747,
+      "45": 0.024661393455081747,
+      "60": 0.024661393455081747
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.024661393455081747,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T13:34:00+00:00",
+     "intensity_mm_h": 0.47398418036524526,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.049322786910163494,
+      "up_max_20km_mm_h": 0.07398418036524523,
+      "up_max_40km_mm_h": 0.09864557382032699,
+      "up_dist_km": 29.260158196347547,
+      "up_wet_frac_40km": 0.024661393455081747,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 13
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.024661393455081747
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T12:40:00+00:00",
+      "generated_at_utc": "2026-06-01T12:54:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.015196099580533877,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.44558829874160166,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T13:10:00+00:00",
+     "generated_at_utc": "2026-06-01T13:24:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011310",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.019790253388159654,
+      "20": 0.019790253388159654,
+      "30": 0.019790253388159654,
+      "45": 0.019790253388159654,
+      "60": 0.019790253388159654
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.019790253388159654,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T13:44:00+00:00",
+     "intensity_mm_h": 0.459370760164479,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.03958050677631931,
+      "up_max_20km_mm_h": 0.05937076016447897,
+      "up_max_40km_mm_h": 0.07916101355263862,
+      "up_dist_km": 29.40629239835521,
+      "up_wet_frac_40km": 0.019790253388159654,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 13
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.019790253388159654
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T12:50:00+00:00",
+      "generated_at_utc": "2026-06-01T13:04:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.024421117139657497,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.4732633514189725,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T13:20:00+00:00",
+     "generated_at_utc": "2026-06-01T13:34:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011320",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.011820358093332746,
+      "20": 0.011820358093332746,
+      "30": 0.011820358093332746,
+      "45": 0.011820358093332746,
+      "60": 0.011820358093332746
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.011820358093332746,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T13:54:00+00:00",
+     "intensity_mm_h": 0.43546107427999825,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.02364071618666549,
+      "up_max_20km_mm_h": 0.035461074279998235,
+      "up_max_40km_mm_h": 0.04728143237333098,
+      "up_dist_km": 29.64538925720002,
+      "up_wet_frac_40km": 0.011820358093332746,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 13
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.011820358093332746
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T13:00:00+00:00",
+      "generated_at_utc": "2026-06-01T13:14:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.024661393455081747,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.47398418036524526,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    },
+    {
+     "radar_ts_utc": "2026-06-01T13:30:00+00:00",
+     "generated_at_utc": "2026-06-01T13:44:00+00:00",
+     "frame_age_min": 14.0,
+     "frame_age_source": "feature",
+     "frame_age_min_stored": 14.0,
+     "frame_ref": "202606011330",
+     "row_source": null,
+     "p_rain": {
+      "10": 0.028390430728385263,
+      "20": 0.028390430728385263,
+      "30": 0.028390430728385263,
+      "45": 0.028390430728385263,
+      "60": 0.028390430728385263
+     },
+     "p_post": {
+      "10": null,
+      "20": null,
+      "30": null,
+      "45": null,
+      "60": null
+     },
+     "p_decision": 0.028390430728385263,
+     "p_decision_source": "curve",
+     "p_decision_lead_min": 30,
+     "threshold_pct": 50,
+     "over_threshold": false,
+     "eta_min": 20.0,
+     "eta_arrival_utc": "2026-06-01T14:04:00+00:00",
+     "intensity_mm_h": 0.4851712921851558,
+     "observed_mm_h": 0.0,
+     "forecast_now_mm_h": 0.0,
+     "features": {
+      "raw_frac_10": null,
+      "raw_frac_20": null,
+      "raw_frac_30": null,
+      "raw_frac_45": null,
+      "raw_frac_60": null,
+      "obs_max_5km_mm_h": 0.056780861456770526,
+      "up_max_20km_mm_h": 0.08517129218515579,
+      "up_max_40km_mm_h": 0.11356172291354105,
+      "up_dist_km": 29.148287078148442,
+      "up_wet_frac_40km": 0.028390430728385263,
+      "bulk_kmh": 32.0,
+      "bulk_dir_deg": 250.0,
+      "local_speed_kmh": 28.0,
+      "stalled_share": 0.07,
+      "frame_age_min": 14.0,
+      "station_radar_km": 45.0,
+      "season": "summer",
+      "hour_utc": 13
+     },
+     "features_present": true,
+     "replay": {
+      "action": "none",
+      "skipped_reason": null,
+      "armed_before": true,
+      "armed_after": true,
+      "streak_before": 0,
+      "streak_after": 0,
+      "below_since_utc": null,
+      "run_id": 0,
+      "run_boundary_rearm": false
+     },
+     "stored": {
+      "action": "none",
+      "armed_after": true,
+      "streak_after": 0,
+      "threshold_pct": 40,
+      "p_rain_at_rule_lead": 0.028390430728385263
+     },
+     "latest_estimate": {
+      "radar_ts_utc": "2026-06-01T13:10:00+00:00",
+      "generated_at_utc": "2026-06-01T13:24:00+00:00",
+      "age_min": 6.0,
+      "p_decision": 0.019790253388159654,
+      "eta_min": 20.0,
+      "intensity_mm_h": 0.459370760164479,
+      "observed_mm_h": 0.0,
+      "action": "none"
+     }
+    }
+   ],
+   "decision_gaps": [],
+   "prologue": {
+    "run_id": 0,
+    "run_start_utc": "2026-06-01T00:00:00+00:00",
+    "armed_at_window_start": true,
+    "streak_at_window_start": 0,
+    "below_since_utc": null,
+    "minutes_to_rearm_at_window_start": null,
+    "last_notify_utc": null,
+    "last_already_raining_utc": null,
+    "recent_actions": [],
+    "rearm_after_min": 60,
+    "at_anchor": {
+     "armed": true,
+     "streak": 0,
+     "minutes_to_rearm": null
+    },
+    "run_boundary_rearms_utc": [],
+    "note": "A disarmed subscription re-arms only after 60 minutes of radar time below threshold, and any over-threshold row resets that clock while disarmed. minutes_to_rearm is null when the clock is not running at all."
+   },
+   "gauge": {
+    "station_id": "06182",
+    "slot_min": 10,
+    "wet_rule": "precip_past10min >= 0.1 mm OR precip_dur_past10min >= 1 min",
+    "onset_rule": "first wet slot after 60 min known dry, delivering 0.2 mm over it and the slot after it",
+    "known_until_utc": "2026-06-02T00:00:00+00:00",
+    "onset_utc": "2026-06-01T12:00:00+00:00",
+    "onset_two_slot_mm": 2.0,
+    "wet_slots_in_window": 4,
+    "known_slots_in_window": 25,
+    "onsets": [
+     {
+      "onset_utc": "2026-06-01T12:00:00+00:00",
+      "two_slot_mm": 2.0,
+      "in_window": true,
+      "is_event": true
+     }
+    ],
+    "suspect_month": false,
+    "slots": [
+     {
+      "slot_end_utc": "2026-06-01T10:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T10:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T10:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T10:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T10:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:00:00+00:00",
+      "known": true,
+      "wet": true,
+      "mm": 1.0,
+      "dur_min": 10.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:10:00+00:00",
+      "known": true,
+      "wet": true,
+      "mm": 1.0,
+      "dur_min": 10.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:20:00+00:00",
+      "known": true,
+      "wet": true,
+      "mm": 1.0,
+      "dur_min": 10.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:30:00+00:00",
+      "known": true,
+      "wet": true,
+      "mm": 1.0,
+      "dur_min": 10.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T14:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T14:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "dur_min": 0.0
+     }
+    ]
+   },
+   "radar_disc": {
+    "disc_radius_m": 1000.0,
+    "statistic": "p90 over the disc, as the service samples it",
+    "source_column": "observed_mm_h",
+    "threshold_mm_h": 0.5,
+    "same_instrument_as_the_forecast": true,
+    "series": [
+     {
+      "radar_ts_utc": "2026-06-01T10:10:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T10:20:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T10:30:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T10:40:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T10:50:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T11:00:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T11:10:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T11:20:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T11:30:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T11:40:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T11:50:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T12:00:00+00:00",
+      "p90_mm_h": 1.5,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T12:10:00+00:00",
+      "p90_mm_h": 1.5,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T12:20:00+00:00",
+      "p90_mm_h": 1.5,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T12:30:00+00:00",
+      "p90_mm_h": 1.5,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T12:40:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T12:50:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T13:00:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T13:10:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T13:20:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T13:30:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T13:40:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T13:50:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T14:00:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     },
+     {
+      "radar_ts_utc": "2026-06-01T14:10:00+00:00",
+      "p90_mm_h": 0.0,
+      "max_mm_h": null,
+      "mean_mm_h": null,
+      "n_pixels": null,
+      "n_valid": null
+     }
+    ],
+    "slots": [
+     {
+      "slot_end_utc": "2026-06-01T10:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T10:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T10:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T10:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T10:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T11:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:00:00+00:00",
+      "known": true,
+      "wet": true,
+      "mm": 0.25,
+      "mm_h": 1.5
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:10:00+00:00",
+      "known": true,
+      "wet": true,
+      "mm": 0.25,
+      "mm_h": 1.5
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:20:00+00:00",
+      "known": true,
+      "wet": true,
+      "mm": 0.25,
+      "mm_h": 1.5
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:30:00+00:00",
+      "known": true,
+      "wet": true,
+      "mm": 0.25,
+      "mm_h": 1.5
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T12:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:20:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:30:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:40:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T13:50:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T14:00:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     },
+     {
+      "slot_end_utc": "2026-06-01T14:10:00+00:00",
+      "known": true,
+      "wet": false,
+      "mm": 0.0,
+      "mm_h": 0.0
+     }
+    ],
+    "wet_in_window": true,
+    "first_wet_utc": "2026-06-01T12:00:00+00:00"
+   },
+   "neighbours": {
+    "radius_km": 20.0,
+    "any_wet_in_window": null,
+    "n_known": 0,
+    "n_wet": 0,
+    "caveat": "A wet neighbour says rain existed in the area, not that it rained at this station.",
+    "stations": []
+   },
+   "dual_truth": {
+    "class": "both_wet",
+    "gauge_wet": true,
+    "radar_wet": true,
+    "neighbour_wet": null,
+    "neighbour_n_known": 0,
+    "window_used": {
+     "kind": "onset",
+     "from_utc": "2026-06-01T11:40:00+00:00",
+     "to_utc": "2026-06-01T12:20:00+00:00",
+     "definition": "(onset -/+ 10 min slot + 10 min tolerance]"
+    },
+    "rule": "gauge: a wet slot in the window; radar: the disc at or above 0.5 mm/h in the window; neighbour: any gauge within 20 km wet in the window",
+    "caveat": "The radar verdict comes from the instrument that made the forecast; agreement is a consistency check, not a second opinion. A wet neighbour says rain existed in the area."
+   },
+   "notifications": [],
+   "frames": [
+    {
+     "radar_ts_utc": "2026-06-01T10:00:00+00:00",
+     "stamp": "202606011000",
+     "product": "fullRange",
+     "overlay": "frames/202606011000.overlay.png",
+     "observed": "frames/202606011000.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T10:10:00+00:00",
+     "stamp": "202606011010",
+     "product": "fullRange",
+     "overlay": "frames/202606011010.overlay.png",
+     "observed": "frames/202606011010.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T10:20:00+00:00",
+     "stamp": "202606011020",
+     "product": "fullRange",
+     "overlay": "frames/202606011020.overlay.png",
+     "observed": "frames/202606011020.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T10:30:00+00:00",
+     "stamp": "202606011030",
+     "product": "fullRange",
+     "overlay": "frames/202606011030.overlay.png",
+     "observed": "frames/202606011030.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T10:40:00+00:00",
+     "stamp": "202606011040",
+     "product": "fullRange",
+     "overlay": "frames/202606011040.overlay.png",
+     "observed": "frames/202606011040.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T10:50:00+00:00",
+     "stamp": "202606011050",
+     "product": "fullRange",
+     "overlay": "frames/202606011050.overlay.png",
+     "observed": "frames/202606011050.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:00:00+00:00",
+     "stamp": "202606011100",
+     "product": "fullRange",
+     "overlay": "frames/202606011100.overlay.png",
+     "observed": "frames/202606011100.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:10:00+00:00",
+     "stamp": "202606011110",
+     "product": "fullRange",
+     "overlay": "frames/202606011110.overlay.png",
+     "observed": "frames/202606011110.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:20:00+00:00",
+     "stamp": "202606011120",
+     "product": "fullRange",
+     "overlay": "frames/202606011120.overlay.png",
+     "observed": "frames/202606011120.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:30:00+00:00",
+     "stamp": "202606011130",
+     "product": "fullRange",
+     "overlay": "frames/202606011130.overlay.png",
+     "observed": "frames/202606011130.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:40:00+00:00",
+     "stamp": "202606011140",
+     "product": "fullRange",
+     "overlay": "frames/202606011140.overlay.png",
+     "observed": "frames/202606011140.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T11:50:00+00:00",
+     "stamp": "202606011150",
+     "product": "fullRange",
+     "overlay": "frames/202606011150.overlay.png",
+     "observed": "frames/202606011150.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:00:00+00:00",
+     "stamp": "202606011200",
+     "product": "fullRange",
+     "overlay": "frames/202606011200.overlay.png",
+     "observed": "frames/202606011200.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:10:00+00:00",
+     "stamp": "202606011210",
+     "product": "fullRange",
+     "overlay": "frames/202606011210.overlay.png",
+     "observed": "frames/202606011210.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:20:00+00:00",
+     "stamp": "202606011220",
+     "product": "fullRange",
+     "overlay": "frames/202606011220.overlay.png",
+     "observed": "frames/202606011220.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:30:00+00:00",
+     "stamp": "202606011230",
+     "product": "fullRange",
+     "overlay": "frames/202606011230.overlay.png",
+     "observed": "frames/202606011230.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:40:00+00:00",
+     "stamp": "202606011240",
+     "product": "fullRange",
+     "overlay": "frames/202606011240.overlay.png",
+     "observed": "frames/202606011240.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T12:50:00+00:00",
+     "stamp": "202606011250",
+     "product": "fullRange",
+     "overlay": "frames/202606011250.overlay.png",
+     "observed": "frames/202606011250.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T13:00:00+00:00",
+     "stamp": "202606011300",
+     "product": "fullRange",
+     "overlay": "frames/202606011300.overlay.png",
+     "observed": "frames/202606011300.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T13:10:00+00:00",
+     "stamp": "202606011310",
+     "product": "fullRange",
+     "overlay": "frames/202606011310.overlay.png",
+     "observed": "frames/202606011310.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T13:20:00+00:00",
+     "stamp": "202606011320",
+     "product": "fullRange",
+     "overlay": "frames/202606011320.overlay.png",
+     "observed": "frames/202606011320.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    },
+    {
+     "radar_ts_utc": "2026-06-01T13:30:00+00:00",
+     "stamp": "202606011330",
+     "product": "fullRange",
+     "overlay": "frames/202606011330.overlay.png",
+     "observed": "frames/202606011330.observed.png",
+     "present": true,
+     "has_decision_row": true,
+     "source": "frame planner",
+     "present_source": "frame writer"
+    }
+   ],
+   "flags": [],
+   "builder_notes": [
+    "The radar verdict comes from the same instrument the forecast was made from, so agreement is a consistency check and not an independent opinion.",
+    "The composite is column-max reflectivity, which biases the rate high: virga and bright band read as rain the gauge never sees.",
+    "A wet neighbour says rain existed in the area, not at this gauge.",
+    "An onset instant is a slot END, so the first drop fell in the preceding 10 minutes and every measured lead is biased that far negative.",
+    "The replay resets the engine at every coverage-run boundary, which hands out a re-arm the live service never had; those rows carry run_boundary_rearm.",
+    "The threshold table was fitted on these same months: the thresholds are in-sample (held_out=false)."
+   ]
+  }
+ },
+ "annotations": {
+  "bundle_id": "review-20260915-bd1bb9",
+  "annotations": [
+   {
+    "bundle_id": "review-20260915-bd1bb9",
+    "event_id": "fa-06181-20260601T0314Z",
+    "station_id": "06181",
+    "anchor_utc": "2026-06-01T03:14:00+00:00",
+    "event_class": "false_alarm",
+    "dual_truth": "both_dry",
+    "season": "summer",
+    "region": "Fyn",
+    "verdict": "metric_artefact",
+    "tags": [
+     "fa_virga_or_aloft",
+     "needs_better_imagery"
+    ],
+    "vocab_version": 1,
+    "confidence": 2,
+    "needs_second_look": true,
+    "note": "snapshot row for the drift alarm",
+    "cursor_utc": "2026-06-01T03:20:00+00:00",
+    "review_seq": 1,
+    "reviewer": "local",
+    "created_utc": "2026-09-15T14:08:45.530671+00:00",
+    "updated_utc": "2026-09-15T14:08:45.530671+00:00",
+    "revision": 1
+   }
+  ]
+ },
+ "health": {
+  "ok": true,
+  "bundle_id": "review-20260915-bd1bb9",
+  "bundle_root": "/private/tmp/genfx",
+  "events": 6,
+  "stored": 1,
+  "annotated": 1,
+  "schema_version": 1,
+  "vocab_version": 1,
+  "db_path": "/tmp/ann.sqlite"
+ }
+}

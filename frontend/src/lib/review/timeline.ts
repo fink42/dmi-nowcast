@@ -22,7 +22,7 @@
  * component at the render boundary and nowhere earlier.
  */
 import { clampIndex, frameDelayMs, nextFrameIndex } from '$lib/nowcast/timeline';
-import type { EventDetail, FrameRef } from './schema';
+import type { DecisionGap, EventDetail, FrameRef } from './schema';
 
 export { clampIndex, frameDelayMs, nextFrameIndex };
 
@@ -52,9 +52,13 @@ export interface TrackBounds {
  * The instants the track runs between.
  *
  * The frame window is the outer one — composites are 13–24 min old, so the
- * builder starts the frames two cadences before the decision window (see
- * `window.frames_from_utc`) — and the track has to show all of it or the
- * earliest decision would stand on a frame off the left edge. Frames and
+ * builder starts the frames two cadences before the decision window and
+ * states both edges (`window.frames_from_utc` / `frames_to_utc`) — and the
+ * track has to show all of it or the earliest decision would stand on a
+ * frame off the left edge. Bounding by the stated edges rather than by the
+ * frames themselves matters at the right: a bundle whose last composites
+ * are missing would otherwise draw a track that stops early and hides the
+ * hole. Frames and
  * decisions outside even that are absorbed rather than clipped: a bundle
  * whose edges disagree with its own contents should draw everything it
  * carries, and the alternative is a marker pinned to the end of the track
@@ -71,6 +75,7 @@ export function trackBounds(event: EventDetail): TrackBounds | null {
 		if (ms !== null) candidates.push(ms);
 	};
 	push(event.window.frames_from_utc);
+	push(event.window.frames_to_utc);
 	push(event.window.from_utc);
 	push(event.window.to_utc);
 	for (const frame of event.frames) push(frame.radar_ts_utc);
@@ -122,6 +127,12 @@ export interface FrameTick {
 	 * evidence, and dropping it would close the hole it makes.
 	 */
 	present: boolean | null;
+	/**
+	 * Whether a decision stood on this composite. A frame that exists with
+	 * no decision behind it is a hole in the engine's attention rather than
+	 * in the imagery, and the two are different failures with different tags.
+	 */
+	hasDecisionRow: boolean | null;
 }
 
 /** Every composite of the event, placed in time. Frames whose stamp will
@@ -140,7 +151,8 @@ export function frameTicks(event: EventDetail): FrameTick[] {
 			radarTsUtc: frame.radar_ts_utc,
 			ms,
 			position,
-			present: frame.present
+			present: frame.present,
+			hasDecisionRow: frame.has_decision_row
 		});
 	});
 	return ticks;
@@ -185,6 +197,15 @@ export interface TrackBand {
 	from: number;
 	to: number;
 	minutes: number;
+	/**
+	 * A coverage break, not a missed cycle: past this length the coverage
+	 * rule stops counting and the replay hands out a free re-arm, so the two
+	 * must not be drawn alike. Always true on a `beyond_known` band, where
+	 * there is no decision record at all.
+	 */
+	coverageBreak: boolean;
+	/** `whole_window` means the window held no decision row at all. */
+	edge: DecisionGap['edge'];
 	reason: string;
 }
 
@@ -207,6 +228,19 @@ export interface TrackMarkers {
  * can draw the instant the event is *about* differently from the other
  * warnings that happened to fall in the same window.
  */
+/**
+ * Is this instant strictly inside the track?
+ *
+ * Both edges are exclusive on purpose. At or past the right edge there is
+ * nothing beyond it to hatch; at or before the left edge the whole track is
+ * beyond it, and a band covering everything says nothing while a marker
+ * clamped to 0 claims the record ends where it in fact begins.
+ */
+function withinTrack(bounds: TrackBounds, utc: string | null): boolean {
+	const ms = msOf(utc);
+	return ms !== null && ms > bounds.fromMs && ms < bounds.toMs;
+}
+
 export function markers(event: EventDetail): TrackMarkers {
 	const bounds = trackBounds(event);
 	if (bounds === null) return { points: [], bands: [] };
@@ -250,7 +284,18 @@ export function markers(event: EventDetail): TrackMarkers {
 	for (const at of event.prologue?.run_boundary_rearms_utc ?? []) {
 		add('run_boundary_rearm', at, 'the replay re-armed here; the live service did not');
 	}
-	add('known_until', event.window.known_until_utc, 'gauge has not reported past here');
+	// The gauge horizon, but ONLY when it falls inside the track.
+	//
+	// A station that has reported for weeks past the event carries a
+	// `known_until` twenty hours beyond the right edge. Drawn on a
+	// time-proportional track that is off-canvas; clamped to the edge — which
+	// is what `positionAt` does — it reads as "the gauge record ends here" on
+	// every event in the bundle, the exact inverse of the truth and precisely
+	// the known-versus-dry confusion this tool exists to expose. Outside the
+	// track there is nothing to hatch and nothing to mark.
+	if (withinTrack(bounds, event.window.known_until_utc)) {
+		add('known_until', event.window.known_until_utc, 'gauge has not reported past here');
+	}
 
 	const bands: TrackBand[] = [];
 	const addBand = (
@@ -258,7 +303,7 @@ export function markers(event: EventDetail): TrackMarkers {
 		fromUtc: string | null,
 		toUtc: string | null,
 		reason: string,
-		minutes?: number
+		options: { minutes?: number; coverageBreak?: boolean; edge?: DecisionGap['edge'] } = {}
 	) => {
 		const fromMs = msOf(fromUtc);
 		const toMs = msOf(toUtc);
@@ -274,23 +319,31 @@ export function markers(event: EventDetail): TrackMarkers {
 			toMs,
 			from,
 			to,
-			minutes: minutes ?? (toMs - fromMs) / 60_000,
+			minutes: options.minutes ?? (toMs - fromMs) / 60_000,
+			coverageBreak: options.coverageBreak ?? true,
+			edge: options.edge ?? null,
 			reason
 		});
 	};
 
 	for (const gap of event.decision_gaps) {
-		addBand('coverage_gap', gap.from_utc, gap.to_utc, gap.reason, gap.minutes);
+		addBand('coverage_gap', gap.from_utc, gap.to_utc, gap.reason, {
+			minutes: gap.minutes,
+			coverageBreak: gap.coverage_break,
+			edge: gap.edge
+		});
 	}
 	// Past the last reported slot the gauge is silent, not dry. The band runs
 	// to the end of the track because that is exactly how far the ignorance
-	// reaches.
-	addBand(
-		'beyond_known',
-		event.window.known_until_utc,
-		bounds.toUtc,
-		'no gauge report past this instant'
-	);
+	// reaches — and it is drawn only when there is some track left to hatch.
+	if (withinTrack(bounds, event.window.known_until_utc)) {
+		addBand(
+			'beyond_known',
+			event.window.known_until_utc,
+			bounds.toUtc,
+			'no gauge report past this instant'
+		);
+	}
 
 	return {
 		points: points.sort((a, b) => a.ms - b.ms),

@@ -32,6 +32,7 @@ import {
 	type DualTruthBlock,
 	type DualTruthClass,
 	type EventDetail,
+	type FeaturesBlock,
 	type EventIndex,
 	type FrameRef,
 	type FramesBlock,
@@ -56,7 +57,8 @@ import {
 	type TruthBlock,
 	type Vocabulary,
 	type VocabularyTag,
-	type WindowBlock
+	type WindowBlock,
+	type WindowGeometry
 } from './schema';
 
 /**
@@ -217,17 +219,36 @@ function parseBuilder(raw: unknown): BuilderBlock | null {
 	};
 }
 
+/**
+ * Where the rows came from. Null for the `{}` a `--fixture` bundle writes,
+ * which is honest rather than broken: that bundle has no corpus behind it,
+ * and the page says "synthetic" rather than quoting a provenance it does
+ * not have.
+ */
 function parseCorpus(raw: unknown): CorpusBlock | null {
 	if (!isObject(raw)) return null;
-	const root = str(raw.root);
-	const hash = str(raw.population_hash);
-	if (root === null || hash === null) return null;
+	const corpusDir = str(raw.corpus_dir);
+	if (corpusDir === null) return null;
 	return {
-		root,
 		decisions_dirs: strings(raw.decisions_dirs),
-		decision_rows_loaded: num(raw.decision_rows_loaded) ?? 0,
-		decision_row_duplicates: num(raw.decision_row_duplicates) ?? 0,
-		population_hash: hash
+		decisions_labels: strings(raw.decisions_labels),
+		decisions_precedence: str(raw.decisions_precedence) ?? '',
+		corpus_dir: corpusDir,
+		files: num(raw.files) ?? 0,
+		files_skipped: num(raw.files_skipped) ?? 0,
+		rows_read: num(raw.rows_read) ?? 0,
+		rows_kept: num(raw.rows_kept) ?? 0,
+		duplicates_dropped: num(raw.duplicates_dropped) ?? 0,
+		leads: Array.isArray(raw.leads)
+			? raw.leads.map(num).filter((lead): lead is number => lead !== null)
+			: [],
+		window_from_utc: iso(raw.window_from_utc),
+		window_to_utc: iso(raw.window_to_utc),
+		// Absent on the honest path: a filler that did not run has no counts,
+		// and an empty object would read as "it ran and filled nothing".
+		probability_fill: isObject(raw.probability_fill)
+			? numberMap(raw.probability_fill)
+			: null
 	};
 }
 
@@ -253,14 +274,9 @@ function parseRule(raw: unknown): RuleBlock | null {
 		] as const
 	);
 	if (timings === null) return null;
-	const thresholds = isObject(raw.thresholds) ? raw.thresholds : null;
-	if (thresholds === null) return null;
-	const fallback = num(thresholds.fallback_threshold_pct);
-	if (fallback === null) return null;
-	const source =
-		raw.source === 'served_rule' || raw.source === 'lomo' || raw.source === 'stored_action'
-			? raw.source
-			: null;
+	const threshold = num(raw.threshold_pct);
+	if (threshold === null) return null;
+	const source = raw.source === 'served' || raw.source === 'lomo' ? raw.source : null;
 	const probability = raw.probability === 'postprocess' || raw.probability === 'curve'
 		? raw.probability
 		: null;
@@ -276,84 +292,129 @@ function parseRule(raw: unknown): RuleBlock | null {
 				'mixed';
 	return {
 		source,
+		// Absent means the producer never CLAIMED the thresholds were held
+		// out, and an unclaimed hold-out is an in-sample one. Defaulting the
+		// other way would let a bundle look honest by omission.
+		held_out: bool(raw.held_out) ?? false,
+		threshold_pct: threshold,
+		threshold_source: str(raw.threshold_source) ?? '',
+		fold_thresholds: Array.isArray(raw.fold_thresholds)
+			? (raw.fold_thresholds as RuleBlock['fold_thresholds'])
+			: null,
 		probability,
 		probability_column: str(raw.probability_column) ?? '',
 		probability_provenance: provenance,
-		thresholds: {
-			by_lead_pct: numberMap(thresholds.by_lead_pct),
-			source: str(thresholds.source) ?? '',
-			fallback_threshold_pct: fallback,
-			fitted_on_months: strings(thresholds.fitted_on_months),
-			// Absent means the producer never claimed the table was held out.
-			held_out: bool(thresholds.held_out) ?? false
-		},
-		...timings,
-		rows_fallback_to_curve: num(raw.rows_fallback_to_curve) ?? 0
+		...timings
 	};
 }
 
+/**
+ * The truth rule. The numbers are required together: the disc radius, the
+ * threshold and the onset rule are what the reviewer is judging the
+ * verdict against, and a block quoting three of them and defaulting the
+ * fourth would put an unlabelled guess in the methods panel.
+ */
 function parseTruth(raw: unknown): TruthBlock | null {
 	if (!isObject(raw)) return null;
-	const onset = isObject(raw.onset_rule)
-		? numbers(raw.onset_rule, [
-				'dry_min',
-				'onset_min_mm',
-				'slot_min',
-				'wet_precip_mm',
-				'wet_dur_min'
-			] as const)
-		: null;
-	const verdict = isObject(raw.radar_verdict) ? raw.radar_verdict : null;
-	if (onset === null || verdict === null) return null;
-	const disc = numbers(verdict, ['disc_radius_m', 'threshold_mm_h'] as const);
-	if (disc === null) return null;
-	const neighbour = isObject(raw.neighbour) ? raw.neighbour : {};
+	const values = numbers(
+		raw,
+		[
+			'dry_min',
+			'onset_min_mm',
+			'tolerance_min',
+			'lead_min',
+			'min_useful_lead_min',
+			'radar_disc_radius_m',
+			'radar_threshold_mm_h',
+			'neighbour_radius_km',
+			'min_known_slots'
+		] as const
+	);
+	if (values === null) return null;
 	return {
-		onset_rule: onset,
-		radar_verdict: {
-			disc_radius_m: disc.disc_radius_m,
-			statistic: str(verdict.statistic) ?? '',
-			threshold_mm_h: disc.threshold_mm_h
-		},
-		neighbour: {
-			radius_km: num(neighbour.radius_km) ?? 0,
-			rule: str(neighbour.rule) ?? ''
-		},
-		dead_gauges_excluded: strings(raw.dead_gauges_excluded),
-		known_until_utc_by_station: stringMap(raw.known_until_utc_by_station)
+		...values,
+		radar_source: str(raw.radar_source) ?? '',
+		dead_gauges: strings(raw.dead_gauges),
+		known_until: stringMap(raw.known_until),
+		suspect_gauge_months: strings(raw.suspect_gauge_months)
 	};
 }
 
 function parseSampling(raw: unknown): SamplingBlock | null {
 	if (!isObject(raw)) return null;
-	const counts = numbers(raw, ['seed', 'target_n', 'drawn_n'] as const);
-	if (counts === null) return null;
+	const seed = num(raw.seed);
+	const hash = str(raw.population_hash);
+	// Without the seed and the hash the draw cannot be reproduced or
+	// compared with a second bundle, which is the whole point of recording it.
+	if (seed === null || hash === null) return null;
 	const cells = Array.isArray(raw.cells)
 		? raw.cells
 				.map((cell) => {
 					if (!isObject(cell)) return null;
-					const n = numbers(cell, ['population', 'drawn'] as const);
-					const outcome = str(cell.outcome_class);
-					if (n === null || outcome === null) return null;
+					const counts = numbers(cell, ['population', 'drawn'] as const);
+					const stratum = str(cell.stratum);
+					if (counts === null || stratum === null) return null;
 					return {
-						outcome_class: outcome,
-						season: str(cell.season) ?? '',
-						region: str(cell.region) ?? '',
-						intensity_band: str(cell.intensity_band) ?? '',
-						...n
+						stratum,
+						keys: strings(cell.keys),
+						group: str(cell.group) ?? '',
+						...counts
 					};
 				})
 				.filter((cell): cell is SamplingBlock['cells'][number] => cell !== null)
 		: [];
 	return {
-		...counts,
-		strata_keys: strings(raw.strata_keys),
-		allocation: str(raw.allocation) ?? '',
+		seed,
+		strata: strings(raw.strata),
 		floor_per_cell: num(raw.floor_per_cell) ?? 0,
-		excluded: numberMap(raw.excluded),
-		population: numberMap(raw.population),
+		targets: numberMap(raw.targets),
 		drawn: numberMap(raw.drawn),
+		population: numberMap(raw.population),
+		total_drawn: num(raw.total_drawn) ?? 0,
+		population_hash: hash,
+		collapsed_late_pairs: num(raw.collapsed_late_pairs) ?? 0,
+		control_groups: strings(raw.control_groups),
 		cells
+	};
+}
+
+/** The window's geometry: minutes either side, and the imagery pad. */
+function parseWindowGeometry(raw: unknown): WindowGeometry | null {
+	if (!isObject(raw)) return null;
+	const values = numbers(raw, ['decision_min', 'frame_pad_min'] as const);
+	return values === null ? null : values;
+}
+
+/**
+ * The feature-gap audit. Null when the producer did not run one, which is
+ * itself worth saying: "we did not check" is not "there was no gap".
+ *
+ * Named apart from `parseFeatureColumns` deliberately: this is the
+ * bundle-wide audit of whether the Phase-H columns were THERE, and that one
+ * reads the columns themselves off a single decision row.
+ */
+function parseFeatureAudit(raw: unknown): FeaturesBlock | null {
+	if (!isObject(raw)) return null;
+	const probe = str(raw.probe_column);
+	if (probe === null) return null;
+	const rowsByDay: FeaturesBlock['rows_by_day'] = {};
+	if (isObject(raw.rows_by_day)) {
+		for (const [day, value] of Object.entries(raw.rows_by_day)) {
+			if (!isObject(value)) continue;
+			const counts = numbers(value, ['rows', 'with_features'] as const);
+			if (counts !== null) rowsByDay[day] = counts;
+		}
+	}
+	return {
+		probe_column: probe,
+		gap_share: num(raw.gap_share) ?? 0,
+		gap_days: strings(raw.gap_days),
+		// "Not stated" is not "excluded": a bundle that does not say whether
+		// it kept the feature-gap days is one the reviewer must treat as
+		// having kept them.
+		allowed: bool(raw.allowed) ?? true,
+		rows_by_day: rowsByDay,
+		documentation: stringMap(raw.documentation)
 	};
 }
 
@@ -499,9 +560,6 @@ export function parseManifest(raw: unknown): Manifest | null {
 	if (bundleId === null) return null;
 	const version = checkVersion('review manifest', raw.schema_version);
 
-	const window = isObject(raw.window) ? raw.window : {};
-	const from = iso(window.from_utc);
-	const to = iso(window.to_utc);
 	const events = isObject(raw.events) ? num(raw.events.count) : null;
 
 	return {
@@ -510,10 +568,11 @@ export function parseManifest(raw: unknown): Manifest | null {
 		built_at_utc: iso(raw.built_at_utc),
 		builder: parseBuilder(raw.builder),
 		corpus: parseCorpus(raw.corpus),
-		window: from !== null && to !== null ? { from_utc: from, to_utc: to } : null,
+		window: parseWindowGeometry(raw.window),
 		rule: parseRule(raw.rule),
 		truth: parseTruth(raw.truth),
 		sampling: parseSampling(raw.sampling),
+		features: parseFeatureAudit(raw.features),
 		grid: parseGrid(raw.grid),
 		frames: parseFrames(raw.frames),
 		events: events === null ? null : { count: events },
@@ -632,6 +691,7 @@ function parseWindow(raw: unknown): WindowBlock | null {
 		// that does not say falls back to the decision edge, which draws a
 		// shorter track rather than an invented one.
 		frames_from_utc: iso(raw.frames_from_utc) ?? from,
+		frames_to_utc: iso(raw.frames_to_utc),
 		slot_from_utc: iso(raw.slot_from_utc) ?? from,
 		slot_to_utc: iso(raw.slot_to_utc) ?? to,
 		known_until_utc: iso(raw.known_until_utc)
@@ -641,9 +701,11 @@ function parseWindow(raw: unknown): WindowBlock | null {
 function parseNeighbourRef(raw: unknown): NeighbourRef | null {
 	if (!isObject(raw)) return null;
 	const id = str(raw.station_id);
-	const values = numbers(raw, ['lat', 'lon', 'distance_km', 'bearing_deg'] as const);
-	if (id === null || values === null) return null;
-	return { station_id: id, name: str(raw.name) ?? id, ...values };
+	const distance = num(raw.distance_km);
+	// The distance is the whole claim a neighbour makes — "rain existed 11 km
+	// away" — so a reference without one says nothing worth drawing.
+	if (id === null || distance === null) return null;
+	return { station_id: id, station_name: str(raw.station_name) ?? id, distance_km: distance };
 }
 
 function parseStation(raw: unknown): StationBlock | null {
@@ -706,7 +768,7 @@ function parseStored(raw: unknown): StoredRow | null {
 }
 
 /** Feature columns: numbers, strings and nulls, kept as the producer wrote them. */
-function parseFeatures(raw: unknown): Record<string, number | string | null> {
+function parseFeatureColumns(raw: unknown): Record<string, number | string | null> {
 	if (!isObject(raw)) return {};
 	const out: Record<string, number | string | null> = {};
 	for (const [key, value] of Object.entries(raw)) {
@@ -755,7 +817,7 @@ function parseDecision(raw: unknown): Decision | null {
 		intensity_mm_h: num(raw.intensity_mm_h),
 		observed_mm_h: num(raw.observed_mm_h),
 		forecast_now_mm_h: num(raw.forecast_now_mm_h),
-		features: parseFeatures(raw.features),
+		features: parseFeatureColumns(raw.features),
 		features_present: bool(raw.features_present) ?? false,
 		replay: parseReplay(raw.replay),
 		stored: parseStored(raw.stored)
@@ -770,12 +832,21 @@ function parseGaps(raw: unknown): DecisionGap[] {
 			const from = iso(entry.from_utc);
 			const to = iso(entry.to_utc);
 			if (from === null || to === null) return null;
+			const edge = entry.edge;
 			return {
 				from_utc: from,
 				to_utc: to,
 				// Derivable from the edges, so a missing figure is computed
 				// rather than dropping a gap the track must draw.
 				minutes: num(entry.minutes) ?? (Date.parse(to) - Date.parse(from)) / 60_000,
+				// Not stated is not "a mere hiccup": claiming the coverage rule
+				// kept counting is what turns an unwatched station into an
+				// apparent miss.
+				coverage_break: bool(entry.coverage_break) ?? true,
+				edge:
+					edge === 'leading' || edge === 'trailing' || edge === 'whole_window'
+						? edge
+						: null,
 				reason: str(entry.reason) ?? ''
 			};
 		})
@@ -841,6 +912,7 @@ function parseSlot(raw: unknown): Slot | null {
 	return {
 		slot_end_utc: end,
 		mm: num(raw.mm),
+		mm_h: num(raw.mm_h),
 		dur_min: num(raw.dur_min),
 		known,
 		// A slot nobody reported cannot be wet, whatever the flag says.
@@ -921,9 +993,18 @@ function parseNeighbours(raw: unknown): NeighboursBlock | null {
 			if (ref === null || !isObject(entry)) return null;
 			return {
 				...ref,
+				// Null-safe on purpose: a neighbour whose coordinates did not
+				// parse still belongs in the panel with its distance and its
+				// slots. It simply gets no dot — see `neighbourFeatures`.
+				lat: num(entry.lat),
+				lon: num(entry.lon),
+				bearing_deg: num(entry.bearing_deg),
 				wet_in_window: bool(entry.wet_in_window),
 				first_wet_utc: iso(entry.first_wet_utc),
 				known_slots: num(entry.known_slots) ?? 0,
+				onsets_in_window_utc: strings(entry.onsets_in_window_utc).filter((at) =>
+					Number.isFinite(Date.parse(at))
+				),
 				slots: parseSlots(entry.slots)
 			};
 		})
@@ -955,6 +1036,7 @@ function parseDualTruth(raw: unknown): DualTruthBlock | null {
 		// is uninterpretable; unreadable edges leave the instants empty rather
 		// than borrowing the event's own window, which is a different span.
 		window_used: {
+			kind: window.kind === 'warning' || window.kind === 'onset' ? window.kind : null,
 			from_utc: from ?? '',
 			to_utc: to ?? '',
 			definition: str(window.definition) ?? ''
@@ -1003,7 +1085,8 @@ function parseFrameRefs(raw: unknown): FrameRef[] {
 				// Null means the builder did not say. The track draws such a
 				// frame as unknown rather than as a hole, and the fetcher still
 				// tries it — an untried frame is a hole we made ourselves.
-				present: bool(entry.present)
+				present: bool(entry.present),
+				has_decision_row: bool(entry.has_decision_row)
 			};
 		})
 		.filter((ref): ref is FrameRef => ref !== null)
