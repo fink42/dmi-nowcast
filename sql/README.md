@@ -50,6 +50,7 @@ here as SQL instead of bespoke pandas.
 | `effective_n_by_stratum.sql` | Kish effective N per lead / region / season stratum |
 | `reliability_gauge.sql` | pooled weighted reliability per lead against **gauge** truth (`gauge_outcome`) |
 | `reliability_radar_vs_gauge.sql` | radar vs gauge observed frequency, paired, per lead × bin |
+| `review_tags.sql` | hand-review tag rates by class × verdict and by review-order decile, against the hit control group's base rate |
 
 ## Gauge truth (Phase F)
 
