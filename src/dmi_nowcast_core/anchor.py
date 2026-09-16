@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -77,6 +78,7 @@ __all__ = [
     "DEFAULT_LAG_FULLRANGE_MIN",
     "DEFAULT_LAG_DOPPLER_MIN",
     "DEFAULT_POLL_INTERVAL_MIN",
+    "DEFAULT_POLL_JITTER_S",
     "DEFAULT_MAX_ANCHOR_AGE_MIN",
     "DEFAULT_STEP_MIN",
     "DEFAULT_TOLERANCE_S",
@@ -123,11 +125,19 @@ DEFAULT_LAG_FULLRANGE_MIN = 13.1
 DEFAULT_LAG_DOPPLER_MIN = 8.1
 
 #: The cycle's poll cadence. The scheduler wakes every 5 min ± 30 s
-#: jitter; a replay cannot reproduce the jitter, so instants sit on the
-#: 5-minute grid and a frame is first seen at the first poll at or after
-#: its publication. This adds the same ~1.9 min to both products, so the
-#: five-minute gap between the policies is unaffected.
+#: jitter and a frame is first seen at the first poll at or after its
+#: publication, so the age it is seen at is the lag plus the remainder to
+#: the next poll. This adds the same ~1.9 min to both products on a rigid
+#: grid, so the five-minute gap between the policies is unaffected.
 DEFAULT_POLL_INTERVAL_MIN = 5.0
+
+#: The scheduler's jitter, seconds (``poll.jitter_seconds``). A replay
+#: cannot reproduce which draws the live process made, but it can
+#: reproduce the *distribution*: without it the poll grid divides the
+#: frame grid exactly and every fullRange anchor is seen at 15.0 minutes,
+#: which is a constant the model cannot learn a discount from. See
+#: :func:`_poll_grid`.
+DEFAULT_POLL_JITTER_S = 30.0
 
 #: A frame older than this is not an anchor at all. Without the cap a gap
 #: in the archive would silently anchor a cycle on a six-hour-old frame
@@ -330,18 +340,52 @@ def select_anchor(
 
 
 def _poll_grid(
-    start: datetime, end: datetime, poll_interval_min: float,
+    start: datetime,
+    end: datetime,
+    poll_interval_min: float,
+    *,
+    jitter_s: float = 0.0,
+    seed: int = 0,
 ) -> Iterable[datetime]:
-    """Poll instants in ``[start, end]``, aligned to midnight UTC."""
+    """Poll instants in ``[start, end]``, aligned to midnight UTC.
+
+    With ``jitter_s = 0`` this is a rigid grid, and on a rigid grid every
+    frame of a given product is seen at exactly the same age: the lag is a
+    constant, the frames are on a 10-minute grid and the poll grid divides
+    it, so ``frame_age_min`` comes out 15.0 for every fullRange anchor
+    there has ever been. A model given a constant learns nothing from it —
+    the fitted coefficient was 0.000 at every lead.
+
+    The service does not run on a rigid grid. Its scheduler fires every
+    ``poll_interval_min`` ± :data:`DEFAULT_POLL_JITTER_S`, so its phase
+    against DMI's publication clock is wherever the last few hundred
+    draws left it, and the frame age it actually computes is the
+    publication lag plus that remainder. With ``jitter_s > 0`` the walk
+    here is the same one: a phase drawn uniformly over the interval, then
+    a step of ``interval ± jitter`` each time. ``seed`` makes it
+    reproducible — a resumed day must re-plan to the same instants as the
+    run it is resuming — and it is the caller's business to key it on
+    something stable, which for the replay is the day.
+    """
     step = timedelta(minutes=poll_interval_min)
     midnight = start.replace(hour=0, minute=0, second=0, microsecond=0)
     n = int((start - midnight) / step)
     t = midnight + n * step
     while t < start:
         t += step
+    if jitter_s <= 0:
+        while t <= end:
+            yield t
+            t += step
+        return
+    rng = random.Random(int(seed))
+    t += timedelta(seconds=rng.uniform(0.0, float(poll_interval_min) * 60.0))
     while t <= end:
-        yield t
-        t += step
+        if t >= start:
+            yield t
+        t += step + timedelta(
+            seconds=rng.uniform(-float(jitter_s), float(jitter_s)),
+        )
 
 
 def decision_instants(
@@ -353,6 +397,8 @@ def decision_instants(
     lag: ProductLag = DEFAULT_LAG,
     poll_interval_min: float = DEFAULT_POLL_INTERVAL_MIN,
     max_age_min: float = DEFAULT_MAX_ANCHOR_AGE_MIN,
+    poll_jitter_s: float = 0.0,
+    poll_seed: int = 0,
 ) -> list[AnchorSelection]:
     """One selection per *new* anchor, over the poll grid in ``[start, end]``.
 
@@ -365,9 +411,16 @@ def decision_instants(
 
     With the measured lags this yields **one instant per ten minutes under
     both policies**, at the same wall-clock instants, differing only in
-    which frame is underneath: fullRange at age 15 min, doppler at age 10.
-    The two products publish together, so "freshest" does not double the
-    decision rate — it makes each decision five minutes fresher.
+    which frame is underneath: on a rigid poll grid, fullRange at age
+    15 min and doppler at age 10. The two products publish together, so
+    "freshest" does not double the decision rate — it makes each decision
+    five minutes fresher.
+
+    ``poll_jitter_s`` (with ``poll_seed``) replaces that rigid grid with
+    the scheduler's own jittered one, which is what turns those two
+    constants back into the distribution the service actually sees — see
+    :func:`_poll_grid`. It changes the *instants*, never which frames
+    become anchors: each frame is still first seen exactly once.
 
     The first poll in ``[start, end]`` always yields a cycle: there is no
     previous anchor to compare it against, so it stands on whatever was
@@ -377,7 +430,10 @@ def decision_instants(
     """
     start, end = _as_utc(start), _as_utc(end)
     if poll_interval_min > 0:
-        candidates: Iterable[datetime] = _poll_grid(start, end, poll_interval_min)
+        candidates: Iterable[datetime] = _poll_grid(
+            start, end, poll_interval_min,
+            jitter_s=poll_jitter_s, seed=poll_seed,
+        )
     else:
         # No poll grid: the cycle is assumed to see a frame the instant it
         # is published. This is what the flat --frame-age-min model means,

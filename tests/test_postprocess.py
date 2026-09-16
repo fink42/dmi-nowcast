@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pytest
@@ -263,6 +264,364 @@ def test_the_feature_catalogue_documents_every_column() -> None:
     assert "eta_min" not in names
 
 
+def test_the_catalogue_is_append_only() -> None:
+    """The v1 block keeps its exact place; the v2 columns come after it.
+
+    A stored row is aligned by name, so the order binds only the writers —
+    but the writers are the parity contract, and a column that moves is a
+    column one writer can fill and the other cannot.
+    """
+    import pyarrow as pa
+
+    names = [name for name, _ in pp.feature_columns((10, 30))]
+    v1 = ["raw_frac_10", "raw_frac_30"] + [
+        name for name, _ in pp.SCALAR_FEATURE_COLUMNS
+    ]
+    assert names[:len(v1)] == v1
+    tail = names[len(v1):]
+    assert tail[:4] == ["ens_mean_10", "ens_p90_10", "ens_mean_30", "ens_p90_30"]
+    assert tail[4:] == [name for name, _ in pp.SCALAR_FEATURE_COLUMNS_V2]
+    # Every v2 column is documented, and every one of them is a nullable
+    # float — "unknown" has to be expressible, and it is never a 0.
+    schema = pp.feature_schema((10, 30))
+    for name, _definition in pp.SCALAR_FEATURE_COLUMNS_V2:
+        assert name in pp.FEATURE_DOC
+        assert schema.field(name).type == pa.float32()
+
+
+# ---------------------------------------------------------------------------
+# v2/F2 — radar history at the point
+# ---------------------------------------------------------------------------
+
+
+class TestRadarHistory:
+    def test_the_previous_frames_are_read_at_the_point(self) -> None:
+        now, prev10, prev20 = _empty_field(), _empty_field(), _empty_field()
+        _blob(prev10, 100, 100, 4.0, half=0)
+        _blob(prev20, 100, 100, 9.0, half=0)
+        out = pp.station_features(
+            now,
+            np.zeros(now.shape, dtype=np.float32),
+            np.zeros(now.shape, dtype=np.float32),
+            np.array([100.0]), np.array([100.0]),
+            pixel_km=PIXEL_KM, dt_min=10.0,
+            bulk_vy=0.0, bulk_vx=2.0, stalled_share=0.0,
+            rain_prev10_mm_h=prev10, rain_prev20_mm_h=prev20,
+        )
+        assert out["obs_prev10_mm_h"][0] == pytest.approx(4.0)
+        assert out["obs_prev20_mm_h"][0] == pytest.approx(9.0)
+        assert out["obs_max_5km_prev10_mm_h"][0] == pytest.approx(4.0)
+
+    def test_without_previous_frames_the_columns_are_absent_not_zero(self) -> None:
+        out = _features_with_flow(_empty_field(), 0.0, 2.0)
+        for name in (
+            "obs_prev10_mm_h", "obs_prev20_mm_h", "obs_max_5km_prev10_mm_h",
+        ):
+            assert name not in out
+        # The row still carries the column — as a null, never a 0 mm/h.
+        row = pp.feature_row(
+            out, 0, raw_fractions={}, leads=(10,),
+            season="summer", hour_utc=12,
+            frame_age_min=15.0, station_radar_km=40.0,
+        )
+        assert row["obs_prev10_mm_h"] is None
+
+    def test_a_previous_frame_of_the_wrong_shape_is_refused(self) -> None:
+        field = _empty_field()
+        with pytest.raises(ValueError, match="rain_prev10_mm_h"):
+            pp.station_features(
+                field,
+                np.zeros(field.shape, dtype=np.float32),
+                np.zeros(field.shape, dtype=np.float32),
+                np.array([100.0]), np.array([100.0]),
+                pixel_km=PIXEL_KM, dt_min=10.0,
+                bulk_vy=0.0, bulk_vx=2.0, stalled_share=0.0,
+                rain_prev10_mm_h=field[:10, :10],
+            )
+
+    def test_the_wet_fraction_is_of_the_finite_pixels(self) -> None:
+        field = _empty_field()
+        rows, cols = np.mgrid[0:GRID, 0:GRID]
+        field[((rows - 100) ** 2 + (cols - 100) ** 2) * PIXEL_KM ** 2 <= 25.0] = 2.0
+        out = _features_with_flow(field, 0.0, 2.0)
+        assert out["wet_frac_5km"][0] == pytest.approx(1.0)
+        # The 10 km disc has four times the area of the wet part of it.
+        assert out["wet_frac_10km"][0] == pytest.approx(0.25, abs=0.02)
+
+    def test_off_the_composite_the_wet_fraction_is_unknown(self) -> None:
+        field = np.full((GRID, GRID), np.nan, dtype=np.float32)
+        out = _features_with_flow(field, 0.0, 2.0)
+        assert math.isnan(float(out["wet_frac_5km"][0]))
+        assert math.isnan(float(out["wet_frac_10km"][0]))
+
+
+# ---------------------------------------------------------------------------
+# v2/F3 — the corridor, resolved
+# ---------------------------------------------------------------------------
+
+
+class TestCorridorProfile:
+    EAST = (0.0, 2.0)
+
+    def test_each_bin_holds_its_own_five_kilometres(self) -> None:
+        field = _empty_field()
+        # One cell 17 km upwind (west): bin 3 is 15-20 km.
+        _blob(field, 100, 100 - int(17.0 / PIXEL_KM), 8.0, half=0)
+        out = _features_with_flow(field, *self.EAST)
+        assert out["up_max_b3"][0] == pytest.approx(8.0)
+        assert [
+            float(out[f"up_max_b{i}"][0]) for i in range(8) if i != 3
+        ] == pytest.approx([0.0] * 7)
+        assert out["up_max_40km_mm_h"][0] == pytest.approx(8.0)
+
+    def test_the_bins_tile_the_whole_forty_kilometres(self) -> None:
+        field = np.full((GRID, GRID), 3.0, dtype=np.float32)
+        out = _features_with_flow(field, *self.EAST)
+        assert [float(out[f"up_max_b{i}"][0]) for i in range(8)] == (
+            pytest.approx([3.0] * 8)
+        )
+        assert out["up_mean_40km_mm_h"][0] == pytest.approx(3.0)
+
+    def test_the_mean_separates_a_band_from_a_core(self) -> None:
+        band = np.full((GRID, GRID), 5.0, dtype=np.float32)
+        core = _empty_field()
+        _blob(core, 100, 100 - int(10.0 / PIXEL_KM), 5.0)
+        wide = _features_with_flow(band, *self.EAST)
+        narrow = _features_with_flow(core, *self.EAST)
+        assert wide["up_max_40km_mm_h"][0] == pytest.approx(
+            narrow["up_max_40km_mm_h"][0],
+        )
+        assert wide["up_mean_40km_mm_h"][0] > narrow["up_mean_40km_mm_h"][0]
+
+    def test_no_usable_flow_leaves_every_bin_undefined(self) -> None:
+        out = _features_with_flow(
+            np.full((GRID, GRID), 5.0, dtype=np.float32), 0.0, 0.0,
+        )
+        assert math.isnan(float(out["up_mean_40km_mm_h"][0]))
+        for index in range(8):
+            assert math.isnan(float(out[f"up_max_b{index}"][0])), index
+
+
+# ---------------------------------------------------------------------------
+# v2/F4 — the shape of the ensemble
+# ---------------------------------------------------------------------------
+
+
+def _ensemble(members: list[list[float]]) -> np.ndarray:
+    """``(n_members, n_timesteps, 1, 1)`` from one rate series per member."""
+    return np.array(members, dtype=np.float32)[:, :, np.newaxis, np.newaxis]
+
+
+class TestEnsembleShape:
+    #: Ten-minute timesteps read with no frame age, so timestep ``t``
+    #: answers for lead ``(t + 1) * 10``.
+    KWARGS = dict(threshold_mm_h=0.5, timestep_min=10.0, frame_age_min=0.0)
+
+    def test_the_mean_and_p90_are_of_the_cumulative_maximum(self) -> None:
+        # Member 0 peaks at 4 and dries; member 1 holds 1 throughout. By
+        # lead 30 their cumulative maxima are 4 and 1.
+        ensemble = _ensemble([[0.0, 4.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
+        out = pp.ensemble_point_features(
+            ensemble, [(0, 0)], leads_min=(10, 30), **self.KWARGS,
+        )
+        assert out["ens_mean_10"][0] == pytest.approx(0.5)
+        assert out["ens_mean_30"][0] == pytest.approx(2.5)
+        assert out["ens_p90_30"][0] == pytest.approx(3.7, abs=0.05)
+
+    def test_the_spread_is_the_iqr_of_the_arrival_times(self) -> None:
+        # Four members arriving at timesteps 0…3 → 10, 20, 30, 40 min.
+        ensemble = _ensemble([
+            [2.0, 2.0, 2.0, 2.0],
+            [0.0, 2.0, 2.0, 2.0],
+            [0.0, 0.0, 2.0, 2.0],
+            [0.0, 0.0, 0.0, 2.0],
+        ])
+        out = pp.ensemble_point_features(
+            ensemble, [(0, 0)], leads_min=(30,), **self.KWARGS,
+        )
+        assert out["ens_eta_spread_min"][0] == pytest.approx(15.0)
+
+    def test_agreement_reads_as_no_spread(self) -> None:
+        ensemble = _ensemble([[0.0, 2.0, 2.0, 2.0]] * 5)
+        out = pp.ensemble_point_features(
+            ensemble, [(0, 0)], leads_min=(30,), **self.KWARGS,
+        )
+        assert out["ens_eta_spread_min"][0] == pytest.approx(0.0)
+
+    def test_under_four_arrivals_there_is_no_spread_to_report(self) -> None:
+        ensemble = _ensemble([
+            [2.0, 2.0, 2.0, 2.0],
+            [0.0, 2.0, 2.0, 2.0],
+            [0.0, 0.0, 2.0, 2.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ])
+        out = pp.ensemble_point_features(
+            ensemble, [(0, 0)], leads_min=(30,), **self.KWARGS,
+        )
+        assert math.isnan(float(out["ens_eta_spread_min"][0]))
+
+    def test_a_point_off_the_product_grid_reads_nothing(self) -> None:
+        ensemble = _ensemble([[2.0, 2.0, 2.0, 2.0]] * 5)
+        out = pp.ensemble_point_features(
+            ensemble, [None], leads_min=(10, 30), **self.KWARGS,
+        )
+        for name in ("ens_mean_10", "ens_p90_30", "ens_eta_spread_min"):
+            assert math.isnan(float(out[name][0])), name
+
+    def test_a_missing_timestep_does_not_poison_the_members_tail(self) -> None:
+        """``fmax`` carries the running maximum past a NaN; ``maximum`` would not."""
+        ensemble = _ensemble([[2.0, np.nan, 0.0, 0.0]] * 4)
+        out = pp.ensemble_point_features(
+            ensemble, [(0, 0)], leads_min=(40,), **self.KWARGS,
+        )
+        assert out["ens_mean_40"][0] == pytest.approx(2.0)
+
+    def test_the_lead_picks_the_timestep_the_fraction_did(self) -> None:
+        """One bucket rule, shared with ``national_products``."""
+        from dmi_nowcast_core.national import national_products
+
+        ensemble = _ensemble([[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 0.0, 2.0]])
+        products = national_products(
+            ensemble, leads_min=(30, 40), threshold_mm_h=0.5,
+            timestep_min=10.0, frame_age_min=0.0, downsample_factor=1,
+        )
+        out = pp.ensemble_point_features(
+            ensemble, [(0, 0)], leads_min=(30, 40), **self.KWARGS,
+        )
+        assert products.p_rain[30][0, 0] == pytest.approx(0.5)
+        assert products.p_rain[40][0, 0] == pytest.approx(1.0)
+        assert out["ens_mean_30"][0] == pytest.approx(1.0)
+        assert out["ens_mean_40"][0] == pytest.approx(2.0)
+
+    def test_it_refuses_an_array_that_is_not_an_ensemble(self) -> None:
+        with pytest.raises(ValueError, match="n_members"):
+            pp.ensemble_point_features(
+                np.zeros((3, 3)), [(0, 0)], leads_min=(10,), **self.KWARGS,
+            )
+
+
+# ---------------------------------------------------------------------------
+# v2/F1 — the station's own gauge, and the availability rule
+# ---------------------------------------------------------------------------
+
+_T0 = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+
+
+def _slots(*entries: tuple[float, bool | None, float | None]) -> list[tuple]:
+    """``(minutes before noon, wet, mm)`` → the triples the core reads."""
+    return [
+        (_T0 - timedelta(minutes=back), wet, mm) for back, wet, mm in entries
+    ]
+
+
+class TestGaugeFeatures:
+    LAG = 10.0
+
+    def test_the_windows_are_measured_from_the_visibility_horizon(self) -> None:
+        out = pp.station_gauge_features(
+            [_slots((10, True, 0.4), (20, True, 0.3), (30, False, 0.0))],
+            now_utc=_T0, lag_min=self.LAG,
+        )
+        assert out["g_mm_10"][0] == pytest.approx(0.4)
+        assert out["g_mm_30"][0] == pytest.approx(0.7)
+        assert out["g_mm_60"][0] == pytest.approx(0.7)
+        assert out["g_known"][0] == pytest.approx(1.0)
+        assert out["g_dry_60"][0] == pytest.approx(0.0)
+        # ...but the age of the rain is measured from the decision
+        # instant, so the lag is part of it.
+        assert out["g_min_since_wet"][0] == pytest.approx(10.0)
+
+    def test_a_slot_inside_the_lag_is_invisible(self) -> None:
+        """The leakage guard: one minute too fresh is not there at all.
+
+        A slot ending at ``t - lag + 1`` had not reached the store when
+        the cycle ran. If the replay could see it, every coefficient on
+        the gauge block would be worth less in production than it looks
+        offline — and nothing would fail.
+        """
+        out = pp.station_gauge_features(
+            [_slots((self.LAG - 1, True, 5.0))],
+            now_utc=_T0, lag_min=self.LAG,
+        )
+        assert out["g_known"][0] == pytest.approx(0.0)
+        for name in ("g_mm_10", "g_mm_30", "g_mm_60", "g_min_since_wet",
+                     "g_dry_60"):
+            assert math.isnan(float(out[name][0])), name
+        # A minute older and it is visible — the boundary from both sides.
+        seen = pp.station_gauge_features(
+            [_slots((self.LAG, True, 5.0))], now_utc=_T0, lag_min=self.LAG,
+        )
+        assert seen["g_mm_10"][0] == pytest.approx(5.0)
+
+    def test_a_dry_hour_is_a_measurement(self) -> None:
+        out = pp.station_gauge_features(
+            [_slots(*[(10 * k, False, 0.0) for k in range(1, 8)])],
+            now_utc=_T0, lag_min=self.LAG,
+        )
+        assert out["g_dry_60"][0] == pytest.approx(1.0)
+        assert out["g_known"][0] == pytest.approx(1.0)
+        assert out["g_mm_60"][0] == pytest.approx(0.0)
+        # Known, and dry as far back as anything can see: the cap, not null.
+        assert out["g_min_since_wet"][0] == pytest.approx(pp.GAUGE_SINCE_CAP_MIN)
+
+    def test_an_unknown_slot_is_not_a_dry_one(self) -> None:
+        out = pp.station_gauge_features(
+            [_slots(*[(10 * k, None, None) for k in range(1, 8)])],
+            now_utc=_T0, lag_min=self.LAG,
+        )
+        assert out["g_known"][0] == pytest.approx(0.0)
+        assert math.isnan(float(out["g_dry_60"][0]))
+        assert math.isnan(float(out["g_mm_60"][0]))
+
+    def test_rain_before_the_hour_still_dates_it(self) -> None:
+        """``g_dry_60`` and ``g_min_since_wet`` answer different questions."""
+        out = pp.station_gauge_features(
+            [_slots((10, False, 0.0), (20, False, 0.0), (130, True, 2.0))],
+            now_utc=_T0, lag_min=self.LAG,
+        )
+        assert out["g_dry_60"][0] == pytest.approx(1.0)
+        assert out["g_min_since_wet"][0] == pytest.approx(130.0)
+
+    def test_a_point_with_no_gauge_is_a_null_block_and_a_zero_flag(self) -> None:
+        out = pp.station_gauge_features([None, []], now_utc=_T0, lag_min=self.LAG)
+        assert list(out["g_known"]) == [0.0, 0.0]
+        for index in (0, 1):
+            assert math.isnan(float(out["g_mm_60"][index]))
+            assert math.isnan(float(out["g_min_since_wet"][index]))
+
+    def test_the_cap_holds_however_old_the_rain_is(self) -> None:
+        out = pp.station_gauge_features(
+            [_slots((10, False, 0.0), (5000, True, 9.0))],
+            now_utc=_T0, lag_min=self.LAG,
+        )
+        assert out["g_min_since_wet"][0] == pytest.approx(pp.GAUGE_SINCE_CAP_MIN)
+
+    def test_a_naive_slot_end_is_a_bug_not_a_zone(self) -> None:
+        with pytest.raises(ValueError, match="timezone-aware"):
+            pp.station_gauge_features(
+                [[(datetime(2026, 9, 16, 11, 50), True, 1.0)]],
+                now_utc=_T0, lag_min=self.LAG,
+            )
+
+    def test_the_wet_rule_is_the_projects_one(self) -> None:
+        """``wet`` arrives already decided — by ``warning_score``, once."""
+        from dmi_nowcast_core import warning_score as ws
+
+        table = [{
+            "station_id": "06180",
+            "observed_utc": _T0 - timedelta(minutes=20),
+            "parameter_id": ws.PRECIP_PARAM,
+            "value": 0.1,
+        }]
+        slots = ws.gauge_slot_amounts(
+            table, "06180",
+            start_utc=_T0 - timedelta(minutes=60), end_utc=_T0,
+        )
+        out = pp.station_gauge_features([slots], now_utc=_T0, lag_min=self.LAG)
+        assert out["g_mm_30"][0] == pytest.approx(0.1)
+        assert out["g_dry_60"][0] == pytest.approx(0.0)
+
+
 # ---------------------------------------------------------------------------
 # The design matrix
 # ---------------------------------------------------------------------------
@@ -366,6 +725,27 @@ def test_a_column_the_run_never_wrote_reads_as_missing() -> None:
     del features["up_max_40km_mm_h"]
     # NaN in the design, which the standardiser then imputes.
     assert math.isnan(_design_value(features, "log1p_up_max_40km_mm_h"))
+
+
+def test_a_row_from_before_the_v2_columns_still_builds_a_design() -> None:
+    """The additive rule, from the direction that would break a refit.
+
+    Every replay row written before 2026-09-16 carries the v1 block and
+    nothing else. The nightly fit reads them by name off parquet, so the
+    v2 columns arrive as nulls — and a design that refused them, or that
+    changed shape because of them, would silently drop ten months of
+    training rows.
+    """
+    v1_only = _one_row()
+    assert not set(v1_only) & {
+        name for name, _ in pp.SCALAR_FEATURE_COLUMNS_V2
+    }
+    design = pp.build_design(v1_only, (20, 30))
+    assert design.shape == (1, len(pp.design_columns((20, 30))))
+    # And it is scoreable: the standardiser imputes what is missing, so
+    # the transformed row is finite whatever the writer could not compute.
+    scaler = pp.Standardiser.fit(design)
+    assert np.all(np.isfinite(scaler.transform(design)))
 
 
 class TestStandardiser:

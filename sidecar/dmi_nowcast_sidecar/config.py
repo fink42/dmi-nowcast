@@ -24,6 +24,7 @@ from dmi_nowcast_core.dense_flow import (
     DEFAULT_TEXTURE_PERCENTILE,
 )
 from dmi_nowcast_core.metobs import DEFAULT_BASE_URL as METOBS_DEFAULT_BASE_URL
+from dmi_nowcast_core import postprocess as core_postprocess
 from dmi_nowcast_core.push_rules import (
     DEFAULT_PERSISTENCE_OBS,
     DEFAULT_REARM_AFTER_MIN,
@@ -357,6 +358,38 @@ class StationObsConfig(BaseModel):
                 "poll leaves a permanent gap in the gauge archive",
             )
         return self
+
+
+class PostprocessConfig(BaseModel):
+    """How the cycle computes the post-processing FEATURES (v2, 2026-09-16).
+
+    Not about the model — that is ``push.postprocess_path`` and
+    ``push.probability_source``, and stays there. This is about the one
+    input the feature row cannot derive from the radar: the station's own
+    gauge, which reaches the store some minutes after the slot it
+    describes ends.
+
+    ``gauge_lag_min`` is the contract between this service and the offline
+    replay. The replay hides every slot that ended later than
+    ``decision instant − gauge_lag_min``, so the model is fitted on what a
+    cycle can actually read; if the live service then reads *fresher*
+    slots than that, it scores rows the model has never seen. Change it in
+    one place and re-replay, never in one place alone.
+
+    Measured 2026-09-16 from the API's own ``created`` stamps (15,184
+    slots, 105 DK stations): a slot is published 1.5 min after it ends at
+    the median, 1.6 at p90, 21.6 at p99. The gauge poller runs every
+    10 minutes, so one poll interval is the honest floor.
+    """
+
+    #: Minutes a gauge slot must be behind the decision instant to count.
+    gauge_lag_min: Annotated[float, Field(ge=0.0, le=180.0)] = (
+        core_postprocess.DEFAULT_GAUGE_LAG_MIN
+    )
+    #: Read the gauge block at all. Off leaves the ``g_*`` columns null,
+    #: which is what they are at every point that is not a gauge anyway —
+    #: the escape hatch if the store read ever costs a cycle.
+    gauge_features: bool = True
 
 
 class ServerConfig(BaseModel):
@@ -752,6 +785,36 @@ class FitPostprocessConfig(BaseModel):
     #: reads, ``push.postprocess_path`` (resolved) — fitting into a file
     #: nothing loads would be a very well-documented no-op.
     out: Path | None = None
+    # -- post-processing v2 -------------------------------------------------
+    # Every default below is the model in service before this track, so a
+    # config that says nothing about them refits exactly what it refitted
+    # yesterday. ``sidecar/tests/test_postprocess_fit.py`` pins that.
+    #: Which of the four arms to fit. A ``-shared`` kind is ONE model over
+    #: every served lead with the lead in the design, which is the only
+    #: way the 20-minute rows inform the 60-minute answer; the plain kinds
+    #: are one model per lead.
+    #:
+    #: **Neither tree kind can be fitted here**: the image has no LightGBM
+    #: by design (see ``dmi_nowcast_core.postprocess_trees``), so asking
+    #: for one fails this step and leaves last night's model in service. A
+    #: tree model reaches the service by being fitted offline in
+    #: ``.venv-fit`` with ``scripts/fit_postprocess.py --model trees`` and
+    #: synced in; the numpy evaluator that SERVES it is in the image.
+    model: Literal[
+        "logistic", "logistic-shared", "trees", "trees-shared",
+    ] = "logistic"
+    #: ``"v1"`` is the 27 columns that shipped; ``"v2"`` is v1 plus every
+    #: feature column the replay catalogue has grown, a spline basis on
+    #: the columns whose effect bends, and the season interactions.
+    design: Literal["v1", "v2"] = "v1"
+    #: Learn a per-station intercept offset (its own, 10× stronger ridge),
+    #: stored as a ``{station_id: offset}`` map and applied only at the
+    #: stations the fit saw. A subscriber's own coordinate gets none.
+    station_offsets: bool = False
+    #: ``"pooled"`` is one recalibration curve per lead; ``"per-season"``
+    #: is one per season, falling back to the pooled curve for a season
+    #: with too few rows to fit one honestly.
+    isotonic: Literal["pooled", "per-season"] = "pooled"
 
 
 class GaugeReliabilityConfig(BaseModel):
@@ -1006,6 +1069,7 @@ class Config(BaseSettings):
     lightning: LightningConfig = Field(default_factory=LightningConfig)
     push: PushConfig = Field(default_factory=PushConfig)
     station_obs: StationObsConfig = Field(default_factory=StationObsConfig)
+    postprocess: PostprocessConfig = Field(default_factory=PostprocessConfig)
     station_eval: StationEvalConfig = Field(default_factory=StationEvalConfig)
     quality_report: QualityReportConfig = Field(default_factory=QualityReportConfig)
     sync: SyncConfig = Field(default_factory=SyncConfig)

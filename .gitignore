@@ -8,6 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+# The offline FIT venv: LightGBM + scikit-learn, for
+# `scripts/fit_postprocess.py --model trees`. Deliberately separate from
+# .venv and from the sidecar's, because the SERVING image must never grow
+# either dependency — see that script's docstring for the two commands
+# that create it.
+.venv-fit
 
 # Tooling caches
 .pytest_cache/

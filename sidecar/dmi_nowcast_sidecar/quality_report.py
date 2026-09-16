@@ -359,6 +359,13 @@ class QualityReportTask:
                 int(lead) for lead in self.config.forecast.national.leads_min
             ),
             l2=float(settings.l2),
+            # Post-processing v2. Defaults are the model that shipped, so
+            # a config that mentions none of these refits what it refitted
+            # yesterday.
+            model=str(settings.model),
+            design=str(settings.design),
+            station_offsets=bool(settings.station_offsets),
+            isotonic=str(settings.isotonic),
             dry_min=int(thresholds.dry_min),
             onset_min_mm=float(thresholds.onset_min_mm),
             min_known_slots=int(thresholds.min_known_slots),

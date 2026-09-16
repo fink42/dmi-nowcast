@@ -107,10 +107,20 @@ def _features(fraction: float) -> dict[str, float]:
 
 
 def _design(samples: list[dict[str, float]], stamps: np.ndarray) -> dict:
-    """Feature dicts → the column mapping ``PostprocessModel`` reads."""
+    """Feature dicts → the column mapping ``PostprocessModel`` reads.
+
+    A stored row carries every column the schema names, and one the
+    writer could not compute is ``None`` — a parquet null — rather than
+    absent. Both mean the same thing, and both become NaN here, exactly
+    as ``push.postprocess._columns_of`` does it for a live row.
+    """
+    def _value(sample: dict, name: str) -> float:
+        raw = sample.get(name)
+        return np.nan if raw is None else float(raw)
+
     columns: dict = {
         name: np.array(
-            [float(s.get(name, np.nan)) for s in samples], dtype=np.float64,
+            [_value(s, name) for s in samples], dtype=np.float64,
         )
         for name in pp.feature_source_columns(DESIGN_LEADS)
     }

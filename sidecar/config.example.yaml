@@ -262,6 +262,34 @@ station_obs:
 #     threshold_pct: 40
 #     lead_min: 30
 
+# --- Post-processing FEATURES (v2, 2026-09-16) ------------------------
+# How the cycle builds the feature row it scores. Not about the model —
+# that is push.postprocess_path and push.probability_source, above.
+#
+# gauge_lag_min is the one number shared with the offline replay. The
+# cycle reads the station's own gauge out of the corpus store for the
+# g_* features, and may only see slots that ENDED at or before
+# `decision instant - gauge_lag_min`. The replay hides exactly the same
+# slots (--gauge-lag-min), so the model is fitted on what a cycle can
+# actually read. Changing it here without re-replaying means scoring
+# rows the model was never shown.
+#
+# 10 minutes = one gauge-poll interval. DMI publishes a 10-minute slot
+# 1.5 min after it ends at the median (p90 1.6, p99 21.6; measured
+# 2026-09-16 over 15,184 slots at 105 stations), but station_obs only
+# polls every 10, so a poll interval is the honest floor.
+#
+# The block is null — and g_known is 0 — at every point that is not a
+# gauge, which is home and every subscriber. Only the scoreboard's
+# stations resolve to one, by coordinate, out of
+# station_eval.points_file.
+#
+# postprocess:
+#   gauge_lag_min: 10.0
+#   # false leaves the g_* columns null everywhere: the escape hatch if
+#   # the corpus read ever costs a cycle.
+#   gauge_features: true
+
 # --- The quality report (Phase F, F4) ---------------------------------
 # The document behind the website's /quality page ("How good are we?"):
 # reliability against radar and gauge truth, the warning scoreboard, the
@@ -407,6 +435,59 @@ quality_report:
     # null -> push.postprocess_path, i.e. the file the running cycle
     # reads. Fitting into anything else would be a no-op.
     out: null
+    #
+    # -- post-processing v2 ---------------------------------------------
+    # Every default below is the model that has been in service since
+    # 2026-09-11, so leaving all four out refits exactly what last night
+    # refitted. Change one only with an out-of-fold report behind it
+    # (scripts/fit_postprocess.py --baseline refit-v1): the shipping rule
+    # is a ΔBSS interval excluding zero on ALL rows AND on the dry subset.
+    #
+    # The rollback for any of them: before overwriting postprocess.json
+    # the job copies it to postprocess.prev.json beside it, so undoing a
+    # bad refit is `cp postprocess.prev.json postprocess.json` plus a
+    # refit of the thresholds on top of it.
+    #
+    #   logistic         one L2 logistic per lead (shipped)
+    #   logistic-shared  ONE logistic over every served lead stacked, with
+    #                    the lead in the design (lead_min, log_lead_min,
+    #                    and raw_frac_own carrying the row's own lead's
+    #                    ensemble fraction). Every slope shared; only the
+    #                    isotonic recalibration stays per lead. It is the
+    #                    only way the 20-minute rows inform the 60-minute
+    #                    answer.
+    #   trees            a boosted ensemble per lead
+    #   trees-shared     one ensemble for every lead, with a monotone
+    #                    (+1) constraint on the lead columns
+    #
+    # NEITHER tree kind can be fitted here: the sidecar image has no
+    # LightGBM by design, so asking for one fails the step and leaves last
+    # night's model in service. A tree model reaches production by being
+    # fitted offline in .venv-fit (scripts/fit_postprocess.py --model
+    # trees) and synced in — the numpy evaluator that SERVES it IS in the
+    # image.
+    #
+    # Whatever the kind, the served probabilities are forced non-decreasing
+    # in the lead before they leave the model: "rain within 60 min"
+    # contains "rain within 45 min", and independently fitted per-lead
+    # curves are free to cross. Same guard the national p_rain curves get.
+    # model: logistic
+    #
+    #   v1  the 27 columns that shipped
+    #   v2  v1 plus every feature column the replay catalogue has grown,
+    #       a natural-cubic-spline basis on the columns whose effect
+    #       bends, and the season interactions
+    # design: v1
+    #
+    # Learn a per-station intercept offset under its own, 10x stronger
+    # ridge. Stored as {station_id: offset} and applied ONLY at the
+    # stations the fit saw — a subscriber's own coordinate gets none.
+    # station_offsets: false
+    #
+    #   pooled      one recalibration curve per lead (shipped)
+    #   per-season  one per season, falling back to the pooled curve for a
+    #               season with too few rows to fit one honestly
+    # isotonic: pooled
 
 # --- Artifact sync (Phase F, F4) --------------------------------------
 # OFF here, and correctly so: this instance PRODUCES the quality report

@@ -492,3 +492,261 @@ def test_the_loader_carries_features_through_the_same_deduplication(
     features = fit.build_features(rows)
     assert set(features["season"]) <= set(pp.SEASONS)
     assert features["hour_utc"].min() >= 0
+
+
+# ---------------------------------------------------------------------------
+# Post-processing v2: the arms, and the evaluation protocol around them
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def fitted_v2(corpus: Path, tmp_path_factory: pytest.TempPathFactory) -> tuple:
+    """One run with every v2 arm on, against a REFITTED v1 baseline.
+
+    The point is the protocol, not the skill: this fixture is three
+    synthetic weeks, so nothing in it is evidence about Denmark. What it
+    does prove is that the candidate and the baseline are both fitted
+    inside the same folds, that every comparison comes back on the dry
+    subset as well as on all rows, and that the learning curve and the
+    ablation produce the rows the report renders.
+    """
+    out = tmp_path_factory.mktemp("fit-out-v2")
+    report = _run(
+        corpus, out,
+        "--design", "v2",
+        "--station-offsets",
+        "--isotonic", "per-season",
+        "--baseline", "refit-v1",
+        "--learning-curve", "3,7",
+        "--ablate",
+    )
+    return report, out
+
+
+class TestTheV2Arms:
+    def test_the_settings_block_records_what_was_fitted(self, fitted_v2) -> None:
+        report, _out = fitted_v2
+        settings = report["settings"]
+        assert settings["design"] == "v2"
+        assert settings["model"] == "logistic"
+        assert settings["isotonic"] == "per-season"
+        assert settings["station_offsets"] is True
+        assert settings["baseline"] == "refit-v1"
+        assert settings["fit"]["design"] == "v2"
+        assert settings["baseline_fit"]["design"] == "v1"
+
+    def test_the_v2_design_is_wider_than_v1(self, fitted_v2) -> None:
+        _report, out = fitted_v2
+        model = pp.PostprocessModel.loads((out / "postprocess.json").read_text())
+        assert model.spec.version == "v2"
+        assert len(model.feature_names) > len(pp.design_columns(model.design_leads))
+        assert model.spec.interactions
+        assert set(model.spec.log_columns) <= set(model.spec.extra_columns)
+
+    def test_the_artefact_carries_the_knots_and_the_offsets(self, fitted_v2) -> None:
+        _report, out = fitted_v2
+        payload = json.loads((out / "postprocess.json").read_text())
+        design = payload["design"]
+        assert design["version"] == "v2"
+        for entry in design["splines"]:
+            assert len(entry["knots"]) >= 3
+            assert entry["knots"] == sorted(entry["knots"])
+        offsets = payload["models"]["20"]["station_offsets"]
+        assert set(offsets) == set(STATIONS)
+
+    def test_a_v2_model_still_scores_rows_through_the_public_api(
+        self, fitted_v2, corpus: Path,
+    ) -> None:
+        """``predict`` is unchanged for callers — the spec does the work."""
+        _report, out = fitted_v2
+        model = pp.PostprocessModel.loads((out / "postprocess.json").read_text())
+        rows = fit.load_rows(
+            [corpus / "replay"], LEADS, model.design_leads, stations=None, log=None,
+        )
+        predicted = model.predict(fit.build_features(rows))
+        assert set(predicted) == set(LEADS)
+        for values in predicted.values():
+            assert values.shape == rows["t"].shape
+            assert numpy.all((values >= 0.0) & (values <= 1.0))
+
+
+class TestTheDrySubset:
+    def test_every_lead_is_scored_on_the_dry_rows_as_well(self, fitted_v2) -> None:
+        report, _out = fitted_v2
+        assert report["dry_rows"] > 0
+        for lead in LEADS:
+            block = report["evaluation"]["leads"][str(lead)][pp.DRY]
+            assert 0 < block["n"] <= report["evaluation"]["leads"][str(lead)]["all"]["n"]
+            assert "bss" in block["baseline"]
+            assert "bss" in block["postprocess"]
+
+    def test_the_headline_carries_the_dry_numbers(self, fitted_v2) -> None:
+        report, _out = fitted_v2
+        headline = fit._headline(report)
+        for lead in LEADS:
+            assert "dry" in headline["leads"][str(lead)]
+            assert headline["leads"][str(lead)]["dry"]["n"] > 0
+
+    def test_the_subset_says_where_it_came_from(self, fitted_v2) -> None:
+        report, _out = fitted_v2
+        assert report["dry_source"] in {"column", "derived from the gauge store"}
+
+
+class TestTheLearningCurveAndAblation:
+    def test_one_learning_curve_row_per_budget(self, fitted_v2) -> None:
+        report, _out = fitted_v2
+        rows = report["learning_curve"]
+        assert [row["days"] for row in rows] == [3, 7]
+        for row in rows:
+            assert row["train_rows"] > 0
+            assert set(row["leads"]) == {str(lead) for lead in LEADS}
+            assert "all" in row["leads"]["20"]
+
+    def test_one_ablation_row_per_family(self, fitted_v2) -> None:
+        report, _out = fitted_v2
+        block = report["ablation"]
+        families = [entry["family"] for entry in block["dropped"]]
+        assert "raw_frac" in families and "up" in families
+        assert families == sorted(families, key=pp.FAMILY_NAMES.index)
+        for entry in block["dropped"]:
+            assert entry["columns"] > 0
+            assert "delta" in entry["leads"]["20"]["all"]
+
+    def test_the_markdown_grows_the_new_sections(self, fitted_v2) -> None:
+        _report, out = fitted_v2
+        text = (out / "postprocess_report.md").read_text()
+        assert "## Candidate vs baseline" in text
+        assert "## Learning curve" in text
+        assert "## Ablation" in text
+        assert "| lead | subset | n |" in text
+        assert "refit-v1" in text
+
+    def test_a_default_run_does_not_grow_them(self, fitted) -> None:
+        """The extra passes cost minutes; they only happen when asked for."""
+        report, out, _back, _corpus = fitted
+        assert report["learning_curve"] == []
+        assert report["ablation"] is None
+        text = (out / "postprocess_report.md").read_text()
+        assert "## Learning curve" not in text
+        assert "## Ablation" not in text
+        # ...but the summary table and the dry subset are always there.
+        assert "## Candidate vs baseline" in text
+
+
+def test_the_default_run_is_still_the_shipped_configuration(fitted) -> None:
+    """No flag, no change: the same family, design, calibration and baseline."""
+    report, out, _back, _corpus = fitted
+    assert report["settings"]["model"] == "logistic"
+    assert report["settings"]["design"] == "v1"
+    assert report["settings"]["isotonic"] == "pooled"
+    assert report["settings"]["station_offsets"] is False
+    assert report["settings"]["baseline"] == "curve"
+    model = pp.PostprocessModel.loads((out / "postprocess.json").read_text())
+    assert model.kind == pp.KIND_LOGISTIC
+    assert model.spec == pp.DesignSpec()
+    assert model.feature_names == pp.design_columns(model.design_leads)
+
+
+def test_tree_params_parse_into_the_types_lightgbm_wants() -> None:
+    parsed = fit.parse_tree_params("n_estimators=500,max_depth=6,learning_rate=0.03")
+    assert parsed == {
+        "n_estimators": 500, "max_depth": 6, "learning_rate": 0.03,
+    }
+    assert fit.parse_tree_params("") == {}
+    with pytest.raises(ValueError, match="key=value"):
+        fit.parse_tree_params("n_estimators")
+
+
+def test_a_baseline_spelling_the_script_does_not_know_is_a_usage_error(
+    corpus: Path, tmp_path: Path,
+) -> None:
+    assert fit.main([
+        "--run", str(corpus / "replay"),
+        "--corpus-dir", str(corpus / "corpus"),
+        "--out-dir", str(tmp_path / "out"),
+        "--leads", "30", "--resamples", "0",
+        "--baseline", "whatever",
+    ]) == 2
+
+
+def test_the_baseline_can_be_read_off_an_existing_model(
+    fitted, corpus: Path, tmp_path: Path,
+) -> None:
+    """``--baseline model:<path>`` refits what is in service, in fold."""
+    _report, out, _back, _corpus = fitted
+    report = _run(
+        corpus, tmp_path / "out",
+        "--design", "v2",
+        "--baseline", f"model:{out / 'postprocess.json'}",
+        "--resamples", "0",
+    )
+    assert report["settings"]["baseline_fit"]["design"] == "v1"
+    assert report["settings"]["baseline_fit"]["kind"] == "logistic"
+
+
+def test_the_four_arms_can_be_scored_side_by_side(
+    corpus: Path, tmp_path: Path,
+) -> None:
+    """``--compare`` puts every family in one table, on one set of folds.
+
+    LightGBM is not in this environment, so the two tree arms are not
+    exercised here — ``tests/test_postprocess_trees.py`` under
+    ``.venv-fit`` is where those live. What this pins is that the arms
+    share the folds, share the baseline, and only ``--model`` reaches
+    ``postprocess.json``.
+    """
+    report = _run(
+        corpus, tmp_path / "out",
+        "--model", "logistic",
+        "--compare", "logistic,logistic-shared",
+        "--baseline", "refit-v1",
+        "--resamples", "0",
+    )
+    assert [arm["model"] for arm in report["arms"]] == ["logistic-shared"]
+    for arm in report["arms"]:
+        for lead in LEADS:
+            assert arm["leads"][str(lead)]["all"]["n"] > 0
+    text = (tmp_path / "out" / "postprocess_report.md").read_text()
+    assert "| `logistic-shared` |" in text
+    assert "| `logistic` |" in text
+    model = pp.PostprocessModel.loads(
+        (tmp_path / "out" / "postprocess.json").read_text()
+    )
+    assert model.kind == "logistic"
+
+
+def test_a_shared_fit_ships_one_coefficient_vector_and_stays_ordered(
+    corpus: Path, tmp_path: Path,
+) -> None:
+    _report = _run(
+        corpus, tmp_path / "out",
+        "--model", "logistic-shared", "--design", "v2", "--resamples", "0",
+    )
+    model = pp.PostprocessModel.loads(
+        (tmp_path / "out" / "postprocess.json").read_text()
+    )
+    assert model.kind == "logistic-shared"
+    assert model.is_shared
+    assert model.spec.lead_column == "lead_min"
+    assert [name for name, _s in model.spec.own_columns][0] == "raw_frac_own"
+    first = model.models[LEADS[0]].coefficients
+    assert all(model.models[lead].coefficients == first for lead in LEADS)
+
+    rows = fit.load_rows(
+        [corpus / "replay"], LEADS, model.design_leads, stations=None, log=None,
+    )
+    predicted = model.predict(fit.build_features(rows))
+    for shorter, longer in zip(LEADS, LEADS[1:]):
+        assert numpy.all(predicted[longer] >= predicted[shorter] - 1e-12)
+
+
+def test_an_unknown_comparison_arm_is_a_usage_error(
+    corpus: Path, tmp_path: Path,
+) -> None:
+    assert fit.main([
+        "--run", str(corpus / "replay"),
+        "--corpus-dir", str(corpus / "corpus"),
+        "--out-dir", str(tmp_path / "out"),
+        "--leads", "30", "--resamples", "0",
+        "--compare", "logistic,randomforest",
+    ]) == 2

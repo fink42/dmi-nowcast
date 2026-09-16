@@ -27,6 +27,7 @@ Offline and synthetic throughout: no radar, no STEPS, no network.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -170,17 +171,103 @@ def _flow() -> tuple[np.ndarray, np.ndarray]:
     return vy, vx
 
 
+def _rain_prev(shift: int) -> np.ndarray:
+    """The same band ``shift`` frames back up the flow — a past frame."""
+    return np.roll(_rain_field(), (-2 * shift, -shift), axis=(0, 1))
+
+
+def _ensemble_array() -> np.ndarray:
+    """``(members, timesteps, h, w)`` on the PRODUCT grid, wet in the NW.
+
+    The members disagree about when the rain arrives — member ``m`` turns
+    wet at timestep ``m`` — which is what makes ``ens_eta_spread_min`` a
+    number rather than a null.
+    """
+    size = GRID_PX // DOWNSAMPLE
+    members, steps = 6, 5
+    out = np.zeros((members, steps, size, size), dtype=np.float32)
+    rows, cols = np.mgrid[0:size, 0:size]
+    wet = rows + cols < 24
+    for m in range(members):
+        for t in range(steps):
+            if t >= min(m, steps - 1):
+                out[m, t][wet] = 1.5 + 0.5 * m
+    return out
+
+
+#: Gauge slots end on the 10-minute grid, and the decision instant does
+#: not: at ``GENERATED_AT`` (12:14Z) with the default 10-minute lag the
+#: visibility horizon is 12:04Z, so the newest slot a cycle may read is
+#: the one ending at 12:00Z and the one ending at 12:10Z is too fresh —
+#: DMI has published it by 12:11 but the store is polled every ten
+#: minutes, which is the whole reason the lag exists.
+_NEWEST_VISIBLE_SLOT = RADAR_TS                       # 12:00Z
+_SLOT_INSIDE_THE_LAG = RADAR_TS + timedelta(minutes=10)
+
+
+def _gauge_slots() -> dict[str, list]:
+    """A slot series per station id: wet at 06180, dry at 06120.
+
+    Both carry a slot ending inside the availability lag, so this fixture
+    is the leakage guard too: a writer that let it through would read
+    9.9 mm the service could not have had.
+    """
+    def series(wet_at: set[int]) -> list:
+        return sorted(
+            [(
+                _SLOT_INSIDE_THE_LAG, True, 9.9,
+            )] + [
+                (
+                    _NEWEST_VISIBLE_SLOT - timedelta(minutes=10 * k),
+                    k in wet_at,
+                    1.2 if k in wet_at else 0.0,
+                )
+                for k in range(6)
+            ],
+        )
+
+    return {"06180": series({0, 1}), "06120": series(set())}
+
+
 def _grid_features() -> dict[str, np.ndarray]:
+    """Every per-point column the cycle assembles, through the core.
+
+    The radar block comes off ``station_features`` (with the two earlier
+    frames both writers carry), the gauge block off
+    ``station_gauge_features`` and the ensemble block off
+    ``ensemble_point_features`` — the three producers, merged exactly as
+    both writers merge them.
+    """
     field = _rain_field()
     vy, vx = _flow()
     native = [_geo().lonlat_to_grid(lon, lat) for _i, lat, lon, _n in POINTS]
-    return pp.station_features(
+    out = pp.station_features(
         field, vy, vx,
         np.array([idx.row for idx in native], dtype=np.float64),
         np.array([idx.col for idx in native], dtype=np.float64),
         pixel_km=PIXEL_KM, dt_min=10.0,
         bulk_vy=2.0, bulk_vx=1.5, stalled_share=0.011,
+        rain_prev10_mm_h=_rain_prev(1), rain_prev20_mm_h=_rain_prev(2),
     )
+    slots = _gauge_slots()
+    out.update(pp.station_gauge_features(
+        [slots.get(station) for station, _lat, _lon, _n in POINTS],
+        now_utc=GENERATED_AT,
+        lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+    ))
+    products = _products()
+    out.update(pp.ensemble_point_features(
+        _ensemble_array(),
+        [
+            compute_mod.product_pixel_of(products, idx.row, idx.col)
+            for idx in native
+        ],
+        leads_min=products.leads_min,
+        threshold_mm_h=products.threshold_mm_h,
+        timestep_min=products.timestep_min,
+        frame_age_min=products.frame_age_min,
+    ))
+    return out
 
 
 def _products(p_rain: float = 0.7) -> NationalProducts:
@@ -284,6 +371,54 @@ class TestParityWithTheReplay:
         runtime = _cycle(PostprocessTable(None))
         assert set(runtime.rows[0]) == set(pp.feature_schema(LEADS).names)
 
+    def test_the_v2_block_is_filled_and_not_a_row_of_nulls(self) -> None:
+        """Parity on nulls is not parity: the columns have to be computed.
+
+        The gauge block is the one that is legitimately null at a point
+        with no gauge, so it is checked at the station that has one and
+        at home, which has not.
+        """
+        runtime = _cycle(PostprocessTable(None))
+        home, station = runtime.rows[0], runtime.rows[1]
+        radar = [
+            "obs_prev10_mm_h", "obs_prev20_mm_h", "obs_max_5km_prev10_mm_h",
+            "wet_frac_5km", "wet_frac_10km", "up_mean_40km_mm_h",
+            # The far bins of the 40 km corridor run off this 32 km
+            # fixture grid and are legitimately null there; the near ones
+            # are on it, and the bins are pinned exactly in
+            # ``tests/test_postprocess.py``.
+            "up_max_b0", "up_max_b1",
+            "ens_eta_spread_min",
+            *(pp.ens_mean_column(lead) for lead in LEADS),
+            *(pp.ens_p90_column(lead) for lead in LEADS),
+        ]
+        for name in radar:
+            assert station[name] is not None, name
+        # The gauge: a measurement where there is a gauge, an absence
+        # where there is not — and ``g_known`` says which.
+        assert station["g_known"] == 1.0
+        assert station["g_mm_60"] is not None
+        assert home["g_known"] == 0.0
+        assert home["g_mm_60"] is None
+        assert home["g_min_since_wet"] is None
+
+    def test_the_gauge_block_never_sees_inside_the_lag(self) -> None:
+        """The fixture's newest slot is one minute too fresh: 9.9 mm of it.
+
+        It must reach no column. A row that had it would be a row the
+        service can never produce, and a coefficient fitted on it would
+        be worth less in production than it looks offline.
+        """
+        runtime = _cycle(PostprocessTable(None))
+        station = runtime.rows[1]
+        assert station["g_mm_10"] == pytest.approx(1.2)
+        assert station["g_mm_60"] == pytest.approx(2.4)
+        assert all(
+            value is None or value < 9.0
+            for name, value in station.items()
+            if name.startswith("g_mm_")
+        )
+
     def test_a_point_off_the_product_grid_reads_no_raw_fraction(self) -> None:
         """Off coverage is unknown, never 0 %."""
         products = _products()
@@ -293,6 +428,196 @@ class TestParityWithTheReplay:
         assert far is not None
         assert far.pixels == (None,)
         assert all(values == (None,) for values in far.raw_fractions.values())
+
+    def test_the_cycles_ensemble_block_is_the_replays(self) -> None:
+        """The live read path and the replay's produce the same columns.
+
+        The cycle takes the ensemble block inside ``_read_points``, in the
+        one window where the members still exist; the replay takes it off
+        the array it is about to drop. Same function, same pixels, same
+        reduction parameters — pinned here because the two call sites are
+        thirty lines apart in two different files.
+        """
+        products = _products()
+        ensemble = _ensemble_array()
+        native = [
+            _geo().lonlat_to_grid(lon, lat) for _i, lat, lon, _n in POINTS
+        ]
+        live = compute_mod._read_points(
+            products, native, ensemble=ensemble,
+            threshold_mm_h=products.threshold_mm_h,
+        )
+        assert live is not None
+        replay = pp.ensemble_point_features(
+            ensemble,
+            [
+                compute_mod.product_pixel_of(products, idx.row, idx.col)
+                for idx in native
+            ],
+            leads_min=products.leads_min,
+            threshold_mm_h=products.threshold_mm_h,
+            timestep_min=products.timestep_min,
+            frame_age_min=products.frame_age_min,
+        )
+        assert set(live.ens_features) == set(replay)
+        for name, values in replay.items():
+            np.testing.assert_allclose(
+                live.ens_features[name], values, equal_nan=True, err_msg=name,
+            )
+
+    def test_a_cycle_without_an_ensemble_writes_nulls_not_zeroes(self) -> None:
+        live = compute_mod._read_points(
+            _products(),
+            [_geo().lonlat_to_grid(lon, lat) for _i, lat, lon, _n in POINTS],
+        )
+        assert live is not None
+        assert live.ens_features == {}
+
+
+class TestGaugeBlockParity:
+    """One gauge archive, two readers, the same columns.
+
+    The replay reads a whole day out of the corpus in its day worker; the
+    cycle reads six hours out of the same store, once per frame. Both hand
+    the slots to one function, and this is the test that says so — with a
+    slot planted one minute inside the availability lag, which neither may
+    see.
+    """
+
+    DAY = GENERATED_AT.date()
+
+    def _store(self, tmp_path: Path):
+        from dmi_nowcast_core.metobs import Observation
+        from dmi_nowcast_core.station_store import StationObsStore
+
+        store = StationObsStore(tmp_path / "corpus")
+        rows = []
+        for station, wet_slots in (("06180", {0, 1}), ("06120", set())):
+            for k in range(6):
+                rows.append(Observation(
+                    station_id=station,
+                    observed_utc=_NEWEST_VISIBLE_SLOT - timedelta(minutes=10 * k),
+                    parameter_id="precip_past10min",
+                    value=1.2 if k in wet_slots else 0.0,
+                ))
+            # One slot too fresh to have reached the service.
+            rows.append(Observation(
+                station_id=station, observed_utc=_SLOT_INSIDE_THE_LAG,
+                parameter_id="precip_past10min", value=9.9,
+            ))
+        store.append(rows)
+        return store
+
+    def _points_file(self, tmp_path: Path) -> Path:
+        path = tmp_path / "station_points.json"
+        path.write_text(json.dumps({
+            "version": 2,
+            "points": [
+                {"id": station, "lat": lat, "lon": lon}
+                for station, lat, lon, _n in POINTS if station != "home"
+            ],
+        }))
+        return path
+
+    def test_the_two_readers_produce_the_same_gauge_block(
+        self, tmp_path: Path,
+    ) -> None:
+        from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+        store = self._store(tmp_path)
+        history = GaugeHistory(
+            store.root, self._points_file(tmp_path),
+            lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+        )
+        keys = [point_key(lat, lon) for _i, lat, lon, _n in POINTS]
+        live = pp.station_gauge_features(
+            history.slots_for(keys, now_utc=GENERATED_AT),
+            now_utc=GENERATED_AT, lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+        )
+        replay_slots = rw.day_feature_slots(
+            store, self.DAY,
+            [station for station, _lat, _lon, _n in POINTS],
+            lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+        )
+        replay = pp.station_gauge_features(
+            [replay_slots.get(station) or None for station, *_ in POINTS],
+            now_utc=GENERATED_AT, lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+        )
+        assert set(live) == set(replay)
+        for name, values in replay.items():
+            np.testing.assert_allclose(
+                live[name], values, equal_nan=True, err_msg=name,
+            )
+        # And the block says what the archive says — from the wet gauge,
+        # the dry one, and home, which is not a gauge at all.
+        assert list(live["g_known"]) == [0.0, 1.0, 1.0]
+        assert live["g_mm_60"][1] == pytest.approx(2.4)
+        assert live["g_dry_60"][2] == pytest.approx(1.0)
+        assert math.isnan(float(live["g_mm_60"][0]))
+
+    def test_neither_reader_sees_the_slot_inside_the_lag(
+        self, tmp_path: Path,
+    ) -> None:
+        """9.9 mm, one minute too fresh, must reach no column."""
+        from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+        store = self._store(tmp_path)
+        history = GaugeHistory(
+            store.root, self._points_file(tmp_path),
+            lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+        )
+        keys = [point_key(lat, lon) for _i, lat, lon, _n in POINTS]
+        live = pp.station_gauge_features(
+            history.slots_for(keys, now_utc=GENERATED_AT),
+            now_utc=GENERATED_AT, lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+        )
+        assert live["g_mm_10"][1] == pytest.approx(1.2)
+        assert live["g_mm_60"][1] == pytest.approx(2.4)
+        # The dry gauge stays dry: 9.9 mm would have made it wet.
+        assert live["g_dry_60"][2] == pytest.approx(1.0)
+        assert live["g_mm_60"][2] == pytest.approx(0.0)
+
+    def test_the_store_read_ends_at_the_visibility_horizon(
+        self, tmp_path: Path,
+    ) -> None:
+        """A row the features may not read is not worth decoding either."""
+        from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+        history = GaugeHistory(
+            tmp_path / "corpus", self._points_file(tmp_path), lag_min=10.0,
+        )
+        start, end = history.window(GENERATED_AT)
+        assert end == GENERATED_AT - timedelta(minutes=10.0)
+        assert end - start >= timedelta(minutes=pp.GAUGE_SINCE_CAP_MIN)
+
+    def test_a_point_that_is_not_a_gauge_resolves_to_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+        history = GaugeHistory(
+            self._store(tmp_path).root, self._points_file(tmp_path),
+            lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+        )
+        slots = history.slots_for(
+            [point_key(HOME_LAT, HOME_LON)], now_utc=GENERATED_AT,
+        )
+        assert slots == [None]
+
+    def test_an_unreadable_catalogue_costs_the_block_and_nothing_else(
+        self, tmp_path: Path,
+    ) -> None:
+        from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+        history = GaugeHistory(
+            tmp_path / "corpus", tmp_path / "missing.json", lag_min=10.0,
+        )
+        with structlog.testing.capture_logs() as logs:
+            slots = history.slots_for(
+                [point_key(HOME_LAT, HOME_LON)], now_utc=GENERATED_AT,
+            )
+        assert slots == [None]
+        assert [e["event"] for e in logs] == ["gauge_history_points_unreadable"]
 
 
 # ---------------------------------------------------------------------------

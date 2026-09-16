@@ -806,7 +806,12 @@ def harmonisation_file(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _anchor_settings(**over) -> "rw.AnchorSettings":
-    base = {"frame_age_override_min": None}
+    # The L3 policy tests are about WHICH frame a cycle stands on, so they
+    # run on the rigid poll grid: with the scheduler's jitter on (the CLI
+    # default since 2026-09-16) the instants move by up to a poll interval
+    # and the ages stop being the two constants these assertions name.
+    # ``TestPollJitter`` below owns that behaviour instead.
+    base = {"frame_age_override_min": None, "poll_jitter_s": 0.0}
     base.update(over)
     return rw.AnchorSettings(**base)
 
@@ -850,6 +855,76 @@ def test_plan_day_clips_on_the_anchor_frame(dual_archive: Path) -> None:
     assert plan[0][0].now == T_ANCHOR + timedelta(minutes=15)
 
 
+class TestPollJitter:
+    """v2/F6 — the frame age the live service actually sees.
+
+    A rigid 5-minute poll grid divides the 10-minute frame grid, so every
+    fullRange anchor was seen at exactly 15.0 minutes and the stored
+    ``frame_age_min`` was a constant: the fitted coefficient came out
+    0.000 at every lead, because a constant carries nothing. The live
+    scheduler fires every 5 min ± 30 s and its phase against DMI's
+    publication clock is wherever the last few hundred draws left it.
+    """
+
+    DAY = datetime(2026, 9, 5).date()
+
+    def _ages(self, archive: Path, **over) -> list[float]:
+        plan = rw.plan_day(
+            archive, self.DAY,
+            rw.dc_replace(TINY, anchor=_anchor_settings(**over)),
+        )
+        return [s.frame_age_min for s, _h in plan]
+
+    def test_the_rigid_grid_gives_one_number_and_the_jitter_a_spread(
+        self, dual_archive: Path,
+    ) -> None:
+        rigid = self._ages(dual_archive)
+        assert rigid == pytest.approx([15.0] * len(rigid))
+        jittered = self._ages(dual_archive, poll_jitter_s=30.0)
+        assert len(jittered) == len(rigid)
+        assert len(set(round(age, 6) for age in jittered)) > 1
+
+    def test_the_age_stays_between_the_lag_and_one_poll_past_it(
+        self, dual_archive: Path,
+    ) -> None:
+        """A jittered poll is still a poll: it cannot see a frame early."""
+        for age in self._ages(dual_archive, poll_jitter_s=30.0):
+            assert rw.anchor_policy.DEFAULT_LAG_FULLRANGE_MIN <= age
+            assert age <= rw.anchor_policy.DEFAULT_LAG_FULLRANGE_MIN + 5.0 + 0.5
+
+    def test_the_same_day_replans_to_the_same_instants(
+        self, dual_archive: Path,
+    ) -> None:
+        """A resumed run must not re-decide a day it already wrote."""
+        assert self._ages(dual_archive, poll_jitter_s=30.0) == (
+            self._ages(dual_archive, poll_jitter_s=30.0)
+        )
+
+    def test_it_still_anchors_every_frame_exactly_once(
+        self, dual_archive: Path,
+    ) -> None:
+        """The jitter moves the instants, never which frames are anchors."""
+        rigid = rw.plan_day(
+            dual_archive, self.DAY,
+            rw.dc_replace(TINY, anchor=_anchor_settings()),
+        )
+        jittered = rw.plan_day(
+            dual_archive, self.DAY,
+            rw.dc_replace(TINY, anchor=_anchor_settings(poll_jitter_s=30.0)),
+        )
+        assert [s.timestamp for s, _h in jittered] == [
+            s.timestamp for s, _h in rigid
+        ]
+
+    def test_the_flat_model_has_no_grid_to_jitter(self) -> None:
+        """``--frame-age-min`` is the rollback, and it stays exact."""
+        flat = rw.AnchorSettings(
+            frame_age_override_min=14.0, poll_jitter_s=30.0,
+        )
+        assert flat.poll_min == 0.0
+        assert flat.jitter_s == 0.0
+
+
 def _cli(archive: Path, out_dir: Path, points_file: Path, *extra: str) -> list[str]:
     return [
         "--archive-dir", str(archive),
@@ -879,14 +954,21 @@ def test_the_default_run_records_a_fullrange_anchor(
     assert anchor["counts"]["fullrange_anchored"] == 1
     assert anchor["counts"]["doppler_anchored"] == 0
     assert anchor["counts"]["degraded"] == 0
-    assert anchor["frame_age_min"]["p50"] == pytest.approx(15.0)
+    # The scheduler's jitter is on by default, so the age is the
+    # publication lag plus wherever the poll phase happens to sit — not
+    # the 15.0 a rigid grid produced for every frame there has ever been.
+    assert anchor["poll_jitter_s"] == pytest.approx(30.0)
+    assert 13.1 <= anchor["frame_age_min"]["p50"] <= 13.1 + 5.0 + 0.5
     # The flat model is off, so the parity key is null rather than a lie.
     assert summary["run"]["frame_age_min"] is None
 
     rows = rw.read_decisions(out_dir / "decisions" / f"{DAY}.parquet")
     assert {r["radar_ts"] for r in rows} == {T_ANCHOR}
     assert all(
-        r["generated_at"] - r["radar_ts"] == timedelta(minutes=15) for r in rows
+        timedelta(minutes=13.1)
+        <= r["generated_at"] - r["radar_ts"]
+        <= timedelta(minutes=13.1 + 5.0 + 0.5)
+        for r in rows
     )
 
 
@@ -909,7 +991,10 @@ def test_the_freshest_anchor_stands_on_the_doppler_frame(
     assert anchor["counts"]["doppler_anchored"] == 1
     assert anchor["counts"]["fullrange_anchored"] == 0
     assert anchor["counts"]["history_fallback"] == 0
-    assert anchor["frame_age_min"]["p50"] == pytest.approx(10.0)
+    # Doppler's lag plus the poll remainder, jittered — see the fullRange
+    # twin above. The point that survives is the five-minute gap between
+    # the products, not the constant the rigid grid used to produce.
+    assert 8.1 <= anchor["frame_age_min"]["p50"] <= 8.1 + 5.0 + 0.5
     stamp = anchor["harmonisation"]
     assert stamp["schema_version"] == 1
     assert stamp["fitted_at"] == "2026-09-08T18:44:53+00:00"
@@ -923,7 +1008,10 @@ def test_the_freshest_anchor_stands_on_the_doppler_frame(
         T_ANCHOR - timedelta(minutes=5),
     }
     assert all(
-        r["generated_at"] - r["radar_ts"] == timedelta(minutes=10) for r in rows
+        timedelta(minutes=8.1)
+        <= r["generated_at"] - r["radar_ts"]
+        <= timedelta(minutes=8.1 + 5.0 + 0.5)
+        for r in rows
     )
     # The stations sit at the grid centre, inside doppler's disc, and the
     # fixture is soaked: the anchor field reads rain there.
@@ -1074,6 +1162,43 @@ class TestFeatureColumns:
             assert wet is None or 0.0 <= wet <= 1.0
             distance = row["up_dist_km"]
             assert distance is None or 0.0 <= distance <= 40.0
+
+    def test_the_v2_columns_are_written_with_values(self, featured_day) -> None:
+        """A real replayed frame fills the radar and ensemble blocks.
+
+        Not the schema — ``test_every_documented_column_is_written`` has
+        that — but the values: a writer that produced a column of nulls
+        would pass the schema test and teach the model nothing.
+        """
+        table, _out_dir = featured_day
+        for row in table.to_pylist():
+            assert row["obs_prev10_mm_h"] is not None
+            assert row["obs_prev20_mm_h"] is not None
+            assert row["obs_max_5km_prev10_mm_h"] >= row["obs_prev10_mm_h"] - 1e-3
+            for name in ("wet_frac_5km", "wet_frac_10km"):
+                assert 0.0 <= row[name] <= 1.0, name
+            # The corridor's mean cannot exceed its maximum, and the bins
+            # tile the same 40 km the maximum is taken over. All three are
+            # null together when the flow gives no usable direction.
+            peak = row["up_max_40km_mm_h"]
+            bins = [row[f"up_max_b{i}"] for i in range(8)]
+            if peak is None:
+                assert row["up_mean_40km_mm_h"] is None
+                assert all(value is None for value in bins)
+            else:
+                assert row["up_mean_40km_mm_h"] <= peak + 1e-3
+                seen = [value for value in bins if value is not None]
+                assert seen and max(seen) == pytest.approx(peak, abs=1e-3)
+            for lead in TINY.leads_min:
+                mean, p90 = row[f"ens_mean_{lead}"], row[f"ens_p90_{lead}"]
+                assert mean is not None and p90 is not None
+                assert p90 >= mean - 1e-3
+            spread = row["ens_eta_spread_min"]
+            assert spread is None or spread >= 0.0
+            # No gauge store was given to the day worker, so the gauge
+            # block is an absence — and says so rather than reading 0 mm.
+            assert row["g_known"] == pytest.approx(0.0)
+            assert row["g_mm_60"] is None
 
     def test_the_calendar_columns_come_off_the_decision_instant(
         self, featured_day,

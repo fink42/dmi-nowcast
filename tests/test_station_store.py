@@ -165,6 +165,122 @@ def test_read_of_an_empty_store_returns_the_typed_empty_table(tmp_path: Path) ->
     assert table.schema.equals(obs_schema())
 
 
+# ---------------------------------------------------------------------------
+# The publication stamp, and the pushdown read the live cycle uses
+# ---------------------------------------------------------------------------
+
+
+def test_the_publication_stamp_round_trips(tmp_path: Path) -> None:
+    """``created_utc`` is what measures the availability lag later on."""
+    store = StationObsStore(tmp_path)
+    created = T0 + timedelta(minutes=2)
+    store.append([
+        Observation("06074", T0, "precip_past10min", 0.4, created_utc=created),
+    ])
+    assert store.read(T0, T0).column("created_utc").to_pylist() == [created]
+
+
+def test_a_reading_with_no_publication_stamp_is_still_a_reading(
+    tmp_path: Path,
+) -> None:
+    """A recorded fixture carries no ``created``; the row still lands."""
+    store = StationObsStore(tmp_path)
+    store.append([_obs("06074", 0, value=0.2)])
+    assert store.read(T0, T0).column("created_utc").to_pylist() == [None]
+
+
+def test_a_partition_written_before_the_column_existed_still_reads(
+    tmp_path: Path,
+) -> None:
+    """The additive rule, from the one direction that can break it.
+
+    Every read passes ``obs_schema()`` explicitly, so pyarrow fills a
+    column the file does not carry with nulls. Without that, adding a
+    column to the store would make ten months of archive unreadable.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    old = pa.schema([
+        ("station_id", pa.string()),
+        ("observed_utc", pa.timestamp("us", tz="UTC")),
+        ("parameter_id", pa.string()),
+        ("value", pa.float32()),
+    ])
+    store = StationObsStore(tmp_path)
+    path = store.partition_path(2026, 6)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "station_id": ["06074"],
+                "observed_utc": [T0],
+                "parameter_id": ["precip_past10min"],
+                "value": [0.4],
+            },
+            schema=old,
+        ),
+        path,
+    )
+    table = store.read(T0, T0)
+    assert table.column("created_utc").to_pylist() == [None]
+    assert table.column("value").to_pylist() == [pytest.approx(0.4)]
+    # And an append onto it keeps the old rows and fills the new column.
+    store.append([
+        Observation(
+            "06074", T0 + timedelta(minutes=10), "precip_past10min", 0.5,
+            created_utc=T0 + timedelta(minutes=12),
+        ),
+    ])
+    assert store.read(T0, T0 + timedelta(minutes=10)).num_rows == 2
+
+
+def test_read_recent_answers_exactly_as_read_does(tmp_path: Path) -> None:
+    """The cycle's cheap path and the tidy one are interchangeable.
+
+    ``read_recent`` pushes the window and the filters into the scanner so
+    the live cycle does not decode a whole month every radar frame. It
+    would be worth nothing if it answered differently.
+    """
+    store = StationObsStore(tmp_path)
+    store.append([
+        _obs(station, m, parameter, value=float(m))
+        for station in ("06074", "06188")
+        for parameter in ("precip_past10min", "precip_dur_past10min")
+        for m in (0, 10, 20, 30)
+    ])
+    end = T0 + timedelta(minutes=20)
+    for kwargs in (
+        {},
+        {"parameter_ids": ["precip_past10min"]},
+        {"station_ids": ["06074"]},
+        {"parameter_ids": ["precip_past10min"], "station_ids": ["06188"]},
+    ):
+        assert store.read_recent(T0, end, **kwargs).to_pylist() == (
+            store.read(T0, end, **kwargs).to_pylist()
+        ), kwargs
+
+
+def test_read_recent_of_an_empty_store_is_the_typed_empty_table(
+    tmp_path: Path,
+) -> None:
+    table = StationObsStore(tmp_path).read_recent(T0, T0 + timedelta(hours=1))
+    assert table.num_rows == 0
+    assert table.schema.equals(obs_schema())
+
+
+def test_read_recent_spans_month_partitions(tmp_path: Path) -> None:
+    store = StationObsStore(tmp_path)
+    store.append([
+        _obs("06074", 0, base=datetime(2026, 5, 31, 23, 50, tzinfo=timezone.utc)),
+        _obs("06074", 0, base=T0),
+    ])
+    table = store.read_recent(
+        datetime(2026, 5, 31, tzinfo=timezone.utc), T0 + timedelta(hours=1),
+    )
+    assert table.num_rows == 2
+
+
 def test_read_is_sorted_by_time(tmp_path: Path) -> None:
     store = StationObsStore(tmp_path)
     store.append([_obs("06074", m) for m in (20, 0, 10)])

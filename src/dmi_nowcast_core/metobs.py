@@ -121,12 +121,21 @@ class Observation:
     ``value`` is exactly what DMI reported — including the ``-0.1``
     trace sentinel. Use :func:`normalize_precip_mm` before treating it
     as an amount.
+
+    ``created_utc`` is the API's own ``created`` property: when DMI
+    published the reading, as opposed to the instant it describes. It is
+    the only measurement of the availability lag the gauge features are
+    built on (``postprocess.DEFAULT_GAUGE_LAG_MIN``), so the store keeps
+    it rather than throwing it away at the parser. ``None`` when the
+    response did not carry one — an older recorded fixture, or a feature
+    DMI served without it.
     """
 
     station_id: str
     observed_utc: datetime
     parameter_id: str
     value: float
+    created_utc: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -250,6 +259,9 @@ def parse_observation(feature: Any, stats: ParseStats | None = None) -> Observat
         observed_utc=observed_utc,
         parameter_id=str(parameter_id),
         value=value_f,
+        # Best-effort: an unparseable or absent ``created`` is a missing
+        # diagnostic, never a reason to drop a measurement.
+        created_utc=_opt_datetime(props.get("created")),
     )
 
 

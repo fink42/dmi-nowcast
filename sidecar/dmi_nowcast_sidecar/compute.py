@@ -69,6 +69,7 @@ from dmi_nowcast_core.transform import dbz_to_rain_rate
 
 from .config import Config
 from .eta_smoother import EtaSmoother
+from .gauge_history import build_gauge_history
 from .lightning_tracker import LightningTracker
 from .national_artifacts import write_national_artifacts
 from .national_sample import finite_or_none, product_pixel_of
@@ -172,6 +173,12 @@ class PointProducts:
     pixels: tuple[tuple[int, int] | None, ...]
     raw_fractions: dict[int, tuple[float | None, ...]]
     raw_grids: dict[int, np.ndarray] | None = None
+    #: v2/F4 — ``{column: per-point array}`` for the ensemble-shape
+    #: features (``ens_mean_<lead>``, ``ens_p90_<lead>``,
+    #: ``ens_eta_spread_min``), taken off the ensemble array in the same
+    #: pass as the fractions above and before it is dropped. Empty when
+    #: the cycle had no ensemble to read.
+    ens_features: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -414,6 +421,11 @@ class CycleEngine:
         # because both move between cycles. Home is always in, so the
         # cycle has at least one point to answer for.
         self._postprocess = PostprocessTable(resolved_postprocess_path(config))
+        #: v2/F1: the gauge archive behind the ``g_*`` feature block, or
+        #: None on a deployment that has no corpus volume or no station
+        #: catalogue to resolve a point against. One store read per cycle,
+        #: inside the worker; see :mod:`dmi_nowcast_sidecar.gauge_history`.
+        self._gauge_history = build_gauge_history(config)
         self._point_sources: list[tuple[str, Any]] = []
         self._postprocess_latest: CyclePostprocess | None = None
         #: The grids behind that answer, kept only while a model is loaded
@@ -1020,6 +1032,19 @@ class CycleEngine:
         if pp_keys:
             try:
                 pp_native = [geo.lonlat_to_grid(lon, lat) for lat, lon in pp_keys]
+                # v2/F2: the same point one and two frames back.
+                # ``rain_prev`` is already in hand for the disc stats, and
+                # each frame is converted with its OWN Z-R parameters —
+                # the replay does the same, so the trend can never pick up
+                # a coefficient change as a change in rain. The t-20 frame
+                # exists only when the cycle has a full triple.
+                rain_prev20 = (
+                    dbz_to_rain_rate(
+                        composites[-3].reflectivity_dbz,
+                        zr_a=composites[-3].zr_a, zr_b=composites[-3].zr_b,
+                    )
+                    if len(composites) >= 3 else None
+                )
                 pp_grid = core_postprocess.station_features(
                     rain_now, vy, vx,
                     np.array([idx.row for idx in pp_native], dtype=np.float64),
@@ -1029,7 +1054,12 @@ class CycleEngine:
                     bulk_vy=motion.bulk_vy,
                     bulk_vx=motion.bulk_vx,
                     stalled_share=motion.stalled_share,
+                    rain_prev10_mm_h=rain_prev,
+                    rain_prev20_mm_h=rain_prev20,
                 )
+                # ~14 MB on the native grid, and STEPS below is the
+                # cycle's memory high-water mark.
+                del rain_prev20
             except Exception as exc:  # noqa: BLE001 — a feature failure costs
                 # the post-processed probability for one cycle, never the
                 # cycle: the engine falls back to the served curve.
@@ -1637,6 +1667,10 @@ class CycleEngine:
                         # where something can read it: the on-demand
                         # ``/forecast`` scoring path, which needs a model.
                         keep_grids=self._postprocess.active,
+                        # v2/F4: the members themselves, at the same
+                        # pixels, before the ``finally`` below drops them.
+                        ensemble=forecast,
+                        threshold_mm_h=self._rain_threshold,
                     )
                     national = self._calibrate_national(raw_national)
                     del raw_national
@@ -1805,6 +1839,38 @@ class CycleEngine:
         if not keys or grid_features is None or points is None:
             return
         try:
+            # v2: the two feature blocks that do not come off the anchor
+            # grid. Merged into a COPY — the caller's dict belongs to the
+            # cycle, and a later reader of it must not find columns that
+            # were assembled here.
+            grid_features = {**grid_features, **points.ens_features}
+            # The gauge block is written even with no archive behind it —
+            # a deployment without a corpus, or a read that failed. Every
+            # ``g_*`` value is then null and ``g_known`` is 0, which is the
+            # honest reading: the indicator that says "no gauge
+            # measurement backs this row" must never itself be missing, or
+            # the design imputes a training mean for it.
+            gauge = self._gauge_history
+            slots: list[Any] = [None] * len(keys)
+            if gauge is not None:
+                try:
+                    slots = gauge.slots_for(keys, now_utc=generated_at_utc)
+                except Exception as exc:  # noqa: BLE001 — the gauge archive
+                    # is a second store on a second volume; a bad read
+                    # costs the g_* columns, never the cycle's features.
+                    _log.warning(
+                        "postprocess_gauge_features_failed", error=str(exc),
+                    )
+            grid_features.update(
+                core_postprocess.station_gauge_features(
+                    slots,
+                    now_utc=generated_at_utc,
+                    lag_min=(
+                        core_postprocess.DEFAULT_GAUGE_LAG_MIN
+                        if gauge is None else gauge.lag_min
+                    ),
+                ),
+            )
             shared: list[dict[str, Any]] = []
             for pixel in points.pixels:
                 if pixel is None:
@@ -2014,6 +2080,8 @@ def _read_points(
     points: Sequence[Any] | None,
     *,
     keep_grids: bool = False,
+    ensemble: np.ndarray | None = None,
+    threshold_mm_h: float | None = None,
 ) -> PointProducts | None:
     """Per-point reads of the RAW national grids (H-P).
 
@@ -2028,6 +2096,12 @@ def _read_points(
     ``_calibrate_national``, for the on-demand ``/forecast`` lookup. ~7 MB
     of float32 at the shipped downsample, so the cycle only asks for it
     when a post-processing model is actually loaded.
+
+    ``ensemble`` is the array the products were just reduced from, and is
+    read here for the v2 ensemble-shape features — at the same pixels, in
+    the same call, in the one window before the cycle drops ~150 MB of
+    members. A failure there costs those columns and not the fractions:
+    the served probability must never depend on a feature.
     """
     if not points:
         return None
@@ -2041,6 +2115,21 @@ def _read_points(
             None if pixel is None else finite_or_none(grid[pixel[0], pixel[1]])
             for pixel in pixels
         )
+    ens: dict[str, np.ndarray] = {}
+    if ensemble is not None:
+        try:
+            ens = core_postprocess.ensemble_point_features(
+                ensemble, pixels,
+                leads_min=products.leads_min,
+                threshold_mm_h=(
+                    products.threshold_mm_h if threshold_mm_h is None
+                    else float(threshold_mm_h)
+                ),
+                timestep_min=products.timestep_min,
+                frame_age_min=products.frame_age_min,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("postprocess_ensemble_features_failed", error=str(exc))
     return PointProducts(
         pixels=pixels,
         raw_fractions=raw,
@@ -2048,6 +2137,7 @@ def _read_points(
             {int(lead): products.p_rain[int(lead)] for lead in products.leads_min}
             if keep_grids else None
         ),
+        ens_features=ens,
     )
 
 

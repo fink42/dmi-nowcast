@@ -65,6 +65,64 @@ Usage (on the VM that holds the corpus)::
 Offline and read-only apart from its own outputs: parquet in, three files
 out (plus the optional copy). Memory-lean — Arrow columns throughout, no
 row dicts; the ten-month replay is around 460,000 rows.
+
+The arms this can compare (post-processing v2)
+----------------------------------------------
+``--model logistic|logistic-shared|trees|trees-shared``, ``--design
+v1|v2``, ``--station-offsets``, ``--isotonic pooled|per-season``. Every
+default is the model in service, so a run with no new flag reproduces the
+shipped fit.
+
+A ``-shared`` kind fits ONE model over the rows of every served lead
+stacked, with the lead in the design: ``lead_min`` and ``log_lead_min``,
+plus ``raw_frac_own`` (and ``ens_mean_own`` / ``ens_p90_own`` under
+``--design v2``), which carry the row's OWN lead's values. Every other
+coefficient is shared, and only the isotonic recalibration stays per lead
+— the base rate at 60 minutes is not the base rate at 20. The four
+kinds are scored side by side in one run with
+``--compare logistic,logistic-shared,trees,trees-shared``; only
+``--model`` is written to ``postprocess.json``.
+
+P(rain within L) is non-decreasing in L, and the served answer is made to
+respect that: ``trees-shared`` carries a LightGBM monotone constraint on
+the lead columns, and every kind goes through the same running max across
+leads (``national.enforce_lead_monotonic``) that guards the served
+``p_rain`` — at scoring time AND on the out-of-fold predictions this
+writes back, so the number that is measured is the number that is served.
+
+``--baseline`` decides what the candidate is measured against.
+``curve`` is the served ``p_rain_<lead>``, which is the comparison that
+argued for shipping the post-processor at all. ``refit-v1`` is the v1
+design plus the shipped logistic, **refitted inside every fold** on the
+same rows and the same folds — the baseline of record for v2, because
+"beats the curve" is settled and the open question is whether a new
+design beats the old one. ``model:<path>`` refits whatever configuration
+a ``postprocess.json`` records.
+
+Everything is reported twice: on all rows, and on the **dry** subset —
+rows whose gauge was dry for the hour before the decision instant. A
+model that wins only on rows where it was already raining has not won.
+
+``--learning-curve 10,20,30,60,90`` adds one LOMO pass per N, trained on
+the first N calendar days of each fold's training rows. ``--ablate`` adds
+one per feature family, with the family dropped.
+
+LightGBM, and why it is not in this project's venv
+--------------------------------------------------
+``--model trees`` fits with LightGBM and exports a JSON description of
+the ensemble that ``dmi_nowcast_core.postprocess_trees`` evaluates in
+pure numpy. The sidecar image has numpy, scipy and pyarrow and will not
+be growing LightGBM or scikit-learn: the serving container is what a
+radar cycle blocks on. So the fit runs in a separate venv beside the
+project's::
+
+    uv venv --python .venv/bin/python .venv-fit
+    uv pip install --python .venv-fit/bin/python lightgbm scikit-learn \\
+        numpy scipy pytest pyarrow
+    .venv-fit/bin/python scripts/fit_postprocess.py --model trees ...
+
+``.venv`` and the sidecar's venv are left alone, and a tree fit attempted
+from either says so with that command in the error.
 """
 from __future__ import annotations
 
@@ -88,6 +146,9 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dmi_nowcast_core import postprocess as pp  # noqa: E402
+from dmi_nowcast_core.postprocess_trees import (  # noqa: E402
+    DEFAULT_TREE_PARAMS,
+)
 from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_DRY_MIN,
     DEFAULT_MIN_KNOWN_SLOTS,
@@ -119,6 +180,112 @@ DEFAULT_DESIGN_LEADS: tuple[int, ...] = (10, 20, 30, 45, 60)
 #: column.
 POST_COLUMN_TEMPLATE = pp.POST_COLUMN_TEMPLATE
 post_column = pp.post_column
+
+#: ``--model`` values — the core module's model kinds, unchanged, so the
+#: flag, the artefact's ``kind`` and the config key all spell the four
+#: arms the same way.
+MODEL_LOGISTIC = pp.KIND_LOGISTIC
+MODEL_LOGISTIC_SHARED = pp.KIND_LOGISTIC_SHARED
+MODEL_TREES = pp.KIND_TREES
+MODEL_TREES_SHARED = pp.KIND_TREES_SHARED
+MODEL_CHOICES: tuple[str, ...] = pp.MODEL_KINDS
+
+#: ``--baseline`` values that are not ``model:<path>``.
+BASELINE_CURVE = "curve"
+BASELINE_REFIT_V1 = "refit-v1"
+
+
+def parse_tree_params(text: str) -> dict:
+    """``"n_estimators=500,max_depth=6"`` → a LightGBM override dict.
+
+    Numbers are parsed as numbers so LightGBM sees an int where it wants
+    one; anything else is left as a string and LightGBM complains about it
+    in its own words, which are better than any this script could add.
+    """
+    out: dict = {}
+    for item in str(text or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"--trees expects key=value, got {item!r}")
+        key, _, value = item.partition("=")
+        value = value.strip()
+        try:
+            out[key.strip()] = int(value)
+        except ValueError:
+            try:
+                out[key.strip()] = float(value)
+            except ValueError:
+                out[key.strip()] = value
+    return out
+
+
+def settings_from_args(args) -> Any:
+    """The :class:`postprocess.FitSettings` the command line describes."""
+    return settings_for(args, str(args.model))
+
+
+def settings_for(args, kind: str):
+    """The same settings under a different model kind — one arm of a sweep."""
+    return pp.FitSettings(
+        kind=kind,
+        design=args.design,
+        l2=float(args.l2),
+        isotonic=args.isotonic,
+        isotonic_bins=int(args.isotonic_bins),
+        station_offsets=bool(args.station_offsets),
+        station_l2_multiple=float(args.station_l2_multiple),
+        tree_params=parse_tree_params(args.trees) or None,
+        seed=int(args.seed),
+    ).validate()
+
+
+def baseline_settings_from_args(args) -> Any:
+    """The baseline configuration, or None for the served curve.
+
+    ``refit-v1`` is the shipped model refitted IN FOLD: the v1 design, the
+    logistic, no station offsets, one pooled curve — whatever ``--l2`` and
+    ``--isotonic-bins`` say, because those are properties of the fit and
+    not of the design under test. ``model:<path>`` reads the settings a
+    ``postprocess.json`` recorded and refits THAT, which is how "did this
+    change beat what is in service?" gets asked of the thing in service.
+    """
+    choice = str(args.baseline or BASELINE_CURVE)
+    if choice == BASELINE_CURVE:
+        return None
+    if choice == BASELINE_REFIT_V1:
+        return pp.FitSettings(
+            l2=float(args.l2), isotonic_bins=int(args.isotonic_bins),
+            seed=int(args.seed),
+        ).validate()
+    if not choice.startswith("model:"):
+        raise ValueError(
+            f"--baseline must be '{BASELINE_CURVE}', '{BASELINE_REFIT_V1}' "
+            f"or 'model:<path>', got {choice!r}"
+        )
+    path = Path(choice.split(":", 1)[1])
+    document = json.loads(path.read_text())
+    stored = ((document.get("training") or {}).get("settings")) or {}
+    return pp.FitSettings(
+        kind=str(document.get("kind", stored.get("kind", pp.KIND_LOGISTIC))),
+        # A pre-v2 document has no ``kind`` and is a per-lead logistic; a
+        # v2 one names its own arm, shared or not.
+        design=str(
+            (document.get("design") or {}).get(
+                "version", stored.get("design", pp.DESIGN_V1),
+            )
+        ),
+        l2=float(document.get("l2", stored.get("l2", args.l2))),
+        isotonic=str(stored.get("isotonic", pp.ISOTONIC_POOLED)),
+        isotonic_bins=int(stored.get("isotonic_bins", args.isotonic_bins)),
+        station_offsets=bool(stored.get("station_offsets", False)),
+        station_l2_multiple=float(
+            stored.get("station_l2_multiple", pp.STATION_L2_MULTIPLE),
+        ),
+        tree_params=dict(stored.get("tree_params") or {}) or None,
+        seed=int(args.seed),
+    ).validate()
 
 
 # ---------------------------------------------------------------------------
@@ -203,25 +370,46 @@ def _ci(triple: Sequence[float] | None, digits: int = 4) -> str:
     return bench._ci(tuple(triple), digits)
 
 
+#: Keys of the LOMO payload that hold one value per row. They are the
+#: write-back's input and have no business in a JSON report.
+_ARRAY_KEYS = frozenset({"out_of_fold", "baseline_out_of_fold"})
+
+
 def _strip_arrays(evaluation: Mapping[str, Any]) -> dict:
     """The LOMO payload without the per-row prediction arrays."""
-    return {k: v for k, v in evaluation.items() if k != "out_of_fold"}
+    return {k: v for k, v in evaluation.items() if k not in _ARRAY_KEYS}
 
 
 def render_markdown(report: Mapping[str, Any]) -> str:
     lines: list[str] = ["# Gauge-trained post-processing (Phase H, H-P)", ""]
     settings = report["settings"]
+    baseline_name = str(settings.get("baseline", BASELINE_CURVE))
     lines += [
         f"Generated {report['generated_at_utc']}.",
         "",
         "Leave-one-(year, month)-out over the replay's decision rows. The "
-        "baseline is the served `p_rain_<lead>` — the per-lead isotonic "
-        "curve on the ensemble fraction — and the candidate is this "
-        "model's out-of-fold prediction on **the same rows**. Every "
-        "confidence interval is a paired day-block bootstrap "
+        + (
+            "baseline is the served `p_rain_<lead>` — the per-lead "
+            "isotonic curve on the ensemble fraction — and the candidate "
+            "is this model's out-of-fold prediction on **the same rows**."
+            if baseline_name == BASELINE_CURVE else
+            f"baseline is `{baseline_name}`, refitted **inside every "
+            "fold** on the same rows and the same folds as the candidate, "
+            "so the difference is attributable to the configuration and "
+            "not to a different sample or a different split."
+        )
+        + " Every confidence interval is a paired day-block bootstrap "
         f"({settings['resamples']} resamples, "
         f"{settings['ci']:.0%}); an interval excluding zero is the plan's "
         "evidence that the difference is real.",
+        "",
+        "Every comparison is reported twice: on **all** rows, and on the "
+        f"**dry** subset — the rows whose gauge was dry for the "
+        f"{pp.DRY_BEFORE_MIN} minutes before the decision instant. Those "
+        "are the onset-relevant ones: a row whose gauge was already wet "
+        "is one nobody needed a warning for, and pooling them in flatters "
+        "every arm equally while hiding which one is better at the thing "
+        "a subscriber notices.",
         "",
         "Shoulder is April alone until October and November 2026 are "
         "archived — read every shoulder row with that in mind.",
@@ -233,12 +421,20 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"| runs | {', '.join(settings['run_dirs'])} |",
         f"| corpus | {settings['corpus_dir']} |",
         f"| rows | {report['rows']} |",
+        f"| dry (onset-relevant) rows | {report.get('dry_rows', 0)} "
+        f"({report.get('dry_source', '–')}) |",
         f"| stations scored | {report['stations']} |",
         f"| days | {report['days']} |",
         f"| window | {report['window']['from']} → {report['window']['to']} |",
         f"| months | {report['n_months']} |",
         f"| leads | {', '.join(str(x) for x in settings['leads'])} |",
         f"| design leads | {', '.join(str(x) for x in settings['design_leads'])} |",
+        f"| model | {settings.get('model', MODEL_LOGISTIC)} |",
+        f"| design | {settings.get('design', pp.DESIGN_V1)} |",
+        f"| isotonic | {settings.get('isotonic', pp.ISOTONIC_POOLED)} |",
+        f"| station offsets | "
+        f"{'yes' if settings.get('station_offsets') else 'no'} |",
+        f"| baseline | {baseline_name} |",
         f"| L2 | {settings['l2']} |",
         f"| dead gauges | "
         f"{', '.join(bench._dead_label(r) for r in report['dead_gauges']) or 'none'} |",
@@ -262,12 +458,143 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "",
         ]
 
+    lines += _summary_section(report)
     lines += _skill_section(report)
+    lines += _learning_curve_section(report)
+    lines += _ablation_section(report)
     lines += _reliability_section(report)
     lines += _coefficient_section(report)
     lines += _fold_section(report)
     lines += _feature_section(report)
     return "\n".join(lines) + "\n"
+
+
+def _summary_section(report: Mapping[str, Any]) -> list[str]:
+    """The one table a reader should be able to stop at.
+
+    Candidate against baseline, ΔBSS with its interval, on all rows and
+    on the dry subset, per lead. Everything below this is the working.
+    """
+    settings = report["settings"]
+    lines = [
+        "## Candidate vs baseline",
+        "",
+        f"`{settings.get('model', MODEL_LOGISTIC)}` on design "
+        f"`{settings.get('design', pp.DESIGN_V1)}`"
+        + (" with station offsets" if settings.get("station_offsets") else "")
+        + f", `{settings.get('isotonic', pp.ISOTONIC_POOLED)}` recalibration, "
+        f"against `{settings.get('baseline', BASELINE_CURVE)}`. ΔBSS is "
+        "candidate minus baseline on the same out-of-fold rows; an "
+        "interval that excludes zero is the evidence.",
+        "",
+        "| model | lead | subset | n | BSS base | BSS cand. | ΔBSS [CI] | real? |",
+        "|---|---|---|---:|---:|---:|---|---|",
+    ]
+    arms = [
+        (str(settings.get("model", MODEL_LOGISTIC)), report["evaluation"]["leads"]),
+    ] + [(str(arm["model"]), arm["leads"]) for arm in report.get("arms") or ()]
+    for model, per_lead in arms:
+        for lead in settings["leads"]:
+            entry = per_lead.get(str(lead)) or {}
+            for subset in (pp.POOLED, pp.DRY):
+                block = entry.get(subset)
+                if not block:
+                    lines.append(
+                        f"| `{model}` | {lead} | {subset} | – | – | – | – | – |"
+                    )
+                    continue
+                diff = block.get("difference") or {}
+                verdict = diff.get("bss_excludes_zero")
+                lines.append(
+                    f"| `{model}` | {lead} | {subset} | {block['n']} | "
+                    f"{_fmt(block['baseline']['bss'], 4)} | "
+                    f"{_fmt(block['postprocess']['bss'], 4)} | "
+                    f"{_ci(diff.get('bss'))} | "
+                    + ("yes" if verdict else ("no" if verdict is False else "–"))
+                    + " |"
+                )
+    lines.append("")
+    if len(arms) > 1:
+        lines += [
+            "Only the first model is written to `postprocess.json`; the "
+            "rest are `--compare` arms, scored on the same folds and "
+            "against the same baseline, so a column means one thing all "
+            "the way down the table.",
+            "",
+        ]
+    return lines
+
+
+def _learning_curve_section(report: Mapping[str, Any]) -> list[str]:
+    """How much archive the configuration needs before it is worth having."""
+    rows = report.get("learning_curve") or []
+    if not rows:
+        return []
+    leads = [str(x) for x in report["settings"]["leads"]]
+    subsets = sorted({
+        name for row in rows for block in row["leads"].values() for name in block
+    })
+    lines = [
+        "## Learning curve",
+        "",
+        "Same folds, but each fold trains on only the first N calendar "
+        "days of its training rows. By date rather than by random sample: "
+        "the question is whether another month of archive would buy "
+        "anything, and a random slice of a year answers an easier one. "
+        "BSS is out of fold, pooled over the folds.",
+        "",
+        "| days | train rows | subset | "
+        + " | ".join(f"BSS {lead} min" for lead in leads) + " |",
+        "|---:|---:|---|" + "---:|" * len(leads),
+    ]
+    for row in rows:
+        for subset in subsets:
+            cells = []
+            for lead in leads:
+                block = (row["leads"].get(lead) or {}).get(subset) or {}
+                cells.append(_fmt(block.get("bss"), 4))
+            lines.append(
+                f"| {row['days']} | {row['train_rows']} | {subset} | "
+                + " | ".join(cells) + " |"
+            )
+    lines.append("")
+    return lines
+
+
+def _ablation_section(report: Mapping[str, Any]) -> list[str]:
+    """What each feature family is worth, by taking it away."""
+    block = report.get("ablation")
+    if not block:
+        return []
+    leads = [str(x) for x in report["settings"]["leads"]]
+    subsets = sorted({
+        name for lead in block["full"].values() for name in lead
+    })
+    lines = [
+        "## Ablation",
+        "",
+        "One re-run of the whole leave-one-month-out per family, with that "
+        "family's columns — and every interaction either parent appears in "
+        "— removed from the design. ΔBSS is *dropped minus full*, so a "
+        "**negative** number means the family was carrying something and "
+        "a positive one means it was costing.",
+        "",
+        "| family | columns dropped | subset | "
+        + " | ".join(f"ΔBSS {lead} min" for lead in leads) + " |",
+        "|---|---:|---|" + "---:|" * len(leads),
+    ]
+    for entry in block["dropped"]:
+        for subset in subsets:
+            cells = []
+            for lead in leads:
+                cell = (entry["leads"].get(lead) or {}).get(subset) or {}
+                cells.append(_fmt(cell.get("delta"), 4))
+            lines.append(
+                f"| `{entry['family']}` | {entry['columns']} | {subset} | "
+                + " | ".join(cells) + " |"
+            )
+    lines.append("")
+    return lines
 
 
 def _skill_section(report: Mapping[str, Any]) -> list[str]:
@@ -284,7 +611,7 @@ def _skill_section(report: Mapping[str, Any]) -> list[str]:
             "ROC base | ROC post |",
             "|---|---:|---:|---:|---:|---:|---|---:|---:|---|---:|---:|",
         ]
-        for stratum in (pp.POOLED,) + pp.SEASONS:
+        for stratum in (pp.POOLED, pp.DRY) + pp.SEASONS:
             block = entry.get(stratum)
             if not block:
                 lines.append(f"| {stratum} | – | – | – | – | – | – | – | – | – | – | – |")
@@ -345,6 +672,8 @@ def _coefficient_section(report: Mapping[str, Any]) -> list[str]:
     model = report["model"]
     leads = [int(x) for x in model["leads"]]
     names = list(model["features"]["names"])
+    if model.get("kind") == pp.KIND_TREES:
+        return _tree_section(report)
     lines = [
         "## Standardised coefficients",
         "",
@@ -393,6 +722,62 @@ def _coefficient_section(report: Mapping[str, Any]) -> list[str]:
             for lead in leads
         )
         + " |",
+        "",
+    ]
+    return lines
+
+
+def _tree_section(report: Mapping[str, Any]) -> list[str]:
+    """What a tree model has instead of coefficients.
+
+    Not a coefficient table and not pretending to be one: a boosted
+    ensemble's answer to "which predictor carries the weight" is the
+    ablation above, which measures what happens when a family is taken
+    away rather than how large a number next to it is.
+    """
+    model = report["model"]
+    leads = [int(x) for x in model["leads"]]
+    shared = model.get("shared_trees")
+    lines = [
+        "## The ensemble",
+        "",
+        "A boosted ensemble has no standardised coefficients to read. "
+        "What it is worth per feature family is in the ablation section; "
+        "what is below is only the size of the artefact the sidecar has "
+        "to evaluate every cycle.",
+        "",
+        "| | " + " | ".join(f"{lead} min" for lead in leads) + " |",
+        "|---|" + "---:|" * len(leads),
+    ]
+
+    def block(lead: int) -> dict:
+        entry = model["models"][str(lead)]
+        return entry.get("trees") or shared or {}
+
+    lines += [
+        "| trees | "
+        + " | ".join(str((block(lead) or {}).get("n_trees", "–")) for lead in leads)
+        + " |",
+        "| base rate | "
+        + " | ".join(
+            _fmt(model["models"][str(lead)]["base_rate"], 4) for lead in leads
+        )
+        + " |",
+        "| training rows | "
+        + " | ".join(str(model["models"][str(lead)]["n"]) for lead in leads)
+        + " |",
+        "",
+        (
+            "One ensemble is shared across every lead, with the lead as a "
+            "feature." if shared else "One ensemble per lead."
+        ),
+        "",
+        "LightGBM parameters: "
+        + ", ".join(
+            f"`{k}={v}`"
+            for k, v in sorted(((block(leads[0]) or {}).get("params") or {}).items())
+        )
+        + ".",
         "",
     ]
     return lines
@@ -594,6 +979,75 @@ def build_parser() -> argparse.ArgumentParser:
                         "the intercept is never penalised")
     p.add_argument("--isotonic-bins", type=int, default=pp.DEFAULT_ISOTONIC_BINS,
                    help="quantile bins for the isotonic recalibration knots")
+    p.add_argument(
+        "--model", default=MODEL_LOGISTIC, choices=list(MODEL_CHOICES),
+        help="model family. 'logistic' is the shipped one, one fit per "
+             "lead. A '-shared' kind is ONE fit over every served lead "
+             "stacked, with the lead in the design (lead_min, "
+             "log_lead_min, raw_frac_own and friends) and every other "
+             "coefficient shared; only the isotonic recalibration stays "
+             "per lead. Both tree options need LightGBM, which lives only "
+             "in .venv-fit (see the module docstring); the sidecar "
+             "evaluates the exported JSON in numpy and never imports it.",
+    )
+    p.add_argument(
+        "--design", default=pp.DESIGN_V1, choices=list(pp.DESIGN_VERSIONS),
+        help="design matrix. v1 is the 27 shipped columns; v2 adds every "
+             "feature column the catalogue has grown, a spline basis on "
+             "the columns that bend, and the season interactions",
+    )
+    p.add_argument(
+        "--station-offsets", action="store_true",
+        help="learn a per-station intercept offset under its own, "
+             "stronger ridge; stored as a {station_id: offset} map and "
+             "applied only at stations the fit saw (a subscriber gets 0)",
+    )
+    p.add_argument(
+        "--station-l2-multiple", type=float, default=pp.STATION_L2_MULTIPLE,
+        help="how much harder the station offsets are shrunk than the slopes",
+    )
+    p.add_argument(
+        "--isotonic", default=pp.ISOTONIC_POOLED,
+        choices=list(pp.ISOTONIC_MODES),
+        help="recalibration: one curve per lead, or one per season with a "
+             f"fallback to the pooled curve below "
+             f"{pp.MIN_SEASON_ISOTONIC_ROWS} rows",
+    )
+    p.add_argument(
+        "--trees", default="", metavar="K=V,...",
+        help="LightGBM overrides, e.g. "
+             "'n_estimators=500,max_depth=6,learning_rate=0.03'. Defaults: "
+             + ", ".join(f"{k}={v}" for k, v in DEFAULT_TREE_PARAMS.items()),
+    )
+    p.add_argument(
+        "--baseline", default=BASELINE_CURVE,
+        help="what the candidate is compared against: 'curve' (the served "
+             "p_rain_<lead>), 'refit-v1' (the v1 design + logistic, "
+             "refitted IN FOLD on the same rows — the baseline of record "
+             "for post-processing v2), or 'model:<path>' to refit the "
+             "configuration a postprocess.json was fitted under",
+    )
+    p.add_argument(
+        "--learning-curve", default="", metavar="N,N,...",
+        help="also fit on the first N days of each fold's training rows "
+             "and score the held-out month, one row per N, e.g. "
+             "'10,20,30,60,90'. Costs one full LOMO pass per N.",
+    )
+    p.add_argument(
+        "--compare", default="", metavar="MODEL,...",
+        help="also score these model kinds out of fold on the SAME folds "
+             "and against the same baseline, and put them beside the "
+             "candidate in the summary table — e.g. "
+             "'logistic,logistic-shared,trees,trees-shared'. Each one "
+             "costs a full LOMO pass; none of them is written to "
+             "postprocess.json, which is always --model.",
+    )
+    p.add_argument(
+        "--ablate", action="store_true",
+        help="also re-run the LOMO once per feature family with that "
+             "family dropped, and report the ΔBSS. Costs one LOMO pass "
+             "per family (" + ", ".join(pp.FAMILY_NAMES) + ").",
+    )
     p.add_argument("--min-known-slots", type=int, default=DEFAULT_MIN_KNOWN_SLOTS,
                    help="dead-gauge rule, as in the benchmark report")
     p.add_argument("--dry-min", type=int, default=DEFAULT_DRY_MIN)
@@ -619,7 +1073,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         leads = parse_leads(args.leads)
         design_leads = parse_leads(args.design_leads)
         stations = bench.load_points(args.points)
-    except ValueError as exc:
+        settings = settings_from_args(args)
+        baseline_config = baseline_settings_from_args(args)
+        curve_days = [
+            int(v) for v in str(args.learning_curve or "").split(",") if v.strip()
+        ]
+        compare = [
+            name.strip() for name in str(args.compare or "").split(",")
+            if name.strip()
+        ]
+        unknown = [name for name in compare if name not in MODEL_CHOICES]
+        if unknown:
+            raise ValueError(
+                f"--compare: unknown model kind(s) {', '.join(unknown)}; "
+                f"expected from {', '.join(MODEL_CHOICES)}"
+            )
+    except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if args.resamples < 0:
@@ -673,26 +1142,88 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     bench._recode_stations(rows, scored)
     truth = build_truth(rows, grid, leads)
-    del grid
 
     features = build_features(rows)
+    # The station id every row was scored at, for the learned offsets and
+    # for a reader of the artefact. Taken AFTER the recode, so a row the
+    # grid dropped carries the station it was actually graded against.
+    station_ids = np.asarray(scored + [""], dtype=object)[
+        np.clip(np.asarray(rows["station"], dtype=np.int64), 0, len(scored))
+    ]
+    features["station_id"] = station_ids.astype(str)
     baseline = {int(lead): rows["p"][int(lead)] for lead in leads}
     month = pp.year_months_from_epoch(rows["t"])
     day = rows["t"] // bench.DAY_SEC
+
+    # The onset-relevant subset. The stored column when the replay wrote
+    # it, otherwise derived from the gauge grid through the SAME function
+    # the writer's definition comes from — never a third opinion.
+    dry = pp.dry_subset(
+        features, grid=grid, t=rows["t"], station=rows["station"],
+    )
+    del grid
+    log(
+        f"onset-relevant (gauge dry for {pp.DRY_BEFORE_MIN} min before the "
+        f"decision): {int(dry.sum())} of {rows['rows']} row(s)"
+        + ("" if pp.DRY_COLUMN in features else f" — derived, no {pp.DRY_COLUMN} column")
+    )
+    season = features.get("season")
+    strata: dict[str, np.ndarray] = {
+        name: np.asarray(season).astype("<U8") == name for name in pp.SEASONS
+    }
+    if dry.any():
+        strata[pp.DRY] = dry
 
     log(f"fitting {len(leads)} lead(s) over {rows['rows']} row(s)")
     evaluation = pp.leave_one_month_out(
         features, truth, leads,
         month=month, day=day, baseline=baseline,
-        l2=float(args.l2), design_leads=design_leads,
+        design_leads=design_leads, strata=strata,
         n_resamples=int(args.resamples), seed=int(args.seed), ci=float(args.ci),
-        isotonic_bins=int(args.isotonic_bins), log=log,
+        settings=settings, baseline_settings=baseline_config,
+        baseline_label=str(args.baseline), log=log,
     )
+    curve_rows: list[dict] = []
+    if curve_days:
+        curve_rows = pp.learning_curve(
+            features, truth, leads,
+            month=month, day=day, settings=settings, days=curve_days,
+            design_leads=design_leads,
+            subsets={pp.POOLED: np.ones(dry.size, dtype=bool), **(
+                {pp.DRY: dry} if dry.any() else {}
+            )},
+            log=log,
+        )
+    arms: list[dict] = []
+    for kind in compare:
+        if kind == str(args.model):
+            continue
+        log(f"comparison arm: {kind}")
+        arm = pp.leave_one_month_out(
+            features, truth, leads,
+            month=month, day=day, baseline=baseline,
+            design_leads=design_leads, strata=strata,
+            n_resamples=int(args.resamples), seed=int(args.seed),
+            ci=float(args.ci),
+            settings=settings_for(args, kind),
+            baseline_settings=baseline_config,
+            baseline_label=str(args.baseline), log=None,
+        )
+        arms.append({"model": kind, "leads": _strip_arrays(arm)["leads"]})
+    ablation_block: dict | None = None
+    if args.ablate:
+        ablation_block = pp.ablation(
+            features, truth, leads,
+            month=month, settings=settings, design_leads=design_leads,
+            subsets={pp.POOLED: np.ones(dry.size, dtype=bool), **(
+                {pp.DRY: dry} if dry.any() else {}
+            )},
+            log=log,
+        )
     window = bench.decision_window(rows["t"])
     model = pp.fit_postprocess(
         features, truth, leads,
-        l2=float(args.l2), design_leads=design_leads,
-        isotonic_bins=int(args.isotonic_bins),
+        design_leads=design_leads, settings=settings,
         training={
             "from": window[0].isoformat(),
             "to": window[1].isoformat(),
@@ -703,6 +1234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "run_dirs": [str(d) for d in run_dirs],
             "corpus_dir": str(args.corpus_dir),
             "dead_gauges": [row["station_id"] for row in dead_rows],
+            "settings": settings.to_json(),
         },
     )
 
@@ -722,16 +1254,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             "run_dirs": [str(d) for d in run_dirs],
             "corpus_dir": str(args.corpus_dir),
             "points_file": None if args.points is None else str(args.points),
-            "baseline_column": "p_rain_<lead>",
+            "baseline_column": (
+                "p_rain_<lead>" if baseline_config is None
+                else f"{args.baseline} (refitted in fold)"
+            ),
+            "model": str(args.model),
+            "design": str(args.design),
+            "isotonic": str(args.isotonic),
+            "station_offsets": bool(args.station_offsets),
+            "baseline": str(args.baseline),
+            "fit": settings.to_json(),
+            "baseline_fit": (
+                None if baseline_config is None else baseline_config.to_json()
+            ),
+            "learning_curve_days": list(curve_days),
+            "ablate": bool(args.ablate),
+            "compare": list(compare),
         },
         "rows": int(rows["rows"]),
         "stations": len(scored),
         "days": int(np.unique(day).size),
         "n_months": len(set(int(m) for m in np.unique(month))),
         "window": {"from": window[0].isoformat(), "to": window[1].isoformat()},
+        "dry_rows": int(dry.sum()),
+        "dry_source": (
+            "column" if pp.DRY_COLUMN in features else "derived from the gauge store"
+        ),
         "dead_gauges": dead_rows,
         "run_settings": bench.run_settings(run_dirs),
         "evaluation": _strip_arrays(evaluation),
+        "arms": arms,
+        "learning_curve": curve_rows,
+        "ablation": ablation_block,
         "model": model.to_json(),
     }
 
@@ -799,6 +1353,17 @@ def _headline(report: Mapping[str, Any]) -> dict:
             "pr_auc_postprocess": _round(block["postprocess"]["pr_auc"]),
             "pr_auc_difference": (block.get("difference") or {}).get("pr_auc"),
         }
+        # The onset-relevant half of the gate, beside the pooled one: a
+        # win on all rows that is not a win here is a win on rows nobody
+        # was going to be warned about.
+        dry = (report["evaluation"]["leads"].get(str(lead)) or {}).get(pp.DRY)
+        if dry:
+            out["leads"][str(lead)]["dry"] = {
+                "n": dry["n"],
+                "bss_baseline": _round(dry["baseline"]["bss"]),
+                "bss_postprocess": _round(dry["postprocess"]["bss"]),
+                "bss_difference": (dry.get("difference") or {}).get("bss"),
+            }
     return out
 
 

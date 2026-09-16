@@ -437,6 +437,12 @@ def run_postprocess_fit(
         run = fitter or fit_it
         result = run(options_from_json(fit.get("options") or {}))
         model = result["model"]
+        # The rollback. Last night's model, kept beside tonight's before
+        # it is overwritten, so undoing a bad refit is a copy rather than
+        # an eight-hour re-run of the study on the VM. One file, one
+        # generation deep: two would need a retention rule and nobody has
+        # ever wanted the night before last.
+        previous = keep_previous(out, log=log)
         # Atomic, like every other publish here: the cycle may be reading
         # this file at any instant, and a half-written model is a crash in
         # the fan-out rather than a fallback.
@@ -455,13 +461,46 @@ def run_postprocess_fit(
     if log:
         log(
             f"postprocess fit done: {out} "
-            f"({summary.get('rows')} row(s), leads {summary.get('leads')})"
+            f"({summary.get('rows')} row(s), leads {summary.get('leads')}, "
+            f"{summary.get('kind', 'logistic')}/"
+            f"{summary.get('design', 'v1')})"
         )
     return {
         "postprocess_path": str(out),
+        "postprocess_previous_path": (
+            None if previous is None else str(previous)
+        ),
         "postprocess_fitted_at": summary.get("fitted_at_utc"),
         "postprocess": summary,
     }
+
+
+#: Suffix of the one-generation rollback copy kept beside a published
+#: artefact: ``postprocess.json`` → ``postprocess.prev.json``.
+PREVIOUS_SUFFIX = ".prev"
+
+
+def keep_previous(
+    path: Path, *, log: Callable[[str], None] | None = None,
+) -> Path | None:
+    """Copy ``path`` to ``<stem>.prev<suffix>`` beside it. ``None`` if absent.
+
+    Never fatal. A rollback copy that could not be made is worth a log
+    line; refusing to publish tonight's model over it would be trading a
+    working service for a convenience.
+    """
+    import shutil
+
+    target = path.with_name(f"{path.stem}{PREVIOUS_SUFFIX}{path.suffix}")
+    try:
+        if not path.exists():
+            return None
+        shutil.copyfile(path, target)
+    except OSError as exc:
+        if log:
+            log(f"could not keep {target.name}: {type(exc).__name__}: {exc}")
+        return None
+    return target
 
 
 def run_gauge_reliability(
@@ -680,6 +719,7 @@ def run_job(
         # Additive (Phase H): where the refit model landed, its stamp, and
         # its counts. Null throughout when the step is off or skipped.
         "postprocess_path": None,
+        "postprocess_previous_path": None,
         "postprocess_fitted_at": None,
         "postprocess": {},
         "postprocess_error": None,
@@ -787,6 +827,7 @@ def main(argv: list[str] | None = None) -> int:
             "thresholds_guard": {},
             "thresholds_error": None,
             "postprocess_path": None,
+            "postprocess_previous_path": None,
             "postprocess_fitted_at": None,
             "postprocess": {},
             "postprocess_error": None,

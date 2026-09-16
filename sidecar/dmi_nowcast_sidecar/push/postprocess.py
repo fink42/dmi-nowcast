@@ -195,6 +195,13 @@ class PostprocessTable:
             leads=self.leads,
             design_leads=self.design_leads,
             fitted_at=self.fitted_at_utc,
+            # Which arm is in service. A document can now be a logistic or
+            # a boosted ensemble, per lead or shared across them, on
+            # either design; a deploy that changes it should be one grep
+            # away rather than a file to go and read on the VM.
+            kind=model.kind,
+            design=model.spec.version,
+            columns=len(model.feature_names),
         )
         return model
 
@@ -563,6 +570,19 @@ def score_point(
     **0.42 ms per point** on the production 1728x1984 composite, which is
     why it stays on the event loop beside the rest of ``/forecast``'s
     arithmetic rather than paying for a thread hop.
+
+    **What this row cannot carry** (v2, 2026-09-16). The context keeps the
+    anchor field and the flow, so every feature taken off those is here —
+    including the wet fractions and the whole resolved corridor. The three
+    blocks that need something the cycle has already dropped are not:
+    ``obs_prev10_mm_h`` / ``obs_prev20_mm_h`` / ``obs_max_5km_prev10_mm_h``
+    would need the previous frames (~27 MB more held for the life of the
+    cycle) and the ``ens_*`` block would need the ensemble (~150 MB); the
+    ``g_*`` block is null at any point without a gauge, which is every
+    point this path serves. They are written as nulls and the design
+    imputes the training mean, so a clicked pixel gets a slightly blunter
+    number than a subscribed one — the alternative is holding a sixth of
+    the VM's memory against a question most cycles are never asked.
     """
     leads = [int(lead) for lead in context.leads]
     grid_features = core_postprocess.station_features(

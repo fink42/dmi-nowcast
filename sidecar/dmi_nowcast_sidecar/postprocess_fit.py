@@ -92,6 +92,27 @@ class PostprocessFitOptions:
     #: Ridge strength on the slopes; the intercept is never penalised.
     l2: float = 1.0
     isotonic_bins: int = pp.DEFAULT_ISOTONIC_BINS
+    #: Which of ``postprocess.MODEL_KINDS`` to fit — ``"logistic"``,
+    #: ``"logistic-shared"``, ``"trees"`` or ``"trees-shared"``.
+    #: ``"logistic"`` is what shipped, and it is the default here for the
+    #: reason it is the default everywhere: changing what the service
+    #: serves is a decision, not a default.
+    #:
+    #: Either tree kind needs LightGBM, which the sidecar image
+    #: deliberately does NOT carry (see
+    #: ``dmi_nowcast_core.postprocess_trees``). Asking for one here fails
+    #: this step with a clear ImportError and leaves last night's model in
+    #: service — the failure policy of every other step in this job. A
+    #: tree model reaches production by being fitted offline in
+    #: ``.venv-fit`` and synced in, never by a nightly refit on the VM.
+    model: str = pp.KIND_LOGISTIC
+    #: ``"v1"`` (the 27 shipped columns) or ``"v2"`` (every catalogue
+    #: column, the spline bases, the interactions).
+    design: str = pp.DESIGN_V1
+    #: Learn a per-station intercept offset under its own stronger ridge.
+    station_offsets: bool = False
+    #: ``"pooled"`` (one curve per lead) or ``"per-season"``.
+    isotonic: str = pp.ISOTONIC_POOLED
     #: The gauge onset/wet definition and the dead-gauge rule, matching
     #: ``fit_thresholds`` so the model and the thresholds stand on the
     #: same rows.
@@ -286,13 +307,33 @@ def run_postprocess_fit(
 
     day = rows["t"] // DAY_SEC
     features = build_features(rows)
+    # The station each row was graded at, for the learned offsets. After
+    # the recode, so a row the grid dropped carries the station it was
+    # actually scored against rather than the one it claimed.
+    scored_ids = np.asarray(list(scored) + [""], dtype=object)
+    features["station_id"] = scored_ids[
+        np.clip(np.asarray(rows["station"], dtype=np.int64), 0, len(scored))
+    ].astype(str)
+    settings = pp.FitSettings(
+        kind=str(options.model),
+        design=str(options.design),
+        l2=float(options.l2),
+        isotonic=str(options.isotonic),
+        isotonic_bins=int(options.isotonic_bins),
+        station_offsets=bool(options.station_offsets),
+    ).validate()
     if log:
-        log(f"fitting {len(leads)} lead(s) over {rows['rows']} row(s)")
+        log(
+            f"fitting {len(leads)} lead(s) over {rows['rows']} row(s) "
+            f"({settings.kind}, design {settings.design}, "
+            f"{settings.isotonic} isotonic"
+            + (", station offsets" if settings.station_offsets else "")
+            + ")"
+        )
     model = pp.fit_postprocess(
         features, truth, leads,
-        l2=float(options.l2),
         design_leads=design_leads,
-        isotonic_bins=int(options.isotonic_bins),
+        settings=settings,
         training={
             "from": window[0].isoformat(),
             "to": window[1].isoformat(),
@@ -328,6 +369,14 @@ def run_postprocess_fit(
         "window": {"from": window[0].isoformat(), "to": window[1].isoformat()},
         "fitted_at_utc": model.fitted_at_utc,
         "held_out": False,
+        # Which configuration tonight's model is, so the summary line and
+        # the quality page say what is in service rather than what the
+        # defaults used to be.
+        "kind": model.kind,
+        "design": model.spec.version,
+        "isotonic": settings.isotonic,
+        "station_offsets": settings.station_offsets,
+        "columns": len(model.feature_names),
     }
     return {"model": model, "summary": summary}
 

@@ -170,6 +170,37 @@ Definitions, also written to ``summary.json`` under ``run.features``:
 ``eta_min`` and ``intensity_mm_h`` are features too, and are already
 decision columns; they are read from there rather than written twice.
 
+The v2 block (2026-09-16), appended after those and equally additive —
+every definition is in ``postprocess.FEATURE_DOC``, and ``summary.json``
+carries the parameters each was computed under:
+
+``g_mm_10`` / ``g_mm_30`` / ``g_mm_60`` / ``g_min_since_wet`` /
+``g_dry_60`` / ``g_known``
+    The station's OWN gauge, from the corpus store, and only what the
+    service could have read: a slot counts once it ended at or before
+    ``generated_at - --gauge-lag-min``. The slots are read once per day
+    (:func:`day_feature_slots`) and the availability rule is applied per
+    cycle by the same function the live cycle calls, so the replay cannot
+    train on rain the service will not have.
+``obs_prev10_mm_h`` / ``obs_prev20_mm_h`` /
+``obs_max_5km_prev10_mm_h`` / ``wet_frac_5km`` / ``wet_frac_10km``
+    Radar history at the point — the other two frames of the same history
+    triple the flow ate — and how wet its surroundings are now.
+``up_mean_40km_mm_h`` / ``up_max_b0`` … ``up_max_b7``
+    The upwind corridor's mean, and its maximum resolved into eight 5 km
+    bins: WHERE along the corridor the rain is, not only how much.
+``ens_mean_<lead>`` / ``ens_p90_<lead>`` / ``ens_eta_spread_min``
+    The ensemble's shape at the same product pixel: the member-mean and
+    member-P90 cumulative rain rate by each lead, and the inter-quartile
+    spread of member arrival times (null under four arrivals).
+
+``--poll-jitter-sec`` belongs to the same block even though it adds no
+column: with a rigid poll grid every fullRange anchor is seen at exactly
+15.0 minutes, so ``frame_age_min`` was a constant and the fitted
+coefficient 0.000 at every lead. The live scheduler's phase is not rigid,
+and the default now reproduces its distribution. ``--poll-jitter-sec 0``
+restores the grid every run before this date used.
+
 Outputs under ``--out-dir``:
 
 ``decisions/YYYY-MM-DD.parquet``
@@ -197,7 +228,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -243,6 +274,7 @@ from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_TOLERANCE_MIN,
     PRECIP_DUR_PARAM,
     PRECIP_PARAM,
+    SLOT_MIN,
     ScoreResult,
     align_decision_table,
     decision_schema,  # noqa: F401 — re-exported for the replay tests
@@ -527,6 +559,13 @@ class AnchorSettings:
     frame_age_override_min: float | None = DEFAULT_FRAME_AGE_MIN
     harmonisation_path: str | None = None
     history_mode: str = anchor_policy.HISTORY_SAME_TYPE
+    # v2/F6 (2026-09-16): the scheduler's jitter. On a rigid 5-minute grid
+    # every fullRange anchor is seen at exactly 15.0 min, so the stored
+    # ``frame_age_min`` was a constant and the fitted coefficient 0.000 at
+    # every lead. The live service's poll phase is not rigid; this makes
+    # the replay's distribution match it. ``--poll-jitter-sec 0`` restores
+    # the rigid grid, which is what every run before this date used.
+    poll_jitter_s: float = anchor_policy.DEFAULT_POLL_JITTER_S
 
     @property
     def lag(self) -> anchor_policy.ProductLag:
@@ -548,11 +587,17 @@ class AnchorSettings:
             return 0.0
         return self.poll_interval_min
 
+    @property
+    def jitter_s(self) -> float:
+        """0 wherever there is no poll grid to jitter (the flat model)."""
+        return 0.0 if self.poll_min <= 0 else float(self.poll_jitter_s)
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "policy": self.policy,
             "lag_min": self.lag.as_dict(),
             "poll_interval_min": self.poll_min,
+            "poll_jitter_s": self.jitter_s,
             "frame_age_override_min": self.frame_age_override_min,
             "max_anchor_age_min": self.max_age_min,
             "history_mode": self.history_mode,
@@ -598,6 +643,13 @@ class FrameSettings:
     # schema and drops what is not in it), so a run WITH features scores
     # identically to one without.
     features: bool = True
+    # v2/F1 (2026-09-16): how far behind the decision instant a gauge slot
+    # has to have ENDED to count as visible. The replay reads an archive
+    # that knows everything; the service reads a store that is one poll
+    # behind. Training on the archive's knowledge would fit a model on
+    # rain the service has not been told about. See
+    # ``postprocess.station_gauge_features``.
+    gauge_lag_min: float = postprocess.DEFAULT_GAUGE_LAG_MIN
 
 
 def production_motion(
@@ -793,12 +845,19 @@ def sample_frame(
     settings: FrameSettings,
     *,
     history: anchor_policy.HistorySelection | None = None,
+    gauge_slots: Mapping[str, Sequence[Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Run one cycle end-to-end; return one sample dict per station.
 
     ``history`` is the planned cycle (:func:`plan_day`). Without one the
     pre-L3 fullRange triple at ``radar_ts`` is used, which is what a
     direct caller and the older tests expect.
+
+    ``gauge_slots`` is ``{station_id: [(slot_end, wet, mm), ...]}`` for the
+    day being replayed — read ONCE per day by :func:`day_feature_slots`
+    and sliced here by the availability rule, not re-read per cycle.
+    Without it the ``g_*`` columns are null, which is exactly what they
+    are at a point that has no gauge.
 
     Raises on a missing input frame or a STEPS failure — the day worker
     catches it and records the frame as an error rather than pretending
@@ -834,8 +893,17 @@ def sample_frame(
     # MotionEstimate (which carries two more native-grid grids) can be
     # dropped before the memory-hungry part of the cycle.
     grid_features = None
+    native: list[Any] = []
     if settings.features:
         native = [geo.lonlat_to_grid(point.lon, point.lat) for point in points]
+        # v2/F2: the same point read one and two frames back. Each frame
+        # is converted with its OWN Z-R parameters — the live cycle's
+        # ``rain_prev`` already is, and the trend must not pick up a
+        # coefficient change as a change in rain.
+        previous = [
+            dbz_to_rain_rate(comp.reflectivity_dbz, zr_a=comp.zr_a, zr_b=comp.zr_b)
+            for comp in composites[-3:-1]
+        ]
         grid_features = postprocess.station_features(
             rain_now, vy, vx,
             np.array([idx.row for idx in native], dtype=np.float64),
@@ -845,7 +913,12 @@ def sample_frame(
             bulk_vy=motion.bulk_vy,
             bulk_vx=motion.bulk_vx,
             stalled_share=motion.stalled_share,
+            rain_prev10_mm_h=previous[-1] if previous else None,
+            rain_prev20_mm_h=previous[-2] if len(previous) > 1 else None,
         )
+        # ~14 MB each on the national grid, and the cascade below is the
+        # cycle's memory high-water mark.
+        del previous
     del motion
 
     n_timesteps = max(1, math.ceil(settings.horizon_min / dt_min - 1e-9))
@@ -869,6 +942,22 @@ def sample_frame(
         frame_age_min=frame_age_min,
         downsample_factor=settings.downsample_factor,
     )
+    # v2/F4: the ensemble's shape at the served points, taken in the ONE
+    # window where the array still exists — one gather of the points' own
+    # columns out of a ~150 MB array, reduced on the small copy. The
+    # product pixel is the same arithmetic ``sample_point`` uses below, so
+    # ``ens_mean_<lead>`` and ``raw_frac_<lead>`` describe one pixel.
+    if grid_features is not None:
+        from dmi_nowcast_sidecar.national_sample import product_pixel_of
+
+        grid_features.update(postprocess.ensemble_point_features(
+            forecast,
+            [product_pixel_of(products, idx.row, idx.col) for idx in native],
+            leads_min=products.leads_min,
+            threshold_mm_h=settings.threshold_mm_h,
+            timestep_min=dt_min,
+            frame_age_min=frame_age_min,
+        ))
     del forecast
 
     # The UNcalibrated fractions, kept by reference before the curves
@@ -917,6 +1006,25 @@ def sample_frame(
         stamped_ts = stamped_ts.replace(tzinfo=timezone.utc)
     generated_at = stamped_ts + timedelta(minutes=frame_age_min)
     season = postprocess.season_of_month(generated_at.month)
+    # v2/F1: the station's own gauge, as of what the service could have
+    # read at ``generated_at``. The slot series was read once for the whole
+    # day; the availability rule is applied here, per cycle, by the same
+    # function the live cycle calls.
+    #
+    # Called even with no slots at all — a run without a gauge archive
+    # behind it. ``g_known`` is then 0 everywhere rather than null, which
+    # is the honest reading and the one the design needs: the indicator
+    # that says "no gauge measurement backs this row" must never itself be
+    # missing, or the model imputes a mean for it.
+    if grid_features is not None:
+        grid_features.update(postprocess.station_gauge_features(
+            [
+                None if gauge_slots is None else gauge_slots.get(point.id)
+                for point in points
+            ],
+            now_utc=generated_at,
+            lag_min=settings.gauge_lag_min,
+        ))
     out: list[dict[str, Any]] = []
     for index, point in enumerate(points):
         sample = sample_point(
@@ -1057,6 +1165,12 @@ def plan_day(
         lag=cfg.lag,
         poll_interval_min=cfg.poll_min,
         max_age_min=cfg.max_age_min,
+        poll_jitter_s=cfg.jitter_s,
+        # Keyed on the day, so a resumed run re-plans the same instants
+        # as the run it resumes and two workers on two days never draw
+        # the same phase. The day is the unit of work here; nothing
+        # smaller is stable across a resume.
+        poll_seed=day.toordinal(),
     )
     out: list[tuple[Any, Any]] = []
     for selection in selections:
@@ -1123,10 +1237,15 @@ def run_day(args: tuple) -> dict:
     Every station starts ARMED with an empty streak — the day-parallel
     simplification stated in the module docstring.
     """
+    # ``corpus_dir`` — the v2 gauge features' source — is the tail of the
+    # tuple and optional: a caller without one gets a run whose ``g_*``
+    # columns are null, which is what every other missing input here does
+    # rather than a TypeError deep inside a worker.
     (
         archive_dir_s, day_s, points, settings, rules, out_dir_s,
-        start_min, end_min,
+        start_min, end_min, *rest,
     ) = args
+    corpus_dir_s = rest[0] if rest else None
     started = time.time()
     day = date.fromisoformat(day_s)
     eng = _engine()
@@ -1151,6 +1270,26 @@ def run_day(args: tuple) -> dict:
         )
         cache = CompositeCache(archive_dir)
         states = {p.id: eng.INITIAL_STATE for p in points}
+        # v2/F1: this day's gauge slots, read once. A store that is not
+        # there yet — or one read that fails — costs the ``g_*`` columns
+        # for the day and nothing else: the radar features, the decisions
+        # and the scoring pass are all untouched by it.
+        gauge_slots: dict[str, Any] | None = None
+        if settings.features and corpus_dir_s:
+            try:
+                from dmi_nowcast_core.station_store import StationObsStore
+
+                gauge_slots = day_feature_slots(
+                    StationObsStore(Path(corpus_dir_s)),
+                    day,
+                    [p.id for p in points],
+                    lag_min=settings.gauge_lag_min,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(
+                    f"{day_s}: gauge features unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         rows: list[dict[str, Any]] = []
         for selection, history in plan:
             t0 = time.time()
@@ -1165,6 +1304,7 @@ def run_day(args: tuple) -> dict:
             try:
                 samples = sample_frame(
                     cache, radar_ts, points, settings, history=history,
+                    gauge_slots=gauge_slots,
                 )
             except Exception as exc:  # noqa: BLE001 — one frame, not the day
                 result["errors"].append(
@@ -1393,6 +1533,46 @@ def day_slots(
     }
 
 
+def day_feature_slots(
+    store: Any,
+    day: date,
+    station_ids: Sequence[str],
+    *,
+    lag_min: float,
+) -> dict[str, list[tuple[datetime, bool | None, float | None]]]:
+    """Gauge slots for the v2 ``g_*`` features of one replayed day.
+
+    Same shape and the same producer as :func:`day_slots` — this is the
+    scoring pass's read, aimed backwards instead of forwards. The window
+    reaches back far enough that the FIRST cycle of the day can still see
+    six hours (``postprocess.GAUGE_SINCE_CAP_MIN``) behind its visibility
+    horizon, and stops at the end of the day because a feature may never
+    look forward at all.
+
+    Read ONCE per day, in the day worker, through the pushdown scan: a
+    month partition is ~1.4M rows and this runs two workers to a 5 GB cap,
+    so the whole-partition decode :meth:`StationObsStore.read` does is the
+    difference between a few megabytes and a few hundred. The rows are
+    bucketed by station in one pass, through the same helper the live
+    cycle uses, rather than walked once per station.
+    """
+    from dmi_nowcast_sidecar.gauge_history import slots_by_station
+
+    day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    start = day_start - timedelta(
+        minutes=postprocess.GAUGE_SINCE_CAP_MIN
+        + float(lag_min)
+        + float(SLOT_MIN),
+    )
+    end = day_start + timedelta(days=1)
+    table = store.read_recent(
+        start, end, [PRECIP_PARAM, PRECIP_DUR_PARAM], list(station_ids),
+    )
+    return slots_by_station(
+        table, list(station_ids), start_utc=start, end_utc=end,
+    )
+
+
 def merge_slots(
     into: dict[str, dict[datetime, tuple[bool | None, float | None]]],
     add: dict[str, list[tuple[datetime, bool | None, float | None]]],
@@ -1580,6 +1760,28 @@ def main(argv: Sequence[str] | None = None) -> int:
              "fast path), which also keeps radar_ts unique per decision.",
     )
     p.add_argument(
+        "--poll-jitter-sec", type=float,
+        default=anchor_policy.DEFAULT_POLL_JITTER_S,
+        help="The scheduler's jitter, seconds (poll.jitter_seconds). On a "
+             "rigid poll grid the interval divides the frame grid, so "
+             "every fullRange anchor is seen at exactly 15.0 min and the "
+             "stored frame_age_min is a constant the model cannot learn "
+             "from; the live poll phase is not rigid. 0 restores the rigid "
+             "grid — what every run before 2026-09-16 used. Ignored under "
+             "--frame-age-min, which has no poll grid at all.",
+    )
+    p.add_argument(
+        "--gauge-lag-min", type=float,
+        default=postprocess.DEFAULT_GAUGE_LAG_MIN,
+        help="How far behind the decision instant a gauge slot must have "
+             "ENDED to be visible to the g_* features. DMI publishes a "
+             "slot ~1.5 min after it ends (measured 2026-09-16) and the "
+             "live store polls every 10, so one poll interval is what the "
+             "service can count on. Raising it is conservative; lowering "
+             "it below what the service really sees trains the model on "
+             "rain it will not have.",
+    )
+    p.add_argument(
         "--anchor-history", choices=anchor_policy.HISTORY_MODES,
         default=anchor_policy.HISTORY_SAME_TYPE,
         help="What the flow and the cascade eat under a doppler anchor. "
@@ -1692,6 +1894,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(args.harmonisation) if args.harmonisation else None
         ),
         history_mode=args.anchor_history,
+        poll_jitter_s=float(args.poll_jitter_sec),
     )
     if anchor_settings.policy == anchor_policy.POLICY_FRESHEST:
         if not anchor_settings.harmonisation_path:
@@ -1721,6 +1924,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         flow_completion=args.flow_completion,
         flow_variant=args.flow_variant,
         features=bool(args.features),
+        gauge_lag_min=float(args.gauge_lag_min),
     )
     out_dir = Path(args.out_dir)
     (out_dir / "decisions").mkdir(parents=True, exist_ok=True)
@@ -1738,7 +1942,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     tasks = [
         (str(args.archive_dir), d, points, settings, rules, str(out_dir),
-         start_min, end_min)
+         start_min, end_min, str(args.corpus_dir))
         for d in todo
     ]
     errors: list[str] = []
@@ -1848,7 +2052,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "near_km": postprocess.UPSTREAM_NEAR_KM,
                     "far_km": postprocess.UPSTREAM_FAR_KM,
                     "step_km": postprocess.UPSTREAM_STEP_KM,
+                    "bin_km": postprocess.UPSTREAM_BIN_KM,
+                    "bins": postprocess.UPSTREAM_BINS,
                 },
+                "wet_frac_disc_km": list(postprocess.WET_FRAC_DISC_KM),
+                # The one number that decides what the g_* block was
+                # allowed to see. A run fitted at one lag and served at
+                # another is a different model.
+                "gauge_lag_min": settings.gauge_lag_min,
+                "gauge_since_cap_min": postprocess.GAUGE_SINCE_CAP_MIN,
             },
             "archive_dir": str(args.archive_dir),
             "corpus_dir": str(args.corpus_dir),

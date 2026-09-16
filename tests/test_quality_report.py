@@ -277,7 +277,11 @@ def write_gauge_store(corpus_dir: Path, *, with_archive: bool = False) -> None:
     schema = obs_schema()
     table = pa.table(
         {
-            name: pa.array([r[name] for r in rows], type=schema.field(name).type)
+            # ``.get``: the obs schema is additive (``created_utc`` arrived
+            # 2026-09-16) and these rows are shaped the way the backfill
+            # wrote them before it existed — null, which is exactly what a
+            # partition of that age holds.
+            name: pa.array([r.get(name) for r in rows], type=schema.field(name).type)
             for name in schema.names
         },
         schema=schema,

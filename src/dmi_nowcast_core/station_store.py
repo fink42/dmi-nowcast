@@ -59,6 +59,15 @@ def obs_schema():
     is float32: gauge readings have 0.1 mm resolution and durations are
     whole minutes, so float64 would be four bytes of nothing per row
     across ~17M rows a year.
+
+    ``created_utc`` (added 2026-09-16) is DMI's own publication stamp for
+    the reading — the only thing that can measure how far behind real
+    time a 10-minute slot becomes available, which is what the gauge
+    features' ``gauge_lag_min`` is set from. **Additive and nullable**:
+    every read below passes this schema explicitly and pyarrow fills a
+    column a partition does not carry with nulls, so a file written
+    before it existed reads back exactly as it did — which is why
+    :data:`SCHEMA_VERSION` does not move.
     """
     pa = _pa()
     return pa.schema([
@@ -66,6 +75,7 @@ def obs_schema():
         ("observed_utc", pa.timestamp("us", tz="UTC")),
         ("parameter_id", pa.string()),
         ("value", pa.float32()),
+        ("created_utc", pa.timestamp("us", tz="UTC")),
     ])
 
 
@@ -187,6 +197,14 @@ class StationObsStore:
                     ),
                     "parameter_id": pa.array([r.parameter_id for r in rows], pa.string()),
                     "value": pa.array([float(r.value) for r in rows], pa.float32()),
+                    # Null wherever the source had no publication stamp —
+                    # a recorded fixture, or a backfill written before the
+                    # column existed. The dedupe key does not include it,
+                    # so re-fetching a slot fills it in.
+                    "created_utc": pa.array(
+                        [_opt_utc(getattr(r, "created_utc", None)) for r in rows],
+                        pa.timestamp("us", tz="UTC"),
+                    ),
                 },
                 schema=obs_schema(),
             )
@@ -252,6 +270,65 @@ class StationObsStore:
         if not tables:
             return obs_schema().empty_table()
         return pa.concat_tables(tables).sort_by([
+            ("observed_utc", "ascending"),
+            ("station_id", "ascending"),
+            ("parameter_id", "ascending"),
+        ])
+
+    def read_recent(
+        self,
+        start_utc: datetime,
+        end_utc: datetime,
+        parameter_ids: Sequence[str] | None = None,
+        station_ids: Sequence[str] | None = None,
+    ):
+        """The same rows as :meth:`read`, with every filter pushed down.
+
+        :meth:`read` decodes each partition whole and then masks it. That
+        is the right shape for a backfill checking a day it just wrote,
+        and the wrong one for the **live cycle**, which asks for the last
+        six hours of ~110 stations every time a radar frame lands, inside
+        the service that also answers HTTP: a month partition is ~1.4M
+        rows, and decoding all of them to keep eight thousand is memory
+        the process holds for nothing.
+
+        Here the time window, the parameters and the stations all go into
+        the dataset scanner. Partitions are written sorted by
+        ``observed_utc``, so the row-group statistics let the reader skip
+        every group outside the window without decoding it — which is what
+        makes a six-hour read cost a fraction of a month.
+
+        Same schema, same inclusive-both-ends semantics and the same sort
+        as :meth:`read`, so the two are interchangeable to a caller.
+        """
+        pa = _pa()
+        import pyarrow.dataset as pds
+
+        start = _as_utc(start_utc)
+        end = _as_utc(end_utc)
+        paths = [
+            str(self.partition_path(y, m))
+            for (y, m) in _months_between(start, end)
+            if self.partition_path(y, m).exists()
+        ]
+        if not paths:
+            return obs_schema().empty_table()
+        predicate = (
+            (pds.field("observed_utc") >= pa.scalar(start))
+            & (pds.field("observed_utc") <= pa.scalar(end))
+        )
+        if parameter_ids is not None:
+            predicate = predicate & pds.field("parameter_id").isin(
+                list(parameter_ids),
+            )
+        if station_ids is not None:
+            predicate = predicate & pds.field("station_id").isin(
+                list(station_ids),
+            )
+        table = pds.dataset(
+            paths, format="parquet", schema=obs_schema(),
+        ).to_table(filter=predicate, use_threads=False)
+        return table.sort_by([
             ("observed_utc", "ascending"),
             ("station_id", "ascending"),
             ("parameter_id", "ascending"),

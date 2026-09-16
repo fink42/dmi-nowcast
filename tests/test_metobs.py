@@ -173,6 +173,44 @@ def test_client_stores_the_raw_trace_value() -> None:
     assert obs.value == pytest.approx(-0.1)
 
 
+def test_the_publication_stamp_is_kept() -> None:
+    """``created`` is the only measurement of the gauge availability lag.
+
+    The features the model reads hide every slot fresher than
+    ``gauge_lag_min``; this column is what says, later, whether that
+    number is still the right one.
+    """
+    obs = parse_observation({
+        "properties": {
+            "stationId": "06074", "parameterId": "precip_past10min",
+            "observed": "2026-09-01T12:00:00Z",
+            "created": "2026-09-01T12:01:30Z", "value": 0.4,
+        },
+    })
+    assert obs is not None
+    assert obs.created_utc == datetime(
+        2026, 9, 1, 12, 1, 30, tzinfo=timezone.utc,
+    )
+    assert (obs.created_utc - obs.observed_utc).total_seconds() == 90.0
+
+
+@pytest.mark.parametrize("created", [None, "", "not-a-date"])
+def test_a_reading_without_a_usable_publication_stamp_still_parses(
+    created: object,
+) -> None:
+    """A missing diagnostic is never a reason to drop a measurement."""
+    props: dict = {
+        "stationId": "06074", "parameterId": "precip_past10min",
+        "observed": "2026-09-01T12:00:00Z", "value": 0.4,
+    }
+    if created is not None:
+        props["created"] = created
+    obs = parse_observation({"properties": props})
+    assert obs is not None
+    assert obs.created_utc is None
+    assert obs.value == pytest.approx(0.4)
+
+
 # ---------------------------------------------------------------------------
 # Request shaping
 # ---------------------------------------------------------------------------
