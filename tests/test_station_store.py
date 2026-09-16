@@ -225,6 +225,15 @@ def test_a_partition_written_before_the_column_existed_still_reads(
     table = store.read(T0, T0)
     assert table.column("created_utc").to_pylist() == [None]
     assert table.column("value").to_pylist() == [pytest.approx(0.4)]
+    # The streaming read the gauge-truth join uses must fill it too: it
+    # projects every schema column by name, and a schema-less dataset
+    # answers "No match for FieldRef.Name(created_utc)" for a file that
+    # predates the column — which is what took every fit down on
+    # 2026-09-16 until the dataset was opened with the schema.
+    batches = list(store.stream_month(2026, 6))
+    assert sum(b.num_rows for b in batches) == 1
+    assert batches[0].column("created_utc").to_pylist() == [None]
+    assert batches[0].column("value").to_pylist() == [pytest.approx(0.4)]
     # And an append onto it keeps the old rows and fills the new column.
     store.append([
         Observation(

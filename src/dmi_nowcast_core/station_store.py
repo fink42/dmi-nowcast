@@ -376,7 +376,12 @@ class StationObsStore:
         if station_ids is not None:
             stations = pds.field("station_id").isin(list(station_ids))
             predicate = stations if predicate is None else predicate & stations
-        dataset = pds.dataset(path, format="parquet")
+        # ``schema=`` for the same reason every other read passes it: a
+        # partition written before ``created_utc`` existed has no such
+        # column, and projecting it by name from a schema-less dataset is
+        # "No match for FieldRef.Name(created_utc)" — which took the gauge
+        # truth join, and with it every fit, down on 2026-09-16.
+        dataset = pds.dataset(path, format="parquet", schema=obs_schema())
         # Single-threaded with one batch in flight: this runs inside a
         # worker that has other work to do, and the scanner's default
         # readahead would keep a dozen batches resident to save time the
