@@ -127,6 +127,23 @@ __all__ = [
     "FEATURE_DOC",
     "SCALAR_FEATURE_COLUMNS",
     "SCALAR_FEATURE_COLUMNS_V2",
+    "SCALAR_FEATURE_COLUMNS_NG",
+    "GaugeSlotTable",
+    "neighbour_gauge_features",
+    "PROTOCOLS",
+    "PROTOCOL_AT_GAUGE",
+    "PROTOCOL_RANDOM_POINT",
+    "mask_own_gauge",
+    "distance_bins",
+    "distance_bin_labels",
+    "DISTANCE_COLUMN",
+    "DISTANCE_BIN_EDGES",
+    "random_point_distance_weights",
+    "gauge_distance_weights",
+    "random_point_expectation",
+    "station_groups",
+    "group_codes",
+    "FoldPlan",
     "DESIGN_SOURCE_COLUMNS",
     "RAW_FRACTION_PREFIX",
     "raw_fraction_column",
@@ -511,6 +528,233 @@ SCALAR_FEATURE_COLUMNS_V2: tuple[tuple[str, str], ...] = (
     ),
 )
 
+# ---------------------------------------------------------------------------
+# The neighbour gauges: what the stations AROUND a point are measuring
+# ---------------------------------------------------------------------------
+#
+# The ``g_*`` block above is the biggest thing v2 added and the one thing a
+# subscriber cannot have: it is what the gauge AT the point measured, and a
+# point is a place someone lives, not a DMI station. The model is fitted at
+# gauges and served at addresses, so a feature that exists only at gauges
+# flatters every offline number by exactly the amount it will not deliver.
+#
+# The approximation is the gauges AROUND the point, placed in the frame of
+# the cycle's own motion. A gauge 20 km upstream of a point, in a band
+# moving at 40 km/h, is telling that point what is going to happen in half
+# an hour; the same gauge 20 km DOWNSTREAM is telling it what already
+# happened somewhere else. Distance alone cannot tell the two apart, which
+# is why everything here is measured along the flow rather than as a radius
+# — with one deliberate exception, the vicinity block, which is
+# direction-free on purpose so that something survives when the motion
+# field does not (:data:`NG_MIN_SPEED_KMH`).
+#
+# Leave-self-out is the whole point and is enforced by construction: the
+# gauge standing at the point, if there is one, is removed before anything
+# is computed (``exclude_self``, plus the :data:`NG_SELF_KM` rule for a
+# point whose station id the caller does not know). A column here can
+# therefore be filled at a gauge station in the archive and mean exactly
+# what it will mean at an address.
+
+#: Radius of the neighbour search, km. Wide enough that a point anywhere in
+#: Denmark has several gauges inside it (the gauge-to-nearest-other-gauge
+#: distance runs ~10-35 km) and narrow enough that "upstream" still means
+#: the same weather system rather than a different front.
+NG_RADIUS_KM = 60.0
+
+#: Half-width of the upstream corridor, km. Wider than the radar corridor
+#: (:data:`UPSTREAM_HALF_WIDTH_KM`, 3 km) by design: that one is laid over a
+#: 500 m grid and can afford to be thin, this one has ~100 gauges for the
+#: whole country and a 3 km corridor would be empty almost everywhere.
+NG_CROSS_KM = 15.0
+
+#: Upper edges of the travel-time bins, minutes. The bins are DISJOINT —
+#: (0, 30], (30, 60], (60, 120] — not cumulative: "there is rain half an
+#: hour upstream" and "there is rain two hours upstream" are different
+#: statements about the next hour, and a cumulative column would let the
+#: second hide inside the first.
+NG_TAU_EDGES_MIN: tuple[float, ...] = (30.0, 60.0, 120.0)
+
+#: Radius of the direction-free vicinity block, km.
+NG_VICINITY_KM = 20.0
+
+#: Cross-track scale of the corridor weight, km: a gauge ``|c|`` km off the
+#: track counts ``1 / (1 + |c| / this)``. A gauge on the track counts
+#: fully, one 15 km off counts a quarter — a soft version of the corridor's
+#: own hard edge, so the weighted mean does not jump when a gauge drifts
+#: across it.
+NG_CROSS_WEIGHT_KM = 5.0
+
+#: A gauge closer than this to the point IS the point. The belt to
+#: ``exclude_self``'s braces: a caller that resolves a point to a station id
+#: excludes it by name, and a caller that does not still cannot read its own
+#: gauge back as a neighbour.
+NG_SELF_KM = 0.5
+
+#: Below this speed there is no motion frame to place anything in: the
+#: direction is noise and ``tau = a / v`` is an hour per kilometre. The
+#: upstream and nearest-upstream-wet blocks go null and ``ng_frame_ok`` says
+#: so; the vicinity block, which never needed a direction, is still filled.
+NG_MIN_SPEED_KMH = 5.0
+
+#: The window a neighbour's "is it raining there" is read over, minutes —
+#: back from the visibility horizon, exactly like ``g_mm_30``.
+NG_WET_WINDOW_MIN = 30
+
+#: The window ``ng_near_mm_60`` sums, minutes.
+NG_NEAR_WINDOW_MIN = 60
+
+#: Latitude the equirectangular kilometre grid is linearised at. Denmark
+#: spans 54.6-57.7 N, so one grid at 56 N costs at most ~1.4 % in the
+#: east-west scale at the far ends of the country — a few hundred metres on
+#: a 20 km distance, against features binned in 10 km steps and a corridor
+#: 30 km wide. A haversine per (point, gauge) pair per cycle would be
+#: exact and would buy nothing.
+NG_REF_LAT_DEG = 56.0
+
+#: Kilometres per degree of latitude on the sphere the rest of the project
+#: measures on (``lightning.EARTH_RADIUS_KM``).
+KM_PER_DEG_LAT = math.pi * 6371.0088 / 180.0
+
+#: Kilometres per degree of longitude at :data:`NG_REF_LAT_DEG`.
+KM_PER_DEG_LON = KM_PER_DEG_LAT * math.cos(math.radians(NG_REF_LAT_DEG))
+
+
+def ng_tau_suffix(edge: float) -> str:
+    """``30.0`` -> ``"t30"`` — the travel-time bin's name in a column."""
+    return f"t{int(edge)}"
+
+
+def _ng_bin_range(index: int) -> tuple[float, float]:
+    lower = 0.0 if index == 0 else float(NG_TAU_EDGES_MIN[index - 1])
+    return lower, float(NG_TAU_EDGES_MIN[index])
+
+
+_NG_UPSTREAM_STATS: tuple[tuple[str, str], ...] = (
+    (
+        "ng_up_mm_max",
+        "the LARGEST of their last-30-visible-minute rainfall totals (mm) "
+        "— one gauge in a core is enough to say a core is coming",
+    ),
+    (
+        "ng_up_mm_wmean",
+        "the same totals averaged, weighted "
+        f"1 / (1 + |cross-track| / {NG_CROSS_WEIGHT_KM:.0f} km) so a gauge "
+        "on the track counts for more than one at the corridor's edge — "
+        "the maximum's counterpart: how WIDE the rain is, not how hard",
+    ),
+    (
+        "ng_up_wet_share",
+        "the share of them that were wet in their last 30 visible minutes "
+        "(``warning_score``'s wet rule). Separates one shower crossing the "
+        "corridor from a front filling it",
+    ),
+    (
+        "ng_up_count",
+        "how many of them there are. Zero is a real answer and not a null: "
+        "'no gauge is due to reach this point in that window' is "
+        "information, and the columns above are null exactly then",
+    ),
+)
+
+
+def _ng_upstream_columns() -> tuple[tuple[str, str], ...]:
+    out: list[tuple[str, str]] = []
+    for stem, meaning in _NG_UPSTREAM_STATS:
+        for index, edge in enumerate(NG_TAU_EDGES_MIN):
+            lower, upper = _ng_bin_range(index)
+            out.append((
+                f"{stem}_{ng_tau_suffix(edge)}",
+                "Over the OTHER gauges whose rain is due to reach this "
+                f"point in ({lower:.0f}, {upper:.0f}] minutes — within "
+                f"{NG_RADIUS_KM:.0f} km, upstream along the cycle's bulk "
+                f"motion, at most {NG_CROSS_KM:.0f} km off the track, and "
+                "with a known last half hour — " + meaning + ". Null when "
+                "the motion frame is unusable (``ng_frame_ok`` = 0) and, "
+                "except for the count, when no such gauge has an amount.",
+            ))
+    return tuple(out)
+
+
+#: The neighbour-gauge block (post-processing v2, 2026-09-17). A family of
+#: its own for the ablation (``neighbour``), appended after the v2 columns
+#: and never mixed into them, for the same append-only reason.
+SCALAR_FEATURE_COLUMNS_NG: tuple[tuple[str, str], ...] = (
+    _ng_upstream_columns()
+    + (
+        (
+            "ng_upwet_tau_min",
+            "Travel time in minutes from the NEAREST-IN-TIME upstream gauge "
+            "that is actually wet — the same candidate set as the bins "
+            f"above (within {NG_RADIUS_KM:.0f} km, upstream, at most "
+            f"{NG_CROSS_KM:.0f} km off the track, tau in (0, "
+            f"{NG_TAU_EDGES_MIN[-1]:.0f}]), restricted to gauges wet in "
+            "their last 30 visible minutes, and then the smallest tau. "
+            "This is the one column that answers 'when', rather than 'how "
+            "much, somewhere in a window'. Null when there is no such "
+            "gauge, and whenever ``ng_frame_ok`` is 0.",
+        ),
+        (
+            "ng_upwet_cross_km",
+            "How far that gauge sits off the track, km, unsigned. A wet "
+            "gauge dead ahead and one at the corridor's edge carry very "
+            "different weight at the same tau, and the model cannot see "
+            "the difference from the tau alone.",
+        ),
+        (
+            "ng_upwet_mm_30",
+            "That gauge's last-30-visible-minute total, mm. Null when it "
+            "reported wet slots but no amount.",
+        ),
+        (
+            "ng_near_km",
+            "Distance in km to the nearest OTHER gauge — pure geometry, "
+            "no weather in it, and the only column here that is (almost) "
+            "constant per point. It is what says how much the rest of this "
+            "block is worth: at a point 6 km from a gauge the neighbour "
+            "block is nearly the gauge block, at 35 km it is a rumour. The "
+            "random-point validation bins its rows on exactly this.",
+        ),
+        (
+            "ng_near_mm_60",
+            "That nearest gauge's rainfall total (mm) over its last 60 "
+            "visible minutes. Null when it said nothing.",
+        ),
+        (
+            "ng_near_min_since_wet",
+            "Minutes from the DECISION INSTANT back to the end of that "
+            "gauge's most recent visible wet slot, capped at 360 "
+            "(``GAUGE_SINCE_CAP_MIN``) — ``g_min_since_wet``'s rule, read "
+            "at the neighbour instead of at the point. The cap means "
+            "'known, and dry for at least six hours'; null means the gauge "
+            "said nothing at all.",
+        ),
+        (
+            "ng_wet_share_20km",
+            f"Share of the other gauges within {NG_VICINITY_KM:.0f} km with "
+            "a known last half hour that were wet in it. Direction-free on "
+            "purpose: it is the one upstream-ish signal that survives a "
+            "stalled or missing motion field.",
+        ),
+        (
+            "ng_count_20km",
+            f"How many other gauges within {NG_VICINITY_KM:.0f} km had a "
+            "known last half hour — the denominator of the share above, so "
+            "a 1.0 over one gauge and a 1.0 over five are not read alike. "
+            "Zero, never null.",
+        ),
+        (
+            "ng_frame_ok",
+            "1 when the cycle's bulk motion gave a usable frame to place "
+            f"the neighbours in — speed at least {NG_MIN_SPEED_KMH:.0f} "
+            "km/h and a finite direction — and 0 when it did not, in which "
+            "case every upstream and upwet column above is null and the "
+            "vicinity block is still filled. Never null: it is the "
+            "indicator that says which half of this block is a measurement.",
+        ),
+    )
+)
+
+
 #: Number of 5 km bins the upwind corridor is resolved into (F3).
 UPSTREAM_BINS = 8
 
@@ -576,7 +820,10 @@ def feature_columns(leads: Sequence[int]) -> tuple[tuple[str, str], ...]:
             ),
         )
     )
-    return raw + SCALAR_FEATURE_COLUMNS + ens + SCALAR_FEATURE_COLUMNS_V2
+    return (
+        raw + SCALAR_FEATURE_COLUMNS + ens + SCALAR_FEATURE_COLUMNS_V2
+        + SCALAR_FEATURE_COLUMNS_NG
+    )
 
 
 #: name → definition, flattened, for the leads the products publish today.
@@ -584,6 +831,7 @@ def feature_columns(leads: Sequence[int]) -> tuple[tuple[str, str], ...]:
 #: :func:`feature_documentation` is the one that answers for a run.
 FEATURE_DOC: dict[str, str] = dict(
     SCALAR_FEATURE_COLUMNS + SCALAR_FEATURE_COLUMNS_V2
+    + SCALAR_FEATURE_COLUMNS_NG
 )
 
 
@@ -1351,6 +1599,305 @@ def station_gauge_features(
     return out
 
 
+
+@dataclass(frozen=True)
+class GaugeSlotTable:
+    """``slots_by_station`` digested once into parallel numpy arrays.
+
+    The live cycle calls :func:`neighbour_gauge_features` once per radar
+    frame and can hand it the mapping directly. The offline builder calls
+    it once per decision instant — ~145 instants for a replayed day, each
+    over the same ~100 stations and the same ~180 slots — and re-walking
+    the Python lists that many times costs more than the features do. Same
+    producer, same numbers; this is only the caller's choice about when the
+    coercion happens.
+
+    ``ends`` is the union of every station's slot ends as epoch seconds,
+    ascending. ``wet`` is 1 / 0 / NaN for wet / dry / not reported, and
+    ``mm`` is NaN where the station reported no amount — the two distinct
+    absences :func:`~dmi_nowcast_core.warning_score.gauge_slot_amounts`
+    is careful to keep apart.
+    """
+
+    stations: tuple[str, ...]
+    ends: np.ndarray
+    wet: np.ndarray
+    mm: np.ndarray
+
+    @classmethod
+    def from_slots(
+        cls, slots_by_station: Mapping[str, Sequence[Any]],
+    ) -> "GaugeSlotTable":
+        stations = tuple(str(sid) for sid in slots_by_station)
+        moments: set[int] = set()
+        per_station: list[list[tuple[int, Any, Any]]] = []
+        for sid in stations:
+            series = slots_by_station[sid] or ()
+            rows = [
+                (int(_slot_utc(end).timestamp()), wet, mm)
+                for end, wet, mm in series
+            ]
+            per_station.append(rows)
+            moments.update(row[0] for row in rows)
+        ends = np.array(sorted(moments), dtype=np.int64)
+        index = {value: position for position, value in enumerate(ends.tolist())}
+        shape = (len(stations), ends.size)
+        wet = np.full(shape, np.nan, dtype=np.float32)
+        mm = np.full(shape, np.nan, dtype=np.float32)
+        for row, series in enumerate(per_station):
+            for end, is_wet, amount in series:
+                column = index[end]
+                if is_wet is not None:
+                    wet[row, column] = 1.0 if is_wet else 0.0
+                if amount is not None:
+                    mm[row, column] = float(amount)
+        return cls(stations=stations, ends=ends, wet=wet, mm=mm)
+
+    def stats(self, now_utc: datetime, lag_min: float) -> dict[str, np.ndarray]:
+        """Per-station scalars as of one decision instant.
+
+        The same availability rule :func:`station_gauge_features` applies,
+        applied to everyone at once: only slots that ENDED at or before
+        ``now - lag`` exist, the millimetre windows are measured back from
+        that horizon, and ``min_since_wet`` is measured from the decision
+        instant because "how long since it last rained there" is a physical
+        age that the lag is part of.
+        """
+        now = _slot_utc(now_utc)
+        now_s = now.timestamp()
+        horizon_s = now_s - float(lag_min) * 60.0
+        visible = self.ends <= horizon_s
+        known = np.isfinite(self.wet) & visible[None, :]
+        is_wet = known & (self.wet > 0.5)
+        recent = visible & (self.ends > horizon_s - NG_WET_WINDOW_MIN * 60.0)
+        near = visible & (self.ends > horizon_s - NG_NEAR_WINDOW_MIN * 60.0)
+
+        def _sum(window: np.ndarray) -> np.ndarray:
+            block = np.isfinite(self.mm) & window[None, :]
+            total = np.where(block, np.nan_to_num(self.mm, nan=0.0), 0.0).sum(1)
+            return np.where(block.any(1), total, np.nan)
+
+        age = (now_s - self.ends.astype(np.float64)) / 60.0
+        since = np.where(
+            is_wet, age[None, :], np.inf,
+        ).min(1) if self.ends.size else np.full(len(self.stations), np.inf)
+        known_any = known.any(1)
+        return {
+            "known_30": (known & recent[None, :]).any(1),
+            "wet_30": (is_wet & recent[None, :]).any(1),
+            "mm_30": _sum(recent),
+            "mm_60": _sum(near),
+            "min_since_wet": np.where(
+                known_any,
+                np.minimum(np.where(np.isfinite(since), since, GAUGE_SINCE_CAP_MIN),
+                           GAUGE_SINCE_CAP_MIN),
+                np.nan,
+            ),
+        }
+
+
+def _ng_columns() -> tuple[str, ...]:
+    return tuple(name for name, _definition in SCALAR_FEATURE_COLUMNS_NG)
+
+
+def neighbour_gauge_features(
+    points: Sequence[tuple[float, float]],
+    slots_by_station: Mapping[str, Sequence[Any]] | GaugeSlotTable,
+    station_coords: Mapping[str, tuple[float, float]],
+    *,
+    now_utc: datetime,
+    bulk_kmh: float | None,
+    bulk_dir_deg: float | None,
+    lag_min: float = DEFAULT_GAUGE_LAG_MIN,
+    exclude_self: Sequence[str | None] | None = None,
+) -> dict[str, np.ndarray]:
+    """The ``ng_*`` block for a whole point list, in the motion's frame.
+
+    ONE producer, for the offline builder now
+    (``scripts/add_neighbour_gauge_features.py``) and the live cycle later,
+    exactly as :func:`station_gauge_features` is: the inputs are what
+    :class:`~dmi_nowcast_sidecar.gauge_history.GaugeHistory` already has in
+    hand at the end of its one read per cycle — the ``{station_id:
+    [(slot_end, wet, mm), ...]}`` dict its own
+    :func:`~dmi_nowcast_sidecar.gauge_history.slots_by_station` builds, and
+    the coordinates from the station points file it already parses.
+
+    ``points`` is ``(lat, lon)`` per point, in degrees — a place, which may
+    or may not have a gauge standing on it. ``exclude_self[i]`` is point
+    *i*'s own station id when the caller knows it (``None`` otherwise); a
+    gauge within :data:`NG_SELF_KM` of the point is dropped regardless, so
+    a caller that cannot name the point still cannot read the point's own
+    gauge back as its neighbour.
+
+    ``bulk_kmh`` / ``bulk_dir_deg`` are the cycle's bulk storm motion — the
+    ``bulk_kmh`` and ``bulk_dir_deg`` feature columns, one pair per
+    decision instant. The bearing is the one this module uses everywhere:
+    the compass direction the rain is heading TOWARD, 0 = north, 90 = east.
+    So a gauge is UPSTREAM of a point when it lies in the direction the
+    rain is coming FROM — opposite the bearing — and ``a``, the along-track
+    distance, is positive there. Denmark under westerlies means the
+    upstream gauges are usually the western ones; the sign is pinned by a
+    test rather than by this sentence.
+
+    Returns ``{column: float32 array of shape (n_points,)}`` with NaN for
+    every unknown, except ``ng_frame_ok`` and ``ng_count_20km``, which are
+    counts and never null.
+    """
+    table = (
+        slots_by_station if isinstance(slots_by_station, GaugeSlotTable)
+        else GaugeSlotTable.from_slots(slots_by_station)
+    )
+    names = _ng_columns()
+    n = len(points)
+    out = {name: np.full(n, np.nan, dtype=np.float32) for name in names}
+
+    speed = float(bulk_kmh) if bulk_kmh is not None else float("nan")
+    bearing = float(bulk_dir_deg) if bulk_dir_deg is not None else float("nan")
+    frame_ok = bool(
+        math.isfinite(speed) and math.isfinite(bearing)
+        and speed >= NG_MIN_SPEED_KMH
+    )
+    out["ng_frame_ok"] = np.full(n, 1.0 if frame_ok else 0.0, dtype=np.float32)
+    # The counts start at a real zero rather than a null: "no gauge is due
+    # to reach this point in that window" is an answer. The upstream ones
+    # only when there is a frame to count in.
+    out["ng_count_20km"] = np.zeros(n, dtype=np.float32)
+    if frame_ok:
+        for edge in NG_TAU_EDGES_MIN:
+            out[f"ng_up_count_{ng_tau_suffix(edge)}"] = np.zeros(
+                n, dtype=np.float32,
+            )
+    if not n:
+        return out
+
+    # Only the gauges this caller gave a coordinate for: a station in the
+    # slot table with no place to put it is not a neighbour of anywhere.
+    positions = {sid: index for index, sid in enumerate(table.stations)}
+    known = [sid for sid in table.stations if sid in station_coords]
+    if not known:
+        return out
+    stats = table.stats(now_utc, lag_min)
+    order = [positions[sid] for sid in known]
+    gauge_lat = np.array(
+        [float(station_coords[sid][0]) for sid in known], dtype=np.float64,
+    )
+    gauge_lon = np.array(
+        [float(station_coords[sid][1]) for sid in known], dtype=np.float64,
+    )
+    known_30 = np.asarray(stats["known_30"])[order]
+    wet_30 = np.asarray(stats["wet_30"])[order]
+    mm_30 = np.asarray(stats["mm_30"], dtype=np.float64)[order]
+    mm_60 = np.asarray(stats["mm_60"], dtype=np.float64)[order]
+    since = np.asarray(stats["min_since_wet"], dtype=np.float64)[order]
+
+    coordinates = np.asarray(points, dtype=np.float64).reshape(n, 2)
+    # Equirectangular kilometres at NG_REF_LAT_DEG — see the constant.
+    north = (gauge_lat[None, :] - coordinates[:, :1]) * KM_PER_DEG_LAT
+    east = (gauge_lon[None, :] - coordinates[:, 1:2]) * KM_PER_DEG_LON
+    distance = np.hypot(north, east)
+
+    other = distance > NG_SELF_KM
+    if exclude_self is not None:
+        if len(exclude_self) != n:
+            raise ValueError("exclude_self must have one entry per point")
+        by_id = {sid: index for index, sid in enumerate(known)}
+        for row, sid in enumerate(exclude_self):
+            column = by_id.get(str(sid)) if sid is not None else None
+            if column is not None:
+                other[row, column] = False
+
+    # -- the vicinity block: no direction, so it survives a dead flow ------
+    vicinity = other & (distance <= NG_VICINITY_KM) & known_30[None, :]
+    count_20 = vicinity.sum(1)
+    out["ng_count_20km"] = count_20.astype(np.float32)
+    with np.errstate(invalid="ignore"):
+        share = np.where(
+            count_20 > 0,
+            (vicinity & wet_30[None, :]).sum(1) / np.maximum(count_20, 1),
+            np.nan,
+        )
+    out["ng_wet_share_20km"] = share.astype(np.float32)
+
+    nearest = np.where(other, distance, np.inf)
+    pick = nearest.argmin(1)
+    has_neighbour = np.isfinite(nearest[np.arange(n), pick])
+    out["ng_near_km"] = np.where(
+        has_neighbour, distance[np.arange(n), pick], np.nan,
+    ).astype(np.float32)
+    out["ng_near_mm_60"] = np.where(
+        has_neighbour, mm_60[pick], np.nan,
+    ).astype(np.float32)
+    out["ng_near_min_since_wet"] = np.where(
+        has_neighbour, since[pick], np.nan,
+    ).astype(np.float32)
+
+    if not frame_ok:
+        return out
+
+    # -- the motion frame --------------------------------------------------
+    heading = math.radians(bearing)
+    d_east, d_north = math.sin(heading), math.cos(heading)
+    # Positive = UPSTREAM: the gauge lies opposite the heading, so the rain
+    # over it is travelling toward this point.
+    along = -(east * d_east + north * d_north)
+    # Positive to the RIGHT of the heading. Only the magnitude is used; the
+    # sign is kept so a reader of a debug dump can tell the sides apart.
+    cross = east * d_north - north * d_east
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tau = 60.0 * along / speed
+
+    candidate = (
+        other
+        & (distance <= NG_RADIUS_KM)
+        & (along > 0.0)
+        & (np.abs(cross) <= NG_CROSS_KM)
+        & (tau <= float(NG_TAU_EDGES_MIN[-1]))
+        & known_30[None, :]
+    )
+    weight = 1.0 / (1.0 + np.abs(cross) / NG_CROSS_WEIGHT_KM)
+    has_mm = np.isfinite(mm_30)[None, :]
+    amounts = np.where(has_mm, np.nan_to_num(mm_30, nan=0.0)[None, :], 0.0)
+
+    for index, edge in enumerate(NG_TAU_EDGES_MIN):
+        lower, upper = _ng_bin_range(index)
+        selected = candidate & (tau > lower) & (tau <= upper)
+        suffix = ng_tau_suffix(edge)
+        count = selected.sum(1)
+        out[f"ng_up_count_{suffix}"] = count.astype(np.float32)
+        with_mm = selected & has_mm
+        any_mm = with_mm.any(1)
+        out[f"ng_up_mm_max_{suffix}"] = np.where(
+            any_mm, np.where(with_mm, amounts, -np.inf).max(1), np.nan,
+        ).astype(np.float32)
+        weights = np.where(with_mm, weight, 0.0)
+        total = weights.sum(1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[f"ng_up_mm_wmean_{suffix}"] = np.where(
+                total > 0.0, (weights * amounts).sum(1) / np.maximum(total, 1e-12),
+                np.nan,
+            ).astype(np.float32)
+        out[f"ng_up_wet_share_{suffix}"] = np.where(
+            count > 0,
+            (selected & wet_30[None, :]).sum(1) / np.maximum(count, 1),
+            np.nan,
+        ).astype(np.float32)
+
+    # -- the nearest upstream gauge that is actually wet --------------------
+    wet_candidate = candidate & wet_30[None, :]
+    ranked = np.where(wet_candidate, tau, np.inf)
+    chosen = ranked.argmin(1)
+    rows = np.arange(n)
+    found = np.isfinite(ranked[rows, chosen])
+    out["ng_upwet_tau_min"] = np.where(
+        found, tau[rows, chosen], np.nan,
+    ).astype(np.float32)
+    out["ng_upwet_cross_km"] = np.where(
+        found, np.abs(cross[rows, chosen]), np.nan,
+    ).astype(np.float32)
+    out["ng_upwet_mm_30"] = np.where(found, mm_30[chosen], np.nan).astype(np.float32)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The ensemble block: more than one number per lead
 # ---------------------------------------------------------------------------
@@ -2024,6 +2571,12 @@ DESIGN_SOURCE_COLUMNS: tuple[str, ...] = (
     upstream_bin_column(index) for index in range(UPSTREAM_BINS)
 ) + (
     "ens_eta_spread_min",
+    # -- the neighbour-gauge block (2026-09-17). Appended for the same
+    # reason, and generated from the catalogue rather than retyped: this
+    # family is 21 columns and a typo in one of them would be a silently
+    # imputed column rather than an error.
+) + tuple(
+    name for name, _definition in SCALAR_FEATURE_COLUMNS_NG
 )
 
 
@@ -2206,6 +2759,10 @@ def build_design(
 FEATURE_FAMILIES: tuple[tuple[str, Callable[[str], bool]], ...] = (
     ("raw_frac", lambda name: name.startswith(RAW_FRACTION_PREFIX)),
     ("gauge", lambda name: name.startswith(("g_", "log1p_g_"))),
+    # Tested BEFORE "obs" and "up": every column here starts with the
+    # same three characters, and the ablation's whole job is that
+    # "drop the neighbour gauges" drops all of them and nothing else.
+    ("neighbour", lambda name: name.startswith(("ng_", "log1p_ng_"))),
     ("ensemble", lambda name: name.startswith(("ens_", "log1p_ens_"))),
     (
         "obs",
@@ -2364,6 +2921,531 @@ def dry_subset(
             derived = dry_before(grid, t, station, lag_min=lag_min)
             values = np.where(missing, derived, values)
     return np.isfinite(values) & (values > 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Validating where the subscriber lives, not where the gauge stands
+# ---------------------------------------------------------------------------
+#
+# Every row in the archive is a DMI gauge. Every row in service is somebody's
+# address. The two differ in three ways that all flatter the offline number:
+#
+# 1. the ``g_*`` block is a measurement at a gauge and an absence at an
+#    address, and it is the single biggest thing v2 added;
+# 2. a per-station intercept is learnable at a gauge and meaningless at an
+#    address;
+# 3. leave-one-MONTH-out lets a fold train on the very station it is scored
+#    at, so a model that has quietly learned "station 06180" is never caught.
+#
+# :data:`PROTOCOL_RANDOM_POINT` closes all three: the own-gauge columns are
+# masked to "unknown" in training AND in scoring, station offsets are
+# refused, and the folds hold out a month and a GROUP OF STATIONS together,
+# so every prediction comes from a model that saw neither that month nor
+# that place. What is left is the model a subscriber would actually get —
+# the radar features, and the neighbour gauges, which are leave-self-out by
+# construction and therefore mean the same thing at both kinds of point.
+#
+# The remaining gap is geographic and is reported rather than closed: a
+# gauge's nearest other gauge is not as far away as a random Dane's nearest
+# gauge. :func:`random_point_distance_weights` measures how much not, and
+# the report re-weights the distance-binned skill by it.
+
+#: The evaluation as it has always run: rows are gauges, and they are
+#: allowed to be.
+PROTOCOL_AT_GAUGE = "at-gauge"
+
+#: Rows are treated as the addresses they stand in for. See above.
+PROTOCOL_RANDOM_POINT = "random-point"
+
+PROTOCOLS: tuple[str, ...] = (PROTOCOL_AT_GAUGE, PROTOCOL_RANDOM_POINT)
+
+#: The ``g_*`` columns that are a measurement AT the point — the ones an
+#: address does not have. ``g_known`` is not among them: it is the
+#: indicator, and the masking sets it to 0 rather than removing it.
+OWN_GAUGE_COLUMNS: tuple[str, ...] = (
+    "g_mm_10", "g_mm_30", "g_mm_60", "g_min_since_wet", DRY_COLUMN,
+)
+
+#: The indicator that says whether the rest of the block is a measurement.
+GAUGE_KNOWN_COLUMN = "g_known"
+
+
+def mask_own_gauge(features: Mapping[str, Any]) -> dict[str, Any]:
+    """``features`` with the point's OWN gauge masked to "unknown".
+
+    A shallow copy with :data:`OWN_GAUGE_COLUMNS` replaced by NaN and
+    :data:`GAUGE_KNOWN_COLUMN` by 0 — exactly the block
+    :func:`station_gauge_features` writes for a point that is not a gauge,
+    so the masked row is not an invented shape but a shape the live cycle
+    produces for most of its points already.
+
+    Applied to the WHOLE table, before any fold is cut, so the model is
+    trained on masked rows as well as scored on them. Masking only at
+    scoring time would be worse than not masking at all: a model fitted to
+    lean on ``g_min_since_wet`` and then handed a NaN for it is a model
+    being asked a question in a language it was not taught.
+
+    The ``ng_*`` block is deliberately NOT masked. It never contained the
+    point's own gauge — :func:`neighbour_gauge_features` excludes it by
+    construction — so at a gauge station it already says what it would say
+    at an address a few metres away.
+
+    The truth-side use of the same information is untouched: the
+    onset-relevant :data:`DRY` subset is a statement about what actually
+    happened at the point, not a predictor, and the caller derives it
+    BEFORE masking (or from the gauge grid) for exactly that reason.
+    """
+    out = dict(features)
+    n = _rows_in(features)
+    for name in OWN_GAUGE_COLUMNS:
+        if name in out:
+            out[name] = np.full(n, np.nan, dtype=np.float64)
+    if GAUGE_KNOWN_COLUMN in out:
+        out[GAUGE_KNOWN_COLUMN] = np.zeros(n, dtype=np.float64)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Distance to the nearest gauge: the axis the two kinds of point differ on
+# ---------------------------------------------------------------------------
+
+#: Bin edges on ``ng_near_km``, km. Ten-kilometre steps up to 30 and one
+#: open bin above it: the gauge network's own nearest-neighbour distances
+#: mostly land in the first two bins, and a random point in Denmark mostly
+#: does not, which is the whole point of reporting the two side by side.
+DISTANCE_BIN_EDGES: tuple[float, ...] = (10.0, 20.0, 30.0)
+
+#: The column the bins are cut on.
+DISTANCE_COLUMN = "ng_near_km"
+
+
+def distance_bin_labels(
+    edges: Sequence[float] = DISTANCE_BIN_EDGES,
+) -> tuple[str, ...]:
+    """``("0-10 km", "10-20 km", "20-30 km", "30+ km")`` for the default edges."""
+    bounds = [0.0] + [float(x) for x in edges]
+    labels = [
+        f"{bounds[i]:.0f}-{bounds[i + 1]:.0f} km" for i in range(len(bounds) - 1)
+    ]
+    return tuple(labels + [f"{bounds[-1]:.0f}+ km"])
+
+
+def distance_bins(
+    values: Any, edges: Sequence[float] = DISTANCE_BIN_EDGES,
+) -> dict[str, np.ndarray]:
+    """``{label: boolean mask}`` over rows, by distance to the nearest gauge.
+
+    A row with no distance (a run whose rows predate the ``ng_*`` columns)
+    is in no bin, rather than in the first one.
+    """
+    km = np.asarray(values, dtype=np.float64).reshape(-1)
+    bounds = [0.0] + [float(x) for x in edges] + [float("inf")]
+    labels = distance_bin_labels(edges)
+    finite = np.isfinite(km)
+    return {
+        label: finite & (km >= bounds[index]) & (km < bounds[index + 1])
+        for index, label in enumerate(labels)
+    }
+
+
+def _nearest_other_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """Per station, the distance to the nearest OTHER station, km."""
+    north = (lat[:, None] - lat[None, :]) * KM_PER_DEG_LAT
+    east = (lon[:, None] - lon[None, :]) * KM_PER_DEG_LON
+    distance = np.hypot(north, east)
+    np.fill_diagonal(distance, np.inf)
+    return distance.min(1)
+
+
+def _coordinate_arrays(
+    station_coords: Mapping[str, tuple[float, float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    lat = np.array(
+        [float(v[0]) for v in station_coords.values()], dtype=np.float64,
+    )
+    lon = np.array(
+        [float(v[1]) for v in station_coords.values()], dtype=np.float64,
+    )
+    return lat, lon
+
+
+def _distance_summary(
+    km: np.ndarray, edges: Sequence[float] = DISTANCE_BIN_EDGES,
+) -> dict[str, Any]:
+    """Weights over the distance bins, plus the quantiles behind them."""
+    finite = km[np.isfinite(km)]
+    labels = distance_bin_labels(edges)
+    bounds = [0.0] + [float(x) for x in edges] + [float("inf")]
+    counts = [
+        int(((finite >= bounds[i]) & (finite < bounds[i + 1])).sum())
+        for i in range(len(labels))
+    ]
+    total = max(sum(counts), 1)
+    quantiles = (
+        np.quantile(finite, [0.1, 0.25, 0.5, 0.75, 0.9]) if finite.size
+        else np.full(5, np.nan)
+    )
+    return {
+        "n": int(finite.size),
+        "labels": list(labels),
+        "counts": counts,
+        "weights": [count / total for count in counts],
+        "km": {
+            "mean": float(finite.mean()) if finite.size else float("nan"),
+            "p10": float(quantiles[0]), "p25": float(quantiles[1]),
+            "p50": float(quantiles[2]), "p75": float(quantiles[3]),
+            "p90": float(quantiles[4]),
+            "max": float(finite.max()) if finite.size else float("nan"),
+        },
+    }
+
+
+def gauge_distance_weights(
+    station_coords: Mapping[str, tuple[float, float]],
+    edges: Sequence[float] = DISTANCE_BIN_EDGES,
+) -> dict[str, Any]:
+    """The distribution the ARCHIVE's rows are drawn from.
+
+    Per gauge, the distance to its nearest other gauge — which is what
+    ``ng_near_km`` holds at a training row, because the point's own gauge
+    is excluded. Reported beside
+    :func:`random_point_distance_weights` so a reader can see the size of
+    the extrapolation the re-weighting performs rather than take it on
+    trust.
+    """
+    lat, lon = _coordinate_arrays(station_coords)
+    if lat.size < 2:
+        return _distance_summary(np.full(lat.size, np.nan), edges)
+    return _distance_summary(_nearest_other_km(lat, lon), edges)
+
+
+def _inside_ring(lon: np.ndarray, lat: np.ndarray, ring: np.ndarray) -> np.ndarray:
+    """Ray casting: is each ``(lon, lat)`` inside this closed ring?
+
+    The standard crossing-number test, vectorised over points. A ray is
+    cast toward -lon and the crossings of the ring's edges are counted; an
+    odd count is inside. Points exactly on an edge are undefined and there
+    is no attempt to define them: this is a sampling domain at ~1 km
+    tolerance, and a point on the coastline is a rounding decision either
+    way.
+    """
+    x1, y1 = ring[:, 0][None, :], ring[:, 1][None, :]
+    x2 = np.roll(ring[:, 0], -1)[None, :]
+    y2 = np.roll(ring[:, 1], -1)[None, :]
+    px, py = lon[:, None], lat[:, None]
+    straddles = (y1 > py) != (y2 > py)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        crossing = (x2 - x1) * (py - y1) / (y2 - y1) + x1
+    return ((straddles & (px < crossing)).sum(1) % 2) == 1
+
+
+def points_inside(
+    lon: np.ndarray, lat: np.ndarray, outline: Sequence[Any],
+) -> np.ndarray:
+    """Which of these points fall inside any ring of ``outline``.
+
+    Every ring of :data:`~dmi_nowcast_core.denmark_outline.DENMARK_OUTLINE`
+    is the outer ring of a separate landmass — there are no holes — so
+    "inside Denmark" is "inside any one of them".
+    """
+    inside = np.zeros(lon.size, dtype=bool)
+    for raw in outline:
+        ring = np.asarray(raw, dtype=np.float64)
+        if ring.shape[0] < 3:
+            continue
+        inside |= _inside_ring(lon, lat, ring)
+    return inside
+
+
+#: Rejection-sampling batch. Denmark fills ~30 % of its bounding box, so a
+#: batch this size yields ~15 000 accepted points and the whole draw is a
+#: handful of passes.
+_SAMPLE_BATCH = 50_000
+
+
+def random_points_in(
+    outline: Sequence[Any], *, n: int = 200_000, seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(lat, lon)`` of ``n`` points drawn uniformly by AREA inside ``outline``.
+
+    Uniform in longitude and in the SINE of latitude, not in latitude
+    itself: a degree of latitude covers the same area everywhere but a
+    degree of longitude does not, and sampling latitude flat would over-
+    represent Jutland's north by ~9 % across Denmark's 3.2 degrees. The
+    correction costs one ``arcsin`` and removes an argument.
+
+    Rejection sampling against the bounding box, with a cap on the number
+    of batches so a caller that hands in a degenerate outline gets fewer
+    points rather than an infinite loop.
+    """
+    from .denmark_outline import DENMARK_BBOX
+
+    rings = [np.asarray(ring, dtype=np.float64) for ring in outline]
+    if rings and all(ring.size for ring in rings):
+        stacked = np.concatenate(rings)
+        lon_min, lon_max = float(stacked[:, 0].min()), float(stacked[:, 0].max())
+        lat_min, lat_max = float(stacked[:, 1].min()), float(stacked[:, 1].max())
+    else:
+        lon_min, lat_min, lon_max, lat_max = DENMARK_BBOX
+    rng = np.random.default_rng(int(seed))
+    sin_lo, sin_hi = math.sin(math.radians(lat_min)), math.sin(math.radians(lat_max))
+    lats: list[np.ndarray] = []
+    lons: list[np.ndarray] = []
+    taken = 0
+    for _attempt in range(max(4 * (int(n) // _SAMPLE_BATCH + 1), 64)):
+        if taken >= int(n):
+            break
+        lon = rng.uniform(lon_min, lon_max, _SAMPLE_BATCH)
+        lat = np.degrees(np.arcsin(rng.uniform(sin_lo, sin_hi, _SAMPLE_BATCH)))
+        keep = points_inside(lon, lat, rings)
+        if not keep.any():
+            continue
+        lats.append(lat[keep])
+        lons.append(lon[keep])
+        taken += int(keep.sum())
+    if not lats:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+    return (
+        np.concatenate(lats)[:int(n)], np.concatenate(lons)[:int(n)],
+    )
+
+
+def random_point_distance_weights(
+    station_coords: Mapping[str, tuple[float, float]],
+    outline: Sequence[Any] | None = None,
+    *,
+    edges: Sequence[float] = DISTANCE_BIN_EDGES,
+    n: int = 200_000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """How far a random place in Denmark is from the nearest rain gauge.
+
+    Draws ``n`` points uniformly by area inside ``outline``
+    (:data:`~dmi_nowcast_core.denmark_outline.DENMARK_OUTLINE` by default),
+    measures each one's distance to the nearest station in
+    ``station_coords`` on the same equirectangular kilometre grid the
+    ``ng_*`` features use, and returns the share falling in each distance
+    bin.
+
+    Those shares are the weights the random-point report re-weights its
+    distance-binned skill by. The re-weighting is what turns "the model is
+    worth this much at a gauge 12 km from its neighbour" into "the model is
+    worth this much to a subscriber", and it is an extrapolation only in
+    the bins the archive is thin in — which is why
+    :func:`gauge_distance_weights` is printed beside it.
+    """
+    if outline is None:
+        from .denmark_outline import DENMARK_OUTLINE
+
+        outline = DENMARK_OUTLINE
+    lat, lon = _coordinate_arrays(station_coords)
+    point_lat, point_lon = random_points_in(outline, n=n, seed=seed)
+    if not point_lat.size or not lat.size:
+        summary = _distance_summary(np.full(0, np.nan), edges)
+        summary["seed"] = int(seed)
+        summary["stations"] = int(lat.size)
+        return summary
+    best = np.full(point_lat.size, np.inf, dtype=np.float64)
+    # One station at a time: 200 000 x 100 in one matrix is 160 MB for no
+    # reason, and the running minimum costs nothing.
+    for index in range(lat.size):
+        north = (lat[index] - point_lat) * KM_PER_DEG_LAT
+        east = (lon[index] - point_lon) * KM_PER_DEG_LON
+        np.minimum(best, np.hypot(north, east), out=best)
+    summary = _distance_summary(best, edges)
+    summary["seed"] = int(seed)
+    summary["stations"] = int(lat.size)
+    return summary
+
+
+def expected_at_random_point(
+    by_bin: Mapping[str, float | None], weights: Mapping[str, float],
+) -> float | None:
+    """One number from a distance-binned one, re-weighted.
+
+    ``None`` when no bin that carries weight has a value — an honest
+    refusal, rather than an average over the bins that happen to be filled.
+    Bins with a value are renormalised among themselves and the share of
+    the weight they cover is the caller's to report (``covered`` in
+    :func:`random_point_expectation`).
+    """
+    total = 0.0
+    mass = 0.0
+    for name, weight in weights.items():
+        value = by_bin.get(name)
+        if value is None or not math.isfinite(float(value)):
+            continue
+        total += float(weight) * float(value)
+        mass += float(weight)
+    return None if mass <= 0.0 else total / mass
+
+
+def random_point_expectation(
+    by_bin: Mapping[str, float | None], weights: Mapping[str, float],
+) -> dict[str, Any]:
+    """``{"value": ..., "covered": ...}`` — the re-weighted number and its reach.
+
+    ``covered`` is the share of the random-point weight the filled bins
+    account for. A value standing on 60 % of the weight is a different
+    claim from one standing on 99 %, and the report prints both.
+    """
+    mass = sum(
+        float(weight) for name, weight in weights.items()
+        if by_bin.get(name) is not None
+        and math.isfinite(float(by_bin.get(name)))
+    )
+    return {
+        "value": expected_at_random_point(by_bin, weights),
+        "covered": mass / max(sum(float(w) for w in weights.values()), 1e-12),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Station groups and (month, group) folds
+# ---------------------------------------------------------------------------
+
+#: How many station groups the spatial hold-out cuts the country into.
+DEFAULT_STATION_GROUPS = 5
+
+
+def station_groups(
+    station_coords: Mapping[str, tuple[float, float]],
+    *,
+    groups: int = DEFAULT_STATION_GROUPS,
+) -> dict[str, int]:
+    """``{station_id: group}`` — a deterministic spatial hold-out split.
+
+    Stations are sorted by LONGITUDE and dealt out round-robin, so each
+    group is a west-to-east comb through the country rather than a region.
+    That is deliberate. A split into contiguous regions would hold out
+    Bornholm or west Jutland as a block and measure "does a model trained
+    on the rest of Denmark work there", which is a different and much
+    harder question than the one being asked — "does this model work at a
+    station it has never seen". Interleaving keeps every group spanning the
+    country, so the held-out stations are unfamiliar places in familiar
+    weather, which is exactly a new subscriber.
+
+    Deterministic by construction: no seed, no shuffle. Ties in longitude
+    break on the station id, so the same catalogue always gives the same
+    groups and two runs are comparable.
+    """
+    count = max(int(groups), 1)
+    order = sorted(
+        station_coords, key=lambda sid: (float(station_coords[sid][1]), str(sid)),
+    )
+    return {sid: index % count for index, sid in enumerate(order)}
+
+
+def group_codes(
+    stations: Any, groups: Mapping[str, int], *, unknown: int = -1,
+) -> np.ndarray:
+    """Per row, its station's group; ``unknown`` for a station not in the map.
+
+    An unmatched row gets its own single-member group rather than being
+    folded into group 0, so a station the split never saw cannot end up
+    training on itself.
+    """
+    labels = np.asarray(stations).astype(str).reshape(-1)
+    distinct, inverse = np.unique(labels, return_inverse=True)
+    table = np.array(
+        [int(groups.get(str(name), unknown)) for name in distinct], dtype=np.int64,
+    )
+    return table[inverse]
+
+
+@dataclass(frozen=True)
+class FoldPlan:
+    """What each fold holds out, on one axis or on several.
+
+    ``axes`` is one integer array per row per axis, and a fold is one
+    combination of their values. A row is in the fold's TEST set when it
+    matches on every axis, and in its TRAINING set when it differs on
+    every axis — which is what makes a two-axis plan a genuinely spatial
+    hold-out and not a month hold-out with extra steps: a row sharing the
+    month but not the group, or the group but not the month, is used by
+    neither side.
+
+    One axis reproduces leave-one-(year, month)-out exactly, which is how
+    the default protocol keeps its numbers.
+    """
+
+    axes: tuple[np.ndarray, ...]
+    names: tuple[str, ...] = ()
+    #: Per axis, ``{value: label}`` for the fold names in the report.
+    labels: tuple[Mapping[int, str], ...] = ()
+
+    @classmethod
+    def by_month(cls, month: Any) -> "FoldPlan":
+        """The historical plan: one fold per ``(year, month)``."""
+        keys = np.asarray(month, dtype=np.int64).reshape(-1)
+        return cls(
+            axes=(keys,), names=("month",),
+            labels=({int(k): _month_label(int(k)) for k in np.unique(keys)},),
+        )
+
+    @classmethod
+    def by_month_and_group(cls, month: Any, group: Any) -> "FoldPlan":
+        """Month crossed with station group — the random-point hold-out."""
+        months = np.asarray(month, dtype=np.int64).reshape(-1)
+        groups = np.asarray(group, dtype=np.int64).reshape(-1)
+        if months.size != groups.size:
+            raise ValueError("month and group must have one entry per row")
+        return cls(
+            axes=(months, groups), names=("month", "group"),
+            labels=(
+                {int(k): _month_label(int(k)) for k in np.unique(months)},
+                {int(k): f"g{int(k)}" for k in np.unique(groups)},
+            ),
+        )
+
+    @property
+    def rows(self) -> int:
+        return int(self.axes[0].size) if self.axes else 0
+
+    def folds(self) -> list[tuple[int, ...]]:
+        """Every combination present in the rows, in a stable order.
+
+        A NEGATIVE value on any axis is the project's "not one of ours"
+        code (:func:`group_codes`, :func:`_station_codes`) and never forms
+        a fold of its own: those rows are a station the gauge grid
+        dropped, they carry no gradable outcome, and holding them out
+        would fit a model per month to predict nothing. They still TRAIN
+        the other folds, where they are simply not gradable — which is
+        the same thing that happens to them under a one-axis plan.
+        """
+        stacked = np.stack([np.asarray(a, dtype=np.int64) for a in self.axes], 1)
+        return [
+            tuple(int(v) for v in row) for row in np.unique(stacked, axis=0)
+            if (row >= 0).all()
+        ]
+
+    def test_mask(self, fold: Sequence[int]) -> np.ndarray:
+        mask = np.ones(self.rows, dtype=bool)
+        for axis, value in zip(self.axes, fold):
+            mask &= axis == int(value)
+        return mask
+
+    def train_mask(self, fold: Sequence[int]) -> np.ndarray:
+        mask = np.ones(self.rows, dtype=bool)
+        for axis, value in zip(self.axes, fold):
+            mask &= axis != int(value)
+        return mask
+
+    def label(self, fold: Sequence[int]) -> str:
+        parts = []
+        for index, value in enumerate(fold):
+            table = self.labels[index] if index < len(self.labels) else {}
+            parts.append(str(table.get(int(value), int(value))))
+        return " x ".join(parts)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "axes": list(self.names),
+            "n_folds": len(self.folds()),
+            "sizes": [
+                len({int(v) for v in np.unique(axis)}) for axis in self.axes
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -3710,6 +4792,7 @@ def out_of_fold_predictions(
     settings: FitSettings,
     design_leads: Sequence[int] | None = None,
     stations: Any | None = None,
+    folds: "FoldPlan | None" = None,
     train_mask: Callable[[np.ndarray, int], np.ndarray] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
@@ -3722,9 +4805,17 @@ def out_of_fold_predictions(
     itself a fitted model (``--baseline refit-v1``), and "the same folds"
     has to mean the same code and not two copies of it.
 
+    ``folds`` replaces that plan with any other :class:`FoldPlan` — the
+    random-point protocol hands in a (month, station group) plan, where a
+    row trains a fold only when it differs from it on BOTH axes, so no
+    prediction ever comes from a model that saw that month or that place.
+    ``None`` is ``FoldPlan.by_month(month)``, which is the historical
+    behaviour to the row.
+
     ``train_mask(month, key)`` narrows the training set beyond "not this
     fold" — what :func:`learning_curve` uses to train one fold on a
-    subset of its days.
+    subset of its days. It is handed the plan's FIRST axis and the fold's
+    value on it, which is the month in both plans that exist.
 
     Returns ``{"out_of_fold": {lead: array}, "folds": [...]}``; a row a
     fold could not be fitted for stays NaN.
@@ -3750,17 +4841,21 @@ def out_of_fold_predictions(
 
     spec, names, design = _design_context(rows, in_design, chosen)
     outcomes = {lead: _usable_outcome(truth, lead, n) for lead in wanted}
-    folds = sorted(set(int(m) for m in np.unique(month)))
+    plan = FoldPlan.by_month(month) if folds is None else folds
+    if plan.rows != n:
+        raise ValueError("the fold plan must have one entry per row")
     out_of_fold = {lead: np.full(n, np.nan, dtype=np.float64) for lead in wanted}
     fold_reports: list[dict[str, Any]] = []
 
-    for key in folds:
-        test = month == key
-        train = ~test
+    for fold in plan.folds():
+        test = plan.test_mask(fold)
+        train = plan.train_mask(fold)
         if train_mask is not None:
-            train = train & np.asarray(train_mask(month, key), dtype=bool)
+            train = train & np.asarray(
+                train_mask(plan.axes[0], fold[0]), dtype=bool,
+            )
         entry: dict[str, Any] = {
-            "fold": _month_label(key),
+            "fold": plan.label(fold),
             "n_test": int(test.sum()),
             "n_train": int(train.sum()),
             "leads": {},
@@ -3864,6 +4959,7 @@ def leave_one_month_out(
     month: np.ndarray,
     day: np.ndarray,
     baseline: Mapping[int, Any],
+    folds: "FoldPlan | None" = None,
     l2: float = 1.0,
     design_leads: Sequence[int] | None = None,
     strata: Mapping[str, np.ndarray] | None = None,
@@ -3925,7 +5021,7 @@ def leave_one_month_out(
 
     held = out_of_fold_predictions(
         rows, truth, wanted, month=month, settings=chosen,
-        design_leads=in_design, stations=stations, log=log,
+        design_leads=in_design, stations=stations, folds=folds, log=log,
     )
     out_of_fold = held["out_of_fold"]
     fold_reports = held["folds"]
@@ -3937,7 +5033,7 @@ def leave_one_month_out(
         baseline = out_of_fold_predictions(
             rows, truth, wanted, month=month,
             settings=baseline_settings.validate(),
-            design_leads=in_design, stations=stations, log=None,
+            design_leads=in_design, stations=stations, folds=folds, log=None,
         )["out_of_fold"]
 
     if strata is None:
@@ -4016,6 +5112,9 @@ def leave_one_month_out(
             "seed": int(seed),
             "n_bins": N_BINS,
             "isotonic_bins": int(chosen.isotonic_bins),
+            "folds": (
+                FoldPlan.by_month(month) if folds is None else folds
+            ).to_json(),
             "baseline": baseline_label,
             "fit": chosen.to_json(),
             "baseline_fit": (
@@ -4343,6 +5442,7 @@ def ablation(
     design_leads: Sequence[int] | None = None,
     subsets: Mapping[str, np.ndarray] | None = None,
     stations: Any | None = None,
+    folds: "FoldPlan | None" = None,
     also_finite: Mapping[int, Any] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
@@ -4372,7 +5472,7 @@ def ablation(
 
     full = out_of_fold_predictions(
         rows, truth, leads, month=month, settings=settings,
-        design_leads=design_leads, stations=stations, log=None,
+        design_leads=design_leads, stations=stations, folds=folds, log=None,
     )
     present = {feature_family(name) for name in full["names"]}
     wanted = [
@@ -4397,7 +5497,8 @@ def ablation(
             without = dataclasses_replace(without, station_offsets=False)
         held = out_of_fold_predictions(
             rows, truth, leads, month=month, settings=without,
-            design_leads=design_leads, stations=stations, log=None,
+            design_leads=design_leads, stations=stations, folds=folds,
+            log=None,
         )
         scores = subset_scores(
             held["out_of_fold"], outcomes, subsets, also_finite=also_finite,

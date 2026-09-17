@@ -280,11 +280,18 @@ def test_the_catalogue_is_append_only() -> None:
     assert names[:len(v1)] == v1
     tail = names[len(v1):]
     assert tail[:4] == ["ens_mean_10", "ens_p90_10", "ens_mean_30", "ens_p90_30"]
-    assert tail[4:] == [name for name, _ in pp.SCALAR_FEATURE_COLUMNS_V2]
-    # Every v2 column is documented, and every one of them is a nullable
-    # float — "unknown" has to be expressible, and it is never a 0.
+    # The v2 block keeps its place, and the neighbour-gauge block appended
+    # in 2026-09 comes after it — never inside it.
+    assert tail[4:] == [
+        name for name, _ in
+        pp.SCALAR_FEATURE_COLUMNS_V2 + pp.SCALAR_FEATURE_COLUMNS_NG
+    ]
+    # Every appended column is documented, and every one of them is a
+    # nullable float — "unknown" has to be expressible, and it is never a 0.
     schema = pp.feature_schema((10, 30))
-    for name, _definition in pp.SCALAR_FEATURE_COLUMNS_V2:
+    for name, _definition in (
+        pp.SCALAR_FEATURE_COLUMNS_V2 + pp.SCALAR_FEATURE_COLUMNS_NG
+    ):
         assert name in pp.FEATURE_DOC
         assert schema.field(name).type == pa.float32()
 

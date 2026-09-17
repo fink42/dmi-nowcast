@@ -230,11 +230,18 @@ def parse_tree_params(text: str) -> dict:
 
 def settings_from_args(args) -> Any:
     """The :class:`postprocess.FitSettings` the command line describes."""
-    return settings_for(args, str(args.model))
+    return settings_for(args, str(args.model), parse_families(args.drop_families))
 
 
-def settings_for(args, kind: str):
-    """The same settings under a different model kind — one arm of a sweep."""
+def settings_for(args, kind: str, drop_families: Sequence[str] = ()):
+    """The same settings under a different model kind — one arm of a sweep.
+
+    ``drop_families`` is the arm's own ablation: the families whose design
+    columns are removed before the fit. It is a per-ARM choice rather than a
+    run-wide one so that "v2 with the gauges" and "v2 with no gauge
+    information at all" can be scored in one pass, on the same folds and
+    against the same baseline.
+    """
     return pp.FitSettings(
         kind=kind,
         design=args.design,
@@ -245,6 +252,7 @@ def settings_for(args, kind: str):
         station_l2_multiple=float(args.station_l2_multiple),
         tree_params=parse_tree_params(args.trees) or None,
         seed=int(args.seed),
+        drop_families=tuple(drop_families),
     ).validate()
 
 
@@ -467,6 +475,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 
     lines += _summary_section(report)
     lines += _skill_section(report)
+    lines += _distance_section(report)
+    lines += _random_point_section(report)
     lines += _learning_curve_section(report)
     lines += _ablation_section(report)
     lines += _reliability_section(report)
@@ -483,8 +493,22 @@ def _summary_section(report: Mapping[str, Any]) -> list[str]:
     on the dry subset, per lead. Everything below this is the working.
     """
     settings = report["settings"]
+    protocol = str(settings.get("protocol", PROTOCOL_AT_GAUGE))
     lines = [
-        "## Candidate vs baseline",
+        f"## Candidate vs baseline — protocol `{protocol}`",
+        "",
+        (
+            "Rows are gauges and are allowed to be: the model reads the "
+            "gauge under the point, and the folds hold out a month."
+            if protocol == PROTOCOL_AT_GAUGE else
+            "**Rows are treated as the addresses they stand in for.** The "
+            "point's own gauge block is masked to 'unknown' in training AND "
+            "in scoring, per-station intercepts are refused, and every fold "
+            "holds out a month AND a group of stations together — so no "
+            "prediction comes from a model that saw that month or that "
+            "place. The `ng_*` block is not masked: it never contained the "
+            "point's own gauge."
+        ),
         "",
         f"`{settings.get('model', MODEL_LOGISTIC)}` on design "
         f"`{settings.get('design', pp.DESIGN_V1)}`"
@@ -498,7 +522,8 @@ def _summary_section(report: Mapping[str, Any]) -> list[str]:
         "|---|---|---|---:|---:|---:|---|---|",
     ]
     arms = [
-        (str(settings.get("model", MODEL_LOGISTIC)), report["evaluation"]["leads"]),
+        (str(settings.get("arm") or settings.get("model", MODEL_LOGISTIC)),
+         report["evaluation"]["leads"]),
     ] + [(str(arm["model"]), arm["leads"]) for arm in report.get("arms") or ()]
     for model, per_lead in arms:
         for lead in settings["leads"]:
@@ -988,6 +1013,394 @@ def copy_summary(
 
 
 # ---------------------------------------------------------------------------
+# The validation protocol: at a gauge, or at a random point
+# ---------------------------------------------------------------------------
+
+PROTOCOL_AT_GAUGE = pp.PROTOCOL_AT_GAUGE
+PROTOCOL_RANDOM_POINT = pp.PROTOCOL_RANDOM_POINT
+PROTOCOL_CHOICES: tuple[str, ...] = pp.PROTOCOLS
+
+#: Separator between an arm's model kind and its per-arm options in
+#: ``--compare``, e.g. ``logistic/drop=gauge+neighbour``. A slash rather
+#: than a comma because the flag itself is comma-separated, and a plus
+#: inside ``drop=`` for the same reason.
+ARM_SEPARATOR = "/"
+ARM_DROP = "drop="
+ARM_FAMILY_SEPARATOR = "+"
+
+
+def parse_families(text: str) -> tuple[str, ...]:
+    """``"gauge,neighbour"`` or ``"gauge+neighbour"`` → validated family names.
+
+    Unknown names are an error rather than a no-op: a typo'd ``--drop-families
+    neigbour`` that silently dropped nothing would produce a comparison
+    between two identical arms and a ΔBSS of zero, which reads exactly like
+    a feature family that does not earn its keep.
+    """
+    names = tuple(
+        item.strip()
+        for chunk in str(text or "").split(",")
+        for item in chunk.split(ARM_FAMILY_SEPARATOR)
+        if item.strip()
+    )
+    known = set(pp.FAMILY_NAMES) | {"other"}
+    unknown = [name for name in names if name not in known]
+    if unknown:
+        raise ValueError(
+            f"unknown feature famil(ies) {', '.join(unknown)}; expected from "
+            + ", ".join(pp.FAMILY_NAMES)
+        )
+    return names
+
+
+def arm_label(kind: str, drop_families: Sequence[str]) -> str:
+    """How an arm is named in the summary table: ``logistic -gauge,neighbour``."""
+    if not drop_families:
+        return str(kind)
+    return f"{kind} −{','.join(drop_families)}"
+
+
+def parse_compare(text: str, args) -> list[tuple[str, Any]]:
+    """``--compare`` → ``[(label, FitSettings), ...]``.
+
+    An entry is a model kind, optionally followed by ``/drop=<families>``:
+    ``logistic``, ``trees-shared``, ``logistic/drop=gauge+neighbour``. The
+    drop suffix is what lets one run score "v2 with the gauges" against "v2
+    without any gauge information" on the same folds and against the same
+    baseline — the comparison the random-point protocol exists to make —
+    without a second invocation whose folds a reader would have to take on
+    trust.
+    """
+    out: list[tuple[str, Any]] = []
+    for item in str(text or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        kind, _, options = item.partition(ARM_SEPARATOR)
+        kind = kind.strip() or str(args.model)
+        if kind not in MODEL_CHOICES:
+            raise ValueError(
+                f"--compare: unknown model kind {kind!r}; expected from "
+                + ", ".join(MODEL_CHOICES)
+            )
+        options = options.strip()
+        if options and not options.startswith(ARM_DROP):
+            raise ValueError(
+                f"--compare: unknown arm option {options!r}; the only one is "
+                f"'{ARM_DROP}<family>[{ARM_FAMILY_SEPARATOR}<family>...]'"
+            )
+        families = parse_families(options[len(ARM_DROP):]) if options else ()
+        out.append((
+            arm_label(kind, families), settings_for(args, kind, families),
+        ))
+    return out
+
+
+def station_coordinates(path: Path | None) -> dict[str, tuple[float, float]]:
+    """``{station_id: (lat, lon)}`` — the geometry the protocol needs.
+
+    Read through the neighbour-feature builder's loader, so the coordinates
+    the ``ng_*`` columns were computed from and the coordinates the spatial
+    split and the random-point weights are computed from cannot come apart.
+    """
+    if path is None:
+        raise ValueError(
+            f"--protocol {PROTOCOL_RANDOM_POINT} needs --points: the spatial "
+            "hold-out and the random-point weights are both geometry"
+        )
+    from add_neighbour_gauge_features import load_station_coords
+
+    return load_station_coords(Path(path))
+
+
+def protocol_folds(args, features: Mapping[str, Any], month: np.ndarray):
+    """``(FoldPlan, block for the report)`` for the chosen protocol.
+
+    ``at-gauge`` is one fold per (year, month) — leave-one-month-out, the
+    historical evaluation, unchanged to the row.
+
+    ``random-point`` crosses that with a station group, so a prediction
+    comes only from a model that saw neither the month nor the place. The
+    groups are :func:`~dmi_nowcast_core.postprocess.station_groups`'
+    longitude-interleaved comb, which is deterministic and needs no seed.
+    """
+    if str(args.protocol) == PROTOCOL_AT_GAUGE:
+        return pp.FoldPlan.by_month(month), {"kind": "month"}
+    coords = station_coordinates(args.points)
+    present = {
+        str(sid) for sid in np.unique(np.asarray(features["station_id"]).astype(str))
+        if str(sid) in coords
+    }
+    groups = pp.station_groups(
+        {sid: coords[sid] for sid in sorted(present)},
+        groups=int(args.station_groups),
+    )
+    codes = pp.group_codes(features["station_id"], groups)
+    plan = pp.FoldPlan.by_month_and_group(month, codes)
+    members: dict[str, list[str]] = {}
+    for sid, index in sorted(groups.items()):
+        members.setdefault(f"g{index}", []).append(sid)
+    return plan, {
+        "kind": "month x station group",
+        "station_groups": int(args.station_groups),
+        "split": (
+            "stations sorted by longitude and dealt round-robin, so every "
+            "group spans the country"
+        ),
+        "members": members,
+        "unmatched_rows": int((codes < 0).sum()),
+        "n_folds": len(plan.folds()),
+    }
+
+
+def protocol_strata(
+    features: Mapping[str, Any], dry: np.ndarray, season: Any,
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    """The strata every arm is scored on, plus the distance-bin names.
+
+    Beside the seasons and the onset-relevant ``dry`` subset, the rows are
+    cut by ``ng_near_km`` — how far the point is from the nearest gauge that
+    is not itself. That is the axis a gauge row and a subscriber's address
+    differ on, and binning on it is what lets the skill be re-weighted from
+    the one population to the other.
+    """
+    strata: dict[str, np.ndarray] = {
+        name: np.asarray(season).astype("<U8") == name for name in pp.SEASONS
+    }
+    if dry.any():
+        strata[pp.DRY] = dry
+    distance: list[str] = []
+    values = features.get(pp.DISTANCE_COLUMN)
+    if values is not None and np.any(np.isfinite(np.asarray(values, dtype=float))):
+        for name, mask in pp.distance_bins(values).items():
+            if mask.any():
+                strata[name] = mask
+            distance.append(name)
+    return strata, distance
+
+
+def distance_weights(args, features: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The two nearest-gauge distributions the expectation stands on.
+
+    ``random_point`` is where people live; ``at_gauge`` is where the
+    archive's rows are. Both are reported, because the re-weighting is only
+    as good as the overlap between them and a reader should be able to see
+    the overlap rather than be told about it.
+    """
+    if str(args.protocol) != PROTOCOL_RANDOM_POINT:
+        return None
+    coords = station_coordinates(args.points)
+    present = sorted({
+        str(sid) for sid in np.unique(np.asarray(features["station_id"]).astype(str))
+        if str(sid) in coords
+    })
+    scored = {sid: coords[sid] for sid in present}
+    return {
+        "random_point": pp.random_point_distance_weights(
+            scored, n=int(args.random_point_samples),
+            seed=int(args.random_point_seed),
+        ),
+        "at_gauge": pp.gauge_distance_weights(scored),
+        "column": pp.DISTANCE_COLUMN,
+        "stations": len(scored),
+    }
+
+
+def _bin_values(
+    per_lead: Mapping[str, Any], lead: int, names: Sequence[str], key: str,
+) -> dict[str, float | None]:
+    """One statistic per distance bin, for the re-weighting."""
+    entry = per_lead.get(str(lead)) or {}
+    out: dict[str, float | None] = {}
+    for name in names:
+        block = entry.get(name)
+        if not block:
+            out[name] = None
+        elif key == "delta":
+            difference = block.get("difference") or {}
+            interval = difference.get("bss")
+            # ``(point, lo, hi)`` — ``benchmark.paired_block_bootstrap``'s
+            # order, which ``benchmark_report._ci`` unpacks the same way.
+            # Taking [1] here would re-weight the interval's LOWER BOUND
+            # and call it the difference.
+            out[name] = None if not interval else float(interval[0])
+        else:
+            out[name] = float(block[key]["bss"])
+    return out
+
+
+def random_point_rows(
+    report_leads: Mapping[str, Any],
+    leads: Sequence[int],
+    names: Sequence[str],
+    weights: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Per lead, the distance-binned skill re-weighted to a random point.
+
+    The point estimate only. A confidence interval on a re-weighted mean of
+    four paired bootstraps is a harder object than it looks — the bins are
+    disjoint so the day blocks are not, and the weights are themselves
+    sampled — and inventing one would say more than the evidence does. The
+    per-bin intervals are printed above it; this row says where the weight
+    of the country sits.
+    """
+    shares = {
+        name: float(weight) for name, weight in zip(
+            weights.get("labels") or (), weights.get("weights") or (),
+        )
+        if name in names
+    }
+    out: list[dict[str, Any]] = []
+    for lead in leads:
+        row: dict[str, Any] = {"lead": int(lead)}
+        for key, label in (
+            ("baseline", "bss_baseline"),
+            ("postprocess", "bss_candidate"),
+            ("delta", "bss_difference"),
+        ):
+            got = pp.random_point_expectation(
+                _bin_values(report_leads, lead, names, key), shares,
+            )
+            row[label] = _round(got["value"])
+            # Two coverages, because they can differ: a bin with rows
+            # always has a BSS, but its paired interval is absent when
+            # --resamples is 0, and a ΔBSS standing on fewer bins than
+            # the levels beside it must say so rather than borrow their
+            # reach.
+            row["covered" if key != "delta" else "delta_covered"] = _round(
+                got["covered"], 4,
+            )
+        out.append(row)
+    return out
+
+
+def _distance_section(report: Mapping[str, Any]) -> list[str]:
+    """Skill against the one thing a gauge row and an address differ on."""
+    names = report["settings"].get("distance_bins") or []
+    if not names:
+        return []
+    lines = [
+        "## By distance to the nearest gauge",
+        "",
+        f"Rows binned on `{pp.DISTANCE_COLUMN}` — the distance from the "
+        "point to the nearest gauge that is **not** the point's own. At a "
+        "training row that is the nearest OTHER station; at a subscriber's "
+        "address it is simply the nearest station, and the two are the same "
+        "quantity, which is why a model fitted here can be read there. Skill "
+        "should fall with distance; how fast it falls is what the next "
+        "section re-weights.",
+        "",
+        "| lead | bin | n | BSS base | BSS cand. | ΔBSS [CI] | real? |",
+        "|---|---|---:|---:|---:|---|---|",
+    ]
+    for lead in report["settings"]["leads"]:
+        entry = report["evaluation"]["leads"].get(str(lead)) or {}
+        for name in names:
+            block = entry.get(name)
+            if not block:
+                lines.append(f"| {lead} | {name} | – | – | – | – | – |")
+                continue
+            diff = block.get("difference") or {}
+            verdict = diff.get("bss_excludes_zero")
+            lines.append(
+                f"| {lead} | {name} | {block['n']} | "
+                f"{_fmt(block['baseline']['bss'], 4)} | "
+                f"{_fmt(block['postprocess']['bss'], 4)} | "
+                f"{_ci(diff.get('bss'))} | "
+                + ("yes" if verdict else ("no" if verdict is False else "–"))
+                + " |"
+            )
+    lines.append("")
+    return lines
+
+
+def _random_point_section(report: Mapping[str, Any]) -> list[str]:
+    """What the distance-binned table is worth to somebody who is not a gauge."""
+    block = report.get("distance_weights")
+    if not block:
+        return []
+    random_point = block["random_point"]
+    at_gauge = block["at_gauge"]
+    labels = random_point["labels"]
+    lines = [
+        "## Expected at a random point",
+        "",
+        f"{random_point['n']} points drawn uniformly **by area** inside "
+        "Denmark's coastline (`dmi_nowcast_core.denmark_outline`, Natural "
+        "Earth 1:10m simplified to ~1 km), each one's distance to the "
+        f"nearest of the {block['stations']} scored gauges measured on the "
+        "same kilometre grid the `ng_*` features use "
+        f"(seed {random_point['seed']}).",
+        "",
+        "| bin | random point | the archive's rows |",
+        "|---|---:|---:|",
+    ]
+    for index, name in enumerate(labels):
+        lines.append(
+            f"| {name} | {random_point['weights'][index]:.3f} | "
+            f"{at_gauge['weights'][index]:.3f} |"
+        )
+    closer = float(random_point["km"]["p50"]) < float(at_gauge["km"]["p50"])
+    lines += [
+        f"| **median km** | **{random_point['km']['p50']:.1f}** | "
+        f"**{at_gauge['km']['p50']:.1f}** |",
+        "",
+        "The two columns are the whole reason this section exists — they "
+        "are not the same distribution, and every number above them was "
+        "measured on the right-hand one while every number a subscriber "
+        "sees is drawn from the left.",
+        "",
+        (
+            "Here a random place in Denmark is CLOSER to a gauge than a "
+            "gauge is to its nearest neighbour, which is what a roughly "
+            "regular network gives you: a point sits about half a step "
+            "from a node while a node sits a whole step from the next "
+            "one. The archive is therefore trained and scored under "
+            "conditions slightly HARSHER than a subscriber's, and the "
+            "re-weighting moves the answer toward the close bins rather "
+            "than away from them. The extrapolation is in the near bins, "
+            "which carry most of the country and only the handful of "
+            "gauges that happen to sit near another one — read their row "
+            "counts in the table above before leaning on this number."
+            if closer else
+            "Here a random place in Denmark is FARTHER from a gauge than "
+            "a gauge is from its nearest neighbour, so the archive is "
+            "easier than service and the re-weighting moves the answer "
+            "toward the far bins. Read those bins' row counts in the "
+            "table above before leaning on this number: they are where "
+            "the extrapolation lives."
+        ),
+        "",
+        "| lead | BSS base | BSS cand. | ΔBSS | weight covered |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for row in report.get("random_point") or ():
+        lines.append(
+            f"| {row['lead']} | {_fmt(row.get('bss_baseline'), 4)} | "
+            f"{_fmt(row.get('bss_candidate'), 4)} | "
+            f"{_fmt(row.get('bss_difference'), 4)} | "
+            f"{_fmt(row.get('covered'), 3)}"
+            + (
+                "" if row.get("delta_covered") == row.get("covered")
+                else f" (Δ {_fmt(row.get('delta_covered'), 3)})"
+            )
+            + " |"
+        )
+    lines += [
+        "",
+        "Each number is the per-bin value above, weighted by the random-"
+        "point column. `weight covered` is the share of the country the "
+        "filled bins account for — a ΔBSS standing on 0.96 of the weight is "
+        "a different claim from one standing on 0.5. No interval: the bins "
+        "share day blocks and the weights are themselves sampled, so a "
+        "bootstrap over the re-weighted mean would claim more than the "
+        "evidence supports. The per-bin intervals are the evidence.",
+        "",
+    ]
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1092,12 +1505,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--compare", default="", metavar="MODEL,...",
-        help="also score these model kinds out of fold on the SAME folds "
-             "and against the same baseline, and put them beside the "
-             "candidate in the summary table — e.g. "
-             "'logistic,logistic-shared,trees,trees-shared'. Each one "
-             "costs a full LOMO pass; none of them is written to "
-             "postprocess.json, which is always --model.",
+        help="also score these arms out of fold on the SAME folds and "
+             "against the same baseline, and put them beside the candidate "
+             "in the summary table — e.g. "
+             "'logistic,logistic-shared,trees,trees-shared'. An arm may "
+             "carry its own ablation with a '/drop=' suffix, e.g. "
+             "'logistic/drop=gauge+neighbour' for the same family with no "
+             "gauge information. Each one costs a full pass; none of them "
+             "is written to postprocess.json, which is always --model.",
+    )
+    p.add_argument(
+        "--protocol", default=PROTOCOL_AT_GAUGE, choices=list(PROTOCOL_CHOICES),
+        help="what a row is taken to BE. 'at-gauge' is the historical "
+             "evaluation: the row is a DMI station, it may read its own "
+             "gauge, and the folds hold out a month. 'random-point' treats "
+             "it as the address it stands in for — the point's own g_* "
+             "block is masked to unknown in training and in scoring, "
+             "--station-offsets is refused, and each fold holds out a month "
+             "AND a station group, so no prediction comes from a model that "
+             "saw that place. The ng_* block is never masked: it is "
+             "leave-self-out by construction.",
+    )
+    p.add_argument(
+        "--station-groups", type=int, default=pp.DEFAULT_STATION_GROUPS,
+        help="how many station groups the random-point hold-out cuts the "
+             "country into. Stations are sorted by longitude and dealt "
+             "round-robin, so every group spans the country; no seed, "
+             "because the split is a function of the catalogue. K groups x "
+             "M months is K*M fits per model arm.",
+    )
+    p.add_argument(
+        "--random-point-samples", type=int, default=200_000,
+        help="points drawn inside Denmark's outline to weigh the "
+             "distance-binned skill by where people actually live",
+    )
+    p.add_argument(
+        "--random-point-seed", type=int, default=0,
+        help="seed for that draw, so the weights are reproducible",
+    )
+    p.add_argument(
+        "--drop-families", default="", metavar="FAMILY,...",
+        help="drop these feature families from the candidate's design "
+             "before fitting — the ablation's knob as a first-class arm. "
+             "e.g. 'gauge,neighbour' for a model with no gauge information "
+             "at all. Known families: " + ", ".join(pp.FAMILY_NAMES) + ".",
     )
     p.add_argument(
         "--ablate", action="store_true",
@@ -1135,16 +1586,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         curve_days = [
             int(v) for v in str(args.learning_curve or "").split(",") if v.strip()
         ]
-        compare = [
-            name.strip() for name in str(args.compare or "").split(",")
-            if name.strip()
-        ]
-        unknown = [name for name in compare if name not in MODEL_CHOICES]
-        if unknown:
-            raise ValueError(
-                f"--compare: unknown model kind(s) {', '.join(unknown)}; "
-                f"expected from {', '.join(MODEL_CHOICES)}"
-            )
+        compare = parse_compare(args.compare, args)
+        if str(args.protocol) == PROTOCOL_RANDOM_POINT:
+            if args.station_offsets:
+                raise ValueError(
+                    "--station-offsets cannot be used with --protocol "
+                    f"{PROTOCOL_RANDOM_POINT}: a per-station intercept is "
+                    "learnable at a gauge and meaningless at an address, so "
+                    "a number measured with it is not a number a subscriber "
+                    "would get. Drop the flag, or use --protocol "
+                    f"{PROTOCOL_AT_GAUGE}."
+                )
+            # Read here so a missing or unreadable points file is a message
+            # before the loader spends minutes on parquet.
+            station_coordinates(args.points)
     except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1225,16 +1680,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         + ("" if pp.DRY_COLUMN in features else f" — derived, no {pp.DRY_COLUMN} column")
     )
     season = features.get("season")
-    strata: dict[str, np.ndarray] = {
-        name: np.asarray(season).astype("<U8") == name for name in pp.SEASONS
-    }
-    if dry.any():
-        strata[pp.DRY] = dry
+
+    # The protocol, applied in this order and no other: the onset-relevant
+    # subset is TRUTH about the point and is derived from the gauge above,
+    # before the same gauge is taken away from the model as a PREDICTOR.
+    # Reversing the two would empty the dry subset under the mask.
+    if str(args.protocol) == PROTOCOL_RANDOM_POINT:
+        features = pp.mask_own_gauge(features)
+        log(
+            "protocol random-point: masked the point's own gauge "
+            f"({', '.join(pp.OWN_GAUGE_COLUMNS)}, {pp.GAUGE_KNOWN_COLUMN}=0) "
+            "in training and in scoring; the dry subset above was derived "
+            "before the mask"
+        )
+    strata, distance_names = protocol_strata(features, dry, season)
+    folds, fold_block = protocol_folds(args, features, month)
+    weights_block = distance_weights(args, features)
+    log(
+        f"protocol {args.protocol}: {len(folds.folds())} fold(s) over "
+        f"{' x '.join(folds.names)}"
+    )
+    if distance_names:
+        log(
+            "distance strata: "
+            + ", ".join(
+                f"{name} n={int(strata[name].sum())}"
+                for name in distance_names if name in strata
+            )
+        )
 
     log(f"fitting {len(leads)} lead(s) over {rows['rows']} row(s)")
     evaluation = pp.leave_one_month_out(
         features, truth, leads,
-        month=month, day=day, baseline=baseline,
+        month=month, day=day, baseline=baseline, folds=folds,
         design_leads=design_leads, strata=strata,
         n_resamples=int(args.resamples), seed=int(args.seed), ci=float(args.ci),
         settings=settings, baseline_settings=baseline_config,
@@ -1250,6 +1728,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )}
     curve_rows: list[dict] = []
     if curve_days:
+        if str(args.protocol) != PROTOCOL_AT_GAUGE:
+            log(
+                "learning curve: month folds only — it answers 'how much "
+                "archive', which the spatial hold-out does not change"
+            )
         curve_rows = pp.learning_curve(
             features, truth, leads,
             month=month, day=day, settings=settings, days=curve_days,
@@ -1260,27 +1743,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             log=log,
         )
     arms: list[dict] = []
-    for kind in compare:
-        if kind == str(args.model):
+    candidate = arm_label(str(args.model), settings.drop_families)
+    for label, arm_settings in compare:
+        if label == candidate:
             continue
-        log(f"comparison arm: {kind}")
+        log(f"comparison arm: {label}")
         arm = pp.leave_one_month_out(
             features, truth, leads,
-            month=month, day=day, baseline=baseline,
+            month=month, day=day, baseline=baseline, folds=folds,
             design_leads=design_leads, strata=strata,
             n_resamples=int(args.resamples), seed=int(args.seed),
             ci=float(args.ci),
-            settings=settings_for(args, kind),
+            settings=arm_settings,
             baseline_settings=baseline_config,
             baseline_label=str(args.baseline), log=None,
         )
-        arms.append({"model": kind, "leads": _strip_arrays(arm)["leads"]})
+        arms.append({
+            "model": label, "fit": arm_settings.to_json(),
+            "leads": _strip_arrays(arm)["leads"],
+        })
     ablation_block: dict | None = None
     if args.ablate:
         ablation_block = pp.ablation(
             features, truth, leads,
             month=month, settings=settings, design_leads=design_leads,
-            subsets=subsets, also_finite=scored_against,
+            subsets=subsets, folds=folds, also_finite=scored_against,
             log=log,
         )
     window = bench.decision_window(rows["t"])
@@ -1298,6 +1785,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "corpus_dir": str(args.corpus_dir),
             "dead_gauges": [row["station_id"] for row in dead_rows],
             "settings": settings.to_json(),
+            # The protocol belongs in the ARTEFACT, not only in the
+            # report: a model fitted under 'random-point' was trained
+            # with the point's own gauge masked away and cannot use it in
+            # service either, and somebody reading postprocess.json a
+            # month from now has to be able to see that without going
+            # back to the run that made it.
+            "protocol": str(args.protocol),
+            "folds": fold_block,
         },
     )
 
@@ -1322,6 +1817,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else f"{args.baseline} (refitted in fold)"
             ),
             "model": str(args.model),
+            "arm": candidate,
+            "protocol": str(args.protocol),
+            "folds": fold_block,
+            "drop_families": list(settings.drop_families),
+            "distance_bins": distance_names,
             "design": str(args.design),
             "isotonic": str(args.isotonic),
             "station_offsets": bool(args.station_offsets),
@@ -1334,7 +1834,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "learning_curve_order": str(args.learning_curve_order),
             "learning_curve_seed": int(args.learning_curve_seed),
             "ablate": bool(args.ablate),
-            "compare": list(compare),
+            "compare": [label for label, _settings in compare],
         },
         "rows": int(rows["rows"]),
         "stations": len(scored),
@@ -1348,6 +1848,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "dead_gauges": dead_rows,
         "run_settings": bench.run_settings(run_dirs),
         "evaluation": _strip_arrays(evaluation),
+        "distance_weights": weights_block,
+        "random_point": (
+            random_point_rows(
+                evaluation["leads"], leads, distance_names,
+                weights_block["random_point"],
+            )
+            if weights_block and distance_names else []
+        ),
         "arms": arms,
         "learning_curve": curve_rows,
         "ablation": ablation_block,
@@ -1399,6 +1907,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _headline(report: Mapping[str, Any]) -> dict:
     out: dict[str, Any] = {
+        "protocol": report["settings"].get("protocol", PROTOCOL_AT_GAUGE),
+        "arm": report["settings"].get("arm"),
+        "folds": (report["settings"].get("folds") or {}).get("kind"),
         "rows": report["rows"],
         "stations": report["stations"],
         "months": report["n_months"],
@@ -1429,6 +1940,10 @@ def _headline(report: Mapping[str, Any]) -> dict:
                 "bss_postprocess": _round(dry["postprocess"]["bss"]),
                 "bss_difference": (dry.get("difference") or {}).get("bss"),
             }
+    if report.get("random_point"):
+        # The number the protocol exists to produce, in the one place a
+        # reader of stdout will look.
+        out["random_point"] = report["random_point"]
     return out
 
 
