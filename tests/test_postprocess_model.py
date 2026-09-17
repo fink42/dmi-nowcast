@@ -716,9 +716,162 @@ def test_the_learning_curve_has_one_row_per_budget(synthetic: dict) -> None:
         assert set(row["leads"]) == {str(lead) for lead in LEADS}
         assert row["leads"]["20"][pp.POOLED]["n"] > 0
         assert math.isfinite(row["leads"]["20"][pp.POOLED]["bss"])
+        # What the budget actually bought, beside what it asked for.
+        assert row["train_days"] == row["days"]
+        assert row["order"] == pp.CURVE_ORDER_RANDOM
+        assert row["seed"] == pp.DEFAULT_CURVE_SEED
     # More days of archive means more training rows, which is the only
     # monotone claim this fixture is big enough to make.
     assert rows[1]["train_rows"] > rows[0]["train_rows"]
+
+
+def test_more_training_days_raise_the_curve(synthetic: dict) -> None:
+    """The shape a learning curve has to have when the draw is honest.
+
+    The fixture's outcome is a fixed function of two features, so a fit
+    given more of the SAME distribution can only get closer to it: the
+    curve must rise, and it must not dip on the way. The by-date draw
+    this replaced could not make that claim, because its 12-day point was
+    a January-only fit scored on April as well.
+    """
+    rows = pp.learning_curve(
+        synthetic["features"], synthetic["truth"], list(LEADS),
+        month=synthetic["month"], day=synthetic["day"],
+        settings=pp.FitSettings(), days=[6, 12, 24, 36],
+    )
+    curve = [row["leads"]["20"][pp.POOLED]["bss"] for row in rows]
+    assert all(math.isfinite(value) for value in curve)
+    for earlier, later in zip(curve, curve[1:]):
+        assert later >= earlier - 1e-3, curve
+    assert curve[-1] - curve[0] > 5e-3, curve
+    # Every point is scored on the same rows; only the training set moved.
+    assert len({row["leads"]["20"][pp.POOLED]["n"] for row in rows}) == 1
+
+
+def test_the_draw_is_stratified_by_month(synthetic: dict) -> None:
+    """Each training month gives its share, and the held-out one gives none.
+
+    Twelve days a month, four months, so a fold has three months of
+    twelve days to draw from and a proportional draw is an equal one.
+    """
+    rows = pp.learning_curve(
+        synthetic["features"], synthetic["truth"], list(LEADS),
+        month=synthetic["month"], day=synthetic["day"],
+        settings=pp.FitSettings(), days=[6, 30],
+    )
+    months = pp.month_labels(sorted(set(int(m) for m in synthetic["month"])))
+    assert len(months) == 4
+    for row in rows:
+        assert [fold["fold"] for fold in row["folds"]] == months
+        for fold in row["folds"]:
+            histogram = fold["months"]
+            # The held-out month is not in its own training draw.
+            assert fold["fold"] not in histogram
+            assert set(histogram) == set(months) - {fold["fold"]}
+            assert sum(histogram.values()) == row["days"] == fold["train_days"]
+            share = row["days"] / len(histogram)
+            for count in histogram.values():
+                assert abs(count - share) <= 1
+        # The reported histogram is the folds', summed.
+        assert sum(row["months"].values()) == row["days"] * len(months)
+
+    # HOW MANY days each month gives is decided by the month sizes alone,
+    # so it does not move with the seed; what moves is WHICH days, and a
+    # curve is only reproducible if that is pinned too.
+    pools = pp._day_pools(synthetic["day"], synthetic["month"], seed=0)
+    assert [len(days) for days in pools.values()] == [12, 12, 12, 12]
+    again = pp._day_pools(synthetic["day"], synthetic["month"], seed=0)
+    assert all(np.array_equal(pools[key], again[key]) for key in pools)
+    other = pp._day_pools(synthetic["day"], synthetic["month"], seed=7)
+    assert any(not np.array_equal(pools[key], other[key]) for key in pools)
+    # A nested draw: the 6-day subset is inside the 30-day one, so a step
+    # along the curve is more data and not other data.
+    for key, days in pp._drawn_days(pools, 6).items():
+        assert set(days.tolist()) <= set(pp._drawn_days(pools, 30)[key].tolist())
+
+    def bss(seed: int) -> float:
+        return pp.learning_curve(
+            synthetic["features"], synthetic["truth"], [LEADS[0]],
+            month=synthetic["month"], day=synthetic["day"],
+            settings=pp.FitSettings(), days=[6], seed=seed,
+        )[0]["leads"]["20"][pp.POOLED]["bss"]
+
+    assert bss(0) == bss(0)
+    assert bss(0) != bss(7)
+
+
+def test_the_curves_last_point_is_the_out_of_fold_table(synthetic: dict) -> None:
+    """One scorer, one row set: the same number, not two views of it.
+
+    ``also_finite`` is the table's baseline, so the curve drops the rows
+    the paired table could not grade either. Exact equality — the same
+    function over the same rows — because "roughly the same" is how the
+    curve came to report a NEGATIVE dry BSS beside a positive one in the
+    table above it.
+    """
+    features = dict(synthetic["features"])
+    dry = np.zeros(synthetic["n"], dtype=np.float64)
+    dry[::2] = 1.0
+    features[pp.DRY_COLUMN] = dry
+    baseline = {
+        lead: np.asarray(values, dtype=np.float64).copy()
+        for lead, values in synthetic["baseline"].items()
+    }
+    # A baseline with holes in it: the table cannot score those rows, so
+    # nothing read beside the table may score them either.
+    baseline[LEADS[0]][:37] = np.nan
+    table = pp.leave_one_month_out(
+        features, synthetic["truth"], list(LEADS),
+        month=synthetic["month"], day=synthetic["day"],
+        baseline=baseline, n_resamples=0,
+    )
+    subsets = {
+        pp.POOLED: np.ones(synthetic["n"], dtype=bool),
+        pp.DRY: pp.dry_subset(features),
+    }
+    rows = pp.learning_curve(
+        features, synthetic["truth"], list(LEADS),
+        month=synthetic["month"], day=synthetic["day"],
+        settings=pp.FitSettings(), days=[36], subsets=subsets,
+        also_finite=baseline,
+    )
+    assert rows[0]["train_days"] == 36
+    for lead in LEADS:
+        for subset in (pp.POOLED, pp.DRY):
+            got = rows[0]["leads"][str(lead)][subset]
+            want = table["leads"][str(lead)][subset]
+            assert got["n"] == want["n"] > 0
+            assert got["bss"] == want["postprocess"]["bss"]
+
+
+def test_the_by_date_order_is_still_available(synthetic: dict) -> None:
+    """The season experiment, on purpose and labelled as such.
+
+    Kept because "what would a winter-only fit do" is a question worth
+    asking. The test pins what makes it the wrong default: at twelve days
+    every fold trains inside ONE month and is then scored on another.
+    """
+    rows = pp.learning_curve(
+        synthetic["features"], synthetic["truth"], list(LEADS),
+        month=synthetic["month"], day=synthetic["day"],
+        settings=pp.FitSettings(), days=[12],
+        order=pp.CURVE_ORDER_DATE,
+    )
+    assert rows[0]["order"] == pp.CURVE_ORDER_DATE
+    assert rows[0]["train_days"] == 12
+    assert math.isfinite(rows[0]["leads"]["20"][pp.POOLED]["bss"])
+    assert [sorted(fold["months"]) for fold in rows[0]["folds"]] == [
+        ["2026-02"], ["2026-01"], ["2026-01"], ["2026-01"],
+    ]
+
+
+def test_an_unknown_curve_order_is_refused(synthetic: dict) -> None:
+    with pytest.raises(ValueError, match="order"):
+        pp.learning_curve(
+            synthetic["features"], synthetic["truth"], list(LEADS),
+            month=synthetic["month"], day=synthetic["day"],
+            settings=pp.FitSettings(), days=[4], order="alphabetical",
+        )
 
 
 def test_the_ablation_reports_a_delta_per_family(synthetic: dict) -> None:

@@ -103,9 +103,16 @@ Everything is reported twice: on all rows, and on the **dry** subset —
 rows whose gauge was dry for the hour before the decision instant. A
 model that wins only on rows where it was already raining has not won.
 
-``--learning-curve 10,20,30,60,90`` adds one LOMO pass per N, trained on
-the first N calendar days of each fold's training rows. ``--ablate`` adds
-one per feature family, with the family dropped.
+``--learning-curve 10,20,30,60,90`` adds one LOMO pass per N, each fold
+trained on N of its training DAYS drawn at random and **stratified by
+month** (``--learning-curve-seed``, default 0), so the N-day point
+differs from the all-days point in volume and not in season.
+``--learning-curve-order date`` reverts to the first N calendar days,
+which is the seasonal experiment rather than the data-volume one; the
+report says which order produced the table. Both are scored by the same
+function the out-of-fold table above them uses, on the same rows, so the
+curve's last point IS the table. ``--ablate`` adds one pass per feature
+family, with the family dropped.
 
 LightGBM, and why it is not in this project's venv
 --------------------------------------------------
@@ -534,30 +541,67 @@ def _learning_curve_section(report: Mapping[str, Any]) -> list[str]:
     subsets = sorted({
         name for row in rows for block in row["leads"].values() for name in block
     })
+    order = str(rows[0].get("order", pp.CURVE_ORDER_RANDOM))
+    seed = rows[0].get("seed", pp.DEFAULT_CURVE_SEED)
+    how = (
+        "Each fold trains on **N of its training days, drawn at random "
+        "and stratified by month**: every training month "
+        "contributes a share of the draw proportional to the days it "
+        "has, so an N-day point differs from the all-days point in "
+        "volume and not in season. The draw is nested \u2014 a larger "
+        "budget's days contain a smaller one's."
+        if order == pp.CURVE_ORDER_RANDOM else
+        "Each fold trains on **the first N calendar days** of its "
+        "training rows (`--learning-curve-order date`). That is the "
+        "seasonal experiment: on a winter-first archive the small N "
+        "points are winter-only fits scored on every month, so read a "
+        "non-monotone curve as a statement about season, not about how "
+        "much archive the model wants."
+    )
     lines = [
         "## Learning curve",
         "",
-        "Same folds, but each fold trains on only the first N calendar "
-        "days of its training rows. By date rather than by random sample: "
-        "the question is whether another month of archive would buy "
-        "anything, and a random slice of a year answers an easier one. "
-        "BSS is out of fold, pooled over the folds.",
+        f"Draw order `{order}`, seed {seed}. " + how,
         "",
-        "| days | train rows | subset | "
+        "BSS is out of fold, pooled over the folds, and computed by the "
+        "same function and on the same rows as the out-of-fold table "
+        "above \u2014 so the last point of this curve, where the budget "
+        "covers every training day, is that table's number.",
+        "",
+        "`train days` is the largest number of distinct days any fold "
+        "actually got (a fold with fewer available gives what it has); "
+        "`rows` is the out-of-fold rows scored in that subset, at "
+        "whichever lead grades the most of them.",
+        "",
+        "| days | train days | train rows | subset | rows | "
         + " | ".join(f"BSS {lead} min" for lead in leads) + " |",
-        "|---:|---:|---|" + "---:|" * len(leads),
+        "|---:|---:|---:|---|---:|" + "---:|" * len(leads),
     ]
     for row in rows:
         for subset in subsets:
             cells = []
+            scored = 0
             for lead in leads:
                 block = (row["leads"].get(lead) or {}).get(subset) or {}
                 cells.append(_fmt(block.get("bss"), 4))
+                scored = max(scored, int(block.get("n", 0)))
+            used = row.get("train_days", "\u2013")
             lines.append(
-                f"| {row['days']} | {row['train_rows']} | {subset} | "
+                f"| {row['days']} | {used} | "
+                f"{row['train_rows']} | {subset} | {scored} | "
                 + " | ".join(cells) + " |"
             )
     lines.append("")
+    months = rows[-1].get("months") or {}
+    if months:
+        lines += [
+            "Month mix of the draw at N = "
+            f"{rows[-1]['days']}, summed over the folds (a day drawn for "
+            "three folds is counted three times): "
+            + ", ".join(f"{label} {count}" for label, count in months.items())
+            + ".",
+            "",
+        ]
     return lines
 
 
@@ -1029,9 +1073,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--learning-curve", default="", metavar="N,N,...",
-        help="also fit on the first N days of each fold's training rows "
-             "and score the held-out month, one row per N, e.g. "
-             "'10,20,30,60,90'. Costs one full LOMO pass per N.",
+        help="also fit each fold on N of its training days and score the "
+             "held-out month, one row per N, e.g. '10,20,30,60,90'. "
+             "Costs one full LOMO pass per N.",
+    )
+    p.add_argument(
+        "--learning-curve-order", default=pp.CURVE_ORDER_RANDOM,
+        choices=list(pp.CURVE_ORDERS),
+        help="how those N days are chosen: 'random' draws them "
+             "stratified by month, so less data does not also mean a "
+             "different season; 'date' takes the first N calendar days, "
+             "which is the seasonal experiment the curve used to run by "
+             "accident",
+    )
+    p.add_argument(
+        "--learning-curve-seed", type=int, default=pp.DEFAULT_CURVE_SEED,
+        help="seed for the stratified draw, so a curve is reproducible",
     )
     p.add_argument(
         "--compare", default="", metavar="MODEL,...",
@@ -1183,15 +1240,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings=settings, baseline_settings=baseline_config,
         baseline_label=str(args.baseline), log=log,
     )
+    # The rows the table above scored: whichever baseline it was paired
+    # against decides them, and the curve and the ablation are read
+    # beside that table, so they grade the same rows and not a wider set
+    # of their own.
+    scored_against = evaluation["baseline_out_of_fold"] or baseline
+    subsets = {pp.POOLED: np.ones(dry.size, dtype=bool), **(
+        {pp.DRY: dry} if dry.any() else {}
+    )}
     curve_rows: list[dict] = []
     if curve_days:
         curve_rows = pp.learning_curve(
             features, truth, leads,
             month=month, day=day, settings=settings, days=curve_days,
-            design_leads=design_leads,
-            subsets={pp.POOLED: np.ones(dry.size, dtype=bool), **(
-                {pp.DRY: dry} if dry.any() else {}
-            )},
+            design_leads=design_leads, subsets=subsets,
+            also_finite=scored_against,
+            order=str(args.learning_curve_order),
+            seed=int(args.learning_curve_seed),
             log=log,
         )
     arms: list[dict] = []
@@ -1215,9 +1280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ablation_block = pp.ablation(
             features, truth, leads,
             month=month, settings=settings, design_leads=design_leads,
-            subsets={pp.POOLED: np.ones(dry.size, dtype=bool), **(
-                {pp.DRY: dry} if dry.any() else {}
-            )},
+            subsets=subsets, also_finite=scored_against,
             log=log,
         )
     window = bench.decision_window(rows["t"])
@@ -1268,6 +1331,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if baseline_config is None else baseline_config.to_json()
             ),
             "learning_curve_days": list(curve_days),
+            "learning_curve_order": str(args.learning_curve_order),
+            "learning_curve_seed": int(args.learning_curve_seed),
             "ablate": bool(args.ablate),
             "compare": list(compare),
         },

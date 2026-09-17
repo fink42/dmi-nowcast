@@ -597,10 +597,27 @@ class TestTheLearningCurveAndAblation:
         report, _out = fitted_v2
         rows = report["learning_curve"]
         assert [row["days"] for row in rows] == [3, 7]
+        assert report["settings"]["learning_curve_order"] == "random"
+        assert report["settings"]["learning_curve_seed"] == 0
         for row in rows:
             assert row["train_rows"] > 0
             assert set(row["leads"]) == {str(lead) for lead in LEADS}
             assert "all" in row["leads"]["20"]
+            # The draw, so a reader of the JSON can see what it stands on.
+            assert row["order"] == "random" and row["seed"] == 0
+            assert row["train_days"] == row["days"]
+            assert sum(row["months"].values()) == row["days"] * len(MONTHS)
+            for fold in row["folds"]:
+                # Two of the three fixture months per fold, both drawn from.
+                assert len(fold["months"]) == len(MONTHS) - 1
+                assert sum(fold["months"].values()) == row["days"]
+        # The curve is scored on the rows the out-of-fold table scored.
+        for lead in LEADS:
+            table = report["evaluation"]["leads"][str(lead)]
+            for subset in ("all", pp.DRY):
+                assert rows[-1]["leads"][str(lead)][subset]["n"] == (
+                    table[subset]["n"]
+                )
 
     def test_one_ablation_row_per_family(self, fitted_v2) -> None:
         report, _out = fitted_v2
@@ -617,6 +634,8 @@ class TestTheLearningCurveAndAblation:
         text = (out / "postprocess_report.md").read_text()
         assert "## Candidate vs baseline" in text
         assert "## Learning curve" in text
+        assert "| days | train days | train rows | subset | rows |" in text
+        assert "Draw order `random`, seed 0." in text
         assert "## Ablation" in text
         assert "| lead | subset | n |" in text
         assert "refit-v1" in text

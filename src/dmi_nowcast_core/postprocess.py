@@ -220,6 +220,11 @@ __all__ = [
     "fit_postprocess",
     "out_of_fold_predictions",
     "leave_one_month_out",
+    "subset_scores",
+    "CURVE_ORDER_RANDOM",
+    "CURVE_ORDER_DATE",
+    "CURVE_ORDERS",
+    "DEFAULT_CURVE_SEED",
     "learning_curve",
     "ablation",
     "POOLED",
@@ -3718,7 +3723,8 @@ def out_of_fold_predictions(
     has to mean the same code and not two copies of it.
 
     ``train_mask(month, key)`` narrows the training set beyond "not this
-    fold" — what :func:`learning_curve` uses to train on the first N days.
+    fold" — what :func:`learning_curve` uses to train one fold on a
+    subset of its days.
 
     Returns ``{"out_of_fold": {lead: array}, "folds": [...]}``; a row a
     fold could not be fitted for stays NaN.
@@ -3950,23 +3956,37 @@ def leave_one_month_out(
         (POOLED, np.ones(n, dtype=bool))
     ] + [(name, np.asarray(mask, dtype=bool)) for name, mask in strata.items()]
 
+    strata_map = dict(all_strata)
     per_lead: dict[str, Any] = {}
     for lead in wanted:
-        y, usable = outcomes[lead]
+        y, _usable = outcomes[lead]
         base = np.asarray(baseline[lead], dtype=np.float64).reshape(-1)
         post = out_of_fold[lead]
-        gradable = usable & np.isfinite(base) & np.isfinite(post)
+        # :func:`subset_scores` is THE scorer, called once per arm. Each
+        # call is told about the other arm's predictions, so both are
+        # graded on exactly the rows both can grade — and the learning
+        # curve, which calls the same function with the same argument,
+        # lands on the same rows rather than on a wider set of its own.
+        scored = subset_scores(
+            {lead: post}, outcomes, strata_map,
+            also_finite={lead: base}, day=day, detail=True,
+        )[str(lead)]
+        against = subset_scores(
+            {lead: base}, outcomes, strata_map,
+            also_finite={lead: post}, day=day, detail=True,
+        )[str(lead)]
         by_stratum: dict[str, Any] = {}
-        for name, mask in all_strata:
-            keep = gradable & mask
-            if not keep.any():
+        for name in strata_map:
+            got = scored[name]
+            if not got["n"]:
                 by_stratum[name] = None
                 continue
+            keep = got["keep"]
             block = {
-                "n": int(keep.sum()),
-                "days": int(np.unique(day[keep]).size),
-                "baseline": _scores(base[keep], y[keep]),
-                "postprocess": _scores(post[keep], y[keep]),
+                "n": got["n"],
+                "days": got["days"],
+                "baseline": against[name]["scores"],
+                "postprocess": got["scores"],
                 "difference": _paired_difference(
                     day[keep], post[keep], base[keep], y[keep],
                     n_resamples=n_resamples, seed=seed, ci=ci,
@@ -4021,31 +4041,151 @@ def month_labels(month: Iterable[int]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _bss_by_lead(
+def subset_scores(
     predictions: Mapping[int, np.ndarray],
     outcomes: Mapping[int, tuple[np.ndarray, np.ndarray]],
     subsets: Mapping[str, np.ndarray],
-) -> dict[str, Any]:
-    """``{lead: {subset: {"n", "bss"}}}`` over the rows each can grade."""
-    out: dict[str, Any] = {}
+    *,
+    also_finite: Mapping[int, Any] | None = None,
+    day: np.ndarray | None = None,
+    detail: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """THE out-of-fold scorer: ``{lead: {subset: block}}``.
+
+    One function for the main table (:func:`leave_one_month_out`), for
+    :func:`learning_curve` and for :func:`ablation`, so that a BSS in one
+    of those tables and a BSS in another are the same measurement — the
+    same truth, the same usable mask, the same subsets, and the same
+    :func:`~dmi_nowcast_core.benchmark.brier_decomposition` with the same
+    bins and the same climatological reference.
+
+    A row a lead can grade is one whose outcome is usable and whose
+    prediction is finite. ``also_finite`` names the OTHER arm's
+    predictions per lead and narrows that further: the main table is a
+    *paired* comparison and can only score rows both arms answer for, so
+    anything meant to be read beside it has to drop those rows too.
+    Passing the baseline there is what makes "the curve at N = every day"
+    and "the table" one number instead of two numbers about two samples.
+
+    ``day`` adds the distinct scored days per block. ``detail`` adds the
+    full score block and the boolean ``keep`` mask — arrays, so a caller
+    that serialises the result asks for neither.
+    """
+    out: dict[str, dict[str, Any]] = {}
     for lead, values in sorted(predictions.items()):
         y, usable = outcomes[int(lead)]
-        gradable = usable & np.isfinite(values)
+        p = np.asarray(values, dtype=np.float64).reshape(-1)
+        gradable = usable & np.isfinite(p)
+        other = None if also_finite is None else also_finite.get(int(lead))
+        if other is not None:
+            gradable = gradable & np.isfinite(
+                np.asarray(other, dtype=np.float64).reshape(-1)
+            )
         block: dict[str, Any] = {}
         for name, mask in subsets.items():
-            keep = gradable & mask
-            block[name] = (
-                {"n": 0, "bss": float("nan")} if not keep.any()
-                else {
-                    "n": int(keep.sum()),
-                    "bss": float(
-                        brier_decomposition(
-                            values[keep], y[keep], n_bins=N_BINS,
-                        )["bss"]
-                    ),
-                }
+            keep = gradable & np.asarray(mask, dtype=bool).reshape(-1)
+            entry: dict[str, Any] = {"n": int(keep.sum())}
+            if day is not None:
+                entry["days"] = int(
+                    np.unique(np.asarray(day).reshape(-1)[keep]).size
+                )
+            scores = _scores(p[keep], y[keep]) if keep.any() else None
+            entry["bss"] = (
+                float("nan") if scores is None else float(scores["bss"])
             )
+            if detail:
+                entry["scores"] = scores
+                entry["keep"] = keep
+            block[name] = entry
         out[str(lead)] = block
+    return out
+
+
+#: How :func:`learning_curve` chooses the N training days of a subset.
+#:
+#: ``random`` draws them at random, stratified by month. ``date`` takes
+#: the first N calendar days, which is what the curve did until
+#: 2026-09-17 and which confounds "less data" with "winter only": on the
+#: 90-day archive its 30-day point was a December-to-February fit scored
+#: on every month, and the curve read non-monotone for that reason.
+CURVE_ORDER_RANDOM = "random"
+CURVE_ORDER_DATE = "date"
+CURVE_ORDERS: tuple[str, ...] = (CURVE_ORDER_RANDOM, CURVE_ORDER_DATE)
+
+#: Seed for the stratified draw, so that a curve is reproducible and two
+#: runs of the same configuration can be compared row for row.
+DEFAULT_CURVE_SEED = 0
+
+
+def _day_pools(
+    day: np.ndarray, month: np.ndarray, *, seed: int,
+) -> dict[int, np.ndarray]:
+    """``{month key: that month's distinct days, shuffled once}``.
+
+    Shuffled once per call — not per fold and not per budget — which buys
+    two properties the curve needs. A month contributes the same days to
+    every fold that is allowed to use it, so the folds differ in which
+    month is held out and not in which draw they got; and a larger
+    budget's draw CONTAINS a smaller one's, so a step along the curve is
+    more data rather than other data.
+    """
+    rng = np.random.default_rng(int(seed))
+    pools: dict[int, np.ndarray] = {}
+    for key in sorted({int(m) for m in np.unique(month)}):
+        days = np.unique(day[month == key])
+        rng.shuffle(days)
+        pools[int(key)] = days
+    return pools
+
+
+def _drawn_days(
+    pools: Mapping[int, np.ndarray], budget: int,
+) -> dict[int, np.ndarray]:
+    """``budget`` days over ``pools``, each month's share proportional.
+
+    Largest-remainder allotment: a month with a fifth of the available
+    days supplies a fifth of the draw, and the seats left over by the
+    rounding go round-robin to the months with the largest unserved
+    fraction. So the subset's month mix is the full training set's month
+    mix, which is the whole point — the N-day point has to differ from
+    the all-days point in volume and not in season.
+
+    A budget at or above what is available takes everything, which is
+    what makes the curve's last point the main table's fit.
+    """
+    sizes = {int(key): int(values.size) for key, values in pools.items()}
+    keys = sorted(sizes)
+    total = sum(sizes.values())
+    if budget >= total:
+        quota = dict(sizes)
+    else:
+        exact = {key: budget * sizes[key] / total for key in keys}
+        quota = {key: int(math.floor(exact[key])) for key in keys}
+        left = budget - sum(quota.values())
+        order = sorted(keys, key=lambda key: (-(exact[key] - quota[key]), key))
+        index = 0
+        # Terminates: ``sum(quota) + left == budget <= total``, so while
+        # ``left > 0`` at least one month still has a day to give.
+        while left > 0:
+            key = order[index % len(order)]
+            if quota[key] < sizes[key]:
+                quota[key] += 1
+                left -= 1
+            index += 1
+    return {
+        key: np.sort(pools[key][:quota[key]]) for key in keys if quota[key]
+    }
+
+
+def _month_histogram(
+    day: np.ndarray, month: np.ndarray, mask: np.ndarray,
+) -> dict[str, int]:
+    """``{"YYYY-MM": distinct training days}`` for one fold's draw."""
+    out: dict[str, int] = {}
+    for key in sorted({int(m) for m in np.unique(month[mask])}):
+        out[_month_label(key)] = int(
+            np.unique(day[mask & (month == key)]).size
+        )
     return out
 
 
@@ -4061,20 +4201,49 @@ def learning_curve(
     design_leads: Sequence[int] | None = None,
     subsets: Mapping[str, np.ndarray] | None = None,
     stations: Any | None = None,
+    also_finite: Mapping[int, Any] | None = None,
+    order: str = CURVE_ORDER_RANDOM,
+    seed: int = DEFAULT_CURVE_SEED,
     log: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Out-of-fold skill against how many days of archive the fit was given.
 
     For each ``N`` in ``days``: keep the same leave-one-month-out folds,
-    but train on only the **first N calendar days** of each fold's
-    training rows and score the held-out month as usual. One row per N,
-    pooled over the folds.
+    but train each fold on only ``N`` of its training DAYS and score the
+    held-out month as usual. One row per N, pooled over the folds.
 
-    "First N days by date" rather than "a random N-day sample": the
-    question this answers is whether waiting another month of archive
-    would buy anything, and a random sample of a year would answer a
-    different and much easier question.
+    ``order="random"`` (the default) draws those N days **stratified by
+    month**: every training month contributes a share of the draw
+    proportional to the days it has (:func:`_drawn_days`), from one
+    seeded shuffle reused across folds and budgets
+    (:func:`_day_pools`). The N-day point then differs from the all-days
+    point in volume and not in season, which is the question a learning
+    curve is asked.
+
+    ``order="date"`` keeps the older behaviour — the first N calendar
+    days of each fold's training rows. That is a seasonal experiment, not
+    a data-volume one: on a December-to-February-plus archive its 30-day
+    point trains on winter alone and is then scored on every month, and
+    the curve comes back non-monotone for that reason rather than because
+    more archive stopped helping. It is kept because the experiment is
+    worth running on purpose; the report says which order produced it.
+
+    ``also_finite`` is the baseline the main table scored against — pass
+    it, and the curve grades exactly the table's rows, so the last point
+    of the curve IS the table's out-of-fold BSS. See
+    :func:`subset_scores`, which does the scoring for both.
+
+    Each row carries the budget, the draw's ``order`` and ``seed``, the
+    distinct training days and rows actually used, the drawn days' month
+    histogram (pooled over the folds, so a day drawn for three folds is
+    counted three times), a per-fold breakdown, and the BSS per lead and
+    subset.
     """
+    if order not in CURVE_ORDERS:
+        raise ValueError(
+            f"unknown learning-curve order {order!r}; expected one of "
+            + ", ".join(CURVE_ORDERS)
+        )
     n = _rows_in(rows)
     day = np.asarray(day, dtype=np.int64).reshape(-1)
     month = np.asarray(month, dtype=np.int64).reshape(-1)
@@ -4085,29 +4254,80 @@ def learning_curve(
         if dry.any():
             subsets[DRY] = dry
 
+    folds = sorted({int(m) for m in np.unique(month)})
+    pools = _day_pools(day, month, seed=seed)
+
     out: list[dict[str, Any]] = []
     for budget in sorted({int(v) for v in days}):
-        def window(months: np.ndarray, key: int, budget: int = budget) -> np.ndarray:
-            train = months != key
+        masks: dict[int, np.ndarray] = {}
+        drawn: dict[str, dict[str, Any]] = {}
+        for key in folds:
+            train = month != key
             if not train.any():
-                return train
-            start = int(day[train].min())
-            return day <= start + budget - 1
+                masks[key] = train
+                drawn[_month_label(key)] = {"train_days": 0, "months": {}}
+                continue
+            if order == CURVE_ORDER_DATE:
+                start = int(day[train].min())
+                mask = train & (day <= start + budget - 1)
+            else:
+                chosen = _drawn_days(
+                    {k: v for k, v in pools.items() if k != key}, budget,
+                )
+                mask = train & np.isin(
+                    day,
+                    np.concatenate(list(chosen.values())) if chosen
+                    else np.empty(0, dtype=np.int64),
+                )
+            masks[key] = mask
+            histogram = _month_histogram(day, month, mask)
+            drawn[_month_label(key)] = {
+                "train_days": int(sum(histogram.values())),
+                "months": histogram,
+            }
+
+        def window(
+            months: np.ndarray, key: int, masks: dict = masks,
+        ) -> np.ndarray:
+            return masks[int(key)]
 
         if log:
-            log(f"learning curve: {budget} day(s) of training rows")
+            log(
+                f"learning curve: {budget} training day(s), {order} draw"
+                + (f" (seed {int(seed)})" if order == CURVE_ORDER_RANDOM else "")
+            )
         held = out_of_fold_predictions(
             rows, truth, leads, month=month, settings=settings,
             design_leads=design_leads, stations=stations,
             train_mask=window, log=None,
         )
-        trained = sum(
-            int(entry.get("n_train", 0)) for entry in held["folds"]
-        )
+        by_fold = [
+            {
+                "fold": entry["fold"],
+                "train_days": drawn.get(entry["fold"], {}).get("train_days", 0),
+                "train_rows": int(entry.get("n_train", 0)),
+                "months": drawn.get(entry["fold"], {}).get("months", {}),
+            }
+            for entry in held["folds"]
+        ]
+        months_used: dict[str, int] = {}
+        for entry in by_fold:
+            for label, count in entry["months"].items():
+                months_used[label] = months_used.get(label, 0) + count
         out.append({
             "days": budget,
-            "train_rows": trained,
-            "leads": _bss_by_lead(held["out_of_fold"], outcomes, subsets),
+            "order": order,
+            "seed": int(seed),
+            # What the budget actually bought: a fold with fewer days
+            # available than the budget asks for gives what it has.
+            "train_days": max((entry["train_days"] for entry in by_fold), default=0),
+            "train_rows": sum(entry["train_rows"] for entry in by_fold),
+            "months": dict(sorted(months_used.items())),
+            "folds": by_fold,
+            "leads": subset_scores(
+                held["out_of_fold"], outcomes, subsets,
+                also_finite=also_finite,
+            ),
         })
     return out
 
@@ -4123,6 +4343,7 @@ def ablation(
     design_leads: Sequence[int] | None = None,
     subsets: Mapping[str, np.ndarray] | None = None,
     stations: Any | None = None,
+    also_finite: Mapping[int, Any] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """ΔBSS from dropping each feature family, out of fold.
@@ -4135,6 +4356,11 @@ def ablation(
     Dropping the columns rather than zeroing them is the honest version:
     a zeroed column is still standardised, still penalised and still
     occupies a coefficient, and a fit can route round it.
+
+    ``also_finite`` is the main table's baseline, as in
+    :func:`learning_curve`: pass it and ``full`` is the table's
+    out-of-fold BSS on the table's rows, so the deltas hang off a number
+    a reader can find above them.
     """
     n = _rows_in(rows)
     outcomes = {int(lead): _usable_outcome(truth, int(lead), n) for lead in leads}
@@ -4153,7 +4379,9 @@ def ablation(
         name for name in (families or FAMILY_NAMES)
         if name in present or name == "station"
     ]
-    reference = _bss_by_lead(full["out_of_fold"], outcomes, subsets)
+    reference = subset_scores(
+        full["out_of_fold"], outcomes, subsets, also_finite=also_finite,
+    )
 
     dropped: list[dict[str, Any]] = []
     for family in wanted:
@@ -4171,7 +4399,9 @@ def ablation(
             rows, truth, leads, month=month, settings=without,
             design_leads=design_leads, stations=stations, log=None,
         )
-        scores = _bss_by_lead(held["out_of_fold"], outcomes, subsets)
+        scores = subset_scores(
+            held["out_of_fold"], outcomes, subsets, also_finite=also_finite,
+        )
         dropped.append({
             "family": family,
             "columns": int(
