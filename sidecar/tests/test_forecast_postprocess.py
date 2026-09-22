@@ -33,6 +33,7 @@ Synthetic throughout: no radar, no STEPS, no network.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -56,6 +57,7 @@ from dmi_nowcast_sidecar.push.postprocess import (
     PostprocessTable,
     build_cycle_postprocess,
     point_key,
+    score_point,
 )
 
 RADAR_TS = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
@@ -82,6 +84,56 @@ IN_CYCLE: tuple[tuple[float, float], ...] = (
     (LAT0 - 32 * DEG_PER_PX, LON0 + 36 * DEG_PER_PX),   # a subscription
 )
 OFF_CYCLE = (LAT0 - 26 * DEG_PER_PX, LON0 + 28 * DEG_PER_PX)
+
+
+#: Two gauges for the neighbour block (v2, S1): one at the grid's NW
+#: corner, which the fixture's south-easterly flow puts UPSTREAM of every
+#: test point, and one 20 km down-flow. ``(id, lat, lon, wet)``. At 7.5 km/h
+#: the upstream one is ~80-110 minutes away from the points below, inside the
+#: last travel-time bin — so a clicked pixel has a real ``ng_upwet_tau_min``.
+GAUGES: tuple[tuple[str, float, float, bool], ...] = (
+    ("06180", LAT0, LON0, True),
+    ("06120", LAT0 - 0.2, LON0 + 0.2, False),
+)
+
+
+def _gauge_read(config: Config):
+    """One cycle read over a tiny corpus written under the config's own dirs.
+
+    The live cycle hands its :class:`GaugeCycleRead` to both the published
+    rows and the retained context, and this fixture does the same, because
+    "a clicked pixel is scored on the row a served point would have got" is
+    only true while both come off one read.
+    """
+    from dmi_nowcast_core.metobs import Observation
+    from dmi_nowcast_core.station_store import StationObsStore
+    from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+    points_file = Path(config.storage.corpus_dir).parent / "points.json"
+    if not points_file.exists():
+        store = StationObsStore(config.storage.corpus_dir)
+        store.append([
+            Observation(
+                station_id=station,
+                observed_utc=RADAR_TS - timedelta(minutes=10 * k),
+                parameter_id="precip_past10min",
+                value=1.2 if wet else 0.0,
+            )
+            for station, _lat, _lon, wet in GAUGES
+            for k in range(6)
+        ])
+        points_file.parent.mkdir(parents=True, exist_ok=True)
+        points_file.write_text(json.dumps({
+            "version": 2,
+            "points": [
+                {"id": station, "lat": lat, "lon": lon}
+                for station, lat, lon, _wet in GAUGES
+            ],
+        }))
+    return GaugeHistory(
+        config.storage.corpus_dir, points_file,
+        lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+    ).read(GENERATED_AT)
 
 
 class LinearGeo:
@@ -187,13 +239,20 @@ def _table(config: Config, *, fitted: bool = True) -> PostprocessTable:
 
 
 def _cycle_objects(
-    table: PostprocessTable, keys: tuple[tuple[float, float], ...],
+    table: PostprocessTable,
+    keys: tuple[tuple[float, float], ...],
+    config: Config | None = None,
 ):
     """``(CyclePostprocess, PostprocessContext)`` for ``keys``.
 
     Assembled exactly as ``CycleEngine._publish_postprocess`` does, from
     the same helpers — including ``_read_points``, so the raw fractions
     come off the raw grids at the product pixel the endpoint would read.
+
+    With a ``config`` the cycle's gauge read happens too, which is what
+    gives both the published rows and the retained context their ``ng_*``
+    block. Without one there is no corpus and the block is null — the
+    public instance's state, and the pre-S1 behaviour.
     """
     products = _products()
     raw = _raw_grids()
@@ -235,6 +294,20 @@ def _cycle_objects(
         pixel_km=PIXEL_KM, dt_min=DT_MIN,
         bulk_vy=2.0, bulk_vx=1.5, stalled_share=0.011,
     )
+    # v2/S1: the neighbour block, for the cycle's own points, off the same
+    # read the context below keeps for the clicked ones.
+    read = None if config is None else _gauge_read(config)
+    bulk_kmh, bulk_dir_deg = compute_mod.row_bulk_motion(grid_features)
+    if read is not None:
+        grid_features = {
+            **grid_features,
+            **compute_mod.neighbour_features(
+                read, [point_key(lat, lon) for lat, lon in keys],
+                now_utc=GENERATED_AT,
+                bulk_kmh=bulk_kmh, bulk_dir_deg=bulk_dir_deg,
+                lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
+            ),
+        }
     cycle = build_cycle_postprocess(
         table,
         radar_ts_utc=RADAR_TS,
@@ -267,6 +340,12 @@ def _cycle_objects(
         season=pp.season_of_month(GENERATED_AT.month),
         hour_utc=GENERATED_AT.hour,
         frame_age_min=FRAME_AGE_MIN,
+        gauge_table=None if read is None else read.table,
+        gauge_coords={} if read is None else read.coords,
+        gauge_stations={} if read is None else read.stations,
+        bulk_kmh=bulk_kmh,
+        bulk_dir_deg=bulk_dir_deg,
+        gauge_lag_min=pp.DEFAULT_GAUGE_LAG_MIN,
     )
     return cycle, context, products
 
@@ -282,7 +361,7 @@ def _engine(
     engine._geo = LinearGeo()  # type: ignore[assignment]
     table = _table(config, fitted=fitted)
     engine._postprocess = table
-    cycle, context, products = _cycle_objects(table, keys)
+    cycle, context, products = _cycle_objects(table, keys, config)
     engine._national_latest = NationalSnapshot(
         products, RADAR_TS, _observed(), None, GENERATED_AT,
     )
@@ -394,7 +473,7 @@ class TestPointComputedOnDemand:
         """
         table = _table(minimal_config)
         published, _ctx, _products = _cycle_objects(
-            table, IN_CYCLE + (OFF_CYCLE,),
+            table, IN_CYCLE + (OFF_CYCLE,), minimal_config,
         )
         engine = _engine(minimal_config)  # a cycle WITHOUT that point
         lat, lon = OFF_CYCLE
@@ -432,6 +511,131 @@ class TestPointComputedOnDemand:
         assert body["probability_source"] == "curve"
         assert all(value is None for value in _per_lead(body).values())
         assert all(e["p_rain"] is not None for e in body["per_lead"])
+
+
+# ---------------------------------------------------------------------------
+# 2b. The clicked point's neighbour block (v2, S1)
+# ---------------------------------------------------------------------------
+
+
+class TestTheClickedPointsNeighbourBlock:
+    """``ng_*`` is the one gauge family a clicked pixel can really have.
+
+    ``g_*`` is null at any point without a gauge standing on it, which is
+    every point this path serves — so the docstring of ``score_point`` lists
+    it with the blocks that need something the cycle has dropped. The
+    neighbour block is the opposite: it needs no grid, the cycle already
+    holds the slot table, and its whole subject is what the gauges AROUND a
+    place measured. If it were left null here, a visitor clicking their own
+    street would be scored on 21 imputed means while a subscriber at the
+    same address was scored on measurements.
+    """
+
+    def _row(
+        self, config: Config, place: tuple[float, float], *, named: bool = True,
+    ) -> dict:
+        """``score_point``'s feature row for one clicked place.
+
+        ``named`` withholds the coordinates, which is the pre-S1 call: the
+        pixel alone cannot place a point in the gauge network.
+        """
+        lat, lon = place
+        engine = _engine(config)
+        context = engine._postprocess_context
+        assert context is not None
+        idx = LinearGeo().lonlat_to_grid(lon, lat)
+        _scored, features = score_point(
+            engine._postprocess, context,
+            row=idx.row, col=idx.col,
+            raw_fractions={lead: 0.7 for lead in LEADS},
+            shared={"observed_mm_h": 0.2, "eta_min": 25.0,
+                    "intensity_mm_h": 1.8},
+            station_radar_km=float(nearest_radar_km(lat, lon)),
+            **({"lat": lat, "lon": lon} if named else {}),
+        )
+        return features
+
+    def test_a_clicked_point_gets_the_block(
+        self, minimal_config: Config,
+    ) -> None:
+        """A pixel nobody enumerated, and a measured neighbour block on it."""
+        row = self._row(minimal_config, OFF_CYCLE)
+        assert row["ng_frame_ok"] == 1.0
+        assert row["ng_near_km"] is not None
+        # The wet gauge at the grid's NW corner is upstream of this pixel.
+        assert row["ng_upwet_tau_min"] is not None
+        assert 0.0 < float(row["ng_upwet_tau_min"]) <= pp.NG_TAU_EDGES_MIN[-1]
+        assert row["ng_count_20km"] is not None
+        # And the block it cannot have is still the null it always was.
+        assert row["g_known"] is None
+
+    def test_it_is_the_block_the_cycle_would_have_written(
+        self, minimal_config: Config,
+    ) -> None:
+        """Two assemblies, one set of 21 columns.
+
+        ``OFF_CYCLE`` scored by a cycle that happens to carry it, against
+        the same point scored on demand by a cycle that does not.
+        """
+        table = _table(minimal_config)
+        published, _ctx, _products = _cycle_objects(
+            table, IN_CYCLE + (OFF_CYCLE,), minimal_config,
+        )
+        lat, lon = OFF_CYCLE
+        on_demand = self._row(minimal_config, OFF_CYCLE)
+        index = published.index_of(lat, lon)
+        assert index is not None
+        for name, _definition in pp.SCALAR_FEATURE_COLUMNS_NG:
+            assert on_demand[name] == published.rows[index][name], name
+
+    def test_a_gauge_point_still_excludes_its_own_gauge(
+        self, minimal_config: Config,
+    ) -> None:
+        """Clicking a gauge must not read that gauge back as a neighbour."""
+        _station, lat, lon, _wet = GAUGES[0]
+        row = self._row(minimal_config, (lat, lon))
+        # The other gauge is 28 km away, so nothing is within 20 km and the
+        # wet gauge under the cursor reached no column.
+        assert float(row["ng_count_20km"]) == 0.0
+        assert row["ng_near_km"] is not None
+        assert float(row["ng_near_km"]) > pp.NG_VICINITY_KM
+        assert row["ng_upwet_tau_min"] is None
+
+    def test_without_coordinates_the_block_is_null(
+        self, minimal_config: Config,
+    ) -> None:
+        """A caller that passes only a pixel gets what it always got.
+
+        The neighbour block is geometry plus a gauge archive: a row/col on
+        the native grid is not a place until somebody says which projection
+        it belongs to, so the block is null rather than guessed.
+        """
+        row = self._row(minimal_config, OFF_CYCLE, named=False)
+        assert all(
+            row[name] is None for name, _d in pp.SCALAR_FEATURE_COLUMNS_NG
+        )
+
+    def test_a_deployment_with_no_corpus_keeps_it_null(
+        self, minimal_config: Config,
+    ) -> None:
+        """No archive, no block — and no zero pretending to be one."""
+        table = _table(minimal_config)
+        _cycle, context, _products = _cycle_objects(table, IN_CYCLE)
+        assert context.gauge_table is None
+        lat, lon = OFF_CYCLE
+        idx = LinearGeo().lonlat_to_grid(lon, lat)
+        _scored, features = score_point(
+            table, context,
+            row=idx.row, col=idx.col,
+            raw_fractions={lead: 0.7 for lead in LEADS},
+            shared={},
+            station_radar_km=30.0,
+            lat=lat, lon=lon,
+        )
+        assert all(
+            features[name] is None
+            for name, _d in pp.SCALAR_FEATURE_COLUMNS_NG
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,17 @@ Usage::
         --points /var/lib/dmi-nowcast-corpus/stations/station_points.json \\
         --out-suffix _ng --workers 8
 
+Superseded for NEW runs (v2/S1, 2026-09-22)
+-------------------------------------------
+``scripts/replay_warnings.py`` now writes the block itself, in the same
+pass and through the same core call, so a run produced after that date
+already carries it. This script stays for the runs written before —
+re-replaying a month of archive to add columns that are minutes of
+arithmetic would still be the wrong trade. It therefore refuses a source
+run whose ``ng_*`` columns are already filled unless ``--force``: adding
+the block to a run that has it can only mean the two disagree about which
+gauges or which lag, and a silent second opinion is worse than a message.
+
 Offline and read-only apart from its own outputs. Idempotent: it refuses to
 overwrite an existing copy unless ``--force``, and a forced re-run of the
 same inputs produces the same bytes.
@@ -123,6 +134,39 @@ def decision_files(run_dir: Path) -> list[Path]:
     if not found:
         raise BuildError(f"{run_dir}: no decisions/*.parquet")
     return found
+
+
+def filled_neighbour_rows(path: Path) -> int:
+    """How many ``ng_*`` values a decision file ALREADY carries.
+
+    Metadata only — the per-row-group null counts the parquet footer
+    already holds — so the whole refusal below costs one footer read per
+    file rather than a decode. A column with no statistics is counted as
+    filled: "I cannot tell" has to refuse, or the guard is decoration.
+    """
+    import pyarrow.parquet as pq
+
+    metadata = pq.read_metadata(str(path))
+    names = list(metadata.schema.to_arrow_schema().names)
+    wanted = [
+        names.index(name)
+        for name, _definition in pp.SCALAR_FEATURE_COLUMNS_NG
+        if name in names
+    ]
+    if not wanted:
+        return 0
+    filled = 0
+    for group in range(metadata.num_row_groups):
+        row_group = metadata.row_group(group)
+        for index in wanted:
+            column = row_group.column(index)
+            stats = column.statistics
+            nulls = None if stats is None else stats.null_count
+            if nulls is None:
+                filled += row_group.num_rows
+            else:
+                filled += max(int(row_group.num_rows) - int(nulls), 0)
+    return filled
 
 
 def output_dir(run_dir: Path, suffix: str) -> Path:
@@ -305,8 +349,13 @@ def process_file(
     columns, counts = neighbour_columns_for_table(
         table, slots, station_coords, lag_min=lag_min,
     )
+    dropped: list[str] = []
     for name, values in columns.items():
         if name in table.schema.names:
+            # Replaced, not appended beside: two columns of one name is not
+            # a schema a reader can align. Reported rather than silent —
+            # under --force this is exactly the destructive half of the job.
+            dropped.append(name)
             table = table.drop_columns([name])
         table = table.append_column(name, pa.array(values, type=pa.float32()))
     Path(target).parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +363,7 @@ def process_file(
     counts["file"] = Path(path).name
     counts["seconds"] = round(time.time() - started, 2)
     counts["gauges_read"] = len(wanted)
+    counts["columns_replaced"] = len(dropped)
     return counts
 
 
@@ -391,6 +441,19 @@ def plan(
                 f"{target_dir} already holds {len(existing)} decision file(s); "
                 "pass --force to overwrite it"
             )
+        if not force:
+            # A run written by replay_warnings since 2026-09-22 has the
+            # block already. Recomputing it would replace columns with a
+            # second opinion about the same rows, so say so instead.
+            for path in files:
+                filled = filled_neighbour_rows(path)
+                if filled:
+                    raise BuildError(
+                        f"{path} already carries {filled} non-null ng_* "
+                        "value(s) — the replay writes the block itself "
+                        "since 2026-09-22. Pass --force to recompute and "
+                        "replace them."
+                    )
         out.append((
             Path(run_dir), target_dir,
             [(path, target_dir / "decisions" / path.name) for path in files],
@@ -413,7 +476,7 @@ def build(
     totals = {
         "runs": 0, "files": 0, "rows": 0, "instants": 0,
         "rows_without_coordinates": 0, "instants_with_varying_bulk": 0,
-        "rows_frame_ok": 0,
+        "rows_frame_ok": 0, "columns_replaced": 0,
     }
     outputs: list[str] = []
     for run_dir, target_dir, pairs in jobs:
@@ -444,12 +507,18 @@ def build(
             for key in (
                 "rows", "instants", "rows_without_coordinates",
                 "instants_with_varying_bulk", "rows_frame_ok",
+                "columns_replaced",
             ):
                 totals[key] += int(entry.get(key, 0))
         copied = copy_summary(run_dir, target_dir, lag_min)
+        replaced = sum(int(e.get("columns_replaced", 0)) for e in results)
         log(
             f"  {len(results)} file(s), "
             f"{sum(int(e['rows']) for e in results)} row(s)"
+            + (
+                f" — replaced {replaced} pre-existing ng_* column(s)"
+                if replaced else ""
+            )
             + ("" if copied else " — no summary.json to copy")
         )
         totals["runs"] += 1

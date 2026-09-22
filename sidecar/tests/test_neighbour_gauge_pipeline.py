@@ -449,6 +449,209 @@ class TestTheBuilder:
             ), column
 
 
+class TestTheReplayWritesTheSameBlock:
+    """The replay writes ``ng_*`` itself now (v2/S1); this is against whom.
+
+    The builder above is the reference: the shipped model's ``_ng`` training
+    columns came out of it. From 2026-09-22 ``replay_warnings.sample_frame``
+    writes the block in the same pass as the ``g_*`` one, so every new run
+    carries it without the copy — and the two writers have to agree, or the
+    next refit would be trained on columns that mean something slightly
+    different from the ones before it.
+
+    Compared over a whole replayed day: ~72 decision instants x 6 stations,
+    every one of the 21 columns, against the parquet the builder wrote.
+
+    **Exact, except the millimetres.** The two read the same archive over
+    slightly different windows — the replay reuses the day's read (from
+    midnight minus the six-hour cap), the builder cuts its own from the
+    file's first decision instant. Every slot the availability rule lets a
+    row see is in both, so every count, share, distance, travel time and age
+    is identical. The rainfall totals are a float32 sum whose pairwise
+    grouping depends on how many slots the table holds, so they agree to
+    float32 rounding and not to the bit — ~2e-7 relative on a 3.6 mm total,
+    against columns the model reads in tenths of a millimetre.
+    """
+
+    #: The columns that are a SUM over slots, and therefore the only ones
+    #: whose last bit may depend on the window the slots were read over.
+    SUMMED = tuple(
+        name for name, _d in pp.SCALAR_FEATURE_COLUMNS_NG if "_mm" in name
+    )
+
+    DAY = _days()[3]
+    LAG = pp.DEFAULT_GAUGE_LAG_MIN
+
+    def _built_rows(self, built: Path) -> list[dict]:
+        import pyarrow.parquet as pq
+
+        name = f"{self.DAY[0]:04d}-{self.DAY[1]:02d}-{self.DAY[2]:02d}.parquet"
+        return pq.read_table(built / "decisions" / name).to_pylist()
+
+    def test_every_row_of_a_whole_day_matches_the_builder(
+        self, corpus: Path, built: Path,
+    ) -> None:
+        from datetime import date
+
+        from dmi_nowcast_core.station_store import StationObsStore
+
+        coords = _coords()
+        points = [
+            rw.StationPoint(id=sid, lat=lat, lon=lon, region=None)
+            for sid, (lat, lon) in coords.items()
+        ]
+        order = {point.id: index for index, point in enumerate(points)}
+        # The replay's own read — the day's slots, from the day worker —
+        # rather than the builder's per-file window.
+        slots = rw.day_feature_slots(
+            StationObsStore(corpus / "corpus"),
+            date(*self.DAY),
+            list(coords),
+            lag_min=self.LAG,
+        )
+        names = [name for name, _d in pp.SCALAR_FEATURE_COLUMNS_NG]
+        by_instant: dict[object, list[dict]] = {}
+        for row in self._built_rows(built):
+            by_instant.setdefault(row["generated_at"], []).append(row)
+        assert len(by_instant) > 50            # a whole day, not one frame
+        checked = 0
+        filled = 0
+        for stamp, group in by_instant.items():
+            block = rw.neighbour_gauge_columns(
+                points, slots,
+                bulk_kmh=BAND_KMH, bulk_dir_deg=BAND_DIR_DEG,
+                now_utc=stamp, lag_min=self.LAG,
+            )
+            for row in group:
+                index = order[row["station_id"]]
+                for name in names:
+                    mine = float(block[name][index])
+                    theirs = row[name]
+                    # The builder writes NaN where nothing is computable and
+                    # the replay writes a parquet null for the same case, so
+                    # both absences read as "not a number" here.
+                    if theirs is None or not np.isfinite(theirs):
+                        assert not np.isfinite(mine), (name, stamp, index)
+                        continue
+                    if name in self.SUMMED:
+                        assert mine == pytest.approx(theirs, rel=1e-6), (
+                            name, stamp, index,
+                        )
+                    else:
+                        assert mine == theirs, (name, stamp, index)
+                    filled += 1
+                checked += 1
+        assert checked == len(self._built_rows(built))
+        # Parity on nulls is not parity: most of these are measurements.
+        assert filled > 5 * checked
+
+    def test_a_replayed_cycle_writes_the_block_into_its_own_row(
+        self, corpus: Path,
+    ) -> None:
+        """The writer, not just the producer: through ``feature_row``.
+
+        ``sample_frame`` is the only place the block is merged into the
+        grid-feature dict a replay row is assembled from; this pins that the
+        merge reaches the row under the schema's names, without running a
+        radar cycle.
+        """
+        coords = _coords()
+        points = [
+            rw.StationPoint(id=sid, lat=lat, lon=lon, region=None)
+            for sid, (lat, lon) in coords.items()
+        ]
+        stamp = _at(self.DAY, _onset_min(self.DAY, STATIONS[-1]))
+        slots = {sid: _gauge_slots(self.DAY, sid) for sid in coords}
+        grid_features = {
+            "bulk_kmh": np.full(len(points), BAND_KMH, dtype=np.float32),
+            "bulk_dir_deg": np.full(
+                len(points), BAND_DIR_DEG, dtype=np.float32,
+            ),
+        }
+        grid_features.update(rw.neighbour_gauge_columns(
+            points, slots,
+            bulk_kmh=float(np.float32(grid_features["bulk_kmh"][0])),
+            bulk_dir_deg=float(np.float32(grid_features["bulk_dir_deg"][0])),
+            now_utc=stamp, lag_min=self.LAG,
+        ))
+        row = rw._feature_row(
+            grid_features, 0, points[0],
+            raw_p_rain={}, pixel=None, leads_min=LEADS,
+            season=pp.season_of_month(self.DAY[1]),
+            hour_utc=stamp.hour, frame_age_min=0.0,
+        )
+        assert {name for name, _d in pp.SCALAR_FEATURE_COLUMNS_NG} <= set(row)
+        assert row["ng_frame_ok"] == 1.0
+        assert row["ng_near_km"] == pytest.approx(5.0, abs=0.05)
+        # The westernmost station has nothing upstream of it, so the one
+        # column that answers "when" is null there and the geometry is not.
+        assert row["ng_upwet_tau_min"] is None
+
+    def test_the_settings_block_is_the_builders(self) -> None:
+        """One shape for ``run.features.neighbour``, whoever wrote the run."""
+        mine = rw.neighbour_settings_block(rw.FrameSettings())
+        theirs = ngb.neighbour_settings_block(pp.DEFAULT_GAUGE_LAG_MIN)
+        assert set(mine) == set(theirs)
+        assert {k: v for k, v in mine.items() if k != "gauge_lag_min"} == {
+            k: v for k, v in theirs.items() if k != "gauge_lag_min"
+        }
+
+
+class TestTheBuilderDefersToTheReplay:
+    """It must not quietly recompute a block the run already carries.
+
+    The builder exists for the runs written before the replay wrote the
+    block itself. Pointed at one that has it, a silent second opinion about
+    the same rows — under possibly another lag or another catalogue — is
+    worse than a message.
+    """
+
+    def test_it_refuses_a_run_that_already_carries_the_block(
+        self, corpus: Path, built: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        assert ngb.main([
+            "--run", str(built),
+            "--corpus-dir", str(corpus / "corpus"),
+            "--points", str(corpus / "points.json"),
+            "--out-suffix", "_twice",
+        ]) == 2
+        assert "already carries" in capsys.readouterr().err
+        assert not (corpus / "replay_ng_twice").exists()
+
+    def test_force_recomputes_it_and_says_what_it_replaced(
+        self, corpus: Path, built: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        import shutil
+
+        import pyarrow.parquet as pq
+
+        source = sorted((built / "decisions").glob("*.parquet"))[0]
+        run = tmp_path / "one_day"
+        (run / "decisions").mkdir(parents=True)
+        shutil.copy(source, run / "decisions" / source.name)
+        shutil.copy(built / "summary.json", run / "summary.json")
+        assert ngb.main([
+            "--run", str(run),
+            "--corpus-dir", str(corpus / "corpus"),
+            "--points", str(corpus / "points.json"),
+            "--out-suffix", "_again", "--force",
+        ]) == 0
+        err = capsys.readouterr().err
+        assert "replaced 21 pre-existing ng_* column(s)" in err
+        again = tmp_path / "one_day_again" / "decisions" / source.name
+        before = pq.read_table(source)
+        after = pq.read_table(again)
+        for column, _definition in pp.SCALAR_FEATURE_COLUMNS_NG:
+            assert np.array_equal(
+                before.column(column).to_numpy(zero_copy_only=False),
+                after.column(column).to_numpy(zero_copy_only=False),
+                equal_nan=True,
+            ), column
+        # One column per name, not two: the drop is a replacement.
+        assert len(after.schema.names) == len(before.schema.names)
+
+
 # ---------------------------------------------------------------------------
 # The protocol
 # ---------------------------------------------------------------------------

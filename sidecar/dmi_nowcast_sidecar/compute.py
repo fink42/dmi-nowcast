@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import structlog
@@ -69,7 +69,7 @@ from dmi_nowcast_core.transform import dbz_to_rain_rate
 
 from .config import Config
 from .eta_smoother import EtaSmoother
-from .gauge_history import build_gauge_history
+from .gauge_history import GaugeCycleRead, build_gauge_history
 from .lightning_tracker import LightningTracker
 from .national_artifacts import write_national_artifacts
 from .national_sample import finite_or_none, product_pixel_of
@@ -292,6 +292,102 @@ class CycleResult:
     state: State | None
     error: str | None = None
     diagnostics: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# The neighbour-gauge feature block, live (v2, S1)
+# ---------------------------------------------------------------------------
+
+
+def row_bulk_motion(
+    grid_features: Mapping[str, np.ndarray],
+) -> tuple[float, float]:
+    """``(bulk_kmh, bulk_dir_deg)`` AS THE STORED ROW CARRIES THEM.
+
+    Not a second derivation from ``bulk_vy`` / ``bulk_vx``: the two numbers
+    are taken out of the very arrays
+    :func:`~dmi_nowcast_core.postprocess.station_features` produced, which
+    are the arrays ``feature_row`` writes into the parquet. They are
+    ``float32`` there and the decision schema stores them as ``float32``
+    (``postprocess.feature_schema`` types every numeric feature column that
+    way), so reading element zero of a float32 array reproduces exactly the
+    number the offline builder read back out of a training file — the frame
+    the ``ng_*`` columns were trained in is bit-for-bit the frame they are
+    served in.
+
+    Constant across points by construction (``np.full(n, ...)``), so
+    element zero is the cycle's value; NaN when the cycle had no point.
+    """
+    def first(name: str) -> float:
+        values = grid_features.get(name)
+        if values is None or len(values) == 0:
+            return float("nan")
+        return float(np.float32(values[0]))
+
+    return first("bulk_kmh"), first("bulk_dir_deg")
+
+
+def neighbour_features(
+    read: GaugeCycleRead,
+    keys: Sequence[tuple[float, float]],
+    *,
+    now_utc: datetime,
+    bulk_kmh: float,
+    bulk_dir_deg: float,
+    lag_min: float,
+) -> dict[str, np.ndarray]:
+    """The cycle's ``ng_*`` block: one core call for the whole point list.
+
+    The same producer, the same arguments and the same leave-self-out rule
+    the offline builder uses
+    (``scripts/add_neighbour_gauge_features.py``) — a point's own gauge is
+    excluded by id where the catalogue names one for it, and by the
+    :data:`~dmi_nowcast_core.postprocess.NG_SELF_KM` radius where it does
+    not. ``points`` are the served coordinates themselves, so a
+    subscriber's address is placed in the motion frame exactly as a
+    training row's station was.
+    """
+    return core_postprocess.neighbour_gauge_features(
+        [(float(lat), float(lon)) for lat, lon in keys],
+        read.table,
+        read.coords,
+        now_utc=now_utc,
+        bulk_kmh=bulk_kmh,
+        bulk_dir_deg=bulk_dir_deg,
+        lag_min=float(lag_min),
+        exclude_self=read.station_ids(keys),
+    )
+
+
+def neighbour_counts(
+    grid_features: Mapping[str, np.ndarray],
+) -> dict[str, int]:
+    """Per-cycle non-null counts for the three columns that carry the block.
+
+    The standing rule for an additive feature family: every cycle says out
+    loud how many of its points actually got a number, because a block that
+    silently stopped being computed looks exactly like a block that is
+    legitimately null. Three columns answer three different questions —
+    ``ng_frame_ok`` whether there was a motion frame to place neighbours
+    in, ``ng_near_km`` whether there was a neighbour at all (pure
+    geometry, so it should be ~every point), ``ng_upwet_tau_min`` whether
+    one of them is upstream AND wet (weather, so it should be few).
+    """
+    def finite(name: str) -> int:
+        values = grid_features.get(name)
+        if values is None:
+            return 0
+        return int(np.isfinite(np.asarray(values, dtype=np.float64)).sum())
+
+    flag = grid_features.get("ng_frame_ok")
+    return {
+        "ng_frame_ok": (
+            0 if flag is None
+            else int((np.asarray(flag, dtype=np.float64) > 0.5).sum())
+        ),
+        "ng_near_km": finite("ng_near_km"),
+        "ng_upwet_tau_min": finite("ng_upwet_tau_min"),
+    }
 
 
 class CycleEngine:
@@ -595,6 +691,9 @@ class CycleEngine:
                 raw_fractions=raw,
                 shared=shared,
                 station_radar_km=nearest_radar_km(float(lat), float(lon)),
+                # The neighbour block is geometry plus the gauge archive,
+                # so it wants the place and not the pixel.
+                lat=float(lat), lon=float(lon),
             )
         except Exception as exc:  # noqa: BLE001 — a scoring failure costs the
             # post-processed number for one request, never the response:
@@ -1828,6 +1927,15 @@ class CycleEngine:
         row: the decision schema already carries them, and one column has
         one writer.
 
+        The two gauge blocks come out of ONE store read (v2/S1): ``g_*``
+        from the per-point series, ``ng_*`` from the whole-catalogue slot
+        table the same read digested. Both are best-effort and say so in
+        their own indicator column — ``g_known`` = 0 for a point with no
+        gauge, ``ng_frame_ok`` = 0 for a cycle with no usable motion frame
+        — and a read that failed leaves the neighbour block null rather
+        than zero, because a zero there would be a claim about the gauge
+        network.
+
         The grids and flow are published alongside as a
         :class:`~dmi_nowcast_sidecar.push.postprocess.PostprocessContext`,
         and ONLY while a model is loaded: they are ~45 MB held for the
@@ -1851,13 +1959,24 @@ class CycleEngine:
             # measurement backs this row" must never itself be missing, or
             # the design imputes a training mean for it.
             gauge = self._gauge_history
+            gauge_lag_min = (
+                core_postprocess.DEFAULT_GAUGE_LAG_MIN
+                if gauge is None else float(gauge.lag_min)
+            )
             slots: list[Any] = [None] * len(keys)
+            # ONE read for both gauge blocks: the per-point series below
+            # and the whole-catalogue slot table the neighbour block needs.
+            # None here means "no archive, or a read that failed", and both
+            # blocks then say so in the way their own indicator column can.
+            read: GaugeCycleRead | None = None
             if gauge is not None:
                 try:
-                    slots = gauge.slots_for(keys, now_utc=generated_at_utc)
+                    read = gauge.read(generated_at_utc)
+                    slots = read.series_for(keys)
                 except Exception as exc:  # noqa: BLE001 — the gauge archive
                     # is a second store on a second volume; a bad read
                     # costs the g_* columns, never the cycle's features.
+                    read = None
                     _log.warning(
                         "postprocess_gauge_features_failed", error=str(exc),
                     )
@@ -1865,12 +1984,33 @@ class CycleEngine:
                 core_postprocess.station_gauge_features(
                     slots,
                     now_utc=generated_at_utc,
-                    lag_min=(
-                        core_postprocess.DEFAULT_GAUGE_LAG_MIN
-                        if gauge is None else gauge.lag_min
-                    ),
+                    lag_min=gauge_lag_min,
                 ),
             )
+            # v2/S1: what the gauges AROUND each point measured, in the
+            # cycle's own motion frame. Unlike ``g_*`` this block has a real
+            # answer at a point with no gauge on it, which is every
+            # subscriber's address — and unlike ``g_*`` it needs the whole
+            # catalogue, which is why the read above is not restricted to
+            # the cycle's own points. Computed only from a read that
+            # happened: a null block is the honest reading of "no archive",
+            # where a zero would read as "no rain upstream".
+            bulk_kmh, bulk_dir_deg = row_bulk_motion(grid_features)
+            if read is not None:
+                try:
+                    grid_features.update(neighbour_features(
+                        read, keys,
+                        now_utc=generated_at_utc,
+                        bulk_kmh=bulk_kmh,
+                        bulk_dir_deg=bulk_dir_deg,
+                        lag_min=gauge_lag_min,
+                    ))
+                except Exception as exc:  # noqa: BLE001 — as above: the
+                    # block, never the cycle. The columns stay NaN.
+                    _log.warning(
+                        "postprocess_neighbour_features_failed",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
             shared: list[dict[str, Any]] = []
             for pixel in points.pixels:
                 if pixel is None:
@@ -1928,6 +2068,17 @@ class CycleEngine:
                     ),
                     hour_utc=generated_at_utc.hour,
                     frame_age_min=float(frame_age_min),
+                    # The gauge read, by reference, so a clicked pixel gets
+                    # the same ``ng_*`` block a served point got — off the
+                    # same slot table, the same catalogue and the same bulk
+                    # motion. Nothing here is a grid, so it adds kilobytes
+                    # to a context that already holds ~45 MB.
+                    gauge_table=None if read is None else read.table,
+                    gauge_coords={} if read is None else read.coords,
+                    gauge_stations={} if read is None else read.stations,
+                    bulk_kmh=bulk_kmh,
+                    bulk_dir_deg=bulk_dir_deg,
+                    gauge_lag_min=gauge_lag_min,
                 )
                 if self._postprocess.active and points.raw_grids
                 else None
@@ -1939,6 +2090,11 @@ class CycleEngine:
                 leads=list(self._postprocess_latest.leads),
                 fitted_at=self._postprocess_latest.fitted_at_utc,
                 on_demand=self._postprocess_context is not None,
+                # How many points the neighbour block actually answered
+                # for, per cycle. A family that quietly stopped being
+                # computed is indistinguishable from one that is honestly
+                # null unless somebody counts.
+                **neighbour_counts(grid_features),
             )
         except Exception as exc:  # noqa: BLE001 — see the docstring
             _log.warning("postprocess_cycle_failed", error=str(exc))

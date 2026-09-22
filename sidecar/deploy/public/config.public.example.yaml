@@ -198,7 +198,7 @@ quality_report:
   enabled: false
 
 sync:
-  # Pull the two files this instance serves but cannot produce, from the
+  # Pull the files this instance serves but cannot produce, from the
   # private instance over the shared docker network (website Phase F, F4).
   #
   #   nowcast/quality.json            → /var/lib/dmi-nowcast/nowcast/
@@ -210,6 +210,12 @@ sync:
   #                                     (what makes the notifications warn
   #                                      at the measured threshold for
   #                                      each horizon, Phase G)
+  #   calibration/postprocess.json    → push.postprocess_path
+  #                                     (the gauge-trained model this
+  #                                      instance's push engine decides
+  #                                      with, Phase H — it runs its own
+  #                                      fan-out but has no gauge store,
+  #                                      so it can only ever receive this)
   #
   # LAST GOOD WINS. A refused connection, a 500, or a body that is not the
   # JSON it claims to be leaves the file already on disk untouched: this
@@ -218,7 +224,13 @@ sync:
   #
   # New curves are re-read at the start of the next radar cycle, and a new
   # threshold table at the start of the next fan-out — no restart, unlike
-  # the manual copy this replaces.
+  # the manual copy this replaces. So is a new post-processing model
+  # (sync.py nudges the engine's PostprocessTable.note_changed, and the
+  # swap happens at the start of a cycle rather than in the middle of one).
+  #
+  # The model is the largest of the four by three orders of magnitude — a
+  # tree document is ~7 MB against a few kilobytes for the tables — and
+  # still an order under the 16 MB max_bytes ceiling a body is refused at.
   enabled: true
   # Requires the two stacks to share a docker network: deploy with
   # PUBLIC_SHARED_NETWORK=<network> (see docker-compose.shared-net.yml)
@@ -230,6 +242,14 @@ sync:
     - nowcast/quality.json
     - calibration/national_curves.json
     - calibration/push_thresholds.json
+    # The gauge-trained post-processing model (Phase H, H-P). Without it
+    # this instance's notifications fall back to the curve-calibrated
+    # probability while it warns at thresholds that were fitted on the
+    # post-processed one — a working service at the wrong percent on every
+    # horizon. It also covers a model fitted on the workstation and
+    # installed on the private stack (sidecar/deploy/install_artifact.sh):
+    # this list is how it reaches the public instance.
+    - calibration/postprocess.json
   timeout_s: 30.0
   # Bearer for the source, when the private instance has server.api_key
   # set. Null on a trusted network, which is the normal case here.

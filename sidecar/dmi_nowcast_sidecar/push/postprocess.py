@@ -43,7 +43,7 @@ model fitted on replay rows is applied to live rows of identical shape.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -92,6 +92,68 @@ def _file_stamp(path: Path) -> tuple[int, int] | None:
     except OSError:
         return None
     return (stat.st_mtime_ns, stat.st_size)
+
+
+def _lead_width(lead_model: Any) -> int | None:
+    """How many design columns this lead expects, or None when it cannot say.
+
+    A tree ensemble records the width it was fitted on (``n_features``),
+    except that a document written before that field existed stores 0,
+    which means "unknown" and not "zero columns". A logistic's width is
+    the length of its coefficient vector — and a hand-built tree document
+    carries an empty one, which is why the ensemble is asked first.
+    """
+    trees = getattr(lead_model, "trees", None)
+    if trees is not None:
+        width = int(getattr(trees, "n_features", 0) or 0)
+        return width or None
+    coefficients = getattr(lead_model, "coefficients", ())
+    return len(coefficients) or None
+
+
+def _structural_problem(model: PostprocessModel) -> str | None:
+    """Why this document cannot be served, or None when it can be.
+
+    The check that matters is WIDTH: the design is built from
+    ``features.names``, and a lead model fitted on a different number of
+    columns cannot consume it. Until now that mismatch surfaced as an
+    exception inside every single predict, caught and turned into a
+    curve-calibrated answer plus one warning line per cycle — a service
+    that had silently stopped using its model and said so only in a place
+    that looks like ordinary noise. Catching it once, at load, turns a
+    permanent silent degradation into a single loud one.
+
+    The protocol is checked too, and for the same reason: a value this
+    build does not recognise would be served as if it were ``at-gauge``,
+    which for a future masked protocol means serving a model rows it was
+    never fitted on. Refusing is the safe direction.
+    """
+    width = len(model.feature_names)
+    if width == 0:
+        return "the document names no design column"
+    if str(model.protocol) not in core_postprocess.PROTOCOLS:
+        return (
+            f"protocol {model.protocol!r} is not one this build knows "
+            f"({', '.join(core_postprocess.PROTOCOLS)})"
+        )
+    if not model.is_trees:
+        for half, values in (
+            ("mean", model.standardiser.mean),
+            ("scale", model.standardiser.scale),
+        ):
+            if len(values) != width:
+                return (
+                    f"the standardiser's {half} has {len(values)} column(s) "
+                    f"but the design names {width}"
+                )
+    for lead in sorted(model.models):
+        expected = _lead_width(model.models[lead])
+        if expected is not None and expected != width:
+            return (
+                f"lead {int(lead)} was fitted on {expected} column(s) but "
+                f"the design names {width}"
+            )
+    return None
 
 
 class PostprocessTable:
@@ -188,6 +250,25 @@ class PostprocessTable:
                 error="the document carries no fitted lead",
             )
             return None
+        reason = _structural_problem(model)
+        if reason is not None:
+            # ONE line, here, once — not one per cycle from inside
+            # ``predict_table``. A document whose design does not fit its
+            # own models is a permanent fallback to the curve, and a
+            # permanent fallback that only announces itself in the noise
+            # of every five minutes is a fallback nobody notices.
+            _log.error(
+                "push_postprocess_model_invalid",
+                path=str(self.path),
+                reason=reason,
+                kind=model.kind,
+                design=model.spec.version,
+                protocol=model.protocol,
+                columns=len(model.feature_names),
+                fitted_at=model.fitted_at_utc or None,
+                note="falling back to the curve-calibrated probability",
+            )
+            return None
         self._model = model
         _log.info(
             "push_postprocess_loaded",
@@ -201,6 +282,13 @@ class PostprocessTable:
             # away rather than a file to go and read on the VM.
             kind=model.kind,
             design=model.spec.version,
+            # And under which protocol it was fitted — which is not
+            # provenance here: ``random-point`` means the model masks the
+            # point's own gauge away before it scores anything, so the two
+            # values answer different questions about the same numbers and
+            # the log has to say which one is being served.
+            protocol=model.protocol,
+            masks_own_gauge=model.masks_own_gauge,
             columns=len(model.feature_names),
         )
         return model
@@ -537,6 +625,65 @@ class PostprocessContext:
     season: str
     hour_utc: int
     frame_age_min: float
+    # -- the neighbour-gauge block (v2, S1) --------------------------------
+    #
+    # ``g_*`` stays null on this path — a clicked pixel has no gauge on it,
+    # which is what ``g_known = 0`` says — but ``ng_*`` is exactly the
+    # block that DOES have an answer for a point with no gauge: what the
+    # gauges around it measured. It needs no grid, so unlike the three
+    # blocks the docstring below lists as unavailable it costs the cycle
+    # nothing to keep: the slot table is the one the cycle already digested
+    # for its own points (~110 stations x ~40 slots of float32) and the
+    # coordinates are the catalogue dict, both held by reference.
+    #: The cycle's gauge read, digested
+    #: (:class:`~dmi_nowcast_core.postprocess.GaugeSlotTable`), or None on a
+    #: deployment with no gauge archive — in which case the block stays
+    #: null, exactly as it does for the cycle's own points.
+    gauge_table: Any = None
+    #: ``{station_id: (lat, lon)}`` — the catalogue behind that table.
+    gauge_coords: Mapping[str, tuple[float, float]] = field(
+        default_factory=dict,
+    )
+    #: ``{rounded (lat, lon): station_id}``: how a clicked point that IS a
+    #: gauge excludes its own measurement from its own neighbour features.
+    gauge_stations: Mapping[tuple[float, float], str] = field(
+        default_factory=dict,
+    )
+    #: The bulk motion AS THE ROW STORES IT — the ``bulk_kmh`` /
+    #: ``bulk_dir_deg`` feature columns, float32-rounded, not a second
+    #: derivation from ``bulk_vy`` / ``bulk_vx``. The neighbour block is
+    #: placed in this frame and a training row was placed in the frame its
+    #: own parquet carries.
+    bulk_kmh: float = float("nan")
+    bulk_dir_deg: float = float("nan")
+    #: The gauge availability lag the block was computed under, minutes.
+    gauge_lag_min: float = core_postprocess.DEFAULT_GAUGE_LAG_MIN
+
+
+def neighbour_features_for(
+    context: PostprocessContext, lat: float, lon: float,
+) -> dict[str, np.ndarray]:
+    """The ``ng_*`` block for ONE point, off the cycle's retained gauge read.
+
+    The same producer and the same four inputs the cycle gives it for its
+    whole point list — the digested slot table, the catalogue coordinates,
+    the row's own bulk motion and the availability lag — with a list of
+    one. ``{}`` when the cycle kept no gauge read, which leaves every
+    ``ng_*`` column null rather than a zero that would read as "no rain
+    upstream".
+    """
+    if context.gauge_table is None:
+        return {}
+    return core_postprocess.neighbour_gauge_features(
+        [(float(lat), float(lon))],
+        context.gauge_table,
+        context.gauge_coords,
+        now_utc=context.generated_at_utc,
+        bulk_kmh=context.bulk_kmh,
+        bulk_dir_deg=context.bulk_dir_deg,
+        lag_min=float(context.gauge_lag_min),
+        exclude_self=[context.gauge_stations.get(point_key(lat, lon))],
+    )
 
 
 def score_point(
@@ -548,6 +695,8 @@ def score_point(
     raw_fractions: Mapping[int, float | None],
     shared: Mapping[str, Any],
     station_radar_km: float,
+    lat: float | None = None,
+    lon: float | None = None,
 ) -> tuple[dict[int, float | None], dict[str, Any]]:
     """One point's ``({lead: p_post}, feature_row)``, computed on demand.
 
@@ -583,6 +732,14 @@ def score_point(
     imputes the training mean, so a clicked pixel gets a slightly blunter
     number than a subscribed one — the alternative is holding a sixth of
     the VM's memory against a question most cycles are never asked.
+
+    **The neighbour block IS here** (v2, S1), given ``lat`` / ``lon``: it
+    is the one gauge-derived family that has a real answer at a place with
+    no gauge, it needs no grid, and the context already carries the cycle's
+    own gauge read. Without the coordinates — or on a deployment with no
+    gauge archive — it stays null like the three blocks above. A failure
+    inside it costs the block and not the answer: ``/forecast`` would
+    otherwise fall back to the curve over a gauge archive hiccup.
     """
     leads = [int(lead) for lead in context.leads]
     grid_features = core_postprocess.station_features(
@@ -595,6 +752,16 @@ def score_point(
         bulk_vx=context.bulk_vx,
         stalled_share=context.stalled_share,
     )
+    if lat is not None and lon is not None:
+        try:
+            grid_features.update(
+                neighbour_features_for(context, float(lat), float(lon)),
+            )
+        except Exception as exc:  # noqa: BLE001 — the block, never the row
+            _log.warning(
+                "postprocess_neighbour_features_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
     features = core_postprocess.feature_row(
         grid_features, 0,
         raw_fractions={lead: raw_fractions.get(lead) for lead in leads},
@@ -644,6 +811,7 @@ __all__ = [
     "PostprocessTable",
     "ProbabilitySource",
     "build_cycle_postprocess",
+    "neighbour_features_for",
     "point_key",
     "score_point",
 ]

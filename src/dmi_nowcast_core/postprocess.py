@@ -3985,6 +3985,14 @@ class PostprocessModel:
     #: One ensemble answering for every lead (``--model trees-shared``),
     #: stored once. Per-lead ensembles live on their :class:`LeadModel`.
     shared_trees: Any | None = None
+    #: Which validation protocol fitted this document —
+    #: :data:`PROTOCOL_AT_GAUGE` or :data:`PROTOCOL_RANDOM_POINT`. Not
+    #: provenance: under ``random-point`` the fit never saw the point's
+    #: own gauge, so serving has to take it away too. See
+    #: :meth:`masked_features`. Additive with the historical default, so
+    #: a document written before this field existed loads as the at-gauge
+    #: model it is.
+    protocol: str = PROTOCOL_AT_GAUGE
 
     # -- prediction ---------------------------------------------------------
 
@@ -3997,6 +4005,44 @@ class PostprocessModel:
         """One fit over every lead, with the lead in the design."""
         return bool(self.spec.lead_column) or is_shared_kind(self.kind)
 
+    @property
+    def masks_own_gauge(self) -> bool:
+        """Does serving this model hide the point's own gauge from it?
+
+        True exactly for :data:`PROTOCOL_RANDOM_POINT`. An unrecognised
+        protocol string reads as False — the at-gauge behaviour, which is
+        what every document written before the field existed meant.
+        """
+        return str(self.protocol) == PROTOCOL_RANDOM_POINT
+
+    def masked_features(self, features: Mapping[str, Any]) -> Mapping[str, Any]:
+        """``features`` as this model is entitled to see them.
+
+        Under ``random-point`` that is :func:`mask_own_gauge` — the very
+        transform ``scripts/fit_postprocess.py`` applied to the training
+        table — and under ``at-gauge`` it is ``features`` itself, the same
+        object, so nothing about an at-gauge document changes.
+
+        Serving a random-point model on unmasked rows would be the exact
+        train/serve skew the protocol exists to remove: at a gauge it
+        would hand the model a live ``g_min_since_wet`` that every row it
+        was fitted on said was unknown, and the number it returned there
+        would stop being the number a subscriber's address gets.
+
+        For the artefacts fitted so far this is a guard rather than a
+        correction, and deliberately so: masking the whole table before
+        the fit leaves the own-gauge columns constant, so a logistic gives
+        them a coefficient of exactly zero and the shipped tree ensembles
+        never split on them (94-96 of 104 columns used, none of the six).
+        The property that matters is that a random-point document is blind
+        to the own gauge by construction, not by the luck of how this fit
+        happened to go — a fold-local mask, or a protocol that masks after
+        some feature is derived, would leave weights that CAN read it.
+        """
+        if not self.masks_own_gauge:
+            return features
+        return mask_own_gauge(features)
+
     def design(self, features: Mapping[str, Any]) -> np.ndarray:
         """The design matrix for stored feature columns.
 
@@ -4005,8 +4051,15 @@ class PostprocessModel:
         learns its own direction for a missing value — imputing first
         would throw that away and tell it a mean where the cycle knew
         nothing.
+
+        The own-gauge mask is applied HERE, before the columns become a
+        matrix, so every path that scores through this model — the cycle's
+        table, the single row, the on-demand lookup — is masked by
+        construction and none of them has to remember to be.
         """
-        design = build_design(features, self.design_leads, self.spec)
+        design = build_design(
+            self.masked_features(features), self.design_leads, self.spec,
+        )
         if self.is_trees:
             return design
         return self.standardiser.transform(design)
@@ -4092,6 +4145,11 @@ class PostprocessModel:
             "leads": list(self.leads),
             "l2": self.l2,
             "kind": self.kind,
+            # Top level, beside ``kind``, and not only inside the
+            # free-form ``training`` block: the serving path branches on
+            # it, so it is part of the contract the document states, not
+            # a note about how the document came to be.
+            "protocol": self.protocol,
             "design": self.spec.to_json(),
             "features": {
                 "design_leads": list(self.design_leads),
@@ -4138,6 +4196,16 @@ class PostprocessModel:
             int(lead): LeadModel.from_json(int(lead), entry, trees=shared_trees)
             for lead, entry in raw["models"].items()
         }
+        training = dict(raw.get("training") or {})
+        # Top-level key first; then the provenance block, which is where
+        # the protocol lived before the key existed and is therefore the
+        # only place the already-fitted random-point artefacts say it;
+        # then the historical default.
+        protocol = str(
+            raw.get("protocol")
+            or training.get("protocol")
+            or PROTOCOL_AT_GAUGE
+        )
         return cls(
             leads=tuple(int(v) for v in raw["leads"]),
             design_leads=tuple(int(v) for v in features["design_leads"]),
@@ -4149,10 +4217,11 @@ class PostprocessModel:
             models=models,
             l2=float(raw.get("l2", 1.0)),
             fitted_at_utc=str(raw.get("fitted_at_utc", "")),
-            training=dict(raw.get("training") or {}),
+            training=training,
             kind=str(raw.get("kind", KIND_LOGISTIC)),
             spec=DesignSpec.from_json(raw.get("design")),
             shared_trees=shared_trees,
+            protocol=protocol,
         )
 
     @classmethod
@@ -4442,6 +4511,7 @@ def fit_postprocess(
     fitted_at: datetime | None = None,
     settings: FitSettings | None = None,
     stations: Any | None = None,
+    protocol: str = PROTOCOL_AT_GAUGE,
 ) -> PostprocessModel:
     """Fit one model + isotonic map per lead on ``rows``.
 
@@ -4456,6 +4526,16 @@ def fit_postprocess(
     station effects; leaving it out (with ``l2`` / ``isotonic_bins`` as
     before) is the shipped logistic on the v1 design, unchanged.
 
+    ``protocol`` is the validation protocol the CALLER fitted under, and
+    it is recorded on the model because serving has to honour it: it is
+    the caller that masked the rows (``mask_own_gauge`` over the whole
+    table, before any fold is cut), and nothing about a table of numbers
+    says afterwards that it was masked. Passing ``random-point`` here
+    without having masked ``rows`` would produce a model that is served
+    blind to a gauge it was taught to read — so the flag and the mask
+    belong to the same call site, which is
+    ``scripts/fit_postprocess.py``.
+
     Both stages of each lead are fitted on the SAME rows: the model first,
     then the isotonic map of its output. That is in-sample for the
     isotonic, which is why nothing here is a result — the number that
@@ -4469,6 +4549,12 @@ def fit_postprocess(
     wanted = tuple(sorted({int(lead) for lead in leads}))
     if not wanted:
         raise ValueError("no leads to fit")
+    chosen_protocol = str(protocol)
+    if chosen_protocol not in PROTOCOLS:
+        raise ValueError(
+            f"unknown protocol {chosen_protocol!r}; expected one of "
+            f"{', '.join(PROTOCOLS)}"
+        )
     missing = [lead for lead in wanted if lead not in truth]
     if missing:
         raise ValueError(f"no truth for lead(s) {missing}")
@@ -4516,6 +4602,10 @@ def fit_postprocess(
     stamp = (fitted_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
     provenance = dict(training or {"rows": n})
     provenance.setdefault("settings", chosen.to_json())
+    # The provenance block has carried the protocol since the random-point
+    # track opened; keep writing it, so a reader of either half of the
+    # document sees the same answer.
+    provenance.setdefault("protocol", chosen_protocol)
     return PostprocessModel(
         leads=wanted,
         design_leads=in_design,
@@ -4528,6 +4618,7 @@ def fit_postprocess(
         kind=chosen.kind,
         spec=spec,
         shared_trees=shared_trees,
+        protocol=chosen_protocol,
     )
 
 

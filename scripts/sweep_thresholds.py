@@ -29,6 +29,22 @@ Usage (on the VM that holds the corpus)::
         --out-thresholds push_thresholds.json \\
         --previous /var/lib/dmi-nowcast/push_thresholds.json
 
+A threshold is a percent ON a probability. Where the engine decides on the
+post-processed number (``push.probability_source: postprocess``), the fit
+has to be on that number too, filled from the model the service reads —
+including a model fitted on the workstation and installed with
+``sidecar/deploy/install_artifact.sh``, which the numpy evaluator scores
+without LightGBM::
+
+    python scripts/sweep_thresholds.py \\
+        ... \\
+        --probability-column 'p_post_{lead}' \\
+        --postprocess-model /var/lib/dmi-nowcast/postprocess.json \\
+        --design-leads 10,20,30,45,60
+
+The written table records which column it stood on, in
+``objective.probability_column``.
+
 Offline and read-only: parquet in, files out. No DMI calls, no network.
 """
 from __future__ import annotations
@@ -162,6 +178,34 @@ def build_parser() -> argparse.ArgumentParser:
                         "shoulder months (Apr, Oct, Nov), each as a "
                         "self-contained replay. Analysis output only: the "
                         "fitted push_thresholds.json stays the pooled fit.")
+    # WHICH probability the percents are thresholds ON (Phase H). A table
+    # fitted on the curve-calibrated p_rain and then served against the
+    # post-processed p_post warns at the wrong percent on every horizon, so
+    # a manual fit for an instance whose push.probability_source is
+    # ``postprocess`` has to name both of the first two. The nightly job
+    # does exactly this from config — see
+    # ``dmi_nowcast_sidecar.quality_report.QualityReportTask._fit_options``.
+    p.add_argument("--probability-column", default=None,
+                   dest="probability_column", metavar="TEMPLATE",
+                   help="the probability column the rule is replayed on, as a "
+                        "template: 'p_post_{lead}' for the post-processed "
+                        "model. Omitted, the fit is on the served "
+                        "p_rain_<lead>, which is what this always did")
+    p.add_argument("--postprocess-model", type=Path, default=None,
+                   dest="postprocess_model", metavar="PATH",
+                   help="the postprocess.json to fill --probability-column "
+                        "from, for rows that carry the features but no stored "
+                        "value (the replay tree, and every live partition "
+                        "written before the engine stored the column). Point "
+                        "it at the file the service READS, so the table is "
+                        "fitted on the probabilities the service will decide "
+                        "with — including a tree model installed offline, "
+                        "which the numpy evaluator scores without LightGBM")
+    p.add_argument("--design-leads", default=None, dest="design_leads",
+                   help="comma-separated leads whose raw ensemble fraction the "
+                        "model's design reads; must match the model's own "
+                        "design_leads. Only used when filling; defaults to the "
+                        "served product leads")
     p.add_argument("--previous", type=Path, default=None,
                    help="the table currently in service; the stability guard "
                         "keeps its value for any lead the new fit does not "
@@ -190,8 +234,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         requested_leads = parse_leads(args.leads)
         thresholds = parse_thresholds(args.thresholds)
         strata = parse_strata(args.strata)
+        design_leads = (
+            parse_leads(args.design_leads) if args.design_leads else None
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # Refuse the two ways of asking for the post-processed fit and getting
+    # something else. Both would produce a plausible table nobody could
+    # tell was wrong: without the column the sweep quietly fits p_rain,
+    # and with an unreadable model it fits only the rows that already
+    # carry a stored p_post — the hours since the serving path shipped.
+    if args.postprocess_model is not None and not args.probability_column:
+        print(
+            "error: --postprocess-model needs --probability-column "
+            "(e.g. --probability-column 'p_post_{lead}'); without it the fit "
+            "is on the served p_rain_<lead> and the model is never read",
+            file=sys.stderr,
+        )
+        return 2
+    if args.postprocess_model is not None and not args.postprocess_model.is_file():
+        print(
+            f"error: --postprocess-model {args.postprocess_model} is not a file",
+            file=sys.stderr,
+        )
         return 2
     if args.persistence_obs < 1:
         print("error: --persistence-obs must be >= 1", file=sys.stderr)
@@ -243,6 +309,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         fallback_threshold_pct=int(args.fallback_threshold_pct),
         workers=int(args.workers),
         strata=strata,
+        # Phase H. None for both leaves the shipped fit byte for byte: the
+        # served p_rain_<lead>, nothing filled, no model read.
+        probability_column=args.probability_column or None,
+        postprocess_model=args.postprocess_model,
+        **({} if design_leads is None else {"design_leads": design_leads}),
     )
     try:
         payload = run_fit(options, log=log)

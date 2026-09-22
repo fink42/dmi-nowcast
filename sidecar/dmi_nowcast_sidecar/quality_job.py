@@ -416,7 +416,8 @@ def run_postprocess_fit(
 
     Returns the summary fields this step owns: ``postprocess_path`` and
     ``postprocess`` (the fit's counts) on success, ``postprocess_error``
-    otherwise.
+    otherwise, ``postprocess_skipped`` when the model in service is one
+    this job must not touch.
 
     Runs BEFORE the threshold fit, and that order is the point: the
     thresholds have to be fitted on the probability the engine will decide
@@ -425,17 +426,44 @@ def run_postprocess_fit(
     is the consistent state — a new table fitted against an old model
     would warn at the wrong percent.
 
+    The guard (``postprocess_fit.refit_skip_reason``) runs before anything
+    is read or written: a served model this configuration could not have
+    produced — a tree kind, another design, a random-point fit, or an
+    operator's explicit ``fit_postprocess.hold`` — is left exactly as it
+    is, with no ``.prev`` copy taken and no write attempted. The threshold
+    fit then runs as usual and is fitted on THAT model's probabilities,
+    which is what makes installing an offline artefact a complete
+    operation rather than a change that survives until 03:40.
+
     Never raises. No rows, no features, no gauge truth, a model that will
     not converge: each leaves the model already in service exactly where
     it was, which is the failure policy of every other step here.
     """
-    from .postprocess_fit import options_from_json, run_postprocess_fit as fit_it
+    from .postprocess_fit import (
+        options_from_json,
+        refit_skip_reason,
+        run_postprocess_fit as fit_it,
+    )
     from .threshold_sweep import SweepError
 
     out = Path(fit["out"])
+    hold = bool(fit.get("hold"))
     try:
+        options = options_from_json(fit.get("options") or {})
+        # Either half of the job config may carry it: the step's own block
+        # (what a hand-written config says) or the options the parent built.
+        hold = hold or bool(options.hold)
+        reason = refit_skip_reason(out, options, hold=hold)
+        if reason is not None:
+            if log:
+                event = (
+                    "postprocess_refit_skipped_hold" if hold
+                    else "postprocess_refit_skipped_external_model"
+                )
+                log(f"{event}: {reason}")
+            return {"postprocess_skipped": reason}
         run = fitter or fit_it
-        result = run(options_from_json(fit.get("options") or {}))
+        result = run(options)
         model = result["model"]
         # The rollback. Last night's model, kept beside tonight's before
         # it is overwritten, so undoing a bad refit is a copy rather than
@@ -723,6 +751,11 @@ def run_job(
         "postprocess_fitted_at": None,
         "postprocess": {},
         "postprocess_error": None,
+        # Additive: why the refit did NOT run, when a model this job could
+        # not have produced is in service (or the operator has held it).
+        # Not an error — the intended steady state once an offline artefact
+        # is installed — so it is its own field.
+        "postprocess_skipped": None,
         # Additive (Phase H): which probability column the page's gauge
         # curve was scored on and how many leads it covers. Null when the
         # step is off, skipped, or fell back to the station corpus — which
@@ -831,6 +864,7 @@ def main(argv: list[str] | None = None) -> int:
             "postprocess_fitted_at": None,
             "postprocess": {},
             "postprocess_error": None,
+            "postprocess_skipped": None,
             "served_rule": None,
             "error": f"{type(exc).__name__}: {exc}",
         }

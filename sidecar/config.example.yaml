@@ -426,6 +426,30 @@ quality_report:
   # on an imputed mean.
   fit_postprocess:
     enabled: true
+    # NEVER refit; serve whatever is in postprocess.json and let the
+    # threshold fit below run on top of it. The manual override for "that
+    # model was installed on purpose".
+    #
+    # It is the second line of defence, not the first. The job already
+    # refuses to overwrite a model it could not have produced: before
+    # fitting anything it reads the served document's kind, design version
+    # and protocol and stands down when any of them is outside what this
+    # block configures — a tree kind, design v2, a random-point fit. The
+    # night's summary then carries
+    #   postprocess_skipped: "served model kind=trees design=v2
+    #     protocol=random-point is not reproducible by the nightly fit
+    #     (model=logistic design=v1 protocol=at-gauge); left in place"
+    # and one log line, postprocess_refit_skipped_external_model. The
+    # THRESHOLD fit still runs, on the served model's p_post — which is
+    # what makes installing an offline artefact
+    # (sidecar/deploy/install_artifact.sh) a complete operation rather than
+    # one that survives until 03:40.
+    #
+    # Set this only for a model the guard cannot tell apart from its own:
+    # same kind, same design, at-gauge, but fitted elsewhere — on more
+    # rows, or with a different recipe. Unlike `enabled: false` it stays
+    # visible in the nightly summary.
+    hold: false
     # null/empty -> fit_thresholds.decisions_dirs, which is what makes the
     # default correct: one set of rows, fitted on and then swept over.
     decisions_dirs: []
@@ -464,8 +488,10 @@ quality_report:
     # LightGBM by design, so asking for one fails the step and leaves last
     # night's model in service. A tree model reaches production by being
     # fitted offline in .venv-fit (scripts/fit_postprocess.py --model
-    # trees) and synced in — the numpy evaluator that SERVES it IS in the
-    # image.
+    # trees) and installed (sidecar/deploy/install_artifact.sh) or synced
+    # in — the numpy evaluator that SERVES it IS in the image. Once one is
+    # in service this step recognises it and skips itself; see `hold`
+    # above for the whole arrangement.
     #
     # Whatever the kind, the served probabilities are forced non-decreasing
     # in the lead before they leave the model: "rain within 60 min"

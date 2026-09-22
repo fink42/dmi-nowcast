@@ -193,6 +193,17 @@ carries the parameters each was computed under:
     The ensemble's shape at the same product pixel: the member-mean and
     member-P90 cumulative rain rate by each lead, and the inter-quartile
     spread of member arrival times (null under four arrivals).
+``ng_*`` (21 columns, ``--neighbour-features``, 2026-09-22)
+    What the OTHER gauges measured, placed in this cycle's bulk motion
+    frame: how much rain sits 0-30 / 30-60 / 60-120 minutes upstream, how
+    far off the track the nearest wet one is, the nearest gauge's distance
+    and last hour, and the direction-free 20 km vicinity. The station's own
+    gauge is excluded by id and again by a half-kilometre radius, so a
+    column means the same thing at a training row and at a subscriber's
+    address — which is the only reason it is worth fitting on. Written from
+    the same day's slots as the ``g_*`` block above;
+    ``scripts/add_neighbour_gauge_features.py`` is the same arithmetic for
+    the runs written before this flag existed.
 
 ``--poll-jitter-sec`` belongs to the same block even though it adds no
 column: with a rigid poll grid every fullRange anchor is seen at exactly
@@ -650,6 +661,14 @@ class FrameSettings:
     # rain the service has not been told about. See
     # ``postprocess.station_gauge_features``.
     gauge_lag_min: float = postprocess.DEFAULT_GAUGE_LAG_MIN
+    # v2/S1 (2026-09-22): write the neighbour-gauge block (``ng_*``) in the
+    # same pass as the ``g_*`` one, through the same core producer the live
+    # cycle calls. Before this it was a second pass over the finished run
+    # (``scripts/add_neighbour_gauge_features.py``), which is still there
+    # for the runs written without it. Needs the gauge archive: without
+    # slots there is nothing to place in the motion frame, so this is
+    # ignored wherever ``g_*`` is null for want of a corpus.
+    neighbour_features: bool = True
 
 
 def production_motion(
@@ -1025,6 +1044,25 @@ def sample_frame(
             now_utc=generated_at,
             lag_min=settings.gauge_lag_min,
         ))
+    # v2/S1: and what the OTHER gauges measured, in this cycle's motion
+    # frame. Written here rather than in a second pass over the finished
+    # run, so a replay and the live cycle produce the block the same way,
+    # in the same place, from the same slots. Skipped without an archive:
+    # there is nothing to place, and a zeroed block would read as "no rain
+    # upstream" rather than "nobody looked".
+    if (
+        grid_features is not None
+        and settings.neighbour_features
+        and gauge_slots is not None
+        and points
+    ):
+        grid_features.update(neighbour_gauge_columns(
+            points, gauge_slots,
+            bulk_kmh=float(np.float32(grid_features["bulk_kmh"][0])),
+            bulk_dir_deg=float(np.float32(grid_features["bulk_dir_deg"][0])),
+            now_utc=generated_at,
+            lag_min=settings.gauge_lag_min,
+        ))
     out: list[dict[str, Any]] = []
     for index, point in enumerate(points):
         sample = sample_point(
@@ -1055,6 +1093,95 @@ def sample_frame(
             )
         out.append(row)
     return out
+
+
+def neighbour_gauge_columns(
+    points: Sequence[StationPoint],
+    gauge_slots: Mapping[str, Sequence[Any]],
+    *,
+    bulk_kmh: float,
+    bulk_dir_deg: float,
+    now_utc: datetime,
+    lag_min: float,
+) -> dict[str, np.ndarray]:
+    """The ``ng_*`` block for one cycle: one core call for every station.
+
+    The third writer of this block and the same producer as the other two
+    — the live cycle (``dmi_nowcast_sidecar.compute.neighbour_features``)
+    and the offline builder
+    (``scripts/add_neighbour_gauge_features.py``) — with the same
+    leave-self-out rule: every row here IS a gauge, so its own station is
+    excluded by id, and the :data:`postprocess.NG_SELF_KM` radius catches
+    it again.
+
+    ``bulk_kmh`` / ``bulk_dir_deg`` are the cycle's own motion columns,
+    taken from the arrays ``station_features`` just produced rather than
+    recomputed: they are what the row stores, and the block has to be in
+    the frame the row says it is in.
+
+    **Against the offline builder's numbers.** Same call, same slots, same
+    coordinates; the only difference is the window the slots were read
+    over — this reuses the day's read (:func:`day_feature_slots`, from
+    midnight minus the six-hour cap), where the builder reads from its
+    file's FIRST decision instant minus the same cap. Both windows cover
+    every slot the availability rule lets a row see, so every column is
+    identical; the one reachable difference is a station that reported
+    nothing for six hours before the day's first frames and something
+    before that, whose ``ng_near_min_since_wet`` reads "known, dry at
+    least six hours" here and null there.
+    """
+    coords = {
+        str(point.id): (float(point.lat), float(point.lon))
+        for point in points
+    }
+    slots = postprocess.GaugeSlotTable.from_slots({
+        sid: (gauge_slots.get(sid) or ()) for sid in coords
+    })
+    return postprocess.neighbour_gauge_features(
+        [(float(point.lat), float(point.lon)) for point in points],
+        slots,
+        coords,
+        now_utc=now_utc,
+        bulk_kmh=bulk_kmh,
+        bulk_dir_deg=bulk_dir_deg,
+        lag_min=float(lag_min),
+        exclude_self=[str(point.id) for point in points],
+    )
+
+
+def neighbour_settings_block(settings: "FrameSettings") -> dict[str, Any]:
+    """What the run's ``summary.json`` says about the ``ng_*`` columns.
+
+    Deliberately the same shape as
+    ``add_neighbour_gauge_features.neighbour_settings_block``, under the
+    same ``run.features.neighbour`` key, so a run that wrote the block
+    itself and a run that had it added afterwards read alike.
+    """
+    return {
+        "enabled": bool(settings.features and settings.neighbour_features),
+        "columns": [
+            name for name, _definition in postprocess.SCALAR_FEATURE_COLUMNS_NG
+        ],
+        "radius_km": postprocess.NG_RADIUS_KM,
+        "cross_km": postprocess.NG_CROSS_KM,
+        "cross_weight_km": postprocess.NG_CROSS_WEIGHT_KM,
+        "tau_edges_min": list(postprocess.NG_TAU_EDGES_MIN),
+        "vicinity_km": postprocess.NG_VICINITY_KM,
+        "self_km": postprocess.NG_SELF_KM,
+        "min_speed_kmh": postprocess.NG_MIN_SPEED_KMH,
+        "wet_window_min": postprocess.NG_WET_WINDOW_MIN,
+        "near_window_min": postprocess.NG_NEAR_WINDOW_MIN,
+        "gauge_lag_min": float(settings.gauge_lag_min),
+        "reference_lat_deg": postprocess.NG_REF_LAT_DEG,
+        "geometry": (
+            "equirectangular km, linearised at "
+            f"{postprocess.NG_REF_LAT_DEG:.0f} N"
+        ),
+        "leave_self_out": (
+            "the row's own station id is excluded, and so is any gauge "
+            f"within {postprocess.NG_SELF_KM} km of the point"
+        ),
+    }
 
 
 #: ``(lat, lon)`` → km to the nearest radar, memoised per process. The
@@ -1782,6 +1909,18 @@ def main(argv: Sequence[str] | None = None) -> int:
              "rain it will not have.",
     )
     p.add_argument(
+        "--neighbour-features", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write the neighbour-gauge block (ng_*) beside the g_* one, "
+             "from the same read and the same gauge lag — what "
+             "scripts/add_neighbour_gauge_features.py used to add in a "
+             "second pass over a finished run. ON by default whenever the "
+             "gauge features are on; it is ignored without --corpus-dir or "
+             "under --no-features, because both leave nothing to place in "
+             "the motion frame. --no-neighbour-features reproduces a "
+             "pre-2026-09-22 run exactly.",
+    )
+    p.add_argument(
         "--anchor-history", choices=anchor_policy.HISTORY_MODES,
         default=anchor_policy.HISTORY_SAME_TYPE,
         help="What the flow and the cascade eat under a doppler anchor. "
@@ -1925,6 +2064,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         flow_variant=args.flow_variant,
         features=bool(args.features),
         gauge_lag_min=float(args.gauge_lag_min),
+        neighbour_features=bool(args.neighbour_features),
     )
     out_dir = Path(args.out_dir)
     (out_dir / "decisions").mkdir(parents=True, exist_ok=True)
@@ -2061,6 +2201,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # another is a different model.
                 "gauge_lag_min": settings.gauge_lag_min,
                 "gauge_since_cap_min": postprocess.GAUGE_SINCE_CAP_MIN,
+                # v2/S1: every constant the ng_* block's meaning depends
+                # on, so a reader of this run can tell which corridor the
+                # columns in front of them were computed under without
+                # going back to the source. The same block
+                # add_neighbour_gauge_features.py writes for a run it
+                # copies, under the same key.
+                "neighbour": neighbour_settings_block(settings),
             },
             "archive_dir": str(args.archive_dir),
             "corpus_dir": str(args.corpus_dir),

@@ -404,6 +404,42 @@ class TestTheSweepFollowsTheEngine:
         )
         assert payload["settings"]["probability_rows"]["dropped"] > 0
 
+    def test_it_fits_on_a_tree_document_without_lightgbm(
+        self, corpus: Path,
+    ) -> None:
+        """The installed artefact is a tree model, and the sweep must read it.
+
+        Once a model fitted on the workstation
+        (``sidecar/deploy/install_artifact.sh``) is in service, the nightly
+        threshold fit has to be fitted on ITS probabilities — on a VM whose
+        image has no LightGBM. It can: ``ProbabilityFiller`` loads the
+        document through ``PostprocessModel`` and evaluates the ensembles
+        with the numpy evaluator that IS in the image. A stump per lead, so
+        what is under test is the loading and the filling, not the fit.
+        """
+        from tests.test_postprocess_v2 import _as_trees
+
+        model_path = corpus / "postprocess_trees.json"
+        fitted = run_postprocess_fit(_options(corpus))["model"]
+        model_path.write_text(_as_trees(fitted).dumps())
+        assert pp.PostprocessModel.loads(model_path.read_text()).is_trees
+
+        payload = self._sweep(
+            corpus,
+            probability_column=pp.POST_COLUMN_TEMPLATE,
+            postprocess_model=model_path,
+            design_leads=LEADS,
+        )
+        settings = payload["settings"]
+        assert settings["probability_column"] == "p_post_{lead}"
+        # Every row carries features and none a stored value, so the TREE
+        # model spoke for all of them and nothing was excluded.
+        assert settings["probability_rows"]["computed"] > 0
+        assert settings["probability_rows"]["dropped"] == 0
+        assert payload["thresholds"]["objective"]["probability_column"] == (
+            "p_post_{lead}"
+        )
+
     def test_a_template_that_does_not_vary_is_refused(
         self, corpus: Path,
     ) -> None:

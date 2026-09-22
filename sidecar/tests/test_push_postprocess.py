@@ -32,6 +32,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Sequence
 
 import numpy as np
 import pytest
@@ -474,6 +475,63 @@ class TestParityWithTheReplay:
         assert live.ens_features == {}
 
 
+def _gauge_store(
+    tmp_path: Path, catalogue: Sequence[tuple[str, float, float, bool]] | None = None,
+):
+    """A corpus holding six visible slots per station, plus one too fresh.
+
+    ``catalogue`` is ``(id, lat, lon, wet)``; without it, the two gauges
+    among :data:`POINTS` — 06180 wet in its two newest visible slots, 06120
+    dry throughout. The slot planted one minute inside the availability lag
+    is the leakage guard and is in every variant.
+    """
+    from dmi_nowcast_core.metobs import Observation
+    from dmi_nowcast_core.station_store import StationObsStore
+
+    wanted: list[tuple[str, set[int]]] = (
+        [("06180", {0, 1}), ("06120", set())] if catalogue is None
+        else [
+            (station, {0, 1, 2} if wet else set())
+            for station, _lat, _lon, wet in catalogue
+        ]
+    )
+    store = StationObsStore(tmp_path / "corpus")
+    rows = []
+    for station, wet_slots in wanted:
+        for k in range(6):
+            rows.append(Observation(
+                station_id=station,
+                observed_utc=_NEWEST_VISIBLE_SLOT - timedelta(minutes=10 * k),
+                parameter_id="precip_past10min",
+                value=1.2 if k in wet_slots else 0.0,
+            ))
+        # One slot too fresh to have reached the service.
+        rows.append(Observation(
+            station_id=station, observed_utc=_SLOT_INSIDE_THE_LAG,
+            parameter_id="precip_past10min", value=9.9,
+        ))
+    store.append(rows)
+    return store
+
+
+def _gauge_points_file(
+    tmp_path: Path, catalogue: Sequence[tuple[str, float, float, bool]] | None = None,
+) -> Path:
+    """The v2 station points file behind that corpus."""
+    entries = (
+        [
+            {"id": station, "lat": lat, "lon": lon}
+            for station, lat, lon, _n in POINTS if station != "home"
+        ] if catalogue is None else [
+            {"id": station, "lat": lat, "lon": lon}
+            for station, lat, lon, _wet in catalogue
+        ]
+    )
+    path = tmp_path / "station_points.json"
+    path.write_text(json.dumps({"version": 2, "points": entries}))
+    return path
+
+
 class TestGaugeBlockParity:
     """One gauge archive, two readers, the same columns.
 
@@ -487,37 +545,10 @@ class TestGaugeBlockParity:
     DAY = GENERATED_AT.date()
 
     def _store(self, tmp_path: Path):
-        from dmi_nowcast_core.metobs import Observation
-        from dmi_nowcast_core.station_store import StationObsStore
-
-        store = StationObsStore(tmp_path / "corpus")
-        rows = []
-        for station, wet_slots in (("06180", {0, 1}), ("06120", set())):
-            for k in range(6):
-                rows.append(Observation(
-                    station_id=station,
-                    observed_utc=_NEWEST_VISIBLE_SLOT - timedelta(minutes=10 * k),
-                    parameter_id="precip_past10min",
-                    value=1.2 if k in wet_slots else 0.0,
-                ))
-            # One slot too fresh to have reached the service.
-            rows.append(Observation(
-                station_id=station, observed_utc=_SLOT_INSIDE_THE_LAG,
-                parameter_id="precip_past10min", value=9.9,
-            ))
-        store.append(rows)
-        return store
+        return _gauge_store(tmp_path)
 
     def _points_file(self, tmp_path: Path) -> Path:
-        path = tmp_path / "station_points.json"
-        path.write_text(json.dumps({
-            "version": 2,
-            "points": [
-                {"id": station, "lat": lat, "lon": lon}
-                for station, lat, lon, _n in POINTS if station != "home"
-            ],
-        }))
-        return path
+        return _gauge_points_file(tmp_path)
 
     def test_the_two_readers_produce_the_same_gauge_block(
         self, tmp_path: Path,
@@ -618,6 +649,403 @@ class TestGaugeBlockParity:
             )
         assert slots == [None]
         assert [e["event"] for e in logs] == ["gauge_history_points_unreadable"]
+
+
+# ---------------------------------------------------------------------------
+# 1b. The neighbour-gauge block (v2, S1): three writers, one set of numbers
+# ---------------------------------------------------------------------------
+
+#: A catalogue where the neighbour block is a MEASUREMENT rather than a row
+#: of nulls. The two gauges among :data:`POINTS` are 145 km apart — outside
+#: each other's 60 km neighbour radius — so two more are placed relative to
+#: 06180: one 10 km UPSTREAM along the fixture's flow, and wet, and one 5 km
+#: downstream and dry. ``(id, km, bearing from 06180, wet)``.
+_EXTRA_GAUGES: tuple[tuple[str, float, float, bool], ...] = (
+    ("06190", 10.0, 323.0, True),    # upstream: the flow heads 143 deg
+    ("06200", 5.0, 90.0, False),     # downstream, and in the 20 km vicinity
+)
+
+#: A native (row, col) per catalogue station. Arbitrary — ``station_features``
+#: wants indices, not a projection — but fixed, so the radar half of the row
+#: is the same on both sides of the parity check.
+_NG_NATIVE: dict[str, tuple[float, float]] = {
+    "06180": (32.0, 36.0), "06120": (44.0, 12.0),
+    "06190": (18.0, 30.0), "06200": (36.0, 40.0),
+}
+
+
+def _ng_catalogue() -> tuple[tuple[str, float, float, bool], ...]:
+    """``(id, lat, lon, wet)`` for the four gauges of the parity fixture."""
+    base_lat, base_lon = POINTS[1][1], POINTS[1][2]
+    out: list[tuple[str, float, float, bool]] = [
+        (station, lat, lon, station == "06180")
+        for station, lat, lon, _n in POINTS if station != "home"
+    ]
+    for station, km, bearing, wet in _EXTRA_GAUGES:
+        radians = math.radians(bearing)
+        # Rounded to six decimals, which is what the real catalogue carries
+        # (the production station points file is at four) and what
+        # ``point_key`` rounds a served point to. The live cycle places the
+        # point at its serving key and the replay at the catalogue's own
+        # float, so the two are the same place exactly while the file holds
+        # no more than six decimals — a synthetic coordinate with fifteen
+        # would differ in the last bit of ``ng_near_km`` and pin nothing but
+        # the rounding.
+        out.append((
+            station,
+            round(base_lat + km * math.cos(radians) / pp.KM_PER_DEG_LAT, 6),
+            round(base_lon + km * math.sin(radians) / pp.KM_PER_DEG_LON, 6),
+            wet,
+        ))
+    return tuple(out)
+
+
+def _ng_grid_features(
+    catalogue: Sequence[tuple[str, float, float, bool]],
+) -> dict[str, np.ndarray]:
+    """The radar block for the parity fixture's four stations.
+
+    Only ``station_features``: the gauge and ensemble blocks are the same
+    nulls on both sides of the comparison, and what is being pinned here is
+    the neighbour block and the bulk motion it is placed in.
+    """
+    field = _rain_field()
+    vy, vx = _flow()
+    return pp.station_features(
+        field, vy, vx,
+        np.array([_NG_NATIVE[s][0] for s, *_ in catalogue], dtype=np.float64),
+        np.array([_NG_NATIVE[s][1] for s, *_ in catalogue], dtype=np.float64),
+        pixel_km=PIXEL_KM, dt_min=10.0,
+        bulk_vy=2.0, bulk_vx=1.5, stalled_share=0.011,
+        rain_prev10_mm_h=_rain_prev(1), rain_prev20_mm_h=_rain_prev(2),
+    )
+
+
+class TestNeighbourBlockParity:
+    """One gauge archive, three writers, the same 21 columns.
+
+    The live cycle computes ``ng_*`` for the points it serves, the replay
+    computes it for every station of a replayed day, and the offline builder
+    (``scripts/add_neighbour_gauge_features.py``) adds it to a run written
+    before either did. A model fitted on the second or third and served the
+    first is only honest while all three are one call into
+    :func:`~dmi_nowcast_core.postprocess.neighbour_gauge_features` with the
+    same slots, the same coordinates and the same motion frame.
+
+    The third writer is pinned against the second in
+    ``test_neighbour_gauge_pipeline.py``, on a whole synthetic run. This is
+    the first against the second, on one cycle, down to the bit.
+    """
+
+    DAY = GENERATED_AT.date()
+    LAG = pp.DEFAULT_GAUGE_LAG_MIN
+
+    def _both(self, tmp_path: Path):
+        """``(catalogue, grid_features, live_ng, replay_ng)`` for one cycle."""
+        from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+        catalogue = _ng_catalogue()
+        store = _gauge_store(tmp_path, catalogue)
+        history = GaugeHistory(
+            store.root, _gauge_points_file(tmp_path, catalogue),
+            lag_min=self.LAG,
+        )
+        grid_features = _ng_grid_features(catalogue)
+        bulk_kmh, bulk_dir_deg = compute_mod.row_bulk_motion(grid_features)
+        keys = [
+            point_key(lat, lon) for _s, lat, lon, _wet in catalogue
+        ]
+        live = compute_mod.neighbour_features(
+            history.read(GENERATED_AT), keys,
+            now_utc=GENERATED_AT,
+            bulk_kmh=bulk_kmh, bulk_dir_deg=bulk_dir_deg, lag_min=self.LAG,
+        )
+        replay = rw.neighbour_gauge_columns(
+            [
+                rw.StationPoint(id=station, lat=lat, lon=lon, region=None)
+                for station, lat, lon, _wet in catalogue
+            ],
+            rw.day_feature_slots(
+                store, self.DAY,
+                [station for station, *_ in catalogue], lag_min=self.LAG,
+            ),
+            bulk_kmh=bulk_kmh, bulk_dir_deg=bulk_dir_deg,
+            now_utc=GENERATED_AT, lag_min=self.LAG,
+        )
+        return catalogue, grid_features, live, replay
+
+    def test_the_two_writers_produce_the_same_block_bit_for_bit(
+        self, tmp_path: Path,
+    ) -> None:
+        _catalogue, _grid, live, replay = self._both(tmp_path)
+        names = {name for name, _d in pp.SCALAR_FEATURE_COLUMNS_NG}
+        assert set(live) == set(replay) == names
+        for name in sorted(names):
+            # Bit-for-bit, not approximately: these are float32 columns a
+            # model was fitted on, and ``assert_array_equal`` treats NaN in
+            # the same place as equal, which is the only tolerance a null
+            # deserves.
+            np.testing.assert_array_equal(
+                live[name], replay[name], err_msg=name,
+            )
+
+    def test_the_block_is_filled_and_not_a_row_of_nulls(
+        self, tmp_path: Path,
+    ) -> None:
+        """Parity on nulls is not parity.
+
+        06190 is 10 km upstream of 06180 and wet, at 7.5 km/h — so 06180
+        must read a wet gauge 80 minutes out, in the (60, 120] bin, and its
+        own dry gauge must reach nothing.
+        """
+        catalogue, _grid, live, _replay = self._both(tmp_path)
+        index = [s for s, *_ in catalogue].index("06180")
+        assert live["ng_frame_ok"][index] == 1.0
+        assert float(live["ng_upwet_tau_min"][index]) == pytest.approx(
+            80.0, abs=1.0,
+        )
+        assert float(live["ng_upwet_cross_km"][index]) == pytest.approx(
+            0.0, abs=0.1,
+        )
+        # Three visible wet slots of 1.2 mm at the upstream gauge.
+        assert float(live["ng_up_mm_max_t120"][index]) == pytest.approx(3.6)
+        assert float(live["ng_up_count_t120"][index]) == 1.0
+        # 06200, 5 km east and dry, is the nearest neighbour and is in the
+        # vicinity count together with the upstream one.
+        assert float(live["ng_near_km"][index]) == pytest.approx(5.0, abs=0.1)
+        assert float(live["ng_count_20km"][index]) == 2.0
+        assert float(live["ng_wet_share_20km"][index]) == pytest.approx(0.5)
+        # And the 9.9 mm slot inside the availability lag reached nothing.
+        assert all(
+            not np.isfinite(values).any() or float(np.nanmax(values)) < 9.0
+            for name, values in live.items()
+            if name.startswith("ng_up_mm") or name.startswith("ng_near_mm")
+        )
+
+    def test_the_runtime_row_equals_the_replays_row_bit_for_bit(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same seam as ``TestParityWithTheReplay``, one block later.
+
+        Both rows go through ``postprocess.feature_row``, so what is being
+        checked is that the block reaching it carries the same numbers under
+        the same names in the same place — the failure mode being a live row
+        whose ``ng_*`` columns are the nulls this work package was written to
+        remove, against a training row where they are measurements.
+        """
+        catalogue, grid_features, live, replay = self._both(tmp_path)
+        products = _products()
+        native = [
+            GridIndex(row=_NG_NATIVE[s][0], col=_NG_NATIVE[s][1])
+            for s, *_ in catalogue
+        ]
+        point_products = compute_mod._read_points(products, native)
+        assert point_products is not None
+        runtime = build_cycle_postprocess(
+            PostprocessTable(None),
+            radar_ts_utc=RADAR_TS,
+            generated_at_utc=GENERATED_AT,
+            keys=[point_key(lat, lon) for _s, lat, lon, _w in catalogue],
+            grid_features={**grid_features, **live},
+            raw_fractions=point_products.raw_fractions,
+            shared=[{} for _ in catalogue],
+            station_radar_km=[
+                float(rw.station_radar_km(lat, lon))
+                for _s, lat, lon, _w in catalogue
+            ],
+            leads=products.leads_min,
+            season=pp.season_of_month(GENERATED_AT.month),
+            hour_utc=GENERATED_AT.hour,
+            frame_age_min=14.0,
+        )
+        for index, (station, lat, lon, _wet) in enumerate(catalogue):
+            replay_row = rw._feature_row(
+                {**grid_features, **replay},
+                index,
+                rw.StationPoint(id=station, lat=lat, lon=lon, region=None),
+                raw_p_rain=dict(products.p_rain),
+                pixel=compute_mod.product_pixel_of(
+                    products, native[index].row, native[index].col,
+                ),
+                leads_min=products.leads_min,
+                season=pp.season_of_month(GENERATED_AT.month),
+                hour_utc=GENERATED_AT.hour,
+                frame_age_min=14.0,
+            )
+            assert runtime.rows[index] == replay_row
+            assert list(runtime.rows[index]) == list(replay_row)
+        # ... and the block really is in the row, under the schema's names.
+        row = runtime.rows[[s for s, *_ in catalogue].index("06180")]
+        assert row["ng_upwet_tau_min"] is not None
+        assert row["ng_frame_ok"] == 1.0
+        assert {name for name, _d in pp.SCALAR_FEATURE_COLUMNS_NG} <= set(row)
+
+
+class TestTheCycleWritesAndCountsTheBlock:
+    """What ``_publish_postprocess`` does with the neighbour block.
+
+    Two claims, both about a failure that would otherwise be silent. The
+    columns have to reach the published row — the whole work package is that
+    they were 21 nulls before — and the cycle has to SAY how many points it
+    answered for, because a block that stopped being computed and a block
+    that is honestly null look identical in a parquet.
+    """
+
+    LAG = pp.DEFAULT_GAUGE_LAG_MIN
+
+    def _cycle(
+        self, config: Config, tmp_path: Path, *, corpus: bool = True,
+    ):
+        from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+        catalogue = _ng_catalogue()
+        store = _gauge_store(tmp_path, catalogue)
+        engine = compute_mod.CycleEngine(config)
+        engine._gauge_history = (
+            GaugeHistory(
+                store.root, _gauge_points_file(tmp_path, catalogue),
+                lag_min=self.LAG,
+            ) if corpus else None
+        )
+        products = _products()
+        native = [
+            GridIndex(row=_NG_NATIVE[s][0], col=_NG_NATIVE[s][1])
+            for s, *_ in catalogue
+        ]
+        point_products = compute_mod._read_points(
+            products, native, keep_grids=True,
+        )
+        assert point_products is not None
+        vy, vx = _flow()
+        with structlog.testing.capture_logs() as logs:
+            engine._publish_postprocess(
+                keys=[point_key(lat, lon) for _s, lat, lon, _w in catalogue],
+                grid_features=_ng_grid_features(catalogue),
+                points=point_products,
+                products=products,
+                observed_grid=None,
+                radar_ts_utc=RADAR_TS,
+                generated_at_utc=GENERATED_AT,
+                frame_age_min=14.0,
+                rain_mm_h=_rain_field(),
+                vy=vy, vx=vx,
+                pixel_km=PIXEL_KM, dt_min=10.0,
+                bulk_vy=2.0, bulk_vx=1.5, stalled_share=0.011,
+            )
+        published = engine._postprocess_latest
+        assert published is not None
+        event = next(e for e in logs if e["event"] == "postprocess_cycle")
+        return catalogue, engine, published, event, logs
+
+    def test_the_published_rows_carry_the_block(
+        self, minimal_config: Config, tmp_path: Path,
+    ) -> None:
+        catalogue, _engine, published, _event, _logs = self._cycle(
+            minimal_config, tmp_path,
+        )
+        row = published.rows[[s for s, *_ in catalogue].index("06180")]
+        assert row["ng_frame_ok"] == 1.0
+        assert row["ng_upwet_tau_min"] == pytest.approx(80.0, abs=1.0)
+        assert row["ng_near_km"] == pytest.approx(5.0, abs=0.1)
+        # The gauge block is still there beside it, from the same one read.
+        assert row["g_known"] == 1.0
+        assert row["g_mm_30"] == pytest.approx(3.6)
+
+    def test_the_log_counts_are_the_rows_it_filled(
+        self, minimal_config: Config, tmp_path: Path,
+    ) -> None:
+        """Three counts, and each one equals what the rows actually carry.
+
+        Pinned against the rows rather than against a constant: a count that
+        is merely *a* number would go on being logged after the block
+        stopped being computed.
+        """
+        _catalogue, _engine, published, event, _logs = self._cycle(
+            minimal_config, tmp_path,
+        )
+        rows = published.rows
+        assert event["ng_frame_ok"] == sum(
+            row["ng_frame_ok"] == 1.0 for row in rows
+        )
+        assert event["ng_near_km"] == sum(
+            row["ng_near_km"] is not None for row in rows
+        )
+        assert event["ng_upwet_tau_min"] == sum(
+            row["ng_upwet_tau_min"] is not None for row in rows
+        )
+        # Non-trivial: pure geometry answers for every point, a wet gauge
+        # upstream for some of them and not all.
+        assert event["ng_frame_ok"] == len(rows)
+        assert event["ng_near_km"] == len(rows)
+        assert 0 < event["ng_upwet_tau_min"] < len(rows)
+
+    def test_a_deployment_with_no_corpus_counts_zero_and_stays_null(
+        self, minimal_config: Config, tmp_path: Path,
+    ) -> None:
+        """No archive is not "no rain upstream": the block is null.
+
+        A zero in ``ng_count_20km`` would be a claim about the gauge
+        network. Where there is no gauge network to read, every column is a
+        null the design imputes — which is what the public instance, with no
+        corpus volume, has to serve.
+        """
+        _catalogue, _engine, published, event, _logs = self._cycle(
+            minimal_config, tmp_path, corpus=False,
+        )
+        assert event["ng_frame_ok"] == 0
+        assert event["ng_near_km"] == 0
+        assert event["ng_upwet_tau_min"] == 0
+        assert all(row["ng_count_20km"] is None for row in published.rows)
+        assert all(row["ng_frame_ok"] is None for row in published.rows)
+
+    def test_a_broken_archive_costs_the_block_and_not_the_cycle(
+        self, minimal_config: Config, tmp_path: Path,
+    ) -> None:
+        """One log line, a published cycle, and 21 nulls."""
+        from dmi_nowcast_sidecar.gauge_history import GaugeHistory
+
+        catalogue = _ng_catalogue()
+        engine = compute_mod.CycleEngine(minimal_config)
+        history = GaugeHistory(
+            tmp_path / "corpus", _gauge_points_file(tmp_path, catalogue),
+            lag_min=self.LAG,
+        )
+        history.store = SimpleNamespace(  # type: ignore[assignment]
+            read_recent=lambda *a, **k: (_ for _ in ()).throw(
+                OSError("the volume went away"),
+            ),
+        )
+        engine._gauge_history = history
+        products = _products()
+        native = [
+            GridIndex(row=_NG_NATIVE[s][0], col=_NG_NATIVE[s][1])
+            for s, *_ in catalogue
+        ]
+        point_products = compute_mod._read_points(products, native)
+        assert point_products is not None
+        vy, vx = _flow()
+        with structlog.testing.capture_logs() as logs:
+            engine._publish_postprocess(
+                keys=[point_key(lat, lon) for _s, lat, lon, _w in catalogue],
+                grid_features=_ng_grid_features(catalogue),
+                points=point_products,
+                products=products,
+                observed_grid=None,
+                radar_ts_utc=RADAR_TS,
+                generated_at_utc=GENERATED_AT,
+                frame_age_min=14.0,
+                rain_mm_h=_rain_field(), vy=vy, vx=vx,
+                pixel_km=PIXEL_KM, dt_min=10.0,
+                bulk_vy=2.0, bulk_vx=1.5, stalled_share=0.011,
+            )
+        events = [e["event"] for e in logs]
+        assert "postprocess_gauge_features_failed" in events
+        assert "postprocess_cycle" in events
+        published = engine._postprocess_latest
+        assert published is not None
+        assert all(row["ng_near_km"] is None for row in published.rows)
+        # The radar half of the row is untouched by a gauge outage.
+        assert all(row["bulk_kmh"] is not None for row in published.rows)
 
 
 # ---------------------------------------------------------------------------

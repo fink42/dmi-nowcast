@@ -1774,6 +1774,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = pp.fit_postprocess(
         features, truth, leads,
         design_leads=design_leads, settings=settings,
+        # The protocol as a FIELD of the model, not only a note in the
+        # provenance below: `features` above was masked in place for
+        # random-point, and the model has to keep masking when it is
+        # served or the rows it scores stop matching the rows it saw.
+        protocol=str(args.protocol),
         training={
             "from": window[0].isoformat(),
             "to": window[1].isoformat(),

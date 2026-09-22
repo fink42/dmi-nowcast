@@ -191,6 +191,9 @@ class QualityBuildResult:
     postprocess_fitted_at: str | None = None
     postprocess: dict = field(default_factory=dict)
     postprocess_error: str | None = None
+    #: The refit stood down and left the served model alone — the reason
+    #: the child gave (an installed model it cannot reproduce, or a hold).
+    postprocess_skipped: str | None = None
 
 
 class QualityReportTask:
@@ -366,6 +369,11 @@ class QualityReportTask:
             design=str(settings.design),
             station_offsets=bool(settings.station_offsets),
             isotonic=str(settings.isotonic),
+            # Manual hold: the served model is being managed by hand (an
+            # installed artefact the nightly fit cannot reproduce); the
+            # automatic guard in the child covers that case on its own,
+            # this is the operator's explicit second line.
+            hold=bool(settings.hold),
             dry_min=int(thresholds.dry_min),
             onset_min_mm=float(thresholds.onset_min_mm),
             min_known_slots=int(thresholds.min_known_slots),
@@ -656,6 +664,7 @@ class QualityReportTask:
             postprocess_fitted_at=summary.get("postprocess_fitted_at"),
             postprocess=dict(summary.get("postprocess") or {}),
             postprocess_error=summary.get("postprocess_error"),
+            postprocess_skipped=summary.get("postprocess_skipped"),
         )
 
     @staticmethod
@@ -819,6 +828,11 @@ class QualityReportTask:
             _log.info(
                 "quality_report_postprocess_not_applied",
                 reason=result.postprocess_error,
+            )
+        if result.postprocess_skipped:
+            _log.info(
+                "quality_report_postprocess_left_in_place",
+                reason=result.postprocess_skipped,
             )
         # The same hook, for the model: the child wrote the file, the
         # parent tells the running cycle to re-read it. Without this the

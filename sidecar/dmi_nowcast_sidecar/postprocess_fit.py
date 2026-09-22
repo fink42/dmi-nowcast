@@ -34,6 +34,18 @@ The order matters. This runs BEFORE the threshold sweep, because the
 sweep has to be fitted on the probability the engine will decide with —
 see ``threshold_sweep.SweepOptions.probability_column``.
 
+What it refuses to do
+---------------------
+Overwrite a model it could not have produced. Once an artefact fitted on
+the workstation — a tree model, a v2 design, a random-point fit — is
+installed into the served file, a nightly refit would quietly replace it
+with tonight's pooled logistic and then refit the thresholds on the
+replacement. :func:`refit_skip_reason` compares the served document's own
+statement of what it is against this job's configuration and skips the
+refit when the two cannot be the same model. The threshold sweep still
+runs, on the probabilities the SERVED model produces — which is the whole
+point of the order.
+
 Failure policy, as everywhere else in the nightly job: every way this can
 fail leaves the model already in service exactly where it is, and costs
 one log line.
@@ -41,6 +53,7 @@ one log line.
 from __future__ import annotations
 
 import dataclasses
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -124,6 +137,128 @@ class PostprocessFitOptions:
     min_rows: int = 1000
     #: Extra provenance to put in the document's ``training`` block.
     training: dict[str, Any] = field(default_factory=dict)
+    #: Manual override: never refit, whatever is on disk. The operator's
+    #: switch for "this model was installed deliberately, leave it alone"
+    #: — the automatic guard below (:func:`refit_skip_reason`) already
+    #: covers the cases it can recognise from the document itself.
+    hold: bool = False
+
+
+#: The validation protocol a nightly refit runs under, always. It has no
+#: option for anything else: the rows it fits on are gauges, scored at
+#: those gauges, with the point's own gauge in the design. A document
+#: fitted under :data:`~dmi_nowcast_core.postprocess.PROTOCOL_RANDOM_POINT`
+#: is a different model of a different question and cannot be reproduced
+#: here — see :func:`refit_skip_reason`.
+NIGHTLY_PROTOCOL = pp.PROTOCOL_AT_GAUGE
+
+
+@dataclass(frozen=True)
+class ServedModel:
+    """The header of the ``postprocess.json`` currently in service.
+
+    Three fields, read without loading the model: what family it is, what
+    design it was built on, and which protocol fitted it. Enough to answer
+    the only question the nightly job asks of it — "could I have produced
+    this?" — and nothing more.
+    """
+
+    kind: str
+    design: str
+    protocol: str
+
+    def describe(self) -> str:
+        return f"kind={self.kind} design={self.design} protocol={self.protocol}"
+
+
+def describe_served_model(path: Path) -> ServedModel | None:
+    """The served document's kind, design version and protocol.
+
+    ``None`` when there is nothing to protect: no file, unreadable, not
+    JSON, not an object. A junk file is not a model, and the nightly fit
+    should overwrite it exactly as it always has.
+
+    The protocol is read from the top-level ``protocol`` key when the
+    document carries one, and otherwise from ``training.protocol``, which
+    is where the offline study has been recording it. Neither: the
+    document predates the distinction and is therefore
+    :data:`NIGHTLY_PROTOCOL` — every model fitted before the random-point
+    work was an at-gauge fit.
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    design = raw.get("design")
+    version = design.get("version") if isinstance(design, dict) else None
+    training = raw.get("training")
+    protocol = raw.get("protocol")
+    if not protocol and isinstance(training, dict):
+        protocol = training.get("protocol")
+    return ServedModel(
+        kind=str(raw.get("kind") or pp.KIND_LOGISTIC),
+        design=str(version or pp.DESIGN_V1),
+        protocol=str(protocol or NIGHTLY_PROTOCOL),
+    )
+
+
+def refit_skip_reason(
+    out: Path, options: PostprocessFitOptions, *, hold: bool = False,
+) -> str | None:
+    """Why tonight's refit must NOT run, or ``None`` to go ahead.
+
+    The nightly fit publishes into the file the cycle reads, one
+    generation of rollback deep. That is exactly right while the served
+    model is one this job produced — and exactly wrong once an artefact
+    fitted somewhere else is installed there: the refit would replace a
+    tree model trained on the full archive under the random-point
+    protocol with tonight's pooled logistic, the thresholds would be
+    refitted on the replacement, and the only trace would be a
+    ``postprocess.prev.json`` nobody was watching.
+
+    So: if the configuration in this job could not have produced the
+    document in service, leave it alone and say so. The comparison is on
+    the three things the document states about itself — its kind, its
+    design version, and the protocol it was fitted under — plus the flat
+    rule that a tree model never comes from here at all (the image has no
+    LightGBM; see :mod:`dmi_nowcast_core.postprocess_trees`).
+
+    ``hold`` is the manual override, for a model this cannot tell apart
+    from a nightly one but which the operator installed deliberately.
+    """
+    served = describe_served_model(out)
+    if hold:
+        if served is None:
+            return (
+                "fit_postprocess.hold is set; no refit (there is no readable "
+                f"model at {out} to protect, and none will be written)"
+            )
+        return (
+            f"fit_postprocess.hold is set; served model {served.describe()} "
+            "left in place"
+        )
+    if served is None:
+        return None
+    configured = ServedModel(
+        kind=str(options.model),
+        design=str(options.design),
+        protocol=NIGHTLY_PROTOCOL,
+    )
+    reproducible = (
+        not pp.is_tree_kind(served.kind)
+        and served.protocol == configured.protocol
+        and served.design == configured.design
+        and served.kind == configured.kind
+    )
+    if reproducible:
+        return None
+    return (
+        f"served model {served.describe()} is not reproducible by the "
+        f"nightly fit (model={configured.kind} design={configured.design} "
+        f"protocol={configured.protocol}); left in place"
+    )
 
 
 def options_to_json(options: PostprocessFitOptions) -> dict:
@@ -546,12 +681,16 @@ class ProbabilityFiller:
 
 
 __all__ = [
+    "NIGHTLY_PROTOCOL",
     "PostprocessFitOptions",
     "ProbabilityFiller",
+    "ServedModel",
     "build_features",
+    "describe_served_model",
     "featured_mask",
     "filter_rows",
     "options_from_json",
     "options_to_json",
+    "refit_skip_reason",
     "run_postprocess_fit",
 ]

@@ -774,6 +774,16 @@ class FitPostprocessConfig(BaseModel):
     """
 
     enabled: bool = True
+    #: Never refit; serve whatever is in the file and refit the thresholds
+    #: on it. The manual override for "that model was installed on
+    #: purpose". It is deliberately NOT the usual way to protect an
+    #: offline artefact — ``postprocess_fit.refit_skip_reason`` recognises
+    #: a tree kind, a different design and a random-point fit from the
+    #: document itself and skips the refit without being told — but a model
+    #: this job could have produced and must still not touch has no other
+    #: switch. Unlike ``enabled: false`` it is visible: the nightly summary
+    #: carries ``postprocess_skipped`` saying which model was left alone.
+    hold: bool = False
     #: Decision-row trees to fit on. Empty -> ``fit_thresholds.decisions_dirs``,
     #: which is what makes the default correct: one set of rows, fitted on
     #: and swept over, replay first and the live scoreboard second.
@@ -799,7 +809,10 @@ class FitPostprocessConfig(BaseModel):
     #: for one fails this step and leaves last night's model in service. A
     #: tree model reaches the service by being fitted offline in
     #: ``.venv-fit`` with ``scripts/fit_postprocess.py --model trees`` and
-    #: synced in; the numpy evaluator that SERVES it is in the image.
+    #: installed (``sidecar/deploy/install_artifact.sh``) or synced in; the
+    #: numpy evaluator that SERVES it is in the image. Once one is in
+    #: service the nightly refit recognises it and stands down — see
+    #: ``postprocess_fit.refit_skip_reason`` and ``hold`` above.
     model: Literal[
         "logistic", "logistic-shared", "trees", "trees-shared",
     ] = "logistic"
