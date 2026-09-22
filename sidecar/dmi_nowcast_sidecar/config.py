@@ -317,14 +317,29 @@ class StationObsConfig(BaseModel):
     ``(station_id, observed_utc, parameter_id)``, so re-reading a slot is
     free and a missed cycle heals itself.
 
-    **Off by default.** The LAN instance turns it on; the public instance
-    cannot (see ``Config._station_obs_not_public``). Nothing about this
-    feature is served over HTTP — it only writes to the corpus volume.
+    **Off by default.** Two deployments turn it on, for two different
+    reasons (see ``Config._station_obs_not_public``):
+
+    - the LAN instance leaves ``store_dir`` null and writes into the
+      corpus archive it owns. That archive is the benchmark's ground truth
+      and nothing ever prunes it.
+    - the public instance (v2, S5) owns no corpus and sets ``store_dir``
+      to a directory on its own data volume. There the store is not an
+      archive but a working set: the cycle's post-processing model reads
+      the neighbour-gauge (``ng_*``) columns out of it every frame, at a
+      visibility horizon of ``now − postprocess.gauge_lag_min``, so the
+      readings have to be local and minutes old — which an hourly
+      ``sync`` of somebody else's parquet would not be. ``retention_days``
+      is what keeps that store small.
+
+    Nothing about this feature is served over HTTP — it only writes to a
+    volume this process reads back itself.
 
     ``api_key`` is optional and normally ``null``: DMI stopped requiring
     keys on ``opendataapi.dmi.dk`` on 2025-12-02. Fair use still applies,
     which the 10-minute cadence over a 40-minute window satisfies with
-    room to spare (~3 requests per 10 min).
+    room to spare: one request per parameter per poll — 12 an hour under
+    the two defaults, against a limit of 500 per 5 seconds.
 
     Gauge data is DMI Open Data, licence CC BY 4.0.
     """
@@ -334,6 +349,22 @@ class StationObsConfig(BaseModel):
     # Must exceed interval_min, or a cycle that slips leaves a hole no
     # later poll ever revisits.
     lookback_min: Annotated[int, Field(ge=10, le=1440)] = 40
+    #: Root of the ``StationObsStore`` the poller writes. ``None`` — the
+    #: private instance — means ``storage.corpus_dir``, kept for ever. Set
+    #: it and the poller writes there and prunes instead, which is the one
+    #: configuration a public instance may poll under.
+    store_dir: Path | None = None
+    #: How much history the bounded store keeps. **Only honoured with
+    #: ``store_dir`` set**: the corpus archive is never pruned.
+    #:
+    #: Pruning deletes whole month partitions, because a month partition
+    #: is the unit the store writes and rewriting one to drop its oldest
+    #: rows would race the append. So the retained window is this many
+    #: days rounded up to the containing months — 7 days holds between 7
+    #: and 38 of them, which is ~0.3 MiB of real gauge data per month
+    #: (1.4M rows at ~0.2 bytes/row; ~1.5 MiB if every reading in the
+    #: month were distinct) against the 6 hours the features read.
+    retention_days: Annotated[int, Field(ge=1, le=3650)] = 7
     parameters: list[str] = Field(
         default_factory=lambda: ["precip_past10min", "precip_dur_past10min"],
     )
@@ -380,6 +411,14 @@ class PostprocessConfig(BaseModel):
     slots, 105 DK stations): a slot is published 1.5 min after it ends at
     the median, 1.6 at p90, 21.6 at p99. The gauge poller runs every
     10 minutes, so one poll interval is the honest floor.
+
+    The two ``gauge_*_dir``/``_file`` keys say WHERE the cycle reads that
+    gauge archive and its station catalogue. Both default to the private
+    instance's own answers, so setting neither is what the LAN config has
+    always meant; the public instance (v2, S5) points them at the bounded
+    store its own poller fills and at the catalogue ``sync`` copied over
+    (see :func:`~dmi_nowcast_sidecar.gauge_history.build_gauge_history`,
+    which is the one place the fallback chain lives).
     """
 
     #: Minutes a gauge slot must be behind the decision instant to count.
@@ -390,6 +429,21 @@ class PostprocessConfig(BaseModel):
     #: which is what they are at every point that is not a gauge anyway —
     #: the escape hatch if the store read ever costs a cycle.
     gauge_features: bool = True
+    #: Root of the ``StationObsStore`` the cycle reads. ``None`` resolves
+    #: to ``station_obs.store_dir`` and then to ``storage.corpus_dir``, so
+    #: the instance that polls reads the store it just wrote without
+    #: naming the directory twice. Only set this to read a store neither
+    #: of those names.
+    gauge_store_dir: Path | None = None
+    #: The version-2 station points file the coordinate → gauge map and the
+    #: ``ng_*`` geometry are built from. ``None`` resolves to
+    #: ``station_eval.points_file``, which only the private instance has;
+    #: the public instance receives the catalogue through ``sync.files``
+    #: and names the copy here. Read once per process and re-tried every
+    #: cycle until it exists, so the first ``sync`` is picked up without a
+    #: restart; a catalogue REPLACED after it loaded takes one — it names
+    #: DMI's gauges and changes about never.
+    gauge_points_file: Path | None = None
 
 
 class ServerConfig(BaseModel):
@@ -1089,23 +1143,52 @@ class Config(BaseSettings):
 
     @model_validator(mode="after")
     def _station_obs_not_public(self) -> "Config":
-        """The public stack must never poll metObs.
+        """The poller must have somewhere bounded, or private, to write.
 
-        The public instance is internet-facing and owns no corpus
-        volume; a gauge poller there would spend DMI's fair-use budget
-        writing to a container filesystem nobody reads. Refusing at
-        config load is the only place this can be caught before it
-        starts making requests.
+        Until S5 this was a flat refusal: the public instance owns no
+        corpus volume, so a gauge poller there would spend DMI's fair-use
+        budget writing to a container filesystem nobody reads. What
+        changed is the second half of that sentence — the public
+        instance's own cycle now reads neighbour gauges out of a store on
+        its data volume, every frame, at a ten-minute visibility horizon.
+        So it may poll on exactly one condition: ``store_dir`` names that
+        bounded store, which is the difference between a working set the
+        service reads back and an unbounded archive nobody does.
+
+        ``store_dir`` may not BE the corpus, either. The bounded store is
+        pruned to ``retention_days`` and the corpus archive is the
+        benchmark's ground truth; the one thing that must never happen on
+        this path is retention deleting months of it.
+
+        Config load is the only place any of this can be caught before the
+        first request goes out.
         """
-        if self.station_obs.enabled and self.server.public_mode:
+        if not self.station_obs.enabled:
+            return self
+        store_dir = self.station_obs.store_dir
+        if store_dir is None and self.server.public_mode:
             raise ValueError(
                 "station_obs.enabled is not allowed with server.public_mode: "
-                "gauge polling belongs to the LAN instance that owns the corpus",
+                "gauge polling belongs to the LAN instance that owns the "
+                "corpus — unless station_obs.store_dir names a bounded store "
+                "on the data volume, which is how a public instance feeds its "
+                "own ng_* features",
             )
-        if self.station_obs.enabled and self.storage.corpus_dir is None:
+        if store_dir is None and self.storage.corpus_dir is None:
             raise ValueError(
                 "station_obs.enabled requires storage.corpus_dir — the gauge "
                 "archive is written under <corpus_dir>/stations/",
+            )
+        if (
+            store_dir is not None
+            and self.storage.corpus_dir is not None
+            and Path(store_dir) == Path(self.storage.corpus_dir)
+        ):
+            raise ValueError(
+                "station_obs.store_dir must not be storage.corpus_dir: the "
+                "bounded store is pruned to station_obs.retention_days and "
+                "the corpus archive is the benchmark's ground truth. Leave "
+                "store_dir null to write the corpus, unpruned",
             )
         return self
 

@@ -1,16 +1,37 @@
-"""Rain-gauge polling task (Phase F, F1).
+"""Rain-gauge polling task (Phase F, F1; bounded store v2, S5).
 
-Keeps the corpus's gauge archive current so the benchmark has ground
-truth that the radar did not produce. Every ``station_obs.interval_min``
-the poller asks DMI's metObs API for the last ``lookback_min`` of each
-configured parameter and merges the result into
-``<storage.corpus_dir>/stations/obs/YYYY/MM.parquet``.
+Keeps a gauge archive current so the benchmark has ground truth that the
+radar did not produce. Every ``station_obs.interval_min`` the poller asks
+DMI's metObs API for the last ``lookback_min`` of each configured
+parameter and merges the result into
+``<root>/stations/obs/YYYY/MM.parquet``.
+
+Two roots, and the difference is retention, not shape:
+
+``storage.corpus_dir`` (``store_dir`` null — the private instance)
+    The archive. Every month kept for ever, because the backtest, the
+    replay and the quality report all read history out of it.
+``station_obs.store_dir`` (the public instance, S5)
+    A working set on the data volume, pruned to
+    ``station_obs.retention_days`` after every poll. The public stack owns
+    no corpus and cannot archive anything, but its cycle computes the
+    ``ng_*`` neighbour-gauge features on every frame at a ten-minute
+    visibility horizon — so it needs the last few hours of readings
+    locally, which is a different thing from needing the record.
 
 Why a lookback rather than a since-cursor: DMI backfills late station
 reports into slots that already passed, and the store dedupes on
 ``(station_id, observed_utc, parameter_id)``, so re-reading the same
 forty minutes every ten is both cheap and self-healing. A missed cycle
 needs no recovery logic at all.
+
+Request budget, both instances together: one GET per parameter per poll
+(no ``stationId`` filter, and 40 minutes of every Danish gauge is a few
+hundred rows — one page under the client's 300k limit), so 12 an hour
+each against DMI's 500 per 5 seconds. No API key: DMI stopped requiring
+one on ``opendataapi.dmi.dk`` on 2025-12-02, and
+``AsyncMetObsClient`` only sends ``X-Gravitee-Api-Key`` when
+``station_obs.api_key`` is set.
 
 This task owns its own ``AsyncIOScheduler`` rather than riding the radar
 cycle's. The two cadences are unrelated (10 min against 5 min ± jitter),
@@ -60,6 +81,21 @@ _log = structlog.get_logger(__name__)
 JITTER_SEC = 30
 
 
+def month_partition_end(year: int, month: int) -> datetime:
+    """The first instant AFTER everything a ``YYYY/MM`` partition can hold.
+
+    Retention compares this rather than the month's start, so a partition
+    is only ever deleted once every row it could contain is older than the
+    cutoff. Raises ``ValueError`` on a year/month that is not one, which is
+    how :meth:`StationObsPoller.prune_once` refuses to date a file whose
+    name it does not recognise.
+    """
+    return (
+        datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
+        else datetime(year, month + 1, 1, tzinfo=timezone.utc)
+    )
+
+
 @dataclass
 class StationObsPollResult:
     """What one poll did — the shape of its log line, and of its tests."""
@@ -68,6 +104,9 @@ class StationObsPollResult:
     new_rows: int = 0
     traces: int = 0
     skipped: int = 0
+    #: Month partitions retention deleted after this poll. Always 0 on the
+    #: private instance, which prunes nothing.
+    pruned: int = 0
     errors: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -76,10 +115,17 @@ class StationObsPollResult:
 
 
 class StationObsPoller:
-    """Periodically mirror DMI gauge observations into the corpus.
+    """Periodically mirror DMI gauge observations into a store on this host.
 
     ``client`` and ``store`` are injectable so tests exercise the whole
     task with no network and no real corpus directory.
+
+    ``prunes`` is decided here, once, from ``station_obs.store_dir``: only
+    the bounded store is ever pruned, and an injected store inherits that
+    decision from the config rather than from its own path. Retention is
+    the one operation in this module that DELETES data, so which root it
+    may run against is a property of the configuration and not of a
+    per-call argument.
     """
 
     def __init__(
@@ -91,12 +137,15 @@ class StationObsPoller:
     ) -> None:
         self.config = config
         self.settings = config.station_obs
-        corpus_dir = config.storage.corpus_dir
-        if store is None and corpus_dir is None:
+        root = self.settings.store_dir or config.storage.corpus_dir
+        if store is None and root is None:
             raise ValueError(
-                "StationObsPoller needs storage.corpus_dir (or an injected store)",
+                "StationObsPoller needs station_obs.store_dir or "
+                "storage.corpus_dir (or an injected store)",
             )
-        self.store = store or StationObsStore(Path(corpus_dir))  # type: ignore[arg-type]
+        self.store = store or StationObsStore(Path(root))  # type: ignore[arg-type]
+        #: Retention applies to the bounded store and nothing else.
+        self.prunes = self.settings.store_dir is not None
         self._client = client
         self._owns_client = client is None
         self._scheduler = AsyncIOScheduler(timezone=timezone.utc)
@@ -128,6 +177,58 @@ class StationObsPoller:
         end = now or datetime.now(timezone.utc)
         return end - timedelta(minutes=self.settings.lookback_min), end
 
+    # -- retention (bounded store only) -----------------------------------
+
+    def prune_once(self, now: datetime | None = None) -> list[Path]:
+        """Delete month partitions that ended before the retention cutoff.
+
+        Blocking (``unlink``), so callers put it on the ``"station_obs"``
+        worker with the append. Returns the files it removed.
+
+        Month granularity, deliberately: a partition is the unit the store
+        writes atomically, and trimming rows out of the *current* month
+        would mean rewriting the file the next append is about to rewrite.
+        So retention keeps whole months, and the window it actually holds
+        is ``retention_days`` rounded up to the containing months — a week
+        holds between 7 and 38 days. At ~0.3 MiB per month of real gauge
+        data that is the cheapest safe rule there is.
+
+        Two refusals, both about deleting the wrong thing. WHICH store may
+        be pruned is :attr:`prunes`, decided from the config once and
+        checked by the caller, so a poller over the corpus never reaches
+        this method at all. And a file whose path does not parse as
+        ``YYYY/MM`` is left where it is: an unrecognised name is not
+        evidence of age.
+        """
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(
+            days=self.settings.retention_days,
+        )
+        removed: list[Path] = []
+        for path in self.store.partitions():
+            try:
+                end = month_partition_end(int(path.parent.name), int(path.stem))
+            except ValueError:
+                continue
+            if end > cutoff:
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                _log.warning(
+                    "station_obs_prune_failed", path=str(path), error=str(exc),
+                )
+                continue
+            removed.append(path)
+        for year_dir in {path.parent for path in removed}:
+            # An emptied year directory is litter, not data. Anything still
+            # in it (a partition retention kept) makes rmdir fail, which is
+            # the check.
+            try:
+                year_dir.rmdir()
+            except OSError:
+                pass
+        return removed
+
     # -- the job ----------------------------------------------------------
 
     async def poll_once(self, now: datetime | None = None) -> StationObsPollResult:
@@ -137,6 +238,11 @@ class StationObsPoller:
         ``result.errors`` and the others still land. The next interval is
         the retry, and the overlapping lookback means nothing is lost by
         having skipped one.
+
+        Retention runs last, and only on the bounded store. After the
+        append, so a poll never deletes a month it is about to write into;
+        and inside the same failure policy, so a volume that refuses an
+        unlink costs one warning line rather than the readings.
         """
         start, end = self.window(now)
         client = self._get_client()
@@ -170,6 +276,21 @@ class StationObsPoller:
                 )
                 continue
             result.new_rows += int(written.get("new", 0))
+        if self.prunes:
+            try:
+                # Same worker as the append, for the same reason: it is
+                # filesystem work and it must not ride the event loop.
+                removed = await run_in_pool("station_obs", self.prune_once, end)
+            except Exception as exc:  # noqa: BLE001 — housekeeping only
+                _log.warning("station_obs_prune_failed", error=str(exc))
+            else:
+                result.pruned = len(removed)
+                if removed:
+                    _log.info(
+                        "station_obs_pruned",
+                        partitions=[str(path) for path in removed],
+                        retention_days=self.settings.retention_days,
+                    )
         _log.info(
             "station_obs_poll",
             start=start.isoformat(timespec="seconds"),
@@ -178,6 +299,7 @@ class StationObsPoller:
             new_rows=result.new_rows,
             traces=result.traces,
             skipped=result.skipped,
+            pruned=result.pruned,
             errors=len(result.errors),
         )
         return result
@@ -213,6 +335,11 @@ class StationObsPoller:
             lookback_min=self.settings.lookback_min,
             parameters=list(self.settings.parameters),
             store=str(self.store.obs_dir),
+            # Which of the two roots this is, in one field, because the
+            # answer decides whether months get deleted.
+            retention_days=(
+                self.settings.retention_days if self.prunes else None
+            ),
         )
 
     async def shutdown(self) -> None:
@@ -230,13 +357,18 @@ class StationObsPoller:
 def build_station_obs_poller(config: Config) -> StationObsPoller | None:
     """The poller for this config, or ``None`` when it must not run.
 
-    Refuses in public mode as a second line of defence: ``Config``
-    already rejects that combination at load, so reaching this branch
-    means a config object was assembled in code rather than loaded, and
-    the safe answer is still "no poller".
+    A ``store_dir`` is the whole permission: it names a bounded store on
+    this instance's own volume, which is the one arrangement a public
+    instance may poll under (S5) and which the private instance never
+    sets. Without it the two old refusals stand, as a second line of
+    defence — ``Config`` already rejects both at load, so reaching either
+    branch means a config object was assembled in code rather than loaded,
+    and the safe answer is still "no poller".
     """
     if not config.station_obs.enabled:
         return None
+    if config.station_obs.store_dir is not None:
+        return StationObsPoller(config)
     if config.server.public_mode:
         _log.warning("station_obs_disabled_public_mode")
         return None
@@ -250,5 +382,6 @@ __all__ = [
     "StationObsPoller",
     "StationObsPollResult",
     "build_station_obs_poller",
+    "month_partition_end",
     "release_arrow_pool",
 ]

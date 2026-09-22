@@ -20,6 +20,9 @@ Phase F (F4) adds the verification surface:
   model the push engine decides on (Phase H, H-P).
   PRIVATE: not on the public allow-list; it is the source the public
   instance's ``sync`` task reads.
+- ``GET /stations/station_points.json`` — the gauge catalogue the
+  ``ng_*`` features resolve stations with (v2, S5). PRIVATE, and for the
+  same reason: the public instance pulls it rather than building it.
 
 Website Phase D adds the Web Push surface (see ``push/routes.py``):
 
@@ -113,6 +116,7 @@ from . import __version__
 from .compute import CycleEngine, CycleResult
 from .config import Config
 from .eta_smoother import EtaSmoother
+from .gauge_history import resolved_gauge_points_path
 from .lightning_schema import LightningEtaResponse, StrikesAccepted, StrikesIn
 from .national_artifacts import LATEST_MANIFEST_NAME
 from .national_sample import finite_or_none, sample_point
@@ -585,7 +589,7 @@ def create_app(
         public mode 404s it. It exists so the public instance's ``sync``
         task can pull the nightly refit across the shared docker network —
         the public stack runs its own cycle and its own push engine but
-        has no gauge store, so it can serve this model and never fit one.
+        cannot fit a model, so it serves this one and never fits one.
         Subscribers see only the resolved answer at ``/api/push/options``.
         """
         path = resolved_postprocess_path(request.app.state.config)
@@ -593,6 +597,42 @@ def create_app(
             raise HTTPException(
                 status_code=503,
                 detail="no fitted post-processing model on this instance yet",
+            )
+        return Response(
+            content=path.read_bytes(),
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    @app.get("/stations/station_points.json", tags=["stations"])
+    async def station_points_file(
+        request: Request, _: None = Depends(require_api_key),
+    ) -> Response:
+        """The gauge catalogue this instance resolves stations out of (S5).
+
+        The fourth published artifact, and the smallest: ~12 kB naming
+        every DMI rain gauge with the coordinate that turns it into a
+        place. Built here (``scripts/build_station_points.py``) and pulled
+        by the public instance's ``sync`` task, which cannot derive it and
+        needs it to compute the ``ng_*`` neighbour-gauge features its
+        post-processing model was trained on.
+
+        Private, like the other three: ``_PUBLIC_PATHS`` does not list it,
+        so public mode 404s it to anyone without the bearer. The
+        *readings* behind those features are not published at all — the
+        public instance polls metObs itself, because the features read them
+        at a ten-minute visibility horizon and an hourly copy would be a
+        different number.
+
+        503 when this instance has no catalogue configured, or the
+        configured file is not there: the operator's answer is a path or a
+        build, never a body this route could invent.
+        """
+        path = resolved_gauge_points_path(request.app.state.config)
+        if path is None or not path.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail="no station points file on this instance",
             )
         return Response(
             content=path.read_bytes(),

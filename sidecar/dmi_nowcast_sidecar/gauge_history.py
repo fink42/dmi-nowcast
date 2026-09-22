@@ -2,10 +2,18 @@
 
 The post-processing model's radar features all come off grids the cycle
 already holds. The gauge block does not: it is what the *station itself*
-measured in the last hour, and the only place that exists is the corpus's
-observation archive — the same parquet the gauge poller
+measured in the last hour, and the only place that exists is a
+``StationObsStore`` on this host — the parquet the gauge poller
 (:mod:`dmi_nowcast_sidecar.station_obs`) writes every ten minutes and the
 offline replay trains on.
+
+**Which store, and whose** (v2, S5). On the private instance that is the
+corpus archive, kept for ever. On the public instance it is a bounded
+store on the data volume, filled by that instance's own poller and pruned
+to a week, with the station catalogue arriving through ``sync``. Two
+deployments, two directories, one reader: the fallback chain lives in
+:func:`resolved_gauge_store_dir` and :func:`resolved_gauge_points_path`,
+and nothing below this line knows which instance it is running on.
 
 Three things make this narrow on purpose.
 
@@ -75,6 +83,8 @@ __all__ = [
     "GaugeCycleRead",
     "GaugeHistory",
     "build_gauge_history",
+    "resolved_gauge_points_path",
+    "resolved_gauge_store_dir",
     "slots_by_station",
 ]
 
@@ -180,11 +190,13 @@ class GaugeHistory:
     """The gauge archive one cycle reads, once, for both gauge blocks.
 
     ``points_file`` is the version-2 station points file
-    (``station_eval.points_file``): the public catalogue of DMI gauges,
-    the very list the scoreboard evaluates. It is read once, on first use,
-    inside the cycle worker where blocking is allowed, and it answers two
-    questions — which station stands on a given point (:meth:`stations`)
-    and where a given station stands (:meth:`coords`).
+    (:func:`resolved_gauge_points_path`): the public catalogue of DMI
+    gauges, the very list the scoreboard evaluates. It is read on first
+    use — and on every use until it is there, which is what the public
+    instance's synced copy needs — inside the cycle worker where blocking
+    is allowed, and it answers two questions: which station stands on a
+    given point (:meth:`stations`) and where a given station stands
+    (:meth:`coords`).
     """
 
     def __init__(
@@ -199,41 +211,80 @@ class GaugeHistory:
         self.lag_min = float(lag_min)
         self._stations: dict[tuple[float, float], str] | None = None
         self._coords: dict[str, tuple[float, float]] | None = None
+        #: True once a catalogue with stations in it has been parsed. Until
+        #: then every cycle re-reads the file (see :meth:`_load_points`).
+        self._loaded = False
+        #: The last failure, so the retry is quiet after the first line.
+        self._points_error: str | None = None
 
     # -- the coordinate → gauge map ----------------------------------------
 
     def _load_points(self) -> None:
-        """Parse the catalogue once into BOTH directions of the map.
+        """Parse the catalogue into BOTH directions of the map, once.
 
         One file, one read, one failure log line: the point → station
         lookup the ``g_*`` block needs and the station → coordinate map the
         ``ng_*`` geometry needs are the same twelve kilobytes of JSON, and
         parsing it twice would be two chances to disagree about which
         stations exist.
+
+        **Once it exists.** On the private instance the catalogue is there
+        before the process is, so "read on first use" was the whole story.
+        On the public instance (S5) the file arrives by ``sync``, which
+        means the first cycles run before it does — and a cache that
+        remembered "unreadable" would hand out null gauge blocks until
+        somebody noticed and restarted the container. So only a catalogue
+        with stations in it is cached; anything else leaves ``_loaded``
+        false and the next cycle looks again, at the cost of one failed
+        ``read_text`` per cycle. The log line is emitted once per distinct
+        failure rather than once per cycle, and the pickup says so.
         """
-        if self._stations is not None and self._coords is not None:
+        if self._loaded:
             return
         try:
             raw = json.loads(self.points_file.read_text())
             entries = list(raw.get("points") or ())
-            self._stations = {
+            stations = {
                 point_key(float(entry["lat"]), float(entry["lon"])): str(
                     entry["id"],
                 )
                 for entry in entries
             }
-            self._coords = {
+            coords = {
                 str(entry["id"]): (float(entry["lat"]), float(entry["lon"]))
                 for entry in entries
             }
         except Exception as exc:  # noqa: BLE001 — every way a file is junk
+            self._note_points_problem(f"{type(exc).__name__}: {exc}")
+            return
+        if not coords:
+            # A document that parsed and named nobody. Not a crash, not a
+            # catalogue either — and worth retrying, because the file the
+            # sync task is mid-way through replacing looks exactly like it.
+            self._note_points_problem("no points in the document")
+            return
+        self._stations = stations
+        self._coords = coords
+        self._loaded = True
+        self._points_error = None
+        _log.info(
+            "gauge_history_points_loaded",
+            path=str(self.points_file),
+            stations=len(coords),
+        )
+
+    def _note_points_problem(self, error: str) -> None:
+        """Empty maps, and one log line per distinct reason — not per cycle."""
+        self._stations = {}
+        self._coords = {}
+        if error != self._points_error:
+            self._points_error = error
             _log.warning(
                 "gauge_history_points_unreadable",
                 path=str(self.points_file),
-                error=f"{type(exc).__name__}: {exc}",
+                error=error,
+                note="null gauge blocks until the file is readable",
             )
-            self._stations = {}
-            self._coords = {}
 
     def stations(self) -> dict[tuple[float, float], str]:
         """``{rounded (lat, lon): station_id}``, read once. ``{}`` on failure.
@@ -321,23 +372,87 @@ class GaugeHistory:
         return self.read(now_utc).series_for(keys)
 
 
+def resolved_gauge_store_dir(config: Any) -> Path | None:
+    """Root of the ``StationObsStore`` this instance reads gauges out of.
+
+    One chain, three links, and the order is the point:
+
+    1. ``postprocess.gauge_store_dir`` — an explicit override, for a store
+       neither of the others names.
+    2. ``station_obs.store_dir`` — the bounded store this instance's own
+       poller fills (S5). The public stack sets that one key and the
+       reader follows the writer, rather than the operator spelling the
+       same directory twice and getting to spell it differently.
+    3. ``storage.corpus_dir`` — the private instance's archive, which is
+       what this function answered before any of the keys existed.
+
+    ``None`` when none of them is set, which is a deployment with no gauge
+    archive at all.
+    """
+    settings = getattr(config, "postprocess", None)
+    override = None if settings is None else getattr(
+        settings, "gauge_store_dir", None,
+    )
+    if override is not None:
+        return Path(override)
+    bounded = getattr(getattr(config, "station_obs", None), "store_dir", None)
+    if bounded is not None:
+        return Path(bounded)
+    corpus_dir = config.storage.corpus_dir
+    return None if corpus_dir is None else Path(corpus_dir)
+
+
+def resolved_gauge_points_path(config: Any) -> Path | None:
+    """The version-2 station catalogue this instance resolves gauges with.
+
+    ``postprocess.gauge_points_file`` when set — the public instance's
+    synced copy — else ``station_eval.points_file``, which is the private
+    instance's own and the answer this had before the key existed. ``None``
+    when neither is set: a deployment with nothing to map a coordinate to a
+    station id with, which is a null gauge block and not an error.
+
+    Also what ``GET /stations/station_points.json`` publishes and what
+    ``sync``'s target path for that file is, so the catalogue an instance
+    reads is by construction the one it serves.
+    """
+    settings = getattr(config, "postprocess", None)
+    override = None if settings is None else getattr(
+        settings, "gauge_points_file", None,
+    )
+    if override is not None:
+        return Path(override)
+    points_file = getattr(
+        getattr(config, "station_eval", None), "points_file", None,
+    )
+    return None if points_file is None else Path(points_file)
+
+
 def build_gauge_history(config: Any) -> GaugeHistory | None:
     """A :class:`GaugeHistory` for this config, or None when there can be none.
 
     None — and therefore a null gauge block — whenever the deployment has
-    no gauge archive (the public instance owns no corpus volume), no
-    station catalogue to resolve a point against, or the feature turned
-    off. All three are ordinary states, not errors.
+    no gauge archive to read (:func:`resolved_gauge_store_dir`), no station
+    catalogue to resolve a point against
+    (:func:`resolved_gauge_points_path`), or the feature turned off. All
+    three are ordinary states, not errors.
+
+    The public instance used to be the first of those by construction: no
+    corpus volume, no store, null ``ng_*`` columns, a tree model trained on
+    21 features running on 21 nulls. It now polls its own bounded store and
+    receives the catalogue through ``sync``, and both keys resolve — which
+    is the whole of S5 as far as this module is concerned. A catalogue that
+    has not arrived yet is NOT this branch: the object is built and every
+    cycle re-reads the file until it exists (:meth:`_load_points`).
     """
     settings = getattr(config, "postprocess", None)
     if settings is not None and not settings.gauge_features:
         return None
-    corpus_dir = config.storage.corpus_dir
-    points_file = config.station_eval.points_file
-    if corpus_dir is None or points_file is None:
+    store_dir = resolved_gauge_store_dir(config)
+    points_file = resolved_gauge_points_path(config)
+    if store_dir is None or points_file is None:
         return None
     return GaugeHistory(
-        corpus_dir,
+        store_dir,
         points_file,
         lag_min=(
             DEFAULT_GAUGE_LAG_MIN if settings is None

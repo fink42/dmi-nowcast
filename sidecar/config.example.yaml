@@ -208,9 +208,18 @@ lightning:
 # Without it the benchmark verifies the radar against the radar.
 #
 # ON for this (LAN / private) instance: it is the one that owns the
-# corpus volume and runs the calibration jobs. The public instance MUST
-# leave it off — config load refuses the combination outright, because
-# there is no corpus mount there to write to.
+# corpus volume and runs the calibration jobs.
+#
+# The public instance polls too since v2/S5, but only into a BOUNDED store
+# (station_obs.store_dir) on its own volume, pruned to retention_days —
+# its cycle computes the ng_* neighbour-gauge features and needs the
+# readings local and minutes fresh. Config load still refuses
+# station_obs.enabled under server.public_mode with no store_dir.
+#
+# Leave store_dir unset HERE. Null means "write storage.corpus_dir and
+# prune nothing", which is what an archive is; retention_days is ignored
+# without it, and store_dir may not be the corpus (config load refuses
+# that, so nothing can point retention at the archive).
 #
 station_obs:
   enabled: true
@@ -284,11 +293,26 @@ station_obs:
 # stations resolve to one, by coordinate, out of
 # station_eval.points_file.
 #
+# The two gauge_*_dir/_file keys say WHERE that archive and that catalogue
+# are. Leave them unset here: they fall back to storage.corpus_dir and
+# station_eval.points_file, which is what this instance has always meant.
+# They exist for the public instance (v2, S5), which owns neither and
+# points them at its own bounded store and at the catalogue `sync` copied
+# over — see deploy/public/config.public.example.yaml.
+#
+# Which means station_eval.points_file above is load-bearing here even if
+# the scoreboard itself is off: it is what GET /stations/station_points.json
+# serves, and that route is where the public instance gets its catalogue.
+# points_file on its own is legal — `enabled` requires it, not the reverse
+# — so an instance that only publishes the file can set just that.
+#
 # postprocess:
 #   gauge_lag_min: 10.0
 #   # false leaves the g_* columns null everywhere: the escape hatch if
 #   # the corpus read ever costs a cycle.
 #   gauge_features: true
+#   # gauge_store_dir: null   # -> station_obs.store_dir, then corpus_dir
+#   # gauge_points_file: null # -> station_eval.points_file
 
 # --- The quality report (Phase F, F4) ---------------------------------
 # The document behind the website's /quality page ("How good are we?"):

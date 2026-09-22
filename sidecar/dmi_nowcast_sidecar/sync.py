@@ -1,6 +1,6 @@
 """Pulling published artifacts from the private instance (Phase F, F4).
 
-Two files the public instance serves but cannot produce:
+Files the public instance serves, or reads, but cannot produce:
 
 ``nowcast/quality.json``
     Built nightly from the corpora, the warning replay and the live gauge
@@ -18,16 +18,26 @@ Two files the public instance serves but cannot produce:
 ``calibration/postprocess.json``
     The gauge-trained post-processing model, refit nightly beside the
     thresholds (Phase H, H-P). The public instance runs its own cycle and
-    its own push engine but has no gauge store, so it can never fit this
-    and only ever serves it. Without the copy its notifications fall back
-    to the curve-calibrated probability — a working service, with the
-    worse number.
+    its own push engine but can never fit this, so it only ever serves it.
+    Without the copy its notifications fall back to the curve-calibrated
+    probability — a working service, with the worse number.
+``stations/station_points.json``
+    The version-2 catalogue of DMI's rain gauges, built on the private
+    instance (``scripts/build_station_points.py``), and the one input the
+    public instance's ``ng_*`` features cannot derive: a station id, and
+    the coordinate that turns it into a place. NOT in the default
+    ``sync.files`` — it is only wanted where ``postprocess`` reads
+    neighbour gauges out of a local store (v2, S5), which is the public
+    stack's example config and nothing else. Hourly is ample: the file
+    names DMI's gauge network and changes about never, and the READINGS
+    are not synced at all — that instance polls metObs itself, because the
+    features read them at a ten-minute horizon.
 
-Both are small, static-per-cycle JSON documents on a network only these
-two containers share, so the transport is deliberately dull: one
-conditional GET per file per ``interval_min``, ``If-None-Match`` against
-the ETag from last time, and a content hash as the fallback when the
-source sends no ETag.
+These are small, static-per-cycle documents on a network only these two
+containers share, so the transport is deliberately dull: one conditional
+GET per file per ``interval_min``, ``If-None-Match`` against the ETag from
+last time, and a content hash as the fallback when the source sends no
+ETag.
 
 The failure policy is the whole design. **Last good wins**: a refused
 connection, a 500, a body that is not the JSON it claims to be, a body
@@ -62,6 +72,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Config
+from .gauge_history import resolved_gauge_points_path
 from .push.paths import resolved_postprocess_path, resolved_thresholds_path
 
 _log = structlog.get_logger(__name__)
@@ -69,24 +80,31 @@ _log = structlog.get_logger(__name__)
 #: Spread the poll off the exact minute boundary, as every other task does.
 JITTER_SEC = 30
 
-#: The three files that do NOT land under ``data_dir`` by their relative
-#: path: the engine reads its curves from
-#: ``calibration.national_curves_path``, the push service reads its
-#: thresholds from ``push.thresholds_path`` and the cycle reads its
-#: post-processing model from ``push.postprocess_path``, wherever the
+#: The files that do NOT land under ``data_dir`` by their relative path:
+#: the engine reads its curves from ``calibration.national_curves_path``,
+#: the push service reads its thresholds from ``push.thresholds_path``, the
+#: cycle reads its post-processing model from ``push.postprocess_path`` and
+#: its gauge catalogue from ``postprocess.gauge_points_file``, wherever the
 #: operator put them.
 CURVES_FILE = "calibration/national_curves.json"
 THRESHOLDS_FILE = "calibration/push_thresholds.json"
 POSTPROCESS_FILE = "calibration/postprocess.json"
+STATION_POINTS_FILE = "stations/station_points.json"
 
 
 def target_path(config: Config, name: str) -> Path:
     """Where a synced file lands on this instance.
 
-    Everything is ``<storage.data_dir>/<name>`` except the three fitted
-    files, which go to the paths the engine and the push service actually
-    read. Getting this wrong is silent — the file appears, nothing loads
-    it — so it lives in one function with one test.
+    Everything is ``<storage.data_dir>/<name>`` except the fitted files and
+    the gauge catalogue, which go to the paths the engine, the push service
+    and the cycle actually read. Getting this wrong is silent — the file
+    appears, nothing loads it — so it lives in one function with one test.
+
+    The catalogue is the one entry whose special case is conditional: with
+    no ``postprocess.gauge_points_file`` configured there is nothing
+    reading it, and the generic rule puts it at
+    ``<data_dir>/stations/station_points.json``, which is where the public
+    example points that key anyway.
     """
     if name == CURVES_FILE:
         return Path(config.calibration.national_curves_path)
@@ -94,6 +112,10 @@ def target_path(config: Config, name: str) -> Path:
         return resolved_thresholds_path(config)
     if name == POSTPROCESS_FILE:
         return resolved_postprocess_path(config)
+    if name == STATION_POINTS_FILE:
+        configured = resolved_gauge_points_path(config)
+        if configured is not None:
+            return configured
     return Path(config.storage.data_dir).joinpath(*PurePosixPath(name).parts)
 
 
@@ -313,6 +335,11 @@ def build_artifact_sync(
     ``push_thresholds`` is the same arrangement for the fitted threshold
     table, nudged at the start of the next fan-out. Without them, the file
     still lands — it just takes a restart to take effect.
+
+    ``stations/station_points.json`` needs no hook of either kind: the
+    cycle's ``GaugeHistory`` re-reads that file every cycle until it parses
+    (see :meth:`~dmi_nowcast_sidecar.gauge_history.GaugeHistory._load_points`),
+    so the first sync is picked up by the next cycle on its own.
     """
     if not config.sync.enabled:
         return None
@@ -346,6 +373,7 @@ def build_artifact_sync(
 __all__ = [
     "CURVES_FILE",
     "POSTPROCESS_FILE",
+    "STATION_POINTS_FILE",
     "THRESHOLDS_FILE",
     "ArtifactSync",
     "SyncFileResult",

@@ -171,14 +171,62 @@ push:
   persistence_obs: 1
 
 station_obs:
-  # OFF, and not optional: config load REFUSES station_obs.enabled
-  # together with server.public_mode. Gauge polling belongs to the
-  # private instance, which owns the corpus volume the observations are
-  # written to — this stack has storage.corpus_dir: null and would spend
-  # DMI's fair-use budget writing into a container filesystem nobody
-  # reads. See sidecar/config.example.yaml for the private instance's
-  # settings.
-  enabled: false
+  # ON here, which it was not before v2/S5 — and the reason is the
+  # post-processing model this instance's notifications are decided by.
+  #
+  # That model reads 21 neighbour-gauge (ng_*) columns: what the rain
+  # gauges AROUND a subscriber's address measured in the last hours,
+  # placed in the cycle's own motion frame. At an address that is not
+  # itself a gauge — which is every subscriber — those columns are the
+  # only gauge signal there is, and a model trained on them and served 21
+  # nulls is a model running blind. So this instance computes them, which
+  # means it needs the readings LOCALLY and FRESH: the features look back
+  # from `now - postprocess.gauge_lag_min` (10 min), so an hourly `sync`
+  # of somebody else's parquet would be the wrong number, not a late one.
+  #
+  # store_dir is what makes this legal: config load still REFUSES
+  # station_obs.enabled under server.public_mode unless store_dir names a
+  # bounded store on this stack's own data volume. It is not an archive —
+  # whole month partitions older than retention_days are deleted after
+  # every poll (~0.3 MiB per month of real gauge data, so the volume never
+  # notices). The private instance leaves store_dir null, writes the
+  # corpus and prunes nothing; see sidecar/config.example.yaml.
+  #
+  # Cost to DMI: one request per parameter per poll, so 12 an hour,
+  # against a limit of 500 per 5 s. No API key needed or wanted (DMI
+  # dropped the requirement on opendataapi.dmi.dk on 2025-12-02).
+  enabled: true
+  store_dir: /var/lib/dmi-nowcast/gauges
+  retention_days: 7
+  interval_min: 10
+  lookback_min: 40
+  parameters:
+    - precip_past10min
+    - precip_dur_past10min
+  base_url: https://opendataapi.dmi.dk/v2/metObs
+  api_key: null
+
+postprocess:
+  # WHERE the cycle reads the two gauge inputs of its feature row. Both
+  # default to the private instance's answers (storage.corpus_dir and
+  # station_eval.points_file), which this stack has neither of.
+  #
+  # The catalogue — ~12 kB naming every DMI gauge and its coordinate — is
+  # built on the private instance and arrives through `sync` below, at the
+  # path named here. Before the first sync the file is absent: the cycle
+  # logs one line and publishes a null ng_* block, and the cycle after the
+  # sync picks it up without a restart.
+  gauge_points_file: /var/lib/dmi-nowcast/stations/station_points.json
+  # The readings. Not set, deliberately: it falls back to
+  # station_obs.store_dir above, so the reader follows the writer and the
+  # same directory is never spelled twice. Set it only to read a store
+  # this instance's own poller does not fill.
+  # gauge_store_dir: /var/lib/dmi-nowcast/gauges
+  #
+  # The contract with the offline fit. Leave it alone: the model was
+  # trained on slots hidden until they were this old, and reading fresher
+  # ones here would score rows the model has never seen.
+  gauge_lag_min: 10.0
 
 station_eval:
   # OFF, and not optional either: config load REFUSES
@@ -214,8 +262,15 @@ sync:
   #                                     (the gauge-trained model this
   #                                      instance's push engine decides
   #                                      with, Phase H — it runs its own
-  #                                      fan-out but has no gauge store,
+  #                                      fan-out but cannot fit a model,
   #                                      so it can only ever receive this)
+  #   stations/station_points.json    → postprocess.gauge_points_file
+  #                                     (the gauge catalogue the ng_*
+  #                                      features resolve stations and
+  #                                      distances with, v2/S5. The
+  #                                      READINGS are not synced — see
+  #                                      station_obs above for why this
+  #                                      instance polls them itself)
   #
   # LAST GOOD WINS. A refused connection, a 500, or a body that is not the
   # JSON it claims to be leaves the file already on disk untouched: this
@@ -250,6 +305,11 @@ sync:
     # installed on the private stack (sidecar/deploy/install_artifact.sh):
     # this list is how it reaches the public instance.
     - calibration/postprocess.json
+    # The gauge catalogue (v2, S5). NOT in the shipped default file list —
+    # it is wanted only where a cycle computes ng_* features out of a
+    # local store, which is this stack. Without it that block is null and
+    # the model decides on 21 imputed columns.
+    - stations/station_points.json
   timeout_s: 30.0
   # Bearer for the source, when the private instance has server.api_key
   # set. Null on a trusted network, which is the normal case here.

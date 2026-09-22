@@ -19,6 +19,7 @@ route table (see `dmi_nowcast_sidecar/app.py`'s docstring):
 | `/api/push/config`, `/api/push/subscribe`, `/api/push/unsubscribe` | yes | Web Push, subscriber-facing (see below) |
 | `/api/push/test`, `/api/push/stats` | **no** | operator routes — exact paths, not the `/api/push/` prefix |
 | `/state.json`, `/frames/*`, `/lightning/*`, `/docs`, `/openapi.json` | **no** | `404 {"detail":"Not Found"}`, identical to a nonexistent path |
+| `/calibration/*`, `/stations/station_points.json` | **no** | the artefacts this stack *pulls* from the private one, not republishes |
 
 The hidden routes answer normally to a request carrying
 `Authorization: Bearer <server.api_key>`. With `api_key: null` (the
@@ -79,6 +80,78 @@ docker compose -f sidecar/deploy/public/docker-compose.yml restart
 Without it the grids are served raw and reported honestly as
 `calibrated: false` — never silently presented as calibrated.
 
+## Rain gauges on the public stack
+
+This instance decides its notifications with `p_post`, the output of a
+post-processing model whose features include 21 neighbour-gauge (`ng_*`)
+columns: what the rain gauges *around* a subscriber's point measured in
+the last hours, placed in the cycle's own motion frame. At an address that
+is not itself a gauge — which is every subscriber — those columns are the
+only gauge signal in the row, and served as nulls they make a model that
+was trained on them decide on 21 imputed means. So this stack computes
+them, which means it needs gauge readings locally and *fresh*: the
+features look back from `now - postprocess.gauge_lag_min` (10 min), so an
+hourly `sync` of the private instance's parquet would be the wrong number
+rather than a late one.
+
+Two config blocks, both in `config.public.example.yaml`:
+
+```yaml
+station_obs:
+  enabled: true
+  store_dir: /var/lib/dmi-nowcast/gauges   # bounded — NOT an archive
+  retention_days: 7
+  interval_min: 10
+  lookback_min: 40
+  parameters: [precip_past10min, precip_dur_past10min]
+  base_url: https://opendataapi.dmi.dk/v2/metObs
+  api_key: null
+
+postprocess:
+  gauge_points_file: /var/lib/dmi-nowcast/stations/station_points.json
+  gauge_lag_min: 10.0
+
+sync:
+  files:
+    - ...                                  # the three fitted artefacts
+    - stations/station_points.json
+```
+
+- `store_dir` is what makes polling legal here: config load refuses
+  `station_obs.enabled` under `server.public_mode` unless it names a
+  bounded store on this stack's own volume, and it may never be
+  `storage.corpus_dir`. After every poll, month partitions that ended more
+  than `retention_days` ago are deleted — real gauge data is ~0.3 MiB per
+  month (1.4M rows at ~0.2 bytes/row), so the volume never notices. The
+  readings the cycle actually reads are the last six hours of it.
+- `gauge_store_dir` is left unset: it falls back to `station_obs.store_dir`,
+  so the reader follows the writer and the directory is named once.
+- The catalogue is the one piece this instance cannot derive. It is built
+  on the private instance and served there at
+  `GET /stations/station_points.json` — which resolves that instance's
+  `station_eval.points_file`, so it must be set there (the scoreboard
+  itself may stay off); 503 until it exists, behind `server.api_key` if
+  the private instance sets one, and 404 on any public instance. `sync`
+  copies it to `postprocess.gauge_points_file`. Before the first sync the
+  cycle logs one `gauge_history_points_unreadable` line and publishes a
+  null `ng_*` block; the cycle after the sync picks the file up with no
+  restart. A catalogue *replaced* later takes a restart.
+- Cost to DMI: one request per parameter per poll — 12 an hour — against a
+  limit of 500 per 5 s. No API key: DMI dropped that requirement on
+  `opendataapi.dmi.dk` on 2025-12-02.
+
+Check it in the logs:
+
+```bash
+docker compose -f sidecar/deploy/public/docker-compose.yml logs \
+  | grep -E 'station_obs_poll|gauge_history_points_loaded|postprocess_cycle'
+```
+
+`postprocess_cycle` carries `ng_frame_ok`, `ng_near_km` and
+`ng_upwet_tau_min`: how many points the neighbour block answered for. All
+three at zero with a loaded catalogue means the store is empty or
+unreadable, not that it is dry outside.
+
 ## Web Push
 
 `config.public.example.yaml` ships with `push.enabled: true`. Before
@@ -138,7 +211,9 @@ Set `push.enabled: false` to turn the feature off; the routes then answer
 ## Notes
 
 - No corpus bind-mount: `storage.corpus_dir: null`. The public instance
-  archives nothing and writes only inside its own volume.
+  archives nothing and writes only inside its own volume — the bounded
+  gauge store under `station_obs.store_dir` included, which is why
+  retention keeps it a working set and not an archive.
 - Resource budget: a second 10-min-cadence ensemble is roughly +17 s CPU
   per 10 min and ~1 GB transient.
 - Deploying to a remote host: `sidecar/deploy/deploy.sh` ships the service
