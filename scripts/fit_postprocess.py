@@ -99,6 +99,17 @@ same rows and the same folds — the baseline of record for v2, because
 design beats the old one. ``model:<path>`` refits whatever configuration
 a ``postprocess.json`` records.
 
+``--target wet|onset`` decides what the probability is OF. ``wet`` (the
+default, the shipped model) is Layer B's "gauge wet within (t, t+L]".
+``onset`` is the event the push is graded on: a gauge onset from
+``threshold_sweep.gauge_truth`` inside the scorer's window
+``(t, t+L+--onset-tolerance-min]`` (10 min, ``warning_score``'s), 0 only
+where every slot of that window is known, excluded otherwise. Every
+out-of-fold number — the baseline arm's too — is then scored on that
+label, ``--write-back`` writes ``p_onset_<lead>`` instead of
+``p_post_<lead>``, and the artefact says ``"target": "onset"``.
+``--onset-rows dry`` restricts training AND scoring to the dry-60 rows.
+
 Everything is reported twice: on all rows, and on the **dry** subset —
 rows whose gauge was dry for the hour before the decision instant. A
 model that wins only on rows where it was already raining has not won.
@@ -160,10 +171,12 @@ from dmi_nowcast_core.warning_score import (  # noqa: E402
     DEFAULT_DRY_MIN,
     DEFAULT_MIN_KNOWN_SLOTS,
     DEFAULT_ONSET_MIN_MM,
+    DEFAULT_TOLERANCE_MIN,
 )
 from dmi_nowcast_sidecar.threshold_sweep import (  # noqa: E402
     SweepError,
     decision_parquets,
+    gauge_truth,
     parse_leads,
     write_atomic,
 )
@@ -200,6 +213,21 @@ MODEL_CHOICES: tuple[str, ...] = pp.MODEL_KINDS
 #: ``--baseline`` values that are not ``model:<path>``.
 BASELINE_CURVE = "curve"
 BASELINE_REFIT_V1 = "refit-v1"
+
+#: ``--target`` values: the core module's, so the flag and the artefact's
+#: ``target`` spell the same two words.
+TARGET_WET = pp.TARGET_WET
+TARGET_ONSET = pp.TARGET_ONSET
+TARGET_CHOICES: tuple[str, ...] = pp.TARGETS
+
+#: ``--onset-rows`` values. ``all`` keeps every gradable row, including the
+#: ones whose gauge was wet in the hour before — the model has to learn
+#: that rain already at the point means no onset, and under random-point
+#: it must learn it from radar and neighbours because its own gauge is
+#: masked. ``dry`` restricts training AND scoring to the dry-60 subset.
+ONSET_ROWS_ALL = "all"
+ONSET_ROWS_DRY = "dry"
+ONSET_ROWS_CHOICES: tuple[str, ...] = (ONSET_ROWS_ALL, ONSET_ROWS_DRY)
 
 
 def parse_tree_params(text: str) -> dict:
@@ -366,6 +394,126 @@ def build_truth(
     return out
 
 
+def _onset_seconds(onsets: Sequence[Any]) -> np.ndarray:
+    """Sorted epoch seconds of a station's onset instants."""
+    return np.array(
+        sorted(int(o.timestamp()) for o in onsets), dtype=np.int64,
+    )
+
+
+def window_all_known(
+    grid: Any, t: np.ndarray, station: np.ndarray, window_min: int,
+) -> np.ndarray:
+    """True where every gauge slot ending in ``(t, t + window]`` is known.
+
+    The same slot arithmetic as ``GaugeGrid.outcome`` — the window is the
+    slots whose END falls in the half-open interval, and a window running
+    off either end of the grid is not known — read off the grid's known-
+    slot prefix sum. ``outcome`` cannot answer this itself: it certifies
+    "no WET slot", and one wet slot makes its window usable whatever the
+    others said, while "no ONSET" needs every slot, wet or dry.
+    """
+    step = int(grid.step_sec)
+    t = np.asarray(t, dtype=np.int64)
+    station = np.asarray(station, dtype=np.int64)
+    lo = (t - grid.first_sec) // step + 1
+    hi = (t + int(window_min) * 60 - grid.first_sec) // step
+    inside = (lo >= 0) & (hi < grid.n_slots) & (hi >= lo)
+    safe_lo = np.where(inside, lo, 0)
+    safe_hi = np.where(inside, hi, 0)
+    # ``_known_flat`` is the grid's own cumulative count of known slots,
+    # one leading zero per station row; ``_stride`` is that row length.
+    known = grid._known_flat
+    base = station * grid._stride
+    n_known = known[base + safe_hi + 1] - known[base + safe_lo]
+    return inside & (n_known == safe_hi - safe_lo + 1)
+
+
+def build_onset_truth(
+    rows: Mapping[str, Any],
+    grid: Any,
+    onsets: Mapping[str, Sequence[Any]],
+    stations: Sequence[str],
+    leads: Sequence[int],
+    *,
+    tolerance_min: int = DEFAULT_TOLERANCE_MIN,
+    restrict: np.ndarray | None = None,
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """``{lead: (onset in window, usable)}`` — the push's own event.
+
+    A row at decision instant ``t`` (``generated_at``) and lead ``L`` is:
+
+    * **1** when a gauge onset from ``threshold_sweep.gauge_truth`` — the
+      list the push is scored against, same dry spell, same amount rule,
+      same dead-gauge exclusions — falls in ``(t, t + L + tolerance]``,
+      the scorer's window (``warning_score.score_warnings``). An onset is
+      its own evidence, whatever the rest of the window reported.
+    * **0** when no onset falls there AND every gauge slot ending in that
+      window is known.
+    * **excluded** otherwise: an unknown slot cannot certify "no onset".
+
+    Onsets are stamped at their slot's END, so "onset in the window" and
+    "slot ending in the window" are the same interval.
+
+    ``stations`` are the grid's scored stations, indexed by
+    ``rows["station"]`` after ``_recode_stations``. Rows the recode
+    dropped are excluded, as in :func:`build_truth`. ``restrict`` narrows
+    the usable rows further (``--onset-rows dry``).
+
+    Rows whose gauge was wet in the hour before ``t`` keep their label —
+    0 by construction, except where the wet spell ended early enough in
+    that hour for a new onset to fit inside the window.
+    """
+    t = np.asarray(rows["t"], dtype=np.int64)
+    code = np.asarray(rows["station"], dtype=np.int64)
+    dropped = np.asarray(
+        rows.get("dropped", np.zeros(t.size, dtype=bool)), dtype=bool,
+    )
+    keep = ~dropped
+    if restrict is not None:
+        keep = keep & np.asarray(restrict, dtype=bool)
+    by_code = [_onset_seconds(onsets.get(s, ())) for s in stations]
+    order = np.argsort(code, kind="stable")
+    bounds = np.searchsorted(code[order], np.arange(len(stations) + 1))
+    out: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for lead in leads:
+        window = int(lead) + int(tolerance_min)
+        hit = np.zeros(t.size, dtype=bool)
+        for index, times in enumerate(by_code):
+            if times.size == 0:
+                continue
+            members = order[bounds[index]:bounds[index + 1]]
+            if members.size == 0:
+                continue
+            at = t[members]
+            nxt = np.searchsorted(times, at, side="right")
+            ok = nxt < times.size
+            found = np.zeros(at.size, dtype=bool)
+            found[ok] = times[nxt[ok]] <= at[ok] + window * 60
+            hit[members] = found
+        known = window_all_known(grid, t, code, window)
+        usable = keep & (hit | known)
+        out[int(lead)] = (hit.astype(np.float64), usable)
+    return out
+
+
+def target_counts(
+    truth: Mapping[int, tuple[np.ndarray, np.ndarray]], n: int,
+) -> dict[str, dict[str, Any]]:
+    """Per lead: gradable rows, positives, excluded rows and the base rate."""
+    out: dict[str, dict[str, Any]] = {}
+    for lead, (y, usable) in sorted(truth.items()):
+        graded = int(np.count_nonzero(usable))
+        positive = int(np.count_nonzero(usable & (y > 0)))
+        out[str(lead)] = {
+            "rows": graded,
+            "positives": positive,
+            "excluded": int(n - graded),
+            "base_rate": (positive / graded) if graded else None,
+        }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -402,6 +550,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines += [
         f"Generated {report['generated_at_utc']}.",
         "",
+    ]
+    lines += _target_section(report)
+    lines += [
         "Leave-one-(year, month)-out over the replay's decision rows. The "
         + (
             "baseline is the served `p_rain_<lead>` — the per-lead "
@@ -450,6 +601,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"| station offsets | "
         f"{'yes' if settings.get('station_offsets') else 'no'} |",
         f"| baseline | {baseline_name} |",
+        f"| target | {_target_label(settings)} |",
         f"| L2 | {settings['l2']} |",
         f"| dead gauges | "
         f"{', '.join(bench._dead_label(r) for r in report['dead_gauges']) or 'none'} |",
@@ -484,6 +636,66 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines += _fold_section(report)
     lines += _feature_section(report)
     return "\n".join(lines) + "\n"
+
+
+def _target_label(settings: Mapping[str, Any]) -> str:
+    """One cell: the outcome, and under onset its window and its rows."""
+    if settings.get("target", TARGET_WET) != TARGET_ONSET:
+        return "wet within `(t, t + L]`"
+    return (
+        f"onset in `(t, t + L + {settings.get('onset_tolerance_min')}]`, "
+        f"rows `{settings.get('onset_rows', ONSET_ROWS_ALL)}`"
+    )
+
+
+def _target_section(report: Mapping[str, Any]) -> list[str]:
+    """What every number below is a probability OF."""
+    settings = report["settings"]
+    if settings.get("target", TARGET_WET) != TARGET_ONSET:
+        return [
+            "**Target `wet`**: the gauge was wet at some point in "
+            "`(t, t + L]` — Layer B's outcome.",
+            "",
+        ]
+    tolerance = settings.get("onset_tolerance_min")
+    rows_rule = settings.get("onset_rows", ONSET_ROWS_ALL)
+    lines = [
+        f"**Target `onset`**: a gauge onset (rain after "
+        f"{settings.get('dry_min')} dry minutes delivering ≥ "
+        f"{settings.get('onset_min_mm')} mm, `threshold_sweep.gauge_truth`) "
+        f"inside the scorer's window `(t, t + L + {tolerance}]` — the event "
+        "the push is graded on. 1 when an onset falls there; 0 when none "
+        "does and every gauge slot ending in the window is known; excluded "
+        "otherwise. **Every** out-of-fold metric below — the baseline "
+        "arm's included — is scored on this label.",
+        "",
+        (
+            "Rows `all`: rows whose gauge was wet in the hour before `t` are "
+            "kept, with their label (0 unless the wet spell ended early "
+            "enough for a new onset to fit the window)."
+            if rows_rule == ONSET_ROWS_ALL else
+            f"Rows `dry`: training AND scoring are restricted to the dry-"
+            f"{pp.DRY_BEFORE_MIN} subset, so the `all` stratum below IS the "
+            "dry subset."
+        ),
+        "",
+    ]
+    counts = report.get("target_counts") or {}
+    if counts:
+        lines += [
+            "| lead | window | gradable rows | onsets | base rate | excluded |",
+            "|---:|---|---:|---:|---:|---:|",
+        ]
+        for lead in settings["leads"]:
+            entry = counts.get(str(lead)) or {}
+            lines.append(
+                f"| {lead} | `(t, t + {int(lead) + int(tolerance or 0)}]` | "
+                f"{entry.get('rows', '–')} | {entry.get('positives', '–')} | "
+                f"{_fmt(entry.get('base_rate'), 4)} | "
+                f"{entry.get('excluded', '–')} |"
+            )
+        lines.append("")
+    return lines
 
 
 def _summary_section(report: Mapping[str, Any]) -> list[str]:
@@ -706,8 +918,13 @@ def _reliability_section(report: Mapping[str, Any]) -> list[str]:
         "## Reliability, pooled",
         "",
         "Ten bins, `[k/10, (k+1)/10)` with `p == 1` in the last — the "
-        "project-wide binning. `observed` is the share of those rows whose "
-        "gauge was wet inside the lead.",
+        "project-wide binning. `observed` is the share of those rows "
+        + (
+            "with a gauge onset inside the scorer window `(t, t + L + "
+            f"{report['settings'].get('onset_tolerance_min')}]`."
+            if report["settings"].get("target") == TARGET_ONSET else
+            "whose gauge was wet inside the lead."
+        ),
         "",
     ]
     for lead in report["settings"]["leads"]:
@@ -925,8 +1142,13 @@ def write_back(
     station_ids: Sequence[str],
     predictions: Mapping[int, np.ndarray],
     log,
+    column_template: str = POST_COLUMN_TEMPLATE,
 ) -> dict:
     """Copy the run, adding ``p_post_<lead>`` from the out-of-fold rows.
+
+    ``column_template`` names the column: ``p_post_{lead}`` for a ``wet``
+    fit, ``p_onset_{lead}`` for an ``onset`` one, so the two can never be
+    read as each other.
 
     Never in place — see :func:`check_write_back`. A row the fit never saw
     (a station outside ``--points``, a file the loader skipped) gets a
@@ -971,7 +1193,7 @@ def write_back(
             hit = (sorted_keys[safe] == probe) & (codes >= 0)
             for lead, values in columns.items():
                 taken = np.where(hit, values[safe], np.nan)
-                name = post_column(lead)
+                name = column_template.format(lead=int(lead))
                 if name in names:
                     table = table.drop_columns([name])
                 table = table.append_column(
@@ -1556,6 +1778,25 @@ def build_parser() -> argparse.ArgumentParser:
              "family dropped, and report the ΔBSS. Costs one LOMO pass "
              "per family (" + ", ".join(pp.FAMILY_NAMES) + ").",
     )
+    p.add_argument(
+        "--target", default=TARGET_WET, choices=list(TARGET_CHOICES),
+        help="the outcome the model is fitted AND scored on. 'wet' is "
+             "Layer B's 'gauge wet within (t, t+L]' — the shipped model. "
+             "'onset' is the push's own event: a gauge onset "
+             "(threshold_sweep.gauge_truth) in the scorer window "
+             "(t, t+L+tolerance]; 0 needs every slot of that window known",
+    )
+    p.add_argument(
+        "--onset-tolerance-min", type=int, default=DEFAULT_TOLERANCE_MIN,
+        help="the scorer's tolerance added to the lead under --target onset",
+    )
+    p.add_argument(
+        "--onset-rows", default=ONSET_ROWS_ALL, choices=list(ONSET_ROWS_CHOICES),
+        help="under --target onset: 'all' keeps rows whose gauge was wet "
+             "in the hour before (label 0 by construction, so the model "
+             "learns it); 'dry' restricts training AND scoring to the "
+             f"dry-{pp.DRY_BEFORE_MIN} subset",
+    )
     p.add_argument("--min-known-slots", type=int, default=DEFAULT_MIN_KNOWN_SLOTS,
                    help="dead-gauge rule, as in the benchmark report")
     p.add_argument("--dry-min", type=int, default=DEFAULT_DRY_MIN)
@@ -1566,9 +1807,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--write-back", type=Path, default=None,
                    help="copy the run here with the OUT-OF-FOLD "
-                        "probabilities added as p_post_<lead>; score it "
-                        "with benchmark_report.py --probability-column "
-                        "'p_post_{lead}'. Never writes into the run.")
+                        "probabilities added as p_post_<lead> (p_onset_<lead> "
+                        "under --target onset); score it with "
+                        "benchmark_report.py --probability-column "
+                        "'p_post_{lead}' (or 'p_onset_{lead}'). Never writes "
+                        "into the run.")
     return p
 
 
@@ -1612,6 +1855,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.l2 < 0:
         print("error: --l2 must not be negative", file=sys.stderr)
         return 2
+    target = str(args.target)
+    if target != TARGET_ONSET and str(args.onset_rows) != ONSET_ROWS_ALL:
+        print(
+            "error: --onset-rows applies to --target onset only",
+            file=sys.stderr,
+        )
+        return 2
+    if args.onset_tolerance_min < 0:
+        print("error: --onset-tolerance-min must not be negative", file=sys.stderr)
+        return 2
+    column_template = pp.target_column_template(target)
 
     run_dirs = [Path(d) for d in args.run_dirs]
     try:
@@ -1673,7 +1927,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     dry = pp.dry_subset(
         features, grid=grid, t=rows["t"], station=rows["station"],
     )
+    if target == TARGET_ONSET:
+        # The push's event, from the push scorer's own onset list: the same
+        # window, pad, onset rule and dead-gauge rule the threshold sweep
+        # grades a warning with. The grid above is still needed — it is
+        # what says whether a window without an onset was fully reported.
+        onsets, _known_until, _slots, _dead = gauge_truth(
+            Path(args.corpus_dir), sorted(rows["stations"]),
+            bench.decision_window(rows["t"]),
+            dry_min=int(args.dry_min), onset_min_mm=float(args.onset_min_mm),
+            min_known_slots=int(args.min_known_slots), log=log,
+        )
+        truth = build_onset_truth(
+            rows, grid, onsets, scored, leads,
+            tolerance_min=int(args.onset_tolerance_min),
+            restrict=dry if str(args.onset_rows) == ONSET_ROWS_DRY else None,
+        )
+        del onsets
     del grid
+    counts = target_counts(truth, int(rows["rows"]))
+    for lead, entry in counts.items():
+        log(
+            f"target {target} lead {lead}: {entry['positives']} positive(s) "
+            f"of {entry['rows']} gradable row(s), {entry['excluded']} excluded"
+        )
     log(
         f"onset-relevant (gauge dry for {pp.DRY_BEFORE_MIN} min before the "
         f"decision): {int(dry.sum())} of {rows['rows']} row(s)"
@@ -1779,6 +2056,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # random-point, and the model has to keep masking when it is
         # served or the rows it scores stop matching the rows it saw.
         protocol=str(args.protocol),
+        target=target,
         training={
             "from": window[0].isoformat(),
             "to": window[1].isoformat(),
@@ -1798,6 +2076,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             # back to the run that made it.
             "protocol": str(args.protocol),
             "folds": fold_block,
+            # What the probabilities are OF, and under onset the window
+            # and the rows the labels were drawn on.
+            "target": target,
+            "onset_tolerance_min": (
+                int(args.onset_tolerance_min) if target == TARGET_ONSET else None
+            ),
+            "onset_rows": (
+                str(args.onset_rows) if target == TARGET_ONSET else None
+            ),
         },
     )
 
@@ -1822,6 +2109,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else f"{args.baseline} (refitted in fold)"
             ),
             "model": str(args.model),
+            "target": target,
+            "onset_tolerance_min": (
+                int(args.onset_tolerance_min) if target == TARGET_ONSET else None
+            ),
+            "onset_rows": (
+                str(args.onset_rows) if target == TARGET_ONSET else None
+            ),
+            "column_template": column_template,
             "arm": candidate,
             "protocol": str(args.protocol),
             "folds": fold_block,
@@ -1846,6 +2141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "days": int(np.unique(day).size),
         "n_months": len(set(int(m) for m in np.unique(month))),
         "window": {"from": window[0].isoformat(), "to": window[1].isoformat()},
+        "target_counts": counts,
         "dry_rows": int(dry.sum()),
         "dry_source": (
             "column" if pp.DRY_COLUMN in features else "derived from the gauge store"
@@ -1886,13 +2182,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 station_ids=original_ids,
                 predictions=evaluation["out_of_fold"],
                 log=log,
+                column_template=column_template,
             )
         except SweepError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         copy_summary(run_dirs, Path(args.write_back), {
             "source": [str(d) for d in run_dirs],
-            "column_template": POST_COLUMN_TEMPLATE,
+            "column_template": column_template,
+            "target": target,
+            "onset_tolerance_min": (
+                int(args.onset_tolerance_min) if target == TARGET_ONSET else None
+            ),
+            "onset_rows": (
+                str(args.onset_rows) if target == TARGET_ONSET else None
+            ),
             "leads": list(leads),
             "kind": "out-of-fold (leave-one-month-out)",
             "model": str(out_dir / "postprocess.json"),
@@ -1902,7 +2206,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log(
             f"wrote {written['files']} file(s) to {args.write_back}; score "
             "them with benchmark_report.py --probability-column "
-            "'p_post_{lead}'"
+            f"'{column_template}'"
         )
 
     log(f"done in {time.time() - started:.1f}s")
@@ -1913,6 +2217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _headline(report: Mapping[str, Any]) -> dict:
     out: dict[str, Any] = {
         "protocol": report["settings"].get("protocol", PROTOCOL_AT_GAUGE),
+        "target": report["settings"].get("target", TARGET_WET),
         "arm": report["settings"].get("arm"),
         "folds": (report["settings"].get("folds") or {}).get("kind"),
         "rows": report["rows"],

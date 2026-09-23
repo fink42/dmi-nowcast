@@ -181,6 +181,9 @@ class TestTheTableHonoursTheProtocol:
         assert loaded["masks_own_gauge"] is True
         assert loaded["kind"] == pp.KIND_TREES
         assert loaded["design"] == pp.DESIGN_V2
+        # The fit target rides on the same line; a document written
+        # without one is the wet model it has always been.
+        assert loaded["target"] == pp.TARGET_WET
 
     def test_an_at_gauge_document_says_the_other_thing(
         self, tmp_path: Path,

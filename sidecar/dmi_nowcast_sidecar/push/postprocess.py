@@ -288,6 +288,10 @@ class PostprocessTable:
             # values answer different questions about the same numbers and
             # the log has to say which one is being served.
             protocol=model.protocol,
+            # And which outcome it was fitted to — "wet within L" or a
+            # gauge onset inside the scorer's window. Logged only: the
+            # serving path does not branch on it.
+            target=model.target,
             masks_own_gauge=model.masks_own_gauge,
             columns=len(model.feature_names),
         )

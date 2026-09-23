@@ -769,3 +769,234 @@ def test_an_unknown_comparison_arm_is_a_usage_error(
         "--leads", "30", "--resamples", "0",
         "--compare", "logistic,randomforest",
     ]) == 2
+
+
+# ---------------------------------------------------------------------------
+# --target onset: the push's own event as the label
+# ---------------------------------------------------------------------------
+
+
+def _onset_inputs(corpus: Path) -> tuple:
+    """``(grid, onsets, scored)`` over the fixture archive, the script's way."""
+    from dmi_nowcast_sidecar.threshold_sweep import gauge_truth
+
+    days = _days()
+    window = (_at(days[0], 0), _at(days[-1], 23 * 60))
+    grid, _dead, scored = bench.build_gauge_grid(
+        corpus / "corpus", list(STATIONS), window,
+        dry_min=60, onset_min_mm=0.2, min_known_slots=500,
+    )
+    onsets, _known_until, _slots, _dead = gauge_truth(
+        corpus / "corpus", list(STATIONS), window,
+    )
+    return grid, onsets, scored
+
+
+class TestTheOnsetLabel:
+    """Hand-placed rows against the fixture's planted events.
+
+    Day 2026-01-01, station A: the first wet slot ENDS at 09:30 and the
+    rain lasts six slots (to 10:20). Gauge slots are reported 04:00–20:00
+    only, so a window reaching past 20:00 has unknown slots.
+    """
+
+    DAY = (2026, 1, 1)
+
+    def _rows(self, scored, cases) -> dict:
+        t = numpy.array(
+            [int(_at(self.DAY, minute).timestamp()) for minute, _s in cases],
+            dtype=numpy.int64,
+        )
+        station = numpy.array(
+            [scored.index(s) for _m, s in cases], dtype=numpy.int64,
+        )
+        return {"t": t, "station": station,
+                "dropped": numpy.zeros(t.size, dtype=bool)}
+
+    def test_the_planted_cases(self, corpus: Path) -> None:
+        grid, onsets, scored = _onset_inputs(corpus)
+        first = _first_wet_slot_min(self.DAY, STATION_A)
+        assert first == 9 * 60 + 30
+        cases = [
+            (first - 20, STATION_A),    # onset inside (t, t+20+10]  -> 1
+            (first - 30, STATION_A),    # onset at t+30: only the tolerance -> 1
+            (7 * 60, STATION_A),        # a fully reported dry window -> 0
+            (19 * 60 + 50, STATION_A),  # window runs into unreported slots -> excluded
+            (first + 30, STATION_A),    # wet in the hour before, no onset -> 0, kept
+        ]
+        rows = self._rows(scored, cases)
+        truth = fit.build_onset_truth(
+            rows, grid, onsets, scored, [20], tolerance_min=10,
+        )
+        y, usable = truth[20]
+        assert list(usable) == [True, True, True, False, True]
+        assert list(y[usable]) == [1.0, 1.0, 0.0, 0.0]
+
+        # Without the tolerance the onset at t+30 is outside a 20-min window.
+        strict = fit.build_onset_truth(
+            rows, grid, onsets, scored, [20], tolerance_min=0,
+        )
+        assert strict[20][0][1] == 0.0 and strict[20][1][1]
+
+        # The dry-rows rule drops the wet-before row and nothing else.
+        dry = pp.dry_subset(
+            {"x": numpy.zeros(rows["t"].size)},
+            grid=grid, t=rows["t"], station=rows["station"],
+        )
+        assert not dry[4] and dry[0] and dry[2]
+        restricted = fit.build_onset_truth(
+            rows, grid, onsets, scored, [20], tolerance_min=10, restrict=dry,
+        )
+        assert not restricted[20][1][4]
+        assert restricted[20][1][0] and restricted[20][1][2]
+
+    def test_a_dropped_row_is_excluded(self, corpus: Path) -> None:
+        grid, onsets, scored = _onset_inputs(corpus)
+        rows = self._rows(scored, [(7 * 60, STATION_A)])
+        rows["dropped"] = numpy.array([True])
+        truth = fit.build_onset_truth(rows, grid, onsets, scored, [20])
+        assert not truth[20][1][0]
+
+    def test_the_onsets_are_the_sweeps(self, corpus: Path) -> None:
+        """One onset per (day, station): the first wet slot of the event."""
+        _grid, onsets, _scored = _onset_inputs(corpus)
+        for station in STATIONS:
+            got = sorted(onsets[station])
+            want = sorted(
+                _at(day, _first_wet_slot_min(day, station)) for day in _days()
+            )
+            assert got == want
+
+
+@pytest.fixture(scope="module")
+def fitted_onset(corpus: Path, tmp_path_factory: pytest.TempPathFactory) -> tuple:
+    out = tmp_path_factory.mktemp("fit-out-onset")
+    back = tmp_path_factory.mktemp("fit-back-onset") / "replay_onset"
+    report = _run(
+        corpus, out, "--target", "onset", "--baseline", "refit-v1",
+        "--write-back", str(back),
+    )
+    return report, out, back
+
+
+class TestTheOnsetFit:
+    def test_the_report_names_the_target(self, fitted_onset) -> None:
+        report, out, _back = fitted_onset
+        settings = report["settings"]
+        assert settings["target"] == "onset"
+        assert settings["onset_tolerance_min"] == 10
+        assert settings["onset_rows"] == "all"
+        assert settings["column_template"] == "p_onset_{lead}"
+        text = (out / "postprocess_report.md").read_text()
+        assert "**Target `onset`**" in text
+        assert "`(t, t + L + 10]`" in text
+        assert "Rows `all`" in text
+        assert "| target | onset in `(t, t + L + 10]`, rows `all` |" in text
+        assert fit._headline(report)["target"] == "onset"
+
+    def test_every_metric_is_scored_on_the_onset_label(self, fitted_onset) -> None:
+        """One onset per (day, station) → a base rate far below the wet one."""
+        report, _out, _back = fitted_onset
+        for lead in LEADS:
+            counts = report["target_counts"][str(lead)]
+            block = report["evaluation"]["leads"][str(lead)]["all"]
+            assert block["n"] == counts["rows"]
+            assert block["baseline"]["base_rate"] == pytest.approx(
+                counts["base_rate"],
+            )
+            assert block["postprocess"]["base_rate"] == pytest.approx(
+                counts["base_rate"],
+            )
+            # 14 days x 2 stations, one onset each, is at most a handful
+            # of rows per event inside a 30–40 min window.
+            assert 0 < counts["positives"] < 0.1 * counts["rows"]
+
+    def test_the_artefact_says_onset(self, fitted_onset) -> None:
+        _report, out, _back = fitted_onset
+        payload = json.loads((out / "postprocess.json").read_text())
+        assert payload["target"] == "onset"
+        assert payload["training"]["target"] == "onset"
+        assert payload["training"]["onset_tolerance_min"] == 10
+        assert payload["training"]["onset_rows"] == "all"
+        model = pp.PostprocessModel.loads((out / "postprocess.json").read_text())
+        assert model.target == pp.TARGET_ONSET
+
+    def test_the_write_back_column_and_summary(self, fitted_onset) -> None:
+        import pyarrow.parquet as pq
+
+        _report, _out, back = fitted_onset
+        table = pq.read_table(sorted((back / "decisions").glob("*.parquet"))[0])
+        names = set(table.schema.names)
+        assert {"p_onset_20", "p_onset_30"} <= names
+        assert not {"p_post_20", "p_post_30"} & names
+        block = json.loads((back / "summary.json").read_text())["postprocess"]
+        assert block["column_template"] == "p_onset_{lead}"
+        assert block["target"] == "onset"
+        assert block["onset_tolerance_min"] == 10
+        assert block["onset_rows"] == "all"
+
+    def test_the_benchmark_reads_the_onset_column(
+        self, fitted_onset, corpus: Path, tmp_path: Path,
+    ) -> None:
+        _report, _out, back = fitted_onset
+        out = tmp_path / "layer-b-onset"
+        assert bench.main([
+            "--baseline", str(back), "--out-dir", str(out),
+            "--corpus-dir", str(corpus / "corpus"),
+            "--leads", "20,30", "--layers", "b", "--resamples", "0",
+            "--probability-column", "p_onset_{lead}",
+        ]) == 0
+        posted = json.loads((out / "benchmark.json").read_text())
+        assert posted["settings"]["probability_column"] == "p_onset_{lead}"
+        assert posted["layer_b"]["leads"]["30"]["all"]["baseline"]["n"] > 0
+
+    def test_dry_rows_restrict_training_and_scoring(
+        self, fitted_onset, corpus: Path, tmp_path: Path,
+    ) -> None:
+        report_all, _out, _back = fitted_onset
+        report = _run(
+            corpus, tmp_path / "dry", "--target", "onset",
+            "--onset-rows", "dry", "--resamples", "0",
+        )
+        assert report["settings"]["onset_rows"] == "dry"
+        for lead in LEADS:
+            every = report["evaluation"]["leads"][str(lead)]
+            assert every["all"]["n"] == every[pp.DRY]["n"]
+            assert every["all"]["n"] < (
+                report_all["evaluation"]["leads"][str(lead)]["all"]["n"]
+            )
+            # ...and the dry subset itself is the same rows either way.
+            assert every[pp.DRY]["n"] == (
+                report_all["evaluation"]["leads"][str(lead)][pp.DRY]["n"]
+            )
+        assert report["dry_rows"] == report_all["dry_rows"]
+        assert "Rows `dry`" in (tmp_path / "dry" / "postprocess_report.md").read_text()
+
+    def test_onset_rows_without_the_onset_target_is_a_usage_error(
+        self, corpus: Path, tmp_path: Path,
+    ) -> None:
+        assert fit.main([
+            "--run", str(corpus / "replay"),
+            "--corpus-dir", str(corpus / "corpus"),
+            "--out-dir", str(tmp_path / "out"),
+            "--leads", "30", "--resamples", "0",
+            "--onset-rows", "dry",
+        ]) == 2
+
+
+def test_target_wet_is_the_default_to_the_number(
+    fitted, corpus: Path, tmp_path: Path,
+) -> None:
+    """``--target wet`` spelled out changes nothing about the fit or its scores."""
+    report_default, out_default, _back, _corpus = fitted
+    report = _run(corpus, tmp_path / "wet", "--target", "wet")
+    assert report["settings"]["target"] == "wet"
+    assert report_default["settings"]["target"] == "wet"
+    assert report["evaluation"]["leads"] == report_default["evaluation"]["leads"]
+    a = json.loads((out_default / "postprocess.json").read_text())
+    b = json.loads((tmp_path / "wet" / "postprocess.json").read_text())
+    assert a["models"] == b["models"]
+    assert a["target"] == b["target"] == "wet"
+    summary = json.loads((_back / "summary.json").read_text())["postprocess"]
+    assert summary["column_template"] == "p_post_{lead}"
+    assert summary["target"] == "wet"

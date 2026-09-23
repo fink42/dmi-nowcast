@@ -155,6 +155,12 @@ __all__ = [
     "POST_PREFIX",
     "POST_COLUMN_TEMPLATE",
     "post_column",
+    "TARGET_WET",
+    "TARGET_ONSET",
+    "TARGETS",
+    "ONSET_PREFIX",
+    "ONSET_COLUMN_TEMPLATE",
+    "target_column_template",
     "post_schema",
     "SHARED_SOURCE_COLUMNS",
     "feature_source_columns",
@@ -853,6 +859,43 @@ def post_column(lead: int) -> str:
 #: ``threshold_sweep.SweepOptions.probability_column``). Derived from the
 #: prefix so the writer and every reader cannot name three columns.
 POST_COLUMN_TEMPLATE = POST_PREFIX + "{lead}"
+
+
+#: What a model was fitted to predict — the outcome, not the design.
+#:
+#: ``wet`` is the historical target and Layer B's outcome: the gauge was
+#: wet at some point inside ``(t, t + L]``. ``onset`` is the event the
+#: push is GRADED on: a gauge onset (rain after ``dry_min`` dry minutes
+#: that delivers ``onset_min_mm``, ``threshold_sweep.gauge_truth``) inside
+#: the scorer's window ``(t, t + L + tolerance]``. The two differ most on
+#: exactly the rows a push matters for — a point already under rain is
+#: "wet" and is never an onset — so a model of one is not a model of the
+#: other. Additive with the historical default: a document without
+#: ``target`` is a ``wet`` model, which is what every one written before
+#: the field existed was.
+TARGET_WET = "wet"
+TARGET_ONSET = "onset"
+TARGETS: tuple[str, ...] = (TARGET_WET, TARGET_ONSET)
+
+#: Prefix of the out-of-fold ONSET probability a ``--target onset`` fit
+#: writes back — beside ``p_post_<lead>`` rather than over it, so a copy
+#: can never be mistaken for the wet model's probability.
+ONSET_PREFIX = "p_onset_"
+
+#: ``str.format`` template of that column, for
+#: ``benchmark_report --probability-column``.
+ONSET_COLUMN_TEMPLATE = ONSET_PREFIX + "{lead}"
+
+
+def target_column_template(target: str) -> str:
+    """The write-back column template for a fit ``target``."""
+    if str(target) == TARGET_ONSET:
+        return ONSET_COLUMN_TEMPLATE
+    if str(target) == TARGET_WET:
+        return POST_COLUMN_TEMPLATE
+    raise ValueError(
+        f"unknown target {target!r}; expected one of {', '.join(TARGETS)}"
+    )
 
 
 #: Columns :func:`build_design` reads that the decision schema ALREADY
@@ -3993,6 +4036,13 @@ class PostprocessModel:
     #: a document written before this field existed loads as the at-gauge
     #: model it is.
     protocol: str = PROTOCOL_AT_GAUGE
+    #: What the model was fitted to predict — :data:`TARGET_WET` or
+    #: :data:`TARGET_ONSET`. Provenance for serving (nothing branches on
+    #: it), but part of the document's contract, like ``protocol``: an
+    #: onset model's number is P(onset in the scorer window), a different
+    #: quantity from the wet model's, and a threshold fitted on one means
+    #: nothing on the other. Additive with the historical default.
+    target: str = TARGET_WET
 
     # -- prediction ---------------------------------------------------------
 
@@ -4150,6 +4200,10 @@ class PostprocessModel:
             # it, so it is part of the contract the document states, not
             # a note about how the document came to be.
             "protocol": self.protocol,
+            # Beside ``protocol`` for the same reason: which outcome the
+            # numbers are probabilities OF is part of what the document
+            # states, not a note in the free-form provenance.
+            "target": self.target,
             "design": self.spec.to_json(),
             "features": {
                 "design_leads": list(self.design_leads),
@@ -4206,6 +4260,13 @@ class PostprocessModel:
             or training.get("protocol")
             or PROTOCOL_AT_GAUGE
         )
+        # Same order as ``protocol``: the top-level key, then the
+        # provenance block, then the historical default.
+        target = str(
+            raw.get("target")
+            or training.get("target")
+            or TARGET_WET
+        )
         return cls(
             leads=tuple(int(v) for v in raw["leads"]),
             design_leads=tuple(int(v) for v in features["design_leads"]),
@@ -4222,6 +4283,7 @@ class PostprocessModel:
             spec=DesignSpec.from_json(raw.get("design")),
             shared_trees=shared_trees,
             protocol=protocol,
+            target=target,
         )
 
     @classmethod
@@ -4512,6 +4574,7 @@ def fit_postprocess(
     settings: FitSettings | None = None,
     stations: Any | None = None,
     protocol: str = PROTOCOL_AT_GAUGE,
+    target: str = TARGET_WET,
 ) -> PostprocessModel:
     """Fit one model + isotonic map per lead on ``rows``.
 
@@ -4536,6 +4599,11 @@ def fit_postprocess(
     belong to the same call site, which is
     ``scripts/fit_postprocess.py``.
 
+    ``target`` names the outcome ``truth`` encodes — :data:`TARGET_WET`
+    or :data:`TARGET_ONSET` — and, like ``protocol``, is recorded rather
+    than acted on: the caller built ``truth``, and nothing about a pair
+    of arrays says afterwards which event they were labels for.
+
     Both stages of each lead are fitted on the SAME rows: the model first,
     then the isotonic map of its output. That is in-sample for the
     isotonic, which is why nothing here is a result — the number that
@@ -4554,6 +4622,12 @@ def fit_postprocess(
         raise ValueError(
             f"unknown protocol {chosen_protocol!r}; expected one of "
             f"{', '.join(PROTOCOLS)}"
+        )
+    chosen_target = str(target)
+    if chosen_target not in TARGETS:
+        raise ValueError(
+            f"unknown target {chosen_target!r}; expected one of "
+            f"{', '.join(TARGETS)}"
         )
     missing = [lead for lead in wanted if lead not in truth]
     if missing:
@@ -4606,6 +4680,7 @@ def fit_postprocess(
     # track opened; keep writing it, so a reader of either half of the
     # document sees the same answer.
     provenance.setdefault("protocol", chosen_protocol)
+    provenance.setdefault("target", chosen_target)
     return PostprocessModel(
         leads=wanted,
         design_leads=in_design,
@@ -4619,6 +4694,7 @@ def fit_postprocess(
         spec=spec,
         shared_trees=shared_trees,
         protocol=chosen_protocol,
+        target=chosen_target,
     )
 
 
