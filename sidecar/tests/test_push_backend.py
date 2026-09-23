@@ -1292,3 +1292,266 @@ async def test_service_logs_one_push_eval_per_subscription(
     for secret in (ENDPOINT_A, ENDPOINT_B, P256DH, AUTH,
                    str(HOME_LAT), str(HOME_LON)):
         assert secret not in rendered
+
+
+# ---------------------------------------------------------------------------
+# The all-clear: delivered through the same fan-out, only after a delivered
+# warning
+# ---------------------------------------------------------------------------
+
+RADAR_TS3 = RADAR_TS2 + timedelta(minutes=10)
+
+
+def _dry_products() -> NationalProducts:
+    """The same grids as ``products`` with the probability fallen to 0.1."""
+    return NationalProducts(
+        p_rain={20: _grid(0.1), 30: _grid(0.1)},
+        eta_min=_grid(np.nan),
+        intensity_mm_h=_grid(0.0),
+        leads_min=(20, 30),
+        threshold_mm_h=0.5,
+        timestep_min=5.0,
+        frame_age_min=2.0,
+        downsample_factor=DOWNSAMPLE,
+        n_members=8,
+    )
+
+
+async def _warn_then_two_dry_frames(
+    service: PushService, seeded_engine: CycleEngine,
+) -> None:
+    """Push at RADAR_TS (shipped persistence), then two below-threshold frames."""
+    service.config.push.persistence_obs = DEFAULT_PERSISTENCE_OBS
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+    for ts in (RADAR_TS2, RADAR_TS3):
+        seeded_engine._national_latest = (_dry_products(), ts)
+        await service.after_cycle(CycleResult(state=_state_with(ts)))
+
+
+async def test_all_clear_is_delivered_once_and_counted(
+    service: PushService, seeded_engine: CycleEngine, sends: list[dict],
+) -> None:
+    with structlog.testing.capture_logs() as logs:
+        await _warn_then_two_dry_frames(service, seeded_engine)
+
+    assert [s["payload"]["type"] for s in sends] == ["rain_incoming", "all_clear"]
+    assert all(s["endpoint"] == ENDPOINT_A for s in sends)
+    warning, clear = sends[0]["payload"], sends[1]["payload"]
+    # Same tag, so the all-clear REPLACES the warning on the device.
+    assert clear["tag"] == warning["tag"]
+    assert clear["silent"] is True and clear["renotify"] is False
+    assert warning["silent"] is False and warning["renotify"] is True
+    # Same fan-out path: same TTL and VAPID subject as a warning.
+    assert sends[1]["ttl_s"] == sends[0]["ttl_s"]
+    assert sends[1]["vapid_subject"] == SUBJECT
+
+    row = service.store.get(ENDPOINT_A)
+    assert row is not None
+    assert row.armed is False            # the re-arm is untouched
+    assert row.notified is True and row.all_clear_sent is True
+    assert row.below_streak == 2
+    assert row.last_warning_delivered is True
+
+    summary = service.last_fanout
+    assert summary is not None
+    assert summary["all_clear"] == 1 and summary["notified"] == 0
+    assert summary["sent"] == 1
+    assert summary["actions"].get("all_clear") == 1
+
+    events = [e for e in logs if e.get("event") == "push_all_clear"]
+    assert len(events) == 1
+    assert events[0]["sub"] == sub_id(ENDPOINT_A)
+    assert "minutes_since_push" in events[0]
+    assert ENDPOINT_A not in json.dumps(events, default=str)
+
+    # Nothing more until the re-arm: a third dry frame sends nothing.
+    ts4 = RADAR_TS3 + timedelta(minutes=10)
+    seeded_engine._national_latest = (_dry_products(), ts4)
+    await service.after_cycle(CycleResult(state=_state_with(ts4)))
+    assert len(sends) == 2
+    assert service.last_fanout["all_clear"] == 0  # type: ignore[index]
+
+
+async def test_the_first_dry_frame_alone_sends_nothing(
+    service: PushService, seeded_engine: CycleEngine, sends: list[dict],
+) -> None:
+    service.config.push.persistence_obs = DEFAULT_PERSISTENCE_OBS
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+    seeded_engine._national_latest = (_dry_products(), RADAR_TS2)
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS2)))
+    assert [s["payload"]["type"] for s in sends] == ["rain_incoming"]
+    row = service.store.get(ENDPOINT_A)
+    assert row is not None and row.below_streak == 1
+    assert row.all_clear_sent is False
+
+
+async def test_no_all_clear_for_a_warning_that_was_never_delivered(
+    service: PushService, seeded_engine: CycleEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warning's send failed: there is nothing on the device to retract."""
+    calls: list[dict] = []
+
+    def _fail_then_ok(**kwargs) -> SendResult:
+        calls.append(kwargs)
+        if kwargs["payload"]["type"] == "rain_incoming":
+            return SendResult(ok=False, gone=False, status=500, error="boom")
+        return SendResult(ok=True, gone=False, status=201, error=None)
+
+    monkeypatch.setattr(fanout_mod, "send", _fail_then_ok)
+    with structlog.testing.capture_logs() as logs:
+        await _warn_then_two_dry_frames(service, seeded_engine)
+
+    assert [c["payload"]["type"] for c in calls] == ["rain_incoming"]
+    row = service.store.get(ENDPOINT_A)
+    assert row is not None
+    assert row.last_notified_utc is not None
+    assert row.last_delivered_utc is None
+    assert row.last_warning_delivered is False
+    # Spent all the same: never retried on a later frame.
+    assert row.all_clear_sent is True
+    summary = service.last_fanout
+    assert summary["all_clear"] == 0            # type: ignore[index]
+    assert summary["all_clear_suppressed"] == 1  # type: ignore[index]
+    suppressed = [e for e in logs if e.get("event") == "push_all_clear_suppressed"]
+    assert len(suppressed) == 1
+    assert suppressed[0]["reason"] == "warning_not_delivered"
+
+
+async def test_no_all_clear_when_the_budget_skipped_the_warning(
+    service: PushService, seeded_engine: CycleEngine, sends: list[dict],
+) -> None:
+    """A warning the fan-out budget dropped was decided but never sent."""
+    service.config.push.fanout_budget_s = 1e-9
+    await _warn_then_two_dry_frames(service, seeded_engine)
+    assert sends == []
+    row = service.store.get(ENDPOINT_A)
+    assert row is not None and row.last_warning_delivered is False
+    assert service.last_fanout["all_clear_suppressed"] == 1  # type: ignore[index]
+
+
+async def test_all_clear_off_sends_only_the_warning(
+    service: PushService, seeded_engine: CycleEngine, sends: list[dict],
+) -> None:
+    service.config.push.allclear_enabled = False
+    await _warn_then_two_dry_frames(service, seeded_engine)
+    assert [s["payload"]["type"] for s in sends] == ["rain_incoming"]
+
+
+async def test_all_clear_is_not_deferred_by_quiet_hours(
+    service: PushService, seeded_engine: CycleEngine, sends: list[dict],
+) -> None:
+    """Quiet hours hold back a warning, never the silent retraction.
+
+    The warning goes out before the window; the window is then switched on
+    around the two dry frames (a 24-hour window spelled 00:00–23:59).
+    """
+    service.config.push.persistence_obs = DEFAULT_PERSISTENCE_OBS
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
+    row = service.store.get(ENDPOINT_A)
+    assert row is not None
+    with service.store._lock:  # flip the window on without restarting the machine
+        service.store._conn.execute(
+            "UPDATE subscriptions SET quiet_enabled = 1, quiet_start = '00:00', "
+            "quiet_end = '23:59' WHERE endpoint = ?", (ENDPOINT_A,),
+        )
+        service.store._conn.commit()
+    for ts in (RADAR_TS2, RADAR_TS3):
+        seeded_engine._national_latest = (_dry_products(), ts)
+        await service.after_cycle(CycleResult(state=_state_with(ts)))
+    assert [s["payload"]["type"] for s in sends] == ["rain_incoming", "all_clear"]
+
+
+def test_store_migrates_a_pre_all_clear_database(tmp_path: Path) -> None:
+    """A store written before the all-clear columns loads unchanged."""
+    path = tmp_path / "push.sqlite"
+    old_schema = """
+    CREATE TABLE subscriptions (
+        endpoint TEXT PRIMARY KEY, p256dh TEXT NOT NULL, auth TEXT NOT NULL,
+        lat REAL NOT NULL, lon REAL NOT NULL, threshold_pct INTEGER,
+        lead_min INTEGER NOT NULL, quiet_enabled INTEGER NOT NULL,
+        quiet_start TEXT NOT NULL, quiet_end TEXT NOT NULL, tz TEXT NOT NULL,
+        lang TEXT NOT NULL, created_utc TEXT NOT NULL, last_notified_utc TEXT,
+        armed INTEGER NOT NULL, streak INTEGER NOT NULL,
+        below_since_utc TEXT, last_eval_radar_ts TEXT
+    )"""
+    conn = sqlite3.connect(path)
+    conn.execute(old_schema)
+    conn.execute(
+        "INSERT INTO subscriptions VALUES (?, ?, ?, ?, ?, NULL, 30, 0, "
+        "'22:00', '07:00', 'Europe/Copenhagen', 'da', ?, ?, 0, 1, NULL, ?)",
+        (ENDPOINT_A, P256DH, AUTH, HOME_LAT, HOME_LON,
+         RADAR_TS.isoformat(), RADAR_TS.isoformat(), RADAR_TS.isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    store = PushStore(path)
+    row = store.get(ENDPOINT_A)
+    assert row is not None
+    assert row.armed is False and row.streak == 1
+    assert row.last_notified_utc == RADAR_TS
+    # The defaults: an old disarmed row can never retract a push it has
+    # no record of.
+    assert row.notified is False
+    assert row.below_streak == 0
+    assert row.all_clear_sent is False
+    assert row.last_delivered_utc is None
+    # And it is writable through the new columns.
+    store.update_state(
+        ENDPOINT_A, armed=False, streak=0, below_since_utc=None,
+        last_eval_radar_ts=RADAR_TS2, notified=True, below_streak=1,
+        all_clear_sent=False,
+    )
+    store.mark_delivered(ENDPOINT_A, RADAR_TS)
+    row = store.get(ENDPOINT_A)
+    assert row is not None
+    assert row.notified is True and row.below_streak == 1
+    assert row.last_delivered_utc == RADAR_TS
+    assert row.last_warning_delivered is True
+    store.close()
+
+
+def test_resubscribe_resets_the_all_clear_memory(tmp_path: Path) -> None:
+    store = PushStore(tmp_path / "push.sqlite")
+    store.upsert(_new_sub(ENDPOINT_A))
+    store.update_state(
+        ENDPOINT_A, armed=False, streak=1, below_since_utc=None,
+        last_eval_radar_ts=RADAR_TS, last_notified_utc=RADAR_TS,
+        notified=True, below_streak=1, all_clear_sent=True,
+    )
+    store.mark_delivered(ENDPOINT_A, RADAR_TS)
+    store.upsert(_new_sub(ENDPOINT_A, lead_min=45))
+    row = store.get(ENDPOINT_A)
+    assert row is not None
+    assert row.armed is True
+    assert row.notified is False and row.below_streak == 0
+    assert row.all_clear_sent is False
+    # Delivery history survives, like ``last_notified_utc``.
+    assert row.last_delivered_utc == RADAR_TS
+    store.close()
+
+
+def test_all_clear_config_defaults_and_overrides() -> None:
+    from dmi_nowcast_core.push_rules import (
+        DEFAULT_ALLCLEAR_ENABLED,
+        DEFAULT_ALLCLEAR_READINGS,
+    )
+
+    assert DEFAULT_ALLCLEAR_ENABLED is True and DEFAULT_ALLCLEAR_READINGS == 2
+    default = PushConfig()
+    assert default.allclear_enabled is DEFAULT_ALLCLEAR_ENABLED
+    assert default.allclear_readings == DEFAULT_ALLCLEAR_READINGS
+    custom = PushConfig(allclear_enabled=False, allclear_readings=3)
+    assert custom.allclear_enabled is False and custom.allclear_readings == 3
+    with pytest.raises(ValueError):
+        PushConfig(allclear_readings=0)
+
+
+def test_service_rules_carry_the_all_clear_settings(
+    service: PushService,
+) -> None:
+    service.config.push.allclear_enabled = False
+    service.config.push.allclear_readings = 3
+    rules = service._rules()
+    assert rules.allclear_enabled is False and rules.allclear_readings == 3

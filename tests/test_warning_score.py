@@ -1347,3 +1347,104 @@ def test_dead_gauges_on_days_restricts_the_population_to_named_dates() -> None:
     # A day nobody was wet on convicts nobody, whatever the counts say.
     dry_day = [datetime(2026, 9, 6, tzinfo=timezone.utc).date()]
     assert dead_gauges(truth, min_known_slots=100, on_days=dry_day) == []
+
+
+# ---------------------------------------------------------------------------
+# The all-clear: graded right / wrong, reported, never scored
+# ---------------------------------------------------------------------------
+
+from dmi_nowcast_core.warning_score import (  # noqa: E402
+    pooled_summary as _pooled,
+    score_warnings as _score,
+)
+
+
+def _m(minutes: float) -> datetime:
+    return T0 + timedelta(minutes=minutes)
+
+
+def test_all_clear_on_a_false_alarm_is_right() -> None:
+    result = _score([(_m(0), 20.0, _m(20))], [], lead_min=30, tolerance_min=10)
+    (w,) = result.warnings
+    assert w.outcome == "false_alarm"
+    assert w.all_clear == "right" and w.all_clear_utc == _m(20)
+    s = result.summary
+    assert (s["all_clears"], s["all_clears_right"], s["all_clears_wrong"]) == (1, 1, 0)
+    assert s["all_clear_median_min"] == pytest.approx(20.0)
+
+
+def test_all_clear_before_the_onset_of_a_hit_is_wrong() -> None:
+    result = _score(
+        [(_m(0), 25.0, _m(20))], [_m(35)], lead_min=30, tolerance_min=10,
+    )
+    (w,) = result.warnings
+    assert w.outcome == "hit" and w.all_clear == "wrong"
+    assert result.summary["all_clears_wrong"] == 1
+
+
+def test_all_clear_after_the_onset_is_neither() -> None:
+    result = _score(
+        [(_m(0), 25.0, _m(40))], [_m(20)], lead_min=30, tolerance_min=10,
+    )
+    (w,) = result.warnings
+    assert w.outcome == "hit" and w.all_clear == "after_onset"
+    s = result.summary
+    assert s["all_clears"] == 1 and s["all_clears_after_onset"] == 1
+    assert s["all_clears_right"] == 0 and s["all_clears_wrong"] == 0
+    # At the very instant of the onset: not before it, so not wrong.
+    same = _score([(_m(0), 25.0, _m(20))], [_m(20)], lead_min=30, tolerance_min=10)
+    assert same.warnings[0].all_clear == "after_onset"
+
+
+def test_a_late_warning_retracted_before_its_onset_is_wrong() -> None:
+    result = _score(
+        [(_m(0), 5.0, _m(1))], [_m(3)], lead_min=30, tolerance_min=10,
+        min_useful_lead_min=5.0,
+    )
+    assert result.warnings[0].outcome == "late"
+    assert result.warnings[0].all_clear == "wrong"
+
+
+def test_a_pending_warning_s_all_clear_is_pending_and_ungraded() -> None:
+    result = _score(
+        [(_m(0), 20.0, _m(20))], [], lead_min=30, tolerance_min=10,
+        known_until=_m(10),
+    )
+    assert result.warnings[0].outcome == "pending"
+    assert result.warnings[0].all_clear == "pending"
+    s = result.summary
+    assert s["all_clears"] == 0 and s["all_clears_pending"] == 1
+    assert s["all_clear_median_min"] is None
+
+
+def test_all_clear_changes_no_rate_and_two_tuples_still_score() -> None:
+    onsets = [_m(35), _m(300)]
+    pairs = [(_m(0), 25.0), (_m(120), 20.0)]
+    triples = [(_m(0), 25.0, _m(20)), (_m(120), 20.0, _m(140))]
+    plain = _score(pairs, onsets, lead_min=30, tolerance_min=10)
+    graded = _score(triples, onsets, lead_min=30, tolerance_min=10)
+    for key in ("hits", "false_alarms", "misses", "pod", "far", "f1", "csi"):
+        assert plain.summary[key] == graded.summary[key], key
+    assert plain.summary["all_clears"] == 0
+    assert plain.summary["all_clear_median_min"] is None
+    assert all(w.all_clear is None for w in plain.warnings)
+    assert (graded.summary["all_clears_right"], graded.summary["all_clears_wrong"]) == (1, 1)
+
+
+def test_pooled_all_clear_counts_and_median() -> None:
+    a = _score(
+        [(_m(0), 25.0, _m(20)), (_m(120), 20.0, _m(150))], [_m(35)],
+        lead_min=30, tolerance_min=10,
+    )
+    b = _score([(_m(0), 20.0, _m(10))], [], lead_min=30, tolerance_min=10)
+    pooled = _pooled([a, b])
+    assert pooled["all_clears"] == 3
+    assert pooled["all_clears_right"] == 2      # two false alarms retracted
+    assert pooled["all_clears_wrong"] == 1      # the hit, retracted at +20
+    # Push → all-clear: 20, 30, 10 → median 20.
+    assert pooled["all_clear_median_min"] == pytest.approx(20.0)
+
+
+def test_a_naive_all_clear_is_a_programming_error() -> None:
+    with pytest.raises(ValueError):
+        _score([(_m(0), 20.0, datetime(2026, 9, 5, 6, 20))], [])

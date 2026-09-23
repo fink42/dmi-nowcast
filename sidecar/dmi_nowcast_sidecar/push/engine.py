@@ -41,6 +41,18 @@ The contract mirrors the Home Assistant integration:
   minutes and gets the next cell at +30 reads ETA ≈ 16 min — "rain
   incoming", sent into falling rain. Two of the first four live pushes
   were exactly that.
+- **the all-clear retracts a pushed warning, once.** While disarmed after
+  a ``notify`` (never after an "already raining" consumption — nothing
+  was sent), consecutive observations whose decision probability is
+  below the threshold are counted; the ``rules.allclear_readings``-th
+  (two as shipped, ``dmi_nowcast_core.push_rules``) returns
+  ``"all_clear"`` and marks it sent. An over-threshold observation resets
+  the count, as it restarts the dry clock; an observation with no
+  probability neither counts nor resets it. After an all-clear nothing
+  more happens until the re-arm, and the re-arm itself is untouched: the
+  all-clear changes no arming decision, so every notify the machine
+  makes is the one it made before the all-clear existed. Quiet hours do
+  not defer it — it is delivered silently.
 
 Since Phase H the *probability* the rule reads is a choice, not a
 constant: ``Observation.p_source`` selects between the served
@@ -61,6 +73,8 @@ from zoneinfo import ZoneInfo
 
 import structlog
 from dmi_nowcast_core.push_rules import (
+    DEFAULT_ALLCLEAR_ENABLED,
+    DEFAULT_ALLCLEAR_READINGS,
     DEFAULT_PERSISTENCE_OBS,
     DEFAULT_REARM_AFTER_MIN,
 )
@@ -96,6 +110,16 @@ class SubState:
     below_since_utc: datetime | None
     #: Radar timestamp of the last observation actually evaluated.
     last_eval_radar_ts: datetime | None
+    # The all-clear's memory. Additive with defaults, so a state stored
+    # before it existed loads unchanged — and, lacking ``notified``, can
+    # never retract a push it has no record of.
+    #: Disarmed because a warning was PUSHED (``notify``), as opposed to
+    #: armed, or disarmed by an "already raining" consumption.
+    notified: bool = False
+    #: Consecutive below-threshold observations since the push.
+    below_streak: int = 0
+    #: The one all-clear for this push has been issued.
+    all_clear_sent: bool = False
 
 
 #: A new (or edited) subscription starts armed with an empty streak.
@@ -186,6 +210,12 @@ class Rules:
     #: ``forecast.rain_threshold_mm_h`` — the detection threshold the rest
     #: of the pipeline (and Home Assistant's ``raining_now``) uses.
     raining_now_mm_h: float = 0.5
+    #: Retract a pushed warning with one silent all-clear (see module
+    #: docstring). Defaults in :mod:`dmi_nowcast_core.push_rules`.
+    allclear_enabled: bool = DEFAULT_ALLCLEAR_ENABLED
+    #: Consecutive below-threshold observations after the push that
+    #: trigger it.
+    allclear_readings: int = DEFAULT_ALLCLEAR_READINGS
 
 
 @dataclass(frozen=True)
@@ -201,7 +231,9 @@ class QuietHours:
     end: str
 
 
-Action = Literal["none", "notify", "deferred_quiet", "already_raining"]
+Action = Literal[
+    "none", "notify", "deferred_quiet", "already_raining", "all_clear",
+]
 
 
 @dataclass(frozen=True)
@@ -270,8 +302,9 @@ def evaluate(
     """Advance the machine by one radar observation.
 
     Returns the state to persist and what the caller should do about it.
-    The caller sends a push only for ``"notify"``; ``"already_raining"``
-    and ``"deferred_quiet"`` are state transitions with no delivery.
+    The caller sends a warning for ``"notify"`` and the silent
+    retraction for ``"all_clear"``; ``"already_raining"`` and
+    ``"deferred_quiet"`` are state transitions with no delivery.
     """
     # An observation is evaluated exactly once. Restarts, the no-new-frame
     # fast path and replays all arrive here as a timestamp we have seen.
@@ -300,6 +333,22 @@ def evaluate(
         if not rearmed:
             # The spell is still too short: an over-threshold observation
             # restarts the dry clock, a dry one starts or keeps it.
+            below_streak = state.below_streak
+            all_clear = False
+            if (
+                state.notified
+                and not state.all_clear_sent
+                and rules.allclear_enabled
+            ):
+                # Only a push can be retracted, and only once. A reading
+                # with no probability is no reading: it neither counts
+                # toward the all-clear nor breaks the run (the replay
+                # study skipped such rows the same way).
+                if over:
+                    below_streak = 0
+                elif decision_p is not None:
+                    below_streak += 1
+                all_clear = below_streak >= max(1, int(rules.allclear_readings))
             return Decision(
                 SubState(
                     armed=False,
@@ -310,8 +359,11 @@ def evaluate(
                         else (state.below_since_utc or obs.radar_ts_utc)
                     ),
                     last_eval_radar_ts=obs.radar_ts_utc,
+                    notified=state.notified,
+                    below_streak=below_streak,
+                    all_clear_sent=state.all_clear_sent or all_clear,
                 ),
-                "none",
+                "all_clear" if all_clear else "none",
             )
         # Re-armed as of this observation, which now goes through the
         # armed rules from a clean slate.
@@ -363,6 +415,9 @@ def evaluate(
                 streak=streak,
                 below_since_utc=None,
                 last_eval_radar_ts=obs.radar_ts_utc,
+                # A push happened: until the re-arm it may be retracted,
+                # once, by an all-clear.
+                notified=True,
             ),
             "notify",
         )

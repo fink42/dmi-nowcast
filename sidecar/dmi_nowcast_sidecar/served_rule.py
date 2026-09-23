@@ -64,7 +64,9 @@ curve column wherever it is null, and the rows that took it are counted.
 
 The output is :attr:`~dmi_nowcast_core.quality_report.QualityInputs.
 decide_warnings`' contract — ``{station_id: [(sent_utc, eta_min,
-probability)]}`` — plus a stats dict the report publishes under
+probability, all_clear_utc)]}``, the last element the instant the engine
+retracted that warning with an all-clear (``None`` when it did not), which
+the report grades right / wrong beside the scoreboard — plus a stats dict the report publishes under
 ``methods.subscriber_rule`` and the job logs. The core report cannot
 import this module (it must import nothing from the sidecar), which is
 why it takes the decision as a callable rather than a path.
@@ -77,6 +79,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from dmi_nowcast_core.push_rules import (
+    DEFAULT_ALLCLEAR_ENABLED,
+    DEFAULT_ALLCLEAR_READINGS,
     DEFAULT_PERSISTENCE_OBS,
     DEFAULT_REARM_AFTER_MIN,
 )
@@ -149,6 +153,11 @@ class ServedRuleOptions:
     rearm_after_min: int = DEFAULT_REARM_AFTER_MIN
     raining_now_mm_h: float = 0.5
     raining_now_eta_min: float = 1.5
+    #: The all-clear, from ``push.allclear_enabled`` /
+    #: ``push.allclear_readings`` — so the retractions the page grades are
+    #: the ones the service sends.
+    allclear_enabled: bool = DEFAULT_ALLCLEAR_ENABLED
+    allclear_readings: int = DEFAULT_ALLCLEAR_READINGS
     #: The same coverage-gap the report scores inside, so the state
     #: machine resets at the instants the coverage runs break.
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN
@@ -232,6 +241,10 @@ class ServedRuleDecider:
             "lead_min": float(options.lead_min),
             "rearm_after_min": float(options.rearm_after_min),
             "persistence_obs": float(options.persistence_obs),
+            # 0 = the all-clear is off; otherwise the readings it takes.
+            "allclear_readings": float(
+                options.allclear_readings if options.allclear_enabled else 0
+            ),
             "probability": self.probability,
             "probability_column": self.column,
             # The core report's own word for it, imported rather than
@@ -250,7 +263,9 @@ class ServedRuleDecider:
 
     def __call__(
         self, rows: Sequence[Mapping[str, Any]],
-    ) -> dict[str, list[tuple[datetime, float | None, float | None]]]:
+    ) -> dict[
+        str, list[tuple[datetime, float | None, float | None, datetime | None]]
+    ]:
         try:
             return self._decide(rows)
         except Exception as exc:  # noqa: BLE001 — see the class docstring
@@ -265,7 +280,9 @@ class ServedRuleDecider:
 
     def _decide(
         self, rows: Sequence[Mapping[str, Any]],
-    ) -> dict[str, list[tuple[datetime, float | None, float | None]]]:
+    ) -> dict[
+        str, list[tuple[datetime, float | None, float | None, datetime | None]]
+    ]:
         from .threshold_sweep import build_tracks, load_decisions, replay_station
 
         keys = {
@@ -329,7 +346,10 @@ class ServedRuleDecider:
             column_for=lambda _lead: self.column,
         )
         del kept
-        out: dict[str, list[tuple[datetime, float | None, float | None]]] = {}
+        out: dict[
+            str,
+            list[tuple[datetime, float | None, float | None, datetime | None]],
+        ] = {}
         total = 0
         for station, track in tracks.items():
             warnings = replay_station(
@@ -339,6 +359,9 @@ class ServedRuleDecider:
                 raining_now_mm_h=float(self.options.raining_now_mm_h),
                 raining_now_eta_min=float(self.options.raining_now_eta_min),
                 with_probability=True,
+                with_all_clear=True,
+                allclear_enabled=bool(self.options.allclear_enabled),
+                allclear_readings=int(self.options.allclear_readings),
             )
             if warnings:
                 out[str(station)] = warnings

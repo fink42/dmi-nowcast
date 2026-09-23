@@ -134,6 +134,29 @@ would flatter a rule that only ever warns at the last moment. The default
 ``min_useful_lead_min=0.0`` makes nothing late and leaves every number
 exactly what it was.
 
+**The all-clear** is reported, never optimised. The push rule may
+retract a warning with one silent "rain no longer expected" once the
+probability has sat below the threshold for two consecutive observations
+after the push (``dmi_nowcast_core.push_rules``). A warning handed in as
+``(sent_utc, eta_min, all_clear_utc)`` carries that instant, and each
+retraction is graded against the same match as the warning itself:
+
+* ``right`` — the warning was a false alarm; retracting it was correct;
+* ``wrong`` — the warning was a hit (or late) and its onset came AFTER
+  the all-clear: the user was told the rain was off and then it rained;
+* ``after_onset`` — a hit or late whose onset had already come when the
+  all-clear went out. The rain arrived as warned and had passed; the
+  retraction told nobody anything false about the warning, so it is
+  neither right nor wrong and is counted on its own;
+* ``pending`` — the warning itself is pending.
+
+The summary carries ``all_clears`` (every graded retraction, so ``right
++ wrong + after_onset``), the three counts, ``all_clears_pending``, and
+``all_clear_median_min``, the median minutes from push to all-clear over
+the graded ones. None of it moves a rate: hits, false alarms, POD, FAR
+and F1 are exactly what they would be without the all-clear, because the
+all-clear changes no warning.
+
 Everything is timezone-aware UTC. A naive datetime is a programming
 error and is raised on rather than guessed at.
 """
@@ -1458,6 +1481,12 @@ class WarningOutcome:
     #: less lead than promised; NEGATIVE = it came later, the warning was
     #: early. ``None`` when the warning missed, or carried no ETA.
     lead_error_min: float | None = None
+    #: When the rule retracted this warning with an all-clear; ``None``
+    #: when it did not.
+    all_clear_utc: datetime | None = None
+    #: The retraction's grade: ``"right"``, ``"wrong"``, ``"after_onset"``
+    #: or ``"pending"`` (see the module docstring); ``None`` without one.
+    all_clear: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1558,8 +1587,60 @@ def skill_scores(
     }
 
 
+def _all_clear_grade(
+    outcome: str, onset: datetime | None, all_clear: datetime | None,
+) -> str | None:
+    """``right`` / ``wrong`` / ``after_onset`` / ``pending`` / ``None``."""
+    if all_clear is None:
+        return None
+    if outcome == "pending":
+        return "pending"
+    if outcome == "false_alarm":
+        return "right"
+    # A hit or late: wrong when the rain came after we said it would not.
+    # Strictly after, as the study timed it (a reversal was a row BEFORE
+    # the onset).
+    if onset is not None and all_clear < onset:
+        return "wrong"
+    return "after_onset"
+
+
+def _all_clear_summary(rows: Sequence[WarningOutcome]) -> dict[str, Any]:
+    """The all-clear counts and the push → all-clear median over ``rows``."""
+    graded = [
+        w for w in rows
+        if w.all_clear is not None and w.all_clear != "pending"
+    ]
+    pending = sum(1 for w in rows if w.all_clear == "pending")
+    minutes = [
+        (w.all_clear_utc - w.sent_utc).total_seconds() / 60.0
+        for w in graded if w.all_clear_utc is not None
+    ]
+    return {
+        "all_clears": len(graded),
+        "all_clears_right": sum(1 for w in graded if w.all_clear == "right"),
+        "all_clears_wrong": sum(1 for w in graded if w.all_clear == "wrong"),
+        "all_clears_after_onset": sum(
+            1 for w in graded if w.all_clear == "after_onset"
+        ),
+        "all_clears_pending": pending,
+        "all_clear_median_min": _quantiles(minutes)["p50"],
+    }
+
+
+def _warning_input(item: Sequence[Any]) -> tuple[datetime, Any, datetime | None]:
+    """``(sent, eta)`` or ``(sent, eta, all_clear_utc)`` → the three."""
+    sent, eta = item[0], item[1]
+    all_clear = item[2] if len(item) > 2 else None
+    return (
+        _as_utc(sent, "sent_utc"),
+        eta,
+        None if all_clear is None else _as_utc(all_clear, "all_clear_utc"),
+    )
+
+
 def score_warnings(
-    warnings: Iterable[tuple[datetime, float | None]],
+    warnings: Iterable[Sequence[Any]],
     onset_times: Sequence[datetime],
     *,
     lead_min: int = DEFAULT_LEAD_MIN,
@@ -1574,7 +1655,9 @@ def score_warnings(
 
     ``warnings`` is ``[(sent_utc, eta_min)]`` for ONE station (an ETA of
     ``None`` is allowed — the warning still counts, it just contributes no
-    lead error). ``onset_times`` is that station's onsets from
+    lead error), or ``[(sent_utc, eta_min, all_clear_utc)]`` when the rule
+    retracted some of them; the third element is graded (see the module
+    docstring) and changes nothing else. ``onset_times`` is that station's onsets from
     :func:`onsets`.
 
     Matching is a one-to-one greedy assignment in send order: each warning
@@ -1632,8 +1715,8 @@ def score_warnings(
         ]
     )
     sent_list = sorted(
-        ((_as_utc(sent, "sent_utc"), eta) for sent, eta in warnings),
-        key=lambda pair: pair[0],
+        (_warning_input(item) for item in warnings),
+        key=lambda triple: triple[0],
     )
     onset_list = sorted(_as_utc(o, "onset") for o in onset_times)
     claimed_by: list[datetime | None] = [None] * len(onset_list)
@@ -1646,7 +1729,7 @@ def score_warnings(
     pending = 0
     late = 0
     useful = float(min_useful_lead_min)
-    for sent, eta in sent_list:
+    for sent, eta, all_clear in sent_list:
         pick: int | None = None
         for i, onset in enumerate(onset_list):
             if onset <= sent:
@@ -1662,9 +1745,15 @@ def score_warnings(
                 # The promise has not come due yet. Grading it now would
                 # only measure how recently the report was built.
                 pending += 1
-                warning_rows.append(WarningOutcome(sent, eta, "pending"))
+                warning_rows.append(WarningOutcome(
+                    sent, eta, "pending", all_clear_utc=all_clear,
+                    all_clear=_all_clear_grade("pending", None, all_clear),
+                ))
                 continue
-            warning_rows.append(WarningOutcome(sent, eta, "false_alarm"))
+            warning_rows.append(WarningOutcome(
+                sent, eta, "false_alarm", all_clear_utc=all_clear,
+                all_clear=_all_clear_grade("false_alarm", None, all_clear),
+            ))
             continue
         onset = onset_list[pick]
         realised = (onset - sent).total_seconds() / 60.0
@@ -1685,8 +1774,11 @@ def score_warnings(
             hits += 1
         else:
             late += 1
+        outcome = "hit" if in_time else "late"
         warning_rows.append(WarningOutcome(
-            sent, eta, "hit" if in_time else "late", onset, error,
+            sent, eta, outcome, onset, error,
+            all_clear_utc=all_clear,
+            all_clear=_all_clear_grade(outcome, onset, all_clear),
         ))
 
     onset_rows = tuple(
@@ -1739,6 +1831,7 @@ def score_warnings(
         "min_useful_lead_min": float(min_useful_lead_min),
         "known_until": horizon,
         "coverage_runs": 0 if runs is None else len(runs),
+        **_all_clear_summary(warning_rows),
     }
     return ScoreResult(tuple(warning_rows), onset_rows, summary)
 
@@ -1825,6 +1918,7 @@ def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
         "f_beta": skill["f_beta"],
         "csi": skill["csi"],
         "lead_error_min": _quantiles(errors),
+        **_all_clear_summary(warnings),
     }
     out.update(params)
     return out

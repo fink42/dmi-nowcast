@@ -297,7 +297,11 @@ class QualityInputs:
     #: ``rows`` in, ``{station_id: [(sent_utc, eta_min, probability)]}``
     #: out. ``probability`` is the number the rule fired ON — the
     #: post-processed one where that is what the service decides with —
-    #: and is what the ``events`` list publishes as ``p_rain``.
+    #: and is what the ``events`` list publishes as ``p_rain``. A fourth
+    #: element, when present, is the instant the rule retracted that
+    #: warning with an all-clear (``None`` = it did not); the retractions
+    #: are graded right / wrong and published beside the rule in
+    #: ``methods.subscriber_rule``.
     #:
     #: The implementation lives in the sidecar (``served_rule.py``): it
     #: needs the decision-row loader and the push engine, and this module
@@ -305,7 +309,7 @@ class QualityInputs:
     #: which is the behaviour that shipped.
     decide_warnings: Callable[
         [Sequence[Mapping[str, Any]]],
-        Mapping[str, list[tuple[datetime, float | None, float | None]]],
+        Mapping[str, list[tuple[Any, ...]]],
     ] | None = None
     #: What :attr:`decide_warnings` decided WITH, for ``methods``. Merged
     #: into ``methods.subscriber_rule``, so the page's definition of the
@@ -1101,6 +1105,10 @@ class _Scoreboard:
     window_days: int = 0
     #: ``warning_score.DeadGauge`` rows for the stations left out.
     dead_gauges: tuple[Any, ...] = ()
+    #: The all-clear's graded counts, for ``methods.subscriber_rule``.
+    #: Only when the scoreboard was re-decided: stored actions carry no
+    #: retraction instant to grade.
+    all_clear: dict | None = None
 
 
 def _score_decisions(
@@ -1160,7 +1168,9 @@ def _score_decisions(
     if excluded_stations:
         station_ids = [s for s in station_ids if s not in excluded_stations]
 
-    warnings_by_station: dict[str, list[tuple[datetime, float | None]]] = defaultdict(list)
+    warnings_by_station: dict[
+        str, list[tuple[datetime, float | None, datetime | None]]
+    ] = defaultdict(list)
     frames_by_station: dict[str, list[datetime]] = defaultdict(list)
     p_rain_at: dict[tuple[str, datetime], float | None] = {}
     # The frames are the coverage runs, and they come from every row
@@ -1177,9 +1187,12 @@ def _score_decisions(
     if inputs.decide_warnings is not None:
         for station, sent_rows in inputs.decide_warnings(rows).items():
             station = str(station)
-            for sent, eta, probability in sent_rows:
+            for sent, eta, probability, *rest in sent_rows:
+                # The fourth element, when the hook gives one, is the
+                # all-clear instant; graded by ``score_warnings``.
+                all_clear = rest[0] if rest else None
                 warnings_by_station[station].append(
-                    (sent, None if eta is None else float(eta)),
+                    (sent, None if eta is None else float(eta), all_clear),
                 )
                 p_rain_at[(station, sent)] = (
                     None if probability is None else float(probability)
@@ -1194,7 +1207,7 @@ def _score_decisions(
             station = str(row.get("station_id"))
             eta = row.get("eta_min")
             warnings_by_station[station].append(
-                (stamp, None if eta is None else float(eta)),
+                (stamp, None if eta is None else float(eta), None),
             )
             p_rain_at[(station, stamp)] = (
                 None if row.get("p_rain") is None else float(row["p_rain"])
@@ -1233,6 +1246,16 @@ def _score_decisions(
         dry_min=inputs.dry_min,
         onset_min_mm=inputs.onset_min_mm,
     )
+    if inputs.decide_warnings is not None:
+        median = pooled.get("all_clear_median_min")
+        board.all_clear = {
+            "all_clears": int(pooled["all_clears"]),
+            "all_clears_right": int(pooled["all_clears_right"]),
+            "all_clears_wrong": int(pooled["all_clears_wrong"]),
+            "all_clear_median_min": (
+                None if median is None else _round(float(median), 1)
+            ),
+        }
     spread = pooled["lead_error_min"]
     if (
         pooled["pod"] is not None
@@ -1638,8 +1661,14 @@ def _brier_improvement(
 #: strings are additive and the client ignores them.
 _SERVED_RULE_NUMBERS = (
     "threshold_pct", "lead_min", "rearm_after_min", "persistence_obs",
-    "rows_fallback",
+    "rows_fallback", "allclear_readings",
 )
+
+#: The all-clear's graded counts in ``methods.subscriber_rule`` (additive;
+#: the client ignores them). Counts are integers; the median is minutes
+#: from push to all-clear, null when there was none.
+_ALL_CLEAR_COUNTS = ("all_clears", "all_clears_right", "all_clears_wrong")
+_ALL_CLEAR_MEDIAN = "all_clear_median_min"
 _SERVED_RULE_WORDS = ("threshold_source", "probability", "scored")
 
 #: What ``subscriber_rule.scored`` says when the scoreboard counted the
@@ -2087,6 +2116,13 @@ def build_quality_report(
         )
         built_at = stamp
 
+    # The all-clear is graded with the scoreboard, on both paths: it is a
+    # fact about tonight's re-decided warnings, not about the corpus.
+    if board.all_clear is not None and isinstance(methods, dict) and isinstance(
+        methods.get("subscriber_rule"), dict,
+    ):
+        methods["subscriber_rule"].update(board.all_clear)
+
     events = [
         {
             "station_id": event["station_id"],
@@ -2436,6 +2472,25 @@ def validate_report(report: Any) -> list[str]:
                 problems.append(
                     "methods.subscriber_rule.rows_fallback: expected a number",
                 )
+            for key in _ALL_CLEAR_COUNTS:
+                if key in rule and (
+                    isinstance(rule[key], bool)
+                    or not isinstance(rule[key], int)
+                    or rule[key] < 0
+                ):
+                    problems.append(
+                        f"methods.subscriber_rule.{key}: expected a "
+                        "non-negative integer",
+                    )
+            median = rule.get(_ALL_CLEAR_MEDIAN)
+            if median is not None and (
+                isinstance(median, bool)
+                or not isinstance(median, (int, float))
+            ):
+                problems.append(
+                    f"methods.subscriber_rule.{_ALL_CLEAR_MEDIAN}: expected "
+                    "a number or null",
+                )
         _check_block(
             (methods or {}).get("sources"), {"radar": str, "gauges": str},
             "methods.sources", problems,
@@ -2708,6 +2763,21 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                     if isinstance(fallback, (int, float))
                     and not isinstance(fallback, bool)
                     and fallback
+                    else ""
+                )
+                + "."
+            )
+        cleared = rule.get("all_clears")
+        if isinstance(cleared, int) and not isinstance(cleared, bool):
+            median = rule.get(_ALL_CLEAR_MEDIAN)
+            add(
+                f"- All-clears: {cleared} warning(s) retracted — "
+                f"{rule.get('all_clears_right', 0)} right (a false alarm), "
+                f"{rule.get('all_clears_wrong', 0)} wrong (rain followed)"
+                + (
+                    f"; median {median:.0f} min after the warning"
+                    if isinstance(median, (int, float))
+                    and not isinstance(median, bool)
                     else ""
                 )
                 + "."

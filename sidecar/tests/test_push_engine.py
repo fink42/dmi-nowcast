@@ -69,8 +69,10 @@ def _drive(
     quiet: QuietHours | None = None,
     tz: str = CPH,
     # Two observations, so every sequence has a streak to observe. See the
-    # module docstring — this is not the shipped persistence.
-    rules: Rules = Rules(persistence_obs=2),
+    # module docstring — this is not the shipped persistence. The
+    # all-clear is off here: these sequences pin the ARMING, whose actions
+    # the all-clear never changes; its own tests enable it explicitly.
+    rules: Rules = Rules(persistence_obs=2, allclear_enabled=False),
     eta: float | None = None,
     observed: float | None = None,
     base: datetime = T0,
@@ -162,7 +164,7 @@ def test_none_probability_breaks_a_streak() -> None:
 
 
 def test_persistence_one_fires_on_the_first_wet_observation() -> None:
-    actions, _, _ = _drive([0.9, 0.9], rules=Rules(persistence_obs=1))
+    actions, _, _ = _drive([0.9, 0.9], rules=Rules(persistence_obs=1, allclear_enabled=False))
     assert actions == ["notify", "none"]
 
 
@@ -257,7 +259,7 @@ def test_over_threshold_at_the_mark_rearms_and_fires_at_persistence_one() -> Non
     # subscription re-arms and this same observation — over threshold,
     # persistence 1 — fires.
     probs = [0.9] + [0.0] * 6 + [0.9]
-    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1))
+    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1, allclear_enabled=False))
     assert actions == ["notify"] + ["none"] * 6 + ["notify"]
     assert states[1].below_since_utc == obs[1].radar_ts_utc
     assert obs[7].radar_ts_utc - obs[1].radar_ts_utc == timedelta(minutes=60)
@@ -271,7 +273,7 @@ def test_over_threshold_before_the_mark_stays_disarmed() -> None:
     # +60 finds a 50-minute spell, so it only clears the dry clock — and
     # with the clock cleared, +70 has nothing to re-arm on either.
     probs = [0.9] + [0.0] * 5 + [0.9, 0.9]
-    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1))
+    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1, allclear_enabled=False))
     assert actions == ["notify"] + ["none"] * 7
     assert obs[6].radar_ts_utc - obs[1].radar_ts_utc == timedelta(minutes=50)
     assert states[6].armed is False
@@ -297,7 +299,7 @@ def test_a_dry_observation_at_the_mark_still_rearms_silently() -> None:
     # included: the observation that finds the spell 60 minutes old
     # re-arms, and being dry it fires nothing.
     probs = [0.9] + [0.0] * 7
-    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1))
+    actions, states, obs = _drive(probs, rules=Rules(persistence_obs=1, allclear_enabled=False))
     assert actions == ["notify"] + ["none"] * 7
     assert states[1].below_since_utc == obs[1].radar_ts_utc
     assert states[6].armed is False  # +60: a 50-minute spell
@@ -851,3 +853,166 @@ def test_evaluate_propagates_the_naive_now_error() -> None:
             tz=CPH,
             now_utc=datetime(2026, 6, 1, 23, 0),
         )
+
+
+# --------------------------------------------------------------------------
+# The all-clear: one silent retraction of a pushed warning
+# --------------------------------------------------------------------------
+
+#: The shipped all-clear on the persistence the rest of this file drives.
+ALLCLEAR = Rules(persistence_obs=2)
+
+
+def test_all_clear_defaults_come_from_push_rules() -> None:
+    from dmi_nowcast_core.push_rules import (
+        DEFAULT_ALLCLEAR_ENABLED,
+        DEFAULT_ALLCLEAR_READINGS,
+    )
+
+    assert Rules().allclear_enabled is DEFAULT_ALLCLEAR_ENABLED is True
+    assert Rules().allclear_readings == DEFAULT_ALLCLEAR_READINGS == 2
+
+
+def test_two_readings_below_after_a_push_give_one_all_clear() -> None:
+    actions, states, _ = _drive([0.9, 0.9, 0.1, 0.1], rules=ALLCLEAR)
+    assert actions == ["none", "notify", "none", "all_clear"]
+    assert states[1].notified is True and states[1].below_streak == 0
+    assert states[2].below_streak == 1 and states[2].all_clear_sent is False
+    assert states[3].below_streak == 2 and states[3].all_clear_sent is True
+    # The all-clear changes no arming: still disarmed, dry clock running.
+    assert states[3].armed is False
+    assert states[3].below_since_utc == states[2].below_since_utc
+
+
+def test_an_over_threshold_reading_resets_the_count() -> None:
+    actions, states, _ = _drive(
+        [0.9, 0.9, 0.1, 0.9, 0.1, 0.1], rules=ALLCLEAR,
+    )
+    assert actions == ["none", "notify", "none", "none", "none", "all_clear"]
+    assert states[3].below_streak == 0
+
+
+def test_all_clear_is_sent_once_until_the_rearm() -> None:
+    # Push, all-clear, then dry for the rest of the hour, a wet frame and
+    # more dry: nothing else is ever retracted before the re-arm.
+    probs = [0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1]
+    actions, _, _ = _drive(probs, rules=ALLCLEAR)
+    assert actions.count("all_clear") == 1
+    assert actions.index("all_clear") == 3
+
+
+def test_all_clear_rearm_and_next_push_are_unchanged() -> None:
+    """The arming sequence is identical with the all-clear on and off."""
+    rng = random.Random(7)
+    probs = [rng.choice([0.0, 0.3, 0.7, 0.9, None]) for _ in range(300)]
+    on, s_on, _ = _drive(probs, rules=ALLCLEAR)
+    off, s_off, _ = _drive(probs, rules=Rules(persistence_obs=2, allclear_enabled=False))
+    assert "all_clear" in on
+    assert [a if a != "all_clear" else "none" for a in on] == off
+    assert [(s.armed, s.streak, s.below_since_utc) for s in s_on] == [
+        (s.armed, s.streak, s.below_since_utc) for s in s_off
+    ]
+    # Every all-clear follows a notify with no re-arm between.
+    last = None
+    for action in on:
+        if action == "notify":
+            last = "notify"
+        elif action == "all_clear":
+            assert last == "notify"
+            last = "all_clear"
+
+
+def test_after_the_rearm_a_new_push_can_be_retracted_again() -> None:
+    probs = [0.9, 0.9, 0.1, 0.1] + [0.1] * 5 + [0.9, 0.9, 0.1, 0.1]
+    actions, states, _ = _drive(probs, rules=ALLCLEAR)
+    assert actions.count("notify") == 2
+    assert actions.count("all_clear") == 2
+    assert actions[-1] == "all_clear"
+
+
+def test_the_rearm_observation_is_not_an_all_clear() -> None:
+    # Readings = 20 with a 60-min re-arm: the dry spell re-arms first, and
+    # the re-arm clears the memory, so the all-clear never comes.
+    rules = Rules(persistence_obs=2, allclear_readings=20)
+    actions, states, _ = _drive([0.9, 0.9] + [0.1] * 25, rules=rules)
+    assert "all_clear" not in actions
+    assert states[-1].armed is True and states[-1].notified is False
+
+
+def test_none_probability_neither_counts_nor_resets() -> None:
+    actions, states, _ = _drive([0.9, 0.9, 0.1, None, 0.1], rules=ALLCLEAR)
+    assert actions == ["none", "notify", "none", "none", "all_clear"]
+    assert states[3].below_streak == 1
+
+
+def test_disabled_flag_never_retracts() -> None:
+    rules = Rules(persistence_obs=2, allclear_enabled=False)
+    actions, states, _ = _drive([0.9, 0.9, 0.1, 0.1, 0.1], rules=rules)
+    assert "all_clear" not in actions
+    assert states[-1].all_clear_sent is False
+
+
+def test_readings_one_retracts_on_the_first_below() -> None:
+    rules = Rules(persistence_obs=2, allclear_readings=1)
+    actions, _, _ = _drive([0.9, 0.9, 0.1], rules=rules)
+    assert actions == ["none", "notify", "all_clear"]
+
+
+def test_no_all_clear_after_already_raining() -> None:
+    """Nothing was sent, so there is nothing to retract."""
+    actions, states, _ = _drive(
+        [0.9, 0.9], rules=ALLCLEAR, observed=2.0,
+    )
+    assert actions == ["none", "already_raining"]
+    assert states[-1].notified is False
+    state = states[-1]
+    later, _, _ = _drive(
+        [None, 0.1, 0.1, 0.1], rules=ALLCLEAR, state=state,
+        base=T0 + 2 * CADENCE,
+    )
+    assert "all_clear" not in later
+
+
+def test_quiet_hours_do_not_defer_an_all_clear() -> None:
+    # Pushed before the window, then the window covers the dry frames.
+    _, states, _ = _drive([0.9, 0.9], rules=ALLCLEAR)
+    assert states[-1].notified is True
+    always_quiet = QuietHours(start="00:00", end="23:59")
+    actions, after, _ = _drive(
+        [0.1, 0.1], rules=ALLCLEAR, state=states[-1],
+        quiet=always_quiet, base=T0 + 2 * CADENCE,
+    )
+    assert actions == ["none", "all_clear"]
+    assert after[-1].all_clear_sent is True
+
+
+def test_quiet_deferred_warning_has_nothing_to_retract() -> None:
+    """A warning quiet hours held back was never sent: still armed."""
+    always_quiet = QuietHours(start="00:00", end="23:59")
+    actions, states, _ = _drive(
+        [0.9, 0.9, 0.1, 0.1, 0.1], rules=ALLCLEAR, quiet=always_quiet,
+    )
+    assert "notify" not in actions and "all_clear" not in actions
+    assert states[-1].notified is False
+
+
+def test_a_state_stored_before_the_all_clear_loads_and_never_retracts() -> None:
+    """Old positional construction still works and defaults are inert."""
+    old = SubState(
+        armed=False, streak=1, below_since_utc=None,
+        last_eval_radar_ts=T0 + CADENCE,
+    )
+    assert (old.notified, old.below_streak, old.all_clear_sent) == (False, 0, False)
+    actions, _, _ = _drive(
+        [0.1, 0.1, 0.1], rules=ALLCLEAR, state=old, base=T0 + 2 * CADENCE,
+    )
+    assert "all_clear" not in actions
+
+
+def test_replayed_observation_cannot_complete_an_all_clear() -> None:
+    _, states, observations = _drive([0.9, 0.9, 0.1], rules=ALLCLEAR)
+    again = evaluate(
+        states[-1], observations[-1], threshold_pct=60, quiet=None, tz=CPH,
+        now_utc=observations[-1].radar_ts_utc, rules=ALLCLEAR,
+    )
+    assert again.action == "none" and again.state == states[-1]

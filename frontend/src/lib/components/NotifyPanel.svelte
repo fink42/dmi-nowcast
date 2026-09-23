@@ -158,6 +158,7 @@
 						)}</span
 					>
 				{/if}
+				<span class="muted">{t().push.summaryWithdraw}</span>
 			</p>
 
 			{#if movedAway}

@@ -14,8 +14,22 @@ Two halves per row:
   A non-null value is a deliberate override and pins that row to a
   percent no refit will move;
 - **state machine** (``armed``, ``streak``, ``below_since_utc``,
-  ``last_eval_radar_ts``, ``last_notified_utc``) — what
-  ``push.engine.evaluate`` carries between radar observations.
+  ``last_eval_radar_ts``, ``last_notified_utc``, and since the all-clear
+  ``notified``, ``below_streak``, ``all_clear_sent``) — what
+  ``push.engine.evaluate`` carries between radar observations;
+- **delivery** (``last_delivered_utc``) — the ``last_notified_utc`` stamp
+  of the newest WARNING the push service actually accepted.
+  ``last_notified_utc`` is written BEFORE the send (persist first, send
+  second), so on its own it says a warning was decided, not that it
+  arrived: a failed send, a fan-out budget that ran out, or a crash
+  mid-fan-out all leave it set. The all-clear is only sent when
+  ``last_delivered_utc >= last_notified_utc`` — retracting a warning the
+  device never showed would be the only thing the subscriber sees.
+
+Columns added after the first release are added in place on open
+(``ALTER TABLE ... ADD COLUMN`` with the defaults a fresh row gets), so a
+store written before them loads unchanged; an old row reads
+``notified = 0`` and can never retract a push it has no record of.
 
 Editing preferences restarts the state machine (see :meth:`PushStore.upsert`):
 a subscriber who lowers their threshold expects the new setting to be
@@ -59,14 +73,29 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     armed               INTEGER NOT NULL,
     streak              INTEGER NOT NULL,
     below_since_utc     TEXT,
-    last_eval_radar_ts  TEXT
+    last_eval_radar_ts  TEXT,
+    notified            INTEGER NOT NULL DEFAULT 0,
+    below_streak        INTEGER NOT NULL DEFAULT 0,
+    all_clear_sent      INTEGER NOT NULL DEFAULT 0,
+    last_delivered_utc  TEXT
 )
 """
 
 _COLUMNS: Final = (
     "endpoint, p256dh, auth, lat, lon, threshold_pct, lead_min, "
     "quiet_enabled, quiet_start, quiet_end, tz, lang, created_utc, "
-    "last_notified_utc, armed, streak, below_since_utc, last_eval_radar_ts"
+    "last_notified_utc, armed, streak, below_since_utc, last_eval_radar_ts, "
+    "notified, below_streak, all_clear_sent, last_delivered_utc"
+)
+
+#: Columns added after the first release: ``(name, declaration)``, added in
+#: place to a store that predates them. The declaration's default is what
+#: an existing row reads.
+_ADDED_COLUMNS: Final = (
+    ("notified", "INTEGER NOT NULL DEFAULT 0"),
+    ("below_streak", "INTEGER NOT NULL DEFAULT 0"),
+    ("all_clear_sent", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_delivered_utc", "TEXT"),
 )
 
 
@@ -128,6 +157,24 @@ class Subscription:
     streak: int
     below_since_utc: datetime | None
     last_eval_radar_ts: datetime | None
+    #: Disarmed by a pushed warning (engine ``SubState.notified``).
+    notified: bool = False
+    #: Below-threshold observations since that push.
+    below_streak: int = 0
+    #: The one all-clear for that push has been issued.
+    all_clear_sent: bool = False
+    #: The ``last_notified_utc`` stamp of the newest warning the push
+    #: service accepted; ``None`` = none ever delivered.
+    last_delivered_utc: datetime | None = None
+
+    @property
+    def last_warning_delivered(self) -> bool:
+        """Did the push service accept the newest warning decided for this row?"""
+        return (
+            self.last_notified_utc is not None
+            and self.last_delivered_utc is not None
+            and self.last_delivered_utc >= self.last_notified_utc
+        )
 
 
 def sub_id(endpoint: str) -> str:
@@ -180,6 +227,10 @@ def _row_to_subscription(row: sqlite3.Row) -> Subscription:
         streak=int(row["streak"]),
         below_since_utc=_from_iso(row["below_since_utc"]),
         last_eval_radar_ts=_from_iso(row["last_eval_radar_ts"]),
+        notified=bool(row["notified"]),
+        below_streak=int(row["below_streak"]),
+        all_clear_sent=bool(row["all_clear_sent"]),
+        last_delivered_utc=_from_iso(row["last_delivered_utc"]),
     )
 
 
@@ -200,6 +251,9 @@ class PushStore:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute(_SCHEMA)
             self._conn.commit()
+            # Before the rebuild below, which copies ``_COLUMNS`` and so
+            # needs every one of them to exist in the old table.
+            self._migrate_added_columns()
             self._migrate_threshold_nullable()
 
     # -- lifecycle ---------------------------------------------------------
@@ -209,6 +263,32 @@ class PushStore:
             self._conn.close()
 
     # -- migrations --------------------------------------------------------
+
+    def _migrate_added_columns(self) -> None:
+        """Add the columns a store written before them lacks.
+
+        ``ADD COLUMN`` with a constant default is an in-place, metadata-only
+        change in SQLite, so an existing row simply reads the default.
+        Called with ``self._lock`` held.
+        """
+        present = {
+            c["name"] for c in self._conn.execute(
+                "PRAGMA table_info(subscriptions)",
+            ).fetchall()
+        }
+        added = []
+        for name, declaration in _ADDED_COLUMNS:
+            if name in present:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE subscriptions ADD COLUMN {name} {declaration}",
+            )
+            added.append(name)
+        if added:
+            self._conn.commit()
+            _log.info(
+                "push_store_migrated", migration="add_columns", columns=added,
+            )
 
     def _migrate_threshold_nullable(self) -> None:
         """Phase G: ``threshold_pct`` becomes nullable, and every row goes null.
@@ -301,7 +381,8 @@ class PushStore:
                         quiet_enabled = ?, quiet_start = ?, quiet_end = ?,
                         tz = ?, lang = ?,
                         armed = 1, streak = 0,
-                        below_since_utc = NULL, last_eval_radar_ts = NULL
+                        below_since_utc = NULL, last_eval_radar_ts = NULL,
+                        notified = 0, below_streak = 0, all_clear_sent = 0
                     WHERE endpoint = ?
                     """,
                     (
@@ -315,13 +396,15 @@ class PushStore:
             else:
                 self._conn.execute(
                     f"INSERT INTO subscriptions ({_COLUMNS}) VALUES "
-                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?)",
                     (
                         sub.endpoint, sub.p256dh, sub.auth, sub.lat, sub.lon,
                         sub.threshold_pct, sub.lead_min,
                         int(sub.quiet_enabled), sub.quiet_start, sub.quiet_end,
                         sub.tz, sub.lang, _to_iso(now),
                         None, 1, 0, None, None,
+                        0, 0, 0, None,
                     ),
                 )
             self._conn.commit()
@@ -345,11 +428,16 @@ class PushStore:
         below_since_utc: datetime | None,
         last_eval_radar_ts: datetime | None,
         last_notified_utc: datetime | None | _Unchanged = UNCHANGED,
+        notified: bool | _Unchanged = UNCHANGED,
+        below_streak: int | _Unchanged = UNCHANGED,
+        all_clear_sent: bool | _Unchanged = UNCHANGED,
     ) -> None:
         """Persist the decision state machine for one subscription.
 
         ``last_notified_utc`` defaults to :data:`UNCHANGED` — only a cycle
-        that actually notified passes it.
+        that actually notified passes it. The three all-clear fields
+        default to :data:`UNCHANGED` too, so a caller that predates them
+        cannot clobber them.
         """
         sets = [
             "armed = ?", "streak = ?",
@@ -362,11 +450,36 @@ class PushStore:
         if not isinstance(last_notified_utc, _Unchanged):
             sets.append("last_notified_utc = ?")
             params.append(_to_iso(last_notified_utc))
+        if not isinstance(notified, _Unchanged):
+            sets.append("notified = ?")
+            params.append(int(bool(notified)))
+        if not isinstance(below_streak, _Unchanged):
+            sets.append("below_streak = ?")
+            params.append(int(below_streak))
+        if not isinstance(all_clear_sent, _Unchanged):
+            sets.append("all_clear_sent = ?")
+            params.append(int(bool(all_clear_sent)))
         params.append(endpoint)
         with self._lock:
             self._conn.execute(
                 f"UPDATE subscriptions SET {', '.join(sets)} WHERE endpoint = ?",
                 params,
+            )
+            self._conn.commit()
+
+    def mark_delivered(self, endpoint: str, notified_utc: datetime) -> None:
+        """Record that the warning stamped ``notified_utc`` was accepted.
+
+        Called by the fan-out after a successful send of a WARNING (never
+        of an all-clear or a test), with the very stamp written into
+        ``last_notified_utc`` for it — so "delivered" is a comparison of
+        two stamps of one event, not of two clocks.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE subscriptions SET last_delivered_utc = ? "
+                "WHERE endpoint = ?",
+                (_to_iso(notified_utc), endpoint),
             )
             self._conn.commit()
 

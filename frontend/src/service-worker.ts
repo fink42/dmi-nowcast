@@ -103,6 +103,11 @@ const ICON = '/icons/icon-192.png';
  * Show what the message asked for. A payload this version cannot parse still
  * gets a notification — the alternative is a silent push, which browsers
  * punish by revoking the permission — in whatever language survived.
+ *
+ * `tag`, `silent` and `renotify` come from the payload (see
+ * `notificationFromPayload`): an `all_clear` reuses the warning's tag with
+ * `silent: true` so it replaces the warning quietly. iOS Safari ignores
+ * `silent`, so there a same-tag replacement may still alert.
  */
 async function showFromPush(data: PushMessageData | null): Promise<void> {
 	let raw: unknown = null;

@@ -347,6 +347,9 @@ def _expected_warnings(
             track, 0, pct,
             persistence_obs=1, rearm_after_min=60, raining_now_mm_h=0.5,
             with_probability=True,
+            # The decider hands the report each warning's all-clear
+            # instant too (``None`` when the engine issued none).
+            with_all_clear=True,
         )
         if warnings:
             out[station] = warnings
@@ -476,7 +479,7 @@ class TestServedRuleDecider:
             narrowed, _expected_column(narrowed, model), SERVED_PCT,
         )
         for warnings in got.values():
-            for sent, _eta, _p in warnings:
+            for sent, _eta, _p, _cleared in warnings:
                 assert sent < cutoff + timedelta(minutes=14)
 
     def test_the_fallback_rows_are_counted(
@@ -513,7 +516,7 @@ class TestServedRuleDecider:
         curve_by_key = {
             (r["radar_ts"], r["station_id"]): r[CURVE] for r in stored
         }
-        for sent, _eta, probability in got[STATION_B]:
+        for sent, _eta, probability, _cleared in got[STATION_B]:
             radar_ts = sent - timedelta(minutes=14)
             assert probability == curve_by_key[(radar_ts, STATION_B)]
 
@@ -644,3 +647,14 @@ class TestServedRuleDecider:
         assert got == _expected_warnings(
             stored, _expected_column(stored, model), SERVED_PCT,
         )
+
+
+def test_the_decider_publishes_its_all_clear_setting(tmp_path: Path, model) -> None:
+    on = ServedRuleDecider(_options(tmp_path / "on", model))
+    assert on.stats["allclear_readings"] == 2.0
+    off = ServedRuleDecider(
+        _options(tmp_path / "off", model, allclear_enabled=False),
+    )
+    assert off.stats["allclear_readings"] == 0.0
+    assert ServedRuleOptions().allclear_enabled is True
+    assert ServedRuleOptions().allclear_readings == 2

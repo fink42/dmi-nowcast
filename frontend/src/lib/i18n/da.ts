@@ -175,6 +175,8 @@ export const da = {
 			`Du får besked ved ${coordinates}, når sandsynligheden for regn inden for ${leadMin} min er over ${thresholdPct} %.`,
 		summaryQuiet: (start: string, end: string) =>
 			`Du får ingen beskeder mellem ${start} og ${end}.`,
+		summaryWithdraw:
+			'Ser regnen alligevel ikke ud til at komme, trækkes beskeden stille tilbage — uden ny lyd.',
 		movedAway: 'Beskeden er sat ved et andet punkt end det, du kigger på nu.',
 		iosNotInstalled:
 			'På iPhone og iPad skal siden lægges på hjemmeskærmen, før den må sende beskeder: tryk Del, vælg “Føj til hjemmeskærm”, og åbn siden derfra.',

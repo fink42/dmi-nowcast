@@ -425,6 +425,10 @@ class QualityReportTask:
             # One detection threshold for the whole pipeline, exactly as
             # ``station_eval._rules`` takes it.
             raining_now_mm_h=float(self.config.forecast.rain_threshold_mm_h),
+            # The all-clear the service sends, so the page grades the
+            # retractions subscribers actually get.
+            allclear_enabled=bool(self.config.push.allclear_enabled),
+            allclear_readings=int(self.config.push.allclear_readings),
             fallback_threshold_pct=int(rules.threshold_pct),
         )
 

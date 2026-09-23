@@ -186,3 +186,93 @@ def test_aggregate_and_gate():
     )
     md = study.render_markdown(report)
     assert "PASSED" in md and "Lead 30 min" in md and "one line" in md
+
+
+# ---------------------------------------------------------------------------
+# The shipped all-clear reproduces the study's "two consecutive" reversal
+# ---------------------------------------------------------------------------
+
+from dmi_nowcast_core.warning_score import score_warnings  # noqa: E402
+
+#: C — push at row 3 (sent 00:45), rows 4 and 5 below the threshold, rain
+#: at 01:20 (inside 30 + 10): a hit the all-clear retracted 20 minutes
+#: after the push, 15 minutes before the onset — a WRONG all-clear.
+STATION_C = _arrays(p={3: 0.6}, eta={3: 25.0}, obs={})
+ONSETS_C = [_at(1, 20)]
+
+
+def _graded(arrays, onsets):
+    rows = [
+        {
+            "radar_ts": study.to_dt(arrays["radar"][i]),
+            "generated_at": study.to_dt(arrays["gen"][i]),
+            "station_id": "X",
+            "eta_min": None if np.isnan(arrays["eta"][i]) else float(arrays["eta"][i]),
+            "observed_mm_h": float(arrays["observed"][i]),
+            f"p_post_{LEAD}": float(arrays[f"p{LEAD}"][i]),
+        }
+        for i in range(N)
+    ]
+    tracks, frames = build_tracks(rows, [LEAD], column_for=lambda lead: f"p_post_{lead}")
+    warnings = replay_station(
+        tracks["X"], 0, THR[LEAD], persistence_obs=1, rearm_after_min=60,
+        with_all_clear=True,
+    )
+    return score_warnings(
+        warnings, onsets, lead_min=LEAD, tolerance_min=10,
+        known_until=KNOWN_UNTIL,
+    )
+
+
+def test_all_clear_right_on_the_false_alarm_wrong_before_an_onset():
+    """The engine's all-clear, graded, is the study's strict reversal.
+
+    Where the study found two consecutive rows below the threshold before
+    the onset (hits) or inside the window (false alarms), the engine
+    issues an all-clear at the second of them, and the scorer grades it
+    ``wrong`` / ``right`` accordingly; where the study found none, the
+    engine's all-clear (if any) comes after the onset.
+    """
+    res = {
+        "A": (_run()["A"][LEAD], _graded(STATION_A, ONSETS_A)),
+        "C": (
+            study.analyse_station(STATION_C, ONSETS_C, KNOWN_UNTIL, [LEAD], THR)[LEAD],
+            _graded(STATION_C, ONSETS_C),
+        ),
+    }
+    # A: the hit's dip is one row, so no strict reversal before the onset;
+    # the engine's all-clear comes once the rain has passed.
+    study_a, scored_a = res["A"]
+    hit, fa = scored_a.warnings
+    assert study_a["warnings"][0]["first_below2_min"] is None
+    assert hit.outcome == "hit" and hit.all_clear == "after_onset"
+    # The false alarm: strict reversal at +20, all-clear right at +20.
+    assert study_a["warnings"][1]["first_below2_min"] == pytest.approx(20.0)
+    assert fa.outcome == "false_alarm" and fa.all_clear == "right"
+    assert (fa.all_clear_utc - fa.sent_utc).total_seconds() / 60 == pytest.approx(20.0)
+
+    # C: strict reversal at +20, 15 min before the onset → wrong.
+    study_c, scored_c = res["C"]
+    (c_hit,) = scored_c.warnings
+    assert study_c["warnings"][0]["first_below2_min"] == pytest.approx(20.0)
+    assert study_c["warnings"][0]["first_below2_to_onset_min"] == pytest.approx(15.0)
+    assert c_hit.outcome == "hit" and c_hit.all_clear == "wrong"
+    assert (c_hit.onset_utc - c_hit.all_clear_utc).total_seconds() / 60 == pytest.approx(15.0)
+
+    pooled = pooled_summary([scored_a, scored_c])
+    assert pooled["all_clears"] == 3
+    assert pooled["all_clears_right"] == 1
+    assert pooled["all_clears_wrong"] == 1
+    assert pooled["all_clears_after_onset"] == 1
+    # The study's counts for the strict rule: FA reversed 1, hits reversed 1.
+    strict_fa = sum(
+        1 for s, _ in res.values() for w in s["warnings"]
+        if w["outcome"] == "false_alarm" and w["first_below2_min"] is not None
+    )
+    strict_hit = sum(
+        1 for s, _ in res.values() for w in s["warnings"]
+        if w["outcome"] in ("hit", "late") and w.get("first_below2_min") is not None
+    )
+    assert (strict_fa, strict_hit) == (
+        pooled["all_clears_right"], pooled["all_clears_wrong"],
+    )

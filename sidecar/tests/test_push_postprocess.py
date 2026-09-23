@@ -1461,7 +1461,7 @@ class TestTheFanOutUsesTheModel:
         monkeypatch.setattr(
             service_mod.PushService, "_fanout",
             lambda self, pending: (
-                sent.extend(payload for _sub, payload in pending)
+                sent.extend(payload for _sub, payload, *_ in pending)
                 or {"sent": len(pending), "failed": 0,
                     "removed": 0, "skipped": 0}
             ),

@@ -200,6 +200,16 @@ lightning:
 #                           # (1 since 2026-09-13: a second observation
 #                           #  costs ~10 min of radar cadence and lost F1
 #                           #  at three of the four served horizons)
+#   # The all-clear: after a warning was pushed, if the decision
+#   # probability sits below the threshold on `allclear_readings`
+#   # consecutive radar observations before the re-arm, ONE silent
+#   # "rain no longer expected" replaces the warning on the device. Never
+#   # after an "already raining" consumption, never for a warning whose
+#   # send failed, not deferred by quiet hours (it is silent). Defaults in
+#   # dmi_nowcast_core.push_rules; the replay retracts 32-57 % of false
+#   # alarms and is wrong on 0.4-3.4 % of hits at two readings.
+#   allclear_enabled: true  # false = never retract a warning
+#   allclear_readings: 2    # consecutive below-threshold observations
 
 # --- Rain-gauge polling (Phase F) -------------------------------------
 # Mirrors DMI metObs station observations into

@@ -135,3 +135,32 @@ def test_every_consumer_follows_push_when_it_is_overridden(
 
     for consumer, timing in _timing(config).items():
         assert timing == (persistence, rearm), consumer
+
+
+@pytest.mark.parametrize("enabled,readings", [(True, 2), (False, 2), (True, 3)])
+def test_every_consumer_follows_push_for_the_all_clear(
+    tmp_path: Path, enabled: bool, readings: int,
+) -> None:
+    """The all-clear has one knob too: ``push.allclear_*``."""
+    from dmi_nowcast_core.push_rules import (
+        DEFAULT_ALLCLEAR_ENABLED,
+        DEFAULT_ALLCLEAR_READINGS,
+    )
+
+    config = _config(tmp_path)
+    assert (config.push.allclear_enabled, config.push.allclear_readings) == (
+        DEFAULT_ALLCLEAR_ENABLED, DEFAULT_ALLCLEAR_READINGS,
+    )
+    config.push.allclear_enabled = enabled
+    config.push.allclear_readings = readings
+    engine_rules: Rules = PushService._rules(SimpleNamespace(config=config))
+    station_rules: Rules = StationEvalService._rules(SimpleNamespace(config=config))
+    served = QualityReportTask(config)._served_rule_options()
+    for consumer, pair in {
+        "push fan-out": (engine_rules.allclear_enabled, engine_rules.allclear_readings),
+        "station scoreboard": (
+            station_rules.allclear_enabled, station_rules.allclear_readings,
+        ),
+        "served-rule hook": (served.allclear_enabled, served.allclear_readings),
+    }.items():
+        assert pair == (enabled, readings), consumer

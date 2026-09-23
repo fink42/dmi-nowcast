@@ -1,4 +1,4 @@
-"""The push rule's two timing constants, with one home.
+"""The push rule's timing constants, and the all-clear's, with one home.
 
 A notification fires when the calibrated probability of rain within the
 subscriber's horizon has sat at or above that horizon's threshold for
@@ -49,10 +49,40 @@ replay's ``DEFAULT_RULES`` and the benchmark's CLI. ``station_eval.rules``
 deliberately has no say: it carries the virtual subscriber's threshold and
 horizon, and takes the timing from ``push.*`` so the measurement and the
 service cannot drift apart again.
+
+**The all-clear (2026-09-23).** After a warning has been pushed, the
+subscription stays disarmed until the re-arm. If, inside that window, the
+decision probability sits BELOW the subscriber's threshold on
+:data:`DEFAULT_ALLCLEAR_READINGS` consecutive radar observations, the
+service sends ONE silent replacement notification ("rain no longer
+expected") under the same tag, so it replaces the warning on the device
+instead of stacking. Nothing more is sent until the re-arm. It is never
+sent after an "already raining" consumption (nothing was sent, so there
+is nothing to retract), and quiet hours do not defer it — it is silent.
+
+Why two readings and not one: a single frame's dip below the threshold
+is exactly the one-frame noise the rest of the rule is built to ignore,
+and a retraction that turns out wrong costs more trust than the false
+alarm it retracts. With two consecutive readings the 272-day replay
+(``scripts/eta_revision_study.py``) retracts 32–57 % of the false alarms
+(by horizon) and is wrong — rain arrived after the all-clear — on only
+0.4–3.4 % of the hits: about 30 right retractions for every wrong one.
+
+Changed the same way as the two numbers above: here, overridden only by
+``push.allclear_enabled`` / ``push.allclear_readings`` in the sidecar
+config. The all-clear changes
+no arming decision, so the threshold fit's objective is untouched; the
+scorer only REPORTS it (``warning_score.score_warnings``: ``right`` for
+a retracted false alarm, ``wrong`` for a hit whose onset followed).
 """
 from __future__ import annotations
 
-__all__ = ["DEFAULT_PERSISTENCE_OBS", "DEFAULT_REARM_AFTER_MIN"]
+__all__ = [
+    "DEFAULT_ALLCLEAR_ENABLED",
+    "DEFAULT_ALLCLEAR_READINGS",
+    "DEFAULT_PERSISTENCE_OBS",
+    "DEFAULT_REARM_AFTER_MIN",
+]
 
 #: Consecutive over-threshold radar observations required to fire.
 DEFAULT_PERSISTENCE_OBS = 1
@@ -64,3 +94,12 @@ DEFAULT_PERSISTENCE_OBS = 1
 #: event the rule could never have warned about twice is not evidence
 #: about the forecast.
 DEFAULT_REARM_AFTER_MIN = 60
+
+#: Whether a pushed warning may be retracted by a silent all-clear.
+DEFAULT_ALLCLEAR_ENABLED = True
+
+#: Consecutive below-threshold radar observations, after a push and
+#: before the re-arm, that trigger the one all-clear. Observations with no
+#: probability (nodata, off coverage) neither count nor break the run —
+#: exactly as the replay study skipped them.
+DEFAULT_ALLCLEAR_READINGS = 2

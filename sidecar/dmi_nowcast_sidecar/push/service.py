@@ -41,6 +41,18 @@ the state has been written. From there:
    cause a repeat. The failure the user forgives is a missed alert; the
    one they uninstall over is the same alert five times.
 
+4a. **The all-clear retracts only what arrived.** An ``"all_clear"``
+   decision (two below-threshold observations after a push, before the
+   re-arm — ``push.engine``) queues one silent replacement through the
+   same fan-out as a warning. It is queued only when the store says the
+   warning it retracts was DELIVERED (``Subscription.
+   last_warning_delivered``: the fan-out records the warning's
+   ``last_notified_utc`` stamp in ``last_delivered_utc`` after a
+   successful send). A warning whose send failed, was skipped by the
+   budget, or never happened because the process died mid-fan-out has
+   nothing on the device to retract; the all-clear is then recorded as
+   spent and not sent, and ``push_all_clear_suppressed`` says why.
+
 5. **Fan out sequentially inside a wall-clock budget.** The push services
    are the slow part and the cycle must not be held hostage to them:
    whatever is still queued when the budget expires is dropped and
@@ -66,7 +78,7 @@ from ..national_sample import sample_point
 from . import engine as decision_engine
 from . import fanout
 from .engine import Observation, QuietHours, Rules, SubState
-from .messages import rain_incoming_payload, test_payload
+from .messages import all_clear_payload, rain_incoming_payload, test_payload
 from .paths import resolved_thresholds_path
 from .store import PushStore, Subscription, sub_id
 from .thresholds import ThresholdTable
@@ -191,6 +203,8 @@ class PushService:
             # everywhere else (Home Assistant's ``raining_now``, the
             # ensemble exceedance, the motion support mask).
             raining_now_mm_h=self.config.forecast.rain_threshold_mm_h,
+            allclear_enabled=self.config.push.allclear_enabled,
+            allclear_readings=self.config.push.allclear_readings,
         )
 
     def _postprocess_for(self, radar_ts: datetime) -> Any:
@@ -241,7 +255,12 @@ class PushService:
         source: str = self.config.push.probability_source
         subs = self.store.list()
         rules = self._rules()
-        pending: list[tuple[Subscription, dict]] = []
+        # ``(subscription, payload, notified stamp)``: the stamp is set for a
+        # WARNING only, and is what a successful send records as delivered.
+        pending: list[tuple[Subscription, dict, datetime | None]] = []
+        notified_count = 0
+        all_clear_count = 0
+        all_clear_suppressed = 0
         errors = 0
         curve_fallbacks = 0
         actions: dict[str, int] = {}
@@ -273,6 +292,9 @@ class PushService:
                 streak=sub.streak,
                 below_since_utc=sub.below_since_utc,
                 last_eval_radar_ts=sub.last_eval_radar_ts,
+                notified=sub.notified,
+                below_streak=sub.below_streak,
+                all_clear_sent=sub.all_clear_sent,
             )
             quiet = (
                 QuietHours(start=sub.quiet_start, end=sub.quiet_end)
@@ -334,18 +356,65 @@ class PushService:
                 forecast_now_mm_h=obs.forecast_now_mm_h,
             )
             notify = decision.action == "notify" and obs.p_decision is not None
+            all_clear = decision.action == "all_clear"
             new_state = decision.state
             # Persist BEFORE sending: a crash may cost a notification, it
-            # must never cause a duplicate one.
+            # must never cause a duplicate one. An all-clear is marked
+            # spent here too, delivered or not — it is never retried.
             self.store.update_state(
                 sub.endpoint,
                 armed=new_state.armed,
                 streak=new_state.streak,
                 below_since_utc=new_state.below_since_utc,
                 last_eval_radar_ts=new_state.last_eval_radar_ts,
+                notified=new_state.notified,
+                below_streak=new_state.below_streak,
+                all_clear_sent=new_state.all_clear_sent,
                 **({"last_notified_utc": now_utc} if notify else {}),
             )
+            if all_clear:
+                minutes_since_push = (
+                    None if sub.last_notified_utc is None
+                    else round(
+                        (now_utc - sub.last_notified_utc).total_seconds() / 60.0,
+                        1,
+                    )
+                )
+                if not sub.last_warning_delivered:
+                    # Nothing on the device to retract: the warning's send
+                    # failed, was skipped, or was never attempted.
+                    all_clear_suppressed += 1
+                    _log.info(
+                        "push_all_clear_suppressed",
+                        sub=sub_id(sub.endpoint),
+                        reason="warning_not_delivered",
+                        minutes_since_push=minutes_since_push,
+                    )
+                    continue
+                all_clear_count += 1
+                _log.info(
+                    "push_all_clear",
+                    sub=sub_id(sub.endpoint),
+                    radar_ts=radar_ts.isoformat(),
+                    lead_min=sub.lead_min,
+                    threshold_pct=threshold_pct,
+                    p_decision=obs.p_decision,
+                    minutes_since_push=minutes_since_push,
+                )
+                pending.append((
+                    sub,
+                    all_clear_payload(
+                        lang=sub.lang,
+                        lat=sub.lat,
+                        lon=sub.lon,
+                        lead_min=sub.lead_min,
+                        sent_utc=now_utc,
+                        tz=sub.tz,
+                    ),
+                    None,
+                ))
             if notify:
+                notified_count += 1
                 pending.append((
                     sub,
                     rain_incoming_payload(
@@ -361,6 +430,7 @@ class PushService:
                         intensity_mm_h=obs.intensity_mm_h,
                         sent_utc=now_utc,
                     ),
+                    now_utc,
                 ))
 
         counts = self._fanout(pending)
@@ -377,7 +447,11 @@ class PushService:
             ),
             "postprocess_curve_fallbacks": curve_fallbacks,
             "subscriptions": len(subs),
-            "notified": len(pending),
+            "notified": notified_count,
+            # Silent retractions queued this cycle, beside the warnings;
+            # and the ones not sent because their warning never arrived.
+            "all_clear": all_clear_count,
+            "all_clear_suppressed": all_clear_suppressed,
             "eval_errors": errors,
             "actions": actions,
             **counts,
@@ -385,11 +459,18 @@ class PushService:
         _log.info("push_fanout", **summary)
         return summary
 
-    def _fanout(self, pending: list[tuple[Subscription, dict]]) -> dict:
-        """Send each queued payload within the wall-clock budget."""
+    def _fanout(
+        self, pending: list[tuple[Subscription, dict, datetime | None]],
+    ) -> dict:
+        """Send each queued payload within the wall-clock budget.
+
+        A queued item's third element is the warning's ``last_notified_utc``
+        stamp (``None`` for an all-clear); a successful send records it as
+        delivered, which is what a later all-clear checks.
+        """
         sent = failed = removed = skipped = 0
         deadline = time.monotonic() + self.config.push.fanout_budget_s
-        for index, (sub, payload) in enumerate(pending):
+        for index, (sub, payload, notified_utc) in enumerate(pending):
             if time.monotonic() >= deadline:
                 skipped = len(pending) - index
                 _log.warning("push_fanout_budget_exhausted", skipped=skipped)
@@ -397,6 +478,15 @@ class PushService:
             ok, gone = self._send_one(sub, payload)
             if ok:
                 sent += 1
+                if notified_utc is not None:
+                    try:
+                        self.store.mark_delivered(sub.endpoint, notified_utc)
+                    except Exception as exc:  # noqa: BLE001 - bookkeeping
+                        # only: the cost is one all-clear not sent.
+                        _log.warning(
+                            "push_mark_delivered_failed",
+                            sub=sub_id(sub.endpoint), error=str(exc),
+                        )
             else:
                 failed += 1
             if gone:

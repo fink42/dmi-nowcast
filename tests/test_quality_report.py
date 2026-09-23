@@ -2565,3 +2565,71 @@ class TestServedRuleMethods:
         report["methods"]["subscriber_rule"]["threshold_source"] = "  "
         problems = validate_report(report)
         assert any("threshold_source" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# The all-clear, graded beside the served rule
+# ---------------------------------------------------------------------------
+
+
+class TestAllClearBlock:
+    """A fourth element from the hook is the all-clear instant; the report
+    grades it and publishes the counts in ``methods.subscriber_rule``."""
+
+    @staticmethod
+    def _decide(rows):
+        at = lambda minutes: DAY + timedelta(minutes=minutes)  # noqa: E731
+        return {
+            "06180": [
+                # 01:50 → onset 02:10; all-clear 02:30 after the rain came.
+                (at(110), 20.0, 0.9, at(150)),
+                # 11:40 → nothing follows; retracted at 12:00: RIGHT.
+                (at(700), 25.0, 0.9, at(720)),
+            ],
+            # 02:30 → onset 03:00; retracted at 02:50, before it: WRONG.
+            "06181": [(at(150), 21.0, 0.9, at(170))],
+        }
+
+    def test_the_counts_and_the_median(self, full_inputs: QualityInputs) -> None:
+        report = build_quality_report(
+            replace(full_inputs, decide_warnings=self._decide),
+        )
+        rule = report["methods"]["subscriber_rule"]
+        assert rule["all_clears"] == 3
+        assert rule["all_clears_right"] == 1
+        assert rule["all_clears_wrong"] == 1
+        # Push → all-clear: 40, 20, 20 minutes.
+        assert rule["all_clear_median_min"] == pytest.approx(20.0)
+        # Reported, not scored: the warnings grade exactly as without it.
+        without = build_quality_report(replace(
+            full_inputs,
+            decide_warnings=lambda rows: {
+                s: [w[:3] for w in ws] for s, ws in self._decide(rows).items()
+            },
+        ))
+        assert report["headline"]["warnings"] == without["headline"]["warnings"]
+        assert without["methods"]["subscriber_rule"]["all_clears"] == 0
+        assert without["methods"]["subscriber_rule"]["all_clear_median_min"] is None
+        assert validate_report(report) == []
+        md = render_markdown(report)
+        assert "All-clears: 3 warning(s) retracted" in md
+        assert "1 right" in md and "1 wrong" in md and "median 20 min" in md
+
+    def test_stored_actions_carry_no_all_clear(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(full_inputs)
+        assert "all_clears" not in report["methods"]["subscriber_rule"]
+        assert "All-clears" not in render_markdown(report)
+
+    def test_the_validator_rejects_a_malformed_count(
+        self, full_inputs: QualityInputs,
+    ) -> None:
+        report = build_quality_report(
+            replace(full_inputs, decide_warnings=self._decide),
+        )
+        report["methods"]["subscriber_rule"]["all_clears_wrong"] = "one"
+        report["methods"]["subscriber_rule"]["all_clear_median_min"] = "x"
+        problems = validate_report(report)
+        assert any("all_clears_wrong" in p for p in problems)
+        assert any("all_clear_median_min" in p for p in problems)

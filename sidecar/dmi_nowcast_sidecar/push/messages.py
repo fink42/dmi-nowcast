@@ -15,16 +15,26 @@ panel never disagree about the word for 3 mm/h:
     <= 0.05 none · < 2.5 light · < 10 moderate · < 50 heavy · else violent
 
 Titles stay short — iOS truncates around 40 characters.
+
+Two delivery flags ride on every alert payload so the service worker can
+honour them rather than guess: ``silent`` and ``renotify``. A warning is
+``silent: False, renotify: True`` — it only fires after the 60-minute
+re-arm, so it is a genuinely new event and must buzz even when it
+replaces an older notification under the shared tag. The all-clear is
+``silent: True, renotify: False``: it quietly replaces the warning it
+retracts and never wakes anyone.
 """
 from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-__all__ = ["rain_incoming_payload", "test_payload"]
+__all__ = ["TAG", "all_clear_payload", "rain_incoming_payload", "test_payload"]
 
-#: Both notification types share a tag, so a newer alert replaces an
-#: unread one on the device instead of stacking.
+#: Every notification type shares a tag, so a newer alert replaces an
+#: unread one on the device instead of stacking — and an all-clear
+#: replaces the warning it retracts.
 TAG = "rain-incoming"
 
 _STRINGS: dict[str, dict[str, str]] = {
@@ -34,6 +44,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "intensity_clause": "{word} regn (~{mm} mm/t). ",
         "prob_eta": "Sandsynlighed inden for {lead} min: {pct} %.",
         "prob_window": "Sandsynlighed for regn ved dit punkt: {pct} %.",
+        "all_clear_title": "Regn alligevel ikke på vej",
+        "all_clear_body": (
+            "Radaren forventer ikke længere regn ved dit punkt inden for "
+            "{lead} min (kl. {time})."
+        ),
         "test_title": "Testbesked fra Regnradar",
         "test_body": "Notifikationer virker på denne enhed.",
         "intensity_light": "Let",
@@ -47,6 +62,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "intensity_clause": "{word} rain (~{mm} mm/h). ",
         "prob_eta": "Probability within {lead} min: {pct}%.",
         "prob_window": "Probability of rain at your point: {pct}%.",
+        "all_clear_title": "Rain no longer expected",
+        "all_clear_body": (
+            "The radar no longer expects rain at your point within "
+            "{lead} min (as of {time})."
+        ),
         "test_title": "Test message from Rain radar",
         "test_body": "Notifications work on this device.",
         "intensity_light": "Light",
@@ -162,6 +182,10 @@ def rain_incoming_payload(
         {
             "title": title,
             "body": body,
+            # A new event after the re-arm: it must alert, even when it
+            # replaces an older notification under the shared tag.
+            "silent": False,
+            "renotify": True,
             "eta_min": eta_out,
             "p_pct": pct,
             "lead_min": lead_min,
@@ -170,6 +194,55 @@ def rain_incoming_payload(
                 if intensity_mm_h is None
                 else round(float(intensity_mm_h), 1)
             ),
+        }
+    )
+    return payload
+
+
+def _local_hhmm(moment: datetime, tz: str | None) -> str:
+    """``HH:MM`` in the subscriber's zone; UTC when the zone is unknown.
+
+    Never raises: a bad zone string in one row must not cost the message.
+    """
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    try:
+        local = moment.astimezone(ZoneInfo(str(tz))) if tz else moment
+    except Exception:  # noqa: BLE001 - unknown zone, missing tzdata
+        local = moment.astimezone(timezone.utc)
+    return local.strftime("%H:%M")
+
+
+def all_clear_payload(
+    *,
+    lang: str,
+    lat: float,
+    lon: float,
+    lead_min: int,
+    sent_utc: datetime,
+    tz: str | None = None,
+) -> dict:
+    """The silent "rain no longer expected" retraction of a warning.
+
+    Same tag as the warning, so it REPLACES it on the device; ``silent``
+    so it never wakes anyone. The body names the horizon the warning was
+    about and the moment of the retraction in the subscriber's local
+    time (``tz``, their stored IANA zone) and language.
+    """
+    lang = _lang(lang)
+    strings = _STRINGS[lang]
+    payload = _base(
+        kind="all_clear", lang=lang, lat=lat, lon=lon, sent_utc=sent_utc
+    )
+    payload.update(
+        {
+            "title": strings["all_clear_title"],
+            "body": strings["all_clear_body"].format(
+                lead=int(lead_min), time=_local_hhmm(sent_utc, tz),
+            ),
+            "silent": True,
+            "renotify": False,
+            "lead_min": int(lead_min),
         }
     )
     return payload

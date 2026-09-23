@@ -144,6 +144,11 @@ def state_to_json(state: SubState) -> dict:
             state.last_eval_radar_ts.isoformat()
             if state.last_eval_radar_ts else None
         ),
+        # The all-clear's memory (additive; a file without it loads with
+        # the engine's defaults — see ``state_from_json``).
+        "notified": bool(state.notified),
+        "below_streak": int(state.below_streak),
+        "all_clear_sent": bool(state.all_clear_sent),
     }
 
 
@@ -155,6 +160,9 @@ def state_from_json(raw: Any) -> SubState:
         streak=int(raw.get("streak", 0)),
         below_since_utc=_parse_iso(raw.get("below_since_utc")),
         last_eval_radar_ts=_parse_iso(raw.get("last_eval_radar_ts")),
+        notified=bool(raw.get("notified", False)),
+        below_streak=int(raw.get("below_streak", 0)),
+        all_clear_sent=bool(raw.get("all_clear_sent", False)),
     )
 
 
@@ -505,6 +513,10 @@ class StationEvalService:
             # One detection threshold for the whole pipeline, exactly as
             # the push service does it.
             raining_now_mm_h=self.config.forecast.rain_threshold_mm_h,
+            # The all-clear too, so a virtual subscriber's row says
+            # ``action = "all_clear"`` exactly where a real one got one.
+            allclear_enabled=self.config.push.allclear_enabled,
+            allclear_readings=self.config.push.allclear_readings,
         )
 
     def _threshold(self) -> tuple[int, str]:

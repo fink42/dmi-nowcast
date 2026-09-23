@@ -161,6 +161,8 @@ export const en: Catalog = {
 			`You will be notified at ${coordinates} when the chance of rain within ${leadMin} min is above ${thresholdPct} %.`,
 		summaryQuiet: (start: string, end: string) =>
 			`Nothing will be sent between ${start} and ${end}.`,
+		summaryWithdraw:
+			'If the rain no longer looks likely, the notification is quietly withdrawn — no new sound.',
 		movedAway: 'Notifications are set for a different point than the one you are looking at.',
 		iosNotInstalled:
 			'On iPhone and iPad the site has to be on your home screen before it may send notifications: tap Share, choose “Add to Home Screen”, and open it from there.',

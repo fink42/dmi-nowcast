@@ -26,6 +26,8 @@ from dmi_nowcast_core.dense_flow import (
 from dmi_nowcast_core.metobs import DEFAULT_BASE_URL as METOBS_DEFAULT_BASE_URL
 from dmi_nowcast_core import postprocess as core_postprocess
 from dmi_nowcast_core.push_rules import (
+    DEFAULT_ALLCLEAR_ENABLED,
+    DEFAULT_ALLCLEAR_READINGS,
     DEFAULT_PERSISTENCE_OBS,
     DEFAULT_REARM_AFTER_MIN,
 )
@@ -600,6 +602,13 @@ class PushConfig(BaseModel):
     # DECIDE-14, 2026-09-13; the F1 evidence is in that module).
     rearm_after_min: Annotated[int, Field(ge=0, le=1440)] = DEFAULT_REARM_AFTER_MIN
     persistence_obs: Annotated[int, Field(ge=1, le=10)] = DEFAULT_PERSISTENCE_OBS
+    # The all-clear: after a push, this many consecutive below-threshold
+    # observations before the re-arm send ONE silent "rain no longer
+    # expected" that replaces the warning on the device. The only override
+    # of the ``dmi_nowcast_core.push_rules`` defaults (on, two readings —
+    # the replay's evidence is in that module).
+    allclear_enabled: bool = DEFAULT_ALLCLEAR_ENABLED
+    allclear_readings: Annotated[int, Field(ge=1, le=10)] = DEFAULT_ALLCLEAR_READINGS
 
     @field_validator("threshold_options_pct")
     @classmethod

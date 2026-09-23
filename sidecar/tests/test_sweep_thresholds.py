@@ -372,6 +372,48 @@ def test_with_probability_adds_the_number_the_rule_fired_on() -> None:
     assert [w[2] for w in triples] == [pytest.approx(0.60)]
 
 
+def test_with_all_clear_records_the_engines_instant() -> None:
+    """Push, two readings below: the all-clear is the second one's time."""
+    track = _track([0.60, 0.10, 0.10, 0.10])
+    plain = sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+    )
+    cleared = sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+        with_all_clear=True,
+    )
+    # The warnings are the same ones; only the instant is appended.
+    assert [w[:2] for w in cleared] == plain
+    assert [w[2] for w in cleared] == [_at(1, 7 * 60 + 20)]
+
+    both = sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+        with_probability=True, with_all_clear=True,
+    )
+    assert both[0][2] == pytest.approx(0.60)
+    assert both[0][3] == _at(1, 7 * 60 + 20)
+
+
+def test_with_all_clear_is_none_without_two_readings_or_when_off() -> None:
+    # Dips once, comes back: no all-clear.
+    track = _track([0.60, 0.10, 0.60, 0.10])
+    assert [w[2] for w in sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+        with_all_clear=True,
+    )] == [None]
+    # Disabled: never, even with the readings there.
+    track = _track([0.60, 0.10, 0.10])
+    assert [w[2] for w in sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+        with_all_clear=True, allclear_enabled=False,
+    )] == [None]
+    # Three readings asked for, two given.
+    assert [w[2] for w in sweep.replay_station(
+        track, 0, 40, persistence_obs=1, rearm_after_min=60,
+        with_all_clear=True, allclear_readings=3,
+    )] == [None]
+
+
 # ---------------------------------------------------------------------------
 # End to end: the hand-worked counts
 # ---------------------------------------------------------------------------

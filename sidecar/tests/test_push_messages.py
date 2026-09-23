@@ -10,7 +10,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dmi_nowcast_sidecar.push.messages import TAG, rain_incoming_payload
+from dmi_nowcast_sidecar.push.messages import (
+    TAG,
+    all_clear_payload,
+    rain_incoming_payload,
+)
 # Aliased on import: pytest would otherwise collect the payload builder
 # itself as a test case, because of its name.
 from dmi_nowcast_sidecar.push.messages import test_payload as build_test_payload
@@ -32,6 +36,9 @@ RAIN_KEYS = {
     "p_pct",
     "lead_min",
     "intensity_mm_h",
+    # Delivery flags the service worker honours (all-clear, 2026-09-23).
+    "silent",
+    "renotify",
 }
 TEST_KEYS = {
     "type",
@@ -289,3 +296,72 @@ def test_titles_stay_short_enough_for_ios(
     payload = _rain(lang=lang, lead_min=lead, eta_min=eta)
     assert len(payload["title"]) <= 40
     assert len(build_test_payload(lang=lang, lat=LAT, lon=LON, sent_utc=SENT)["title"]) <= 40
+
+
+# --------------------------------------------------------------------------
+# The all-clear: silent, same tag, both languages
+# --------------------------------------------------------------------------
+
+ALL_CLEAR_KEYS = {
+    "type", "title", "body", "lang", "lat", "lon", "url", "tag",
+    "sent_utc", "silent", "renotify", "lead_min",
+}
+
+
+def _clear(**overrides) -> dict:
+    kwargs = dict(
+        lang="da", lat=LAT, lon=LON, lead_min=30, sent_utc=SENT,
+        tz="Europe/Copenhagen",
+    )
+    kwargs.update(overrides)
+    return all_clear_payload(**kwargs)
+
+
+def test_warning_alerts_and_is_never_silent() -> None:
+    payload = _rain()
+    assert payload["silent"] is False
+    # A new warning only fires after the re-arm: a new event, so it must
+    # buzz even when it replaces an older notification under the tag.
+    assert payload["renotify"] is True
+    assert payload["tag"] == TAG
+
+
+def test_all_clear_is_silent_does_not_renotify_and_shares_the_tag() -> None:
+    payload = _clear()
+    assert set(payload) == ALL_CLEAR_KEYS
+    assert payload["type"] == "all_clear"
+    assert payload["silent"] is True
+    assert payload["renotify"] is False
+    assert payload["tag"] == TAG == _rain()["tag"]
+    assert payload["url"] == _rain()["url"]
+    assert payload["lat"] == _rain()["lat"] and payload["lon"] == _rain()["lon"]
+    assert payload["sent_utc"] == "2026-09-02T14:05:30Z"
+
+
+def test_all_clear_danish_names_the_horizon_and_local_time() -> None:
+    payload = _clear()
+    assert payload["lang"] == "da"
+    assert payload["title"] == "Regn alligevel ikke på vej"
+    # 14:05Z is 16:05 in Copenhagen (CEST).
+    assert "30 min" in payload["body"] and "16:05" in payload["body"]
+
+
+def test_all_clear_english() -> None:
+    payload = _clear(lang="en-GB", lead_min=45)
+    assert payload["lang"] == "en"
+    assert payload["title"] == "Rain no longer expected"
+    assert "45 min" in payload["body"] and "16:05" in payload["body"]
+
+
+def test_all_clear_unknown_language_is_danish_and_bad_zone_is_utc() -> None:
+    payload = _clear(lang="fr", tz="Not/AZone")
+    assert payload["lang"] == "da"
+    assert payload["title"] == "Regn alligevel ikke på vej"
+    assert "14:05" in payload["body"]
+
+
+@pytest.mark.parametrize("lang", ["da", "en"])
+def test_all_clear_title_is_short_and_serialisable(lang: str) -> None:
+    payload = _clear(lang=lang)
+    assert len(payload["title"]) <= 40
+    assert json.loads(json.dumps(payload)) == payload

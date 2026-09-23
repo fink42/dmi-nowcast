@@ -125,6 +125,97 @@ describe('notificationFromPayload', () => {
 	});
 });
 
+describe('notificationFromPayload: all-clear and the quiet fields', () => {
+	const allClear = {
+		type: 'all_clear',
+		title: 'Regn alligevel ikke på vej',
+		body: 'Radaren viser ikke længere regn ved dit punkt.',
+		lang: 'da',
+		lat: 55.6761,
+		lon: 12.5683,
+		url: '/?lat=55.6761&lon=12.5683',
+		tag: 'rain-incoming',
+		sent_utc: '2026-09-02T13:15:00Z',
+		silent: true,
+		renotify: false
+	};
+
+	it('parses an all_clear payload and reads the booleans', () => {
+		const p = parsePushPayload(allClear);
+		expect(p).toMatchObject({ type: 'all_clear', silent: true, renotify: false });
+	});
+
+	it('replaces the warning quietly: same tag, silent, no renotify', () => {
+		const { title, options } = notificationFromPayload(parsePushPayload(allClear)!);
+		expect(title).toBe('Regn alligevel ikke på vej');
+		expect(options).toEqual({
+			body: 'Radaren viser ikke længere regn ved dit punkt.',
+			icon: '/icons/icon-192.png',
+			badge: '/icons/icon-192.png',
+			tag: 'rain-incoming',
+			lang: 'da',
+			renotify: false,
+			silent: true,
+			data: { url: '/?lat=55.6761&lon=12.5683' }
+		});
+		// Platform default: no vibration pattern, no sticky notification.
+		expect(options).not.toHaveProperty('vibrate');
+		expect(options).not.toHaveProperty('requireInteraction');
+	});
+
+	it('uses the tag and English strings the payload carries', () => {
+		const { title, options } = notificationFromPayload(
+			parsePushPayload({
+				...allClear,
+				lang: 'en',
+				title: 'Rain no longer expected',
+				body: 'No rain at your point after all.',
+				tag: 'rain-incoming-2'
+			})!
+		);
+		expect(title).toBe('Rain no longer expected');
+		expect(options.body).toBe('No rain at your point after all.');
+		expect(options.tag).toBe('rain-incoming-2');
+		expect(options.lang).toBe('en');
+	});
+
+	it('keeps an all_clear quiet even when the fields are missing', () => {
+		const { silent: _s, renotify: _r, ...bare } = allClear;
+		const { options } = notificationFromPayload(parsePushPayload(bare)!);
+		expect(options.silent).toBe(true);
+		expect(options.renotify).toBe(false);
+	});
+
+	it('honours explicit silent/renotify false on a warning', () => {
+		const { options } = notificationFromPayload(
+			parsePushPayload({ ...raw, silent: false, renotify: false })!
+		);
+		expect(options.silent).toBe(false);
+		expect(options.renotify).toBe(false);
+	});
+
+	it('ignores non-boolean values for the quiet fields', () => {
+		const p = parsePushPayload({ ...raw, silent: 'yes', renotify: 1 })!;
+		expect(p.silent).toBeNull();
+		expect(p.renotify).toBeNull();
+	});
+
+	it('leaves a legacy payload exactly as before', () => {
+		const { title, options } = notificationFromPayload(parsePushPayload(raw)!);
+		expect(title).toBe('Regn på vej');
+		expect(options).toEqual({
+			body: 'Regn om ca. 12 min (78 %)',
+			icon: '/icons/icon-192.png',
+			badge: '/icons/icon-192.png',
+			tag: 'rain-incoming',
+			lang: 'da',
+			renotify: true,
+			data: { url: '/?lat=55.6761&lon=12.5683' }
+		});
+		expect(options).not.toHaveProperty('silent');
+	});
+});
+
 describe('pointFromUrl', () => {
 	it('reads a point out of a query string', () => {
 		expect(pointFromUrl('?lat=55.6761&lon=12.5683')).toEqual({ lat: 55.6761, lon: 12.5683 });

@@ -272,6 +272,34 @@ def test_state_json_round_trips(config: Config) -> None:
     assert state_from_json("garbage").streak == 0
 
 
+def test_state_json_carries_the_all_clear_memory(config: Config) -> None:
+    from dmi_nowcast_sidecar.push.engine import SubState
+
+    original = SubState(
+        armed=False, streak=0,
+        below_since_utc=RADAR_TS - timedelta(minutes=10),
+        last_eval_radar_ts=RADAR_TS,
+        notified=True, below_streak=2, all_clear_sent=True,
+    )
+    assert state_from_json(state_to_json(original)) == original
+    # A file written before the all-clear loads with the inert defaults.
+    old = {
+        "armed": False, "streak": 1, "below_since_utc": None,
+        "last_eval_radar_ts": RADAR_TS.isoformat(),
+    }
+    loaded = state_from_json(old)
+    assert (loaded.notified, loaded.below_streak, loaded.all_clear_sent) == (
+        False, 0, False,
+    )
+
+
+def test_the_scoreboard_takes_the_all_clear_from_push(config: Config) -> None:
+    config.push.allclear_enabled = False
+    config.push.allclear_readings = 4
+    rules = StationEvalService(config, _engine(_products()))._rules()
+    assert (rules.allclear_enabled, rules.allclear_readings) == (False, 4)
+
+
 async def test_state_survives_a_restart(config: Config) -> None:
     service = StationEvalService(config, _engine(_products()))
     await service.after_cycle(_cycle_result())

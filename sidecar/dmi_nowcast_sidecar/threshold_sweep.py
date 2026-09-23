@@ -163,6 +163,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from dmi_nowcast_core.push_rules import (
+    DEFAULT_ALLCLEAR_ENABLED,
+    DEFAULT_ALLCLEAR_READINGS,
     DEFAULT_PERSISTENCE_OBS,
     DEFAULT_REARM_AFTER_MIN,
 )
@@ -796,6 +798,9 @@ def replay_station(
     raining_now_mm_h: float = RAIN_THRESHOLD_MM_H,
     raining_now_eta_min: float | None = None,
     with_probability: bool = False,
+    with_all_clear: bool = False,
+    allclear_enabled: bool = DEFAULT_ALLCLEAR_ENABLED,
+    allclear_readings: int = DEFAULT_ALLCLEAR_READINGS,
 ) -> list[tuple]:
     """One station's warnings under one (lead, threshold) rule.
 
@@ -818,6 +823,16 @@ def replay_station(
     which the quality page publishes beside each warning. Off by default —
     ``score_warnings`` unpacks two-tuples, and the sweep's hot loop has no
     use for a third.
+
+    ``with_all_clear`` appends one more element to every warning: the
+    ``generated_at`` of the observation at which the ENGINE returned
+    ``"all_clear"`` for that warning, or ``None`` when it did not before
+    the re-arm (or before the coverage run ended). ``score_warnings``
+    grades it as the third element of ``(sent, eta, all_clear)``. The
+    all-clear changes no arming decision, so the warnings themselves —
+    and with them the sweep's objective — are identical with it on or
+    off; ``allclear_enabled`` / ``allclear_readings`` are the engine's
+    ``push.allclear_*`` settings.
     """
     eng = _engine()
     rules = eng.Rules(
@@ -828,10 +843,14 @@ def replay_station(
             {} if raining_now_eta_min is None
             else {"raining_now_eta_min": float(raining_now_eta_min)}
         ),
+        allclear_enabled=bool(allclear_enabled),
+        allclear_readings=int(allclear_readings),
     )
     state = eng.INITIAL_STATE
     run: int | None = None
     warnings: list[tuple] = []
+    #: The all-clear instant per warning, index-aligned with ``warnings``.
+    cleared: list[datetime | None] = []
     for record in track:
         if record[_RUN] != run:
             run = record[_RUN]
@@ -862,6 +881,13 @@ def replay_station(
                 if with_probability
                 else (record[_GENERATED], record[_ETA])
             )
+            cleared.append(None)
+        elif decision.action == "all_clear" and cleared:
+            # The engine retracts only the push it is disarmed by, which
+            # is the newest one this loop recorded.
+            cleared[-1] = record[_GENERATED]
+    if with_all_clear:
+        return [(*w, c) for w, c in zip(warnings, cleared)]
     return warnings
 
 
@@ -886,6 +912,15 @@ def score_cell(shared: dict, lead: int, threshold_pct: int | None) -> dict:
                 persistence_obs=shared["persistence_obs"],
                 rearm_after_min=shared["rearm_after_min"],
                 raining_now_mm_h=shared["raining_now_mm_h"],
+                # Reported beside the cell, never optimised: the all-clear
+                # changes no warning, so the objective cannot see it.
+                with_all_clear=True,
+                allclear_enabled=shared.get(
+                    "allclear_enabled", DEFAULT_ALLCLEAR_ENABLED,
+                ),
+                allclear_readings=shared.get(
+                    "allclear_readings", DEFAULT_ALLCLEAR_READINGS,
+                ),
             )
         n_sent += len(warnings)
         results.append(score_warnings(
@@ -938,6 +973,12 @@ def _cell(pooled: dict, lead: int, threshold_pct: int | None, shared: dict) -> d
         "csi": pooled["csi"],
         "lead_error_min": spread,
         "warnings_per_station_day": pooled["n_sent"] / station_days,
+        # Reported, not optimised (the pick reads F1): how many warnings
+        # the rule's all-clear would have retracted, graded.
+        "all_clears": pooled["all_clears"],
+        "all_clears_right": pooled["all_clears_right"],
+        "all_clears_wrong": pooled["all_clears_wrong"],
+        "all_clear_median_min": pooled["all_clear_median_min"],
         "n_stations": len(shared["stations"]),
         "n_days": shared["n_days"],
         "n_rows": shared["n_rows"],
@@ -966,6 +1007,8 @@ def build_shared(
     raining_now_mm_h: float = RAIN_THRESHOLD_MM_H,
     n_days: int | None = None,
     n_rows: int | None = None,
+    allclear_enabled: bool = DEFAULT_ALLCLEAR_ENABLED,
+    allclear_readings: int = DEFAULT_ALLCLEAR_READINGS,
 ) -> dict:
     """The frozen payload every cell of one sweep reads.
 
@@ -1010,6 +1053,8 @@ def build_shared(
         "persistence_obs": int(persistence_obs),
         "rearm_after_min": int(rearm_after_min),
         "raining_now_mm_h": float(raining_now_mm_h),
+        "allclear_enabled": bool(allclear_enabled),
+        "allclear_readings": int(allclear_readings),
         "station_days": sum(len(days_by_station[s]) for s in stations),
         "n_days": len(days) if n_days is None else int(n_days),
         "n_rows": (
