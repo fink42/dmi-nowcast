@@ -410,6 +410,15 @@ export const en: Catalog = {
 				rearm: number
 			) =>
 				`Probability above ${threshold} within ${lead} minutes, confirmed on ${persistence} consecutive cycles, and no new notification until ${rearm} minutes later.`,
+			/** The onset AND rule (S11); `post` is null when the onset chance alone decides. */
+			subscriberRuleOnsetValue: (
+				onset: string,
+				post: string | null,
+				lead: number,
+				persistence: number,
+				rearm: number
+			) =>
+				`Chance that rain starts within ${lead} minutes at least ${onset}${post ? ` and chance of rain at least ${post}` : ''}, confirmed on ${persistence} consecutive cycles, and no new notification until ${rearm} minutes later.`,
 			leadErrorNote:
 				'A positive error means the rain had already started when the notification said it would arrive — the notification came late.',
 			windowsTitle: 'Periods',

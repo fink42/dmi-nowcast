@@ -431,6 +431,15 @@ export const da = {
 				rearm: number
 			) =>
 				`Sandsynlighed over ${threshold} inden for ${lead} minutter, bekræftet i ${persistence} cyklusser i træk, og tidligst et nyt varsel ${rearm} minutter senere.`,
+			/** Startreglen (S11); `post` er null, når startsandsynligheden alene afgør. */
+			subscriberRuleOnsetValue: (
+				onset: string,
+				post: string | null,
+				lead: number,
+				persistence: number,
+				rearm: number
+			) =>
+				`Sandsynlighed for, at regnen begynder inden for ${lead} minutter, mindst ${onset}${post ? ` og sandsynlighed for regn mindst ${post}` : ''}, bekræftet i ${persistence} cyklusser i træk, og tidligst et nyt varsel ${rearm} minutter senere.`,
 			leadErrorNote:
 				'En positiv afvigelse betyder, at regnen allerede var i gang, da varslet sagde den ville komme — varslet kom for sent.',
 			windowsTitle: 'Perioder',

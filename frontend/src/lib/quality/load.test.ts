@@ -234,4 +234,16 @@ describe('parseQuality on malformed pieces', () => {
 		(partial.methods as Record<string, unknown>).frame_age_range_min = [14];
 		expect(parseQuality(partial)!.methods).toBeNull();
 	});
+
+	it('reads the onset AND rule halves when present, and leaves them out otherwise', () => {
+		expect(parseQuality(doc())!.methods!.subscriber_rule.onset_threshold_pct).toBeUndefined();
+
+		const raw = doc();
+		const rule = (raw.methods as Record<string, Record<string, unknown>>).subscriber_rule;
+		rule.onset_threshold_pct = 22;
+		rule.post_threshold_pct = 35;
+		const parsed = parseQuality(raw)!.methods!.subscriber_rule;
+		expect(parsed.onset_threshold_pct).toBe(22);
+		expect(parsed.post_threshold_pct).toBe(35);
+	});
 });

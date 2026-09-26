@@ -214,6 +214,13 @@ export interface QualityMethods {
 		lead_min: number;
 		rearm_after_min: number;
 		persistence_obs: number;
+		/**
+		 * S11: set when the lead is on the onset AND rule — the chance that
+		 * rain STARTS (equal to `threshold_pct`) and the chance-of-rain half
+		 * (0 = the onset chance alone decides). Absent on the single rule.
+		 */
+		onset_threshold_pct?: number;
+		post_threshold_pct?: number;
 	};
 	sources: { radar: string; gauges: string };
 }

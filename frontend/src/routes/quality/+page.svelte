@@ -234,12 +234,24 @@
 				</dd>
 				<dt>{t().quality.methods.subscriberRule}</dt>
 				<dd>
-					{t().quality.methods.subscriberRuleValue(
-						t().quality.percent(methods.subscriber_rule.threshold_pct),
-						methods.subscriber_rule.lead_min,
-						methods.subscriber_rule.persistence_obs,
-						methods.subscriber_rule.rearm_after_min
-					)}
+					{#if methods.subscriber_rule.onset_threshold_pct !== undefined}
+						{t().quality.methods.subscriberRuleOnsetValue(
+							t().quality.percent(methods.subscriber_rule.onset_threshold_pct),
+							(methods.subscriber_rule.post_threshold_pct ?? 0) > 0
+								? t().quality.percent(methods.subscriber_rule.post_threshold_pct ?? 0)
+								: null,
+							methods.subscriber_rule.lead_min,
+							methods.subscriber_rule.persistence_obs,
+							methods.subscriber_rule.rearm_after_min
+						)}
+					{:else}
+						{t().quality.methods.subscriberRuleValue(
+							t().quality.percent(methods.subscriber_rule.threshold_pct),
+							methods.subscriber_rule.lead_min,
+							methods.subscriber_rule.persistence_obs,
+							methods.subscriber_rule.rearm_after_min
+						)}
+					{/if}
 				</dd>
 				<dt>{t().quality.methods.sourceRadar}</dt>
 				<dd>{methods.sources.radar}</dd>

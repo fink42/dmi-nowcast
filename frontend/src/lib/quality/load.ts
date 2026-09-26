@@ -295,6 +295,16 @@ function parseMethods(raw: unknown): QualityMethods | null {
 				['threshold_pct', 'lead_min', 'rearm_after_min', 'persistence_obs'] as const
 			)
 		: null;
+	if (rule !== null && isObject(raw.subscriber_rule)) {
+		const onset = num(raw.subscriber_rule.onset_threshold_pct);
+		if (onset !== null) {
+			(rule as QualityMethods['subscriber_rule']).onset_threshold_pct = onset;
+			(rule as QualityMethods['subscriber_rule']).post_threshold_pct = Math.max(
+				0,
+				num(raw.subscriber_rule.post_threshold_pct) ?? 0
+			);
+		}
+	}
 	const sources = isObject(raw.sources) ? raw.sources : {};
 	const radar = str(sources.radar);
 	const gauges = str(sources.gauges);
