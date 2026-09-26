@@ -146,6 +146,9 @@ export const en: Catalog = {
 		factTableUndated: (pct: number) =>
 			`Currently warns at ${pct} % — fitted against DMI’s rain gauges.`,
 		factFallback: (pct: number) => `Currently warns at ${pct} % (default until enough data).`,
+		/** A horizon on the onset rule: rain STARTING, optionally AND rain at all (S11). */
+		factOnset: (onsetPct: number, postPct: number, date: string | null) =>
+			`Currently warns when the chance that rain starts is at least ${onsetPct} %${postPct > 0 ? ` and the chance of rain is at least ${postPct} %` : ''} — fitted against DMI’s rain gauges${date ? ` on ${date}` : ''}.`,
 		factOverride: (pct: number) => `Override: ${pct} % — used instead of the fitted value.`,
 		leadAdjusted: (stored: number, shown: number) =>
 			`Your notifications were set for ${stored} min, which is no longer offered — ${shown} min is selected instead.`,
@@ -159,6 +162,8 @@ export const en: Catalog = {
 		stop: 'Stop notifications',
 		summary: (coordinates: string, leadMin: number, thresholdPct: number) =>
 			`You will be notified at ${coordinates} when the chance of rain within ${leadMin} min is above ${thresholdPct} %.`,
+		summaryOnset: (coordinates: string, leadMin: number, onsetPct: number, postPct: number) =>
+			`You will be notified at ${coordinates} when the chance that rain starts within ${leadMin} min is at least ${onsetPct} %${postPct > 0 ? ` and the chance of rain is at least ${postPct} %` : ''}.`,
 		summaryQuiet: (start: string, end: string) =>
 			`Nothing will be sent between ${start} and ${end}.`,
 		summaryWithdraw:

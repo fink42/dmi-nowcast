@@ -17,6 +17,7 @@ import {
 	fittedDate,
 	isOverridePct,
 	nearestLead,
+	onsetRule,
 	parsePushOptions,
 	thresholdFact,
 	thresholdOverrideFromUrl,
@@ -230,5 +231,49 @@ describe('thresholdFact', () => {
 	it('has no override line without one in force', () => {
 		expect(thresholdFact(en, 'en', options, 20, null).override).toBeNull();
 		expect(thresholdFact(en, 'en', options, 20, 5).override).toBeNull();
+	});
+});
+
+describe('onset AND rule (S11)', () => {
+	const RAW = {
+		lead_options: [20, 30, 45, 60],
+		fallback_threshold_pct: 40,
+		fitted_at_utc: '2026-09-03T02:00:00Z',
+		thresholds: {
+			'20': { threshold_pct: 26, source: 'table', onset_threshold_pct: 26, post_threshold_pct: 0 },
+			'30': { threshold_pct: 22, source: 'table', onset_threshold_pct: 22, post_threshold_pct: 35 },
+			'45': { threshold_pct: 60, source: 'table' }
+		}
+	};
+	const options = parsePushOptions(RAW);
+
+	it('reads the onset fields and leaves single-rule rows alone', () => {
+		expect(onsetRule(options, 20)).toEqual({ onsetPct: 26, postPct: 0 });
+		expect(onsetRule(options, 30)).toEqual({ onsetPct: 22, postPct: 35 });
+		expect(onsetRule(options, 45)).toBeNull();
+		expect(onsetRule(options, 60)).toBeNull();
+	});
+
+	it('an override means the single rule', () => {
+		expect(onsetRule(options, 30, 55)).toBeNull();
+	});
+
+	it('states both halves when both apply, only the onset half at b = 0', () => {
+		const both = thresholdFact(en, 'en', options, 30).fact;
+		expect(both).toContain('rain starts is at least 22 %');
+		expect(both).toContain('chance of rain is at least 35 %');
+		expect(both).toMatch(/3 Sep/);
+		const onsetOnly = thresholdFact(en, 'en', options, 20).fact;
+		expect(onsetOnly).toContain('26 %');
+		expect(onsetOnly).not.toContain('chance of rain is');
+		expect(thresholdFact(da, 'da', options, 30).fact).toContain('regnen begynder');
+		expect(thresholdFact(en, 'en', options, 45).fact).toContain('warns at 60 %');
+	});
+
+	it('summarises the saved rule in both languages', () => {
+		expect(en.push.summaryOnset('X', 30, 22, 35)).toContain(
+			'within 30 min is at least 22 % and the chance of rain is at least 35 %'
+		);
+		expect(da.push.summaryOnset('X', 20, 26, 0)).not.toContain(' og ');
 	});
 });

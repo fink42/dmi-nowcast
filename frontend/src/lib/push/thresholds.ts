@@ -26,6 +26,18 @@ export interface LeadThreshold {
 	thresholdPct: number;
 	/** `fallback` when the fit has nothing to say about this horizon yet. */
 	source: 'table' | 'fallback';
+	/**
+	 * Set when the horizon is on the onset AND rule (S11): `thresholdPct` is
+	 * then the chance that rain STARTS, and this is the chance-of-rain half
+	 * (0 = the onset chance alone decides). Absent on the single rule.
+	 */
+	postThresholdPct?: number;
+}
+
+/** The onset AND rule in force for one horizon. */
+export interface OnsetRule {
+	onsetPct: number;
+	postPct: number;
 }
 
 /** `/api/push/options`, camel-cased. */
@@ -157,10 +169,16 @@ export function parsePushOptions(raw: unknown): PushOptions {
 			// A row with no number in it is a row that says nothing; it falls
 			// back like an absent one rather than becoming a threshold of 0.
 			if (pct === null) continue;
-			thresholds[lead] = {
+			const row: LeadThreshold = {
 				thresholdPct: Math.round(pct),
 				source: value.source === 'table' ? 'table' : 'fallback'
 			};
+			// The server sends the onset fields only for a horizon on the
+			// onset AND rule; there `threshold_pct` is the onset half.
+			if (toNumber(value.onset_threshold_pct) !== null) {
+				row.postThresholdPct = Math.max(0, Math.round(toNumber(value.post_threshold_pct) ?? 0));
+			}
+			thresholds[lead] = row;
 		}
 	}
 
@@ -194,6 +212,24 @@ export function effectiveThreshold(
 		pct: entry ? entry.thresholdPct : options.fallbackThresholdPct,
 		source: 'fallback'
 	};
+}
+
+/**
+ * The onset AND rule for a horizon, or null for the single threshold.
+ *
+ * An override always means the single rule — the server judges an
+ * overridden subscription on its own number alone — and so does a horizon
+ * the table has nothing fitted for.
+ */
+export function onsetRule(
+	options: PushOptions,
+	leadMin: number,
+	override: number | null = null
+): OnsetRule | null {
+	if (override !== null && isOverridePct(override)) return null;
+	const entry = options.thresholds[leadMin];
+	if (!entry || entry.source !== 'table' || entry.postThresholdPct === undefined) return null;
+	return { onsetPct: entry.thresholdPct, postPct: entry.postThresholdPct };
 }
 
 /** "3 Sep" / "3. sep." — the day the table was fitted, no year, no clock. */
@@ -231,8 +267,11 @@ export function thresholdFact(
 	const pick = effectiveThreshold(options, leadMin, override);
 	const date = options.fittedAtUtc === null ? null : fittedDate(options.fittedAtUtc, locale);
 
+	const rule = onsetRule(options, leadMin, null);
 	let fact: string;
-	if (table.source === 'fallback') {
+	if (rule !== null) {
+		fact = t.push.factOnset(rule.onsetPct, rule.postPct, date);
+	} else if (table.source === 'fallback') {
 		fact = t.push.factFallback(table.pct);
 	} else if (date === null) {
 		fact = t.push.factTableUndated(table.pct);

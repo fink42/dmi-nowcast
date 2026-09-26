@@ -159,6 +159,9 @@ export const da = {
 			`Varsler i dag ved ${pct} % — tilpasset efter DMI’s regnmålere.`,
 		factFallback: (pct: number) =>
 			`Varsler i dag ved ${pct} % (standard, indtil der er data nok).`,
+		/** En horisont på startreglen: regnen BEGYNDER, evt. OG regn i det hele taget (S11). */
+		factOnset: (onsetPct: number, postPct: number, date: string | null) =>
+			`Varsler i dag, når sandsynligheden for, at regnen begynder, er mindst ${onsetPct} %${postPct > 0 ? ` og sandsynligheden for regn er mindst ${postPct} %` : ''} — tilpasset efter DMI’s regnmålere${date ? ` ${date}` : ''}.`,
 		factOverride: (pct: number) =>
 			`Tilsidesat: ${pct} % — bruges i stedet for den tilpassede værdi.`,
 		leadAdjusted: (stored: number, shown: number) =>
@@ -173,6 +176,8 @@ export const da = {
 		stop: 'Stop besked',
 		summary: (coordinates: string, leadMin: number, thresholdPct: number) =>
 			`Du får besked ved ${coordinates}, når sandsynligheden for regn inden for ${leadMin} min er over ${thresholdPct} %.`,
+		summaryOnset: (coordinates: string, leadMin: number, onsetPct: number, postPct: number) =>
+			`Du får besked ved ${coordinates}, når sandsynligheden for, at regnen begynder inden for ${leadMin} min, er mindst ${onsetPct} %${postPct > 0 ? ` og sandsynligheden for regn er mindst ${postPct} %` : ''}.`,
 		summaryQuiet: (start: string, end: string) =>
 			`Du får ingen beskeder mellem ${start} og ${end}.`,
 		summaryWithdraw:

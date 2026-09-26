@@ -14,7 +14,7 @@
 	import { nowcast } from '$lib/nowcast/store.svelte';
 	import { defaultPrefs, type PushPrefs } from '$lib/push/prefs';
 	import { push } from '$lib/push/store.svelte';
-	import { effectiveThreshold, nearestLead, thresholdFact } from '$lib/push/thresholds';
+	import { effectiveThreshold, nearestLead, onsetRule, thresholdFact } from '$lib/push/thresholds';
 
 	/** ~50 m: closer than this and it is the same place, not a new one. */
 	const SAME_POINT_DEG = 0.0005;
@@ -85,6 +85,11 @@
 			: null
 	);
 
+	/** The saved subscription's onset AND rule, when its horizon is on one (S11). */
+	const storedOnsetRule = $derived(
+		stored ? onsetRule(options, stored.prefs.leadMin, stored.prefs.thresholdPct) : null
+	);
+
 	/**
 	 * Which operation "try again" repeats. Subscribing at the point on screen
 	 * and saving preferences at the saved point are different requests, and
@@ -145,11 +150,20 @@
 			<p class="muted">{t().push.denied}</p>
 		{:else if stored}
 			<p class="summary" aria-live="polite">
-				{t().push.summary(
-					t().panel.coordinates(stored.lat, stored.lon),
-					stored.prefs.leadMin,
-					storedThresholdPct ?? options.fallbackThresholdPct
-				)}
+				{#if storedOnsetRule}
+					{t().push.summaryOnset(
+						t().panel.coordinates(stored.lat, stored.lon),
+						stored.prefs.leadMin,
+						storedOnsetRule.onsetPct,
+						storedOnsetRule.postPct
+					)}
+				{:else}
+					{t().push.summary(
+						t().panel.coordinates(stored.lat, stored.lon),
+						stored.prefs.leadMin,
+						storedThresholdPct ?? options.fallbackThresholdPct
+					)}
+				{/if}
 				{#if stored.prefs.quietHours.enabled}
 					<span class="muted"
 						>{t().push.summaryQuiet(
