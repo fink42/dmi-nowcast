@@ -416,6 +416,7 @@ def apply_thresholds(
         effective_threshold,
         lead_pick,
         load_thresholds,
+        onset_rule,
     )
 
     doc = load_thresholds(path)
@@ -425,6 +426,14 @@ def apply_thresholds(
             "(drop --thresholds to replay at the --rules percent)",
         )
     lead = str(int(rules["lead_min"]))
+    if onset_rule(doc, lead) is not None:
+        # S11: the replay decides on one column; the table's p_post half
+        # alone (possibly 0 %) is not the rule the service runs.
+        raise ValueError(
+            f"{path}: lead {lead} is on the onset AND rule "
+            "(onset_threshold_pct), which this replay does not run; "
+            "drop --thresholds or pass a single-threshold table",
+        )
     rules = dict(rules)
     rules["threshold_pct"] = float(effective_threshold(doc, lead))
     source = (

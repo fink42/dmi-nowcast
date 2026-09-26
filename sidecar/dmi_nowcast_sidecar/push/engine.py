@@ -61,6 +61,16 @@ curve-calibrated ``p_rain`` and the gauge-trained post-processed
 itself is unchanged by that — it compares ``obs.p_decision`` to a number,
 as it always did, and never learns where either came from.
 
+Since S11 a lead may be on the **onset AND rule** instead: fire when
+``p_onset >= onset_threshold_pct AND p_decision >= threshold_pct``, where
+``p_onset`` is the onset-target model's probability that rain STARTS within
+the lead (``Observation.p_onset``). ``threshold_pct`` may then be 0 —
+onset alone decides. An observation with no ``p_onset`` falls back to the
+single-threshold rule at ``single_threshold_pct``. Everything downstream of
+"is this observation over?" — persistence, re-arm, quiet hours, already
+raining, the all-clear — reads the same one boolean, so it follows the
+rule unchanged (:func:`is_over`).
+
 Timestamps are UTC everywhere; the subscriber's IANA time zone is used
 for exactly one thing, the quiet-hours comparison.
 """
@@ -91,6 +101,7 @@ __all__ = [
     "Decision",
     "in_quiet_hours",
     "evaluate",
+    "is_over",
 ]
 
 
@@ -167,6 +178,10 @@ class Observation:
     #: observation: one point off coverage for the model must not silence
     #: it, and one model outage must not silence everyone.
     p_source: Literal["postprocess", "curve"] = "curve"
+    #: P(rain STARTS within the lead) from the onset-target model (S11).
+    #: Set only when the subscription's lead is on the onset AND rule;
+    #: ``None`` means the rule falls back to the single threshold.
+    p_onset: float | None = None
 
     @property
     def p_decision(self) -> float | None:
@@ -181,8 +196,15 @@ class Observation:
         return self.p_rain
 
     @property
-    def p_decision_source(self) -> Literal["postprocess", "curve"]:
-        """Where :attr:`p_decision` came from, after the per-row fallback."""
+    def p_decision_source(self) -> Literal["postprocess", "curve", "onset_and"]:
+        """Where :attr:`p_decision` came from, after the per-row fallback.
+
+        ``"onset_and"`` when the observation carries ``p_onset`` — the
+        caller sets it only for a lead on the onset AND rule, so the
+        decision read ``p_onset`` beside ``p_decision``.
+        """
+        if self.p_onset is not None and self.p_decision is not None:
+            return "onset_and"
         if self.p_source == "postprocess" and self.p_post is not None:
             return "postprocess"
         return "curve"
@@ -289,6 +311,31 @@ def in_quiet_hours(
     return now >= start or now < end
 
 
+def is_over(
+    obs: Observation,
+    threshold_pct: int,
+    onset_threshold_pct: int | None = None,
+    single_threshold_pct: int | None = None,
+) -> bool:
+    """Is this observation over the rule? The one predicate of the machine.
+
+    Single-threshold rule (``onset_threshold_pct`` None): ``p_decision >=
+    threshold_pct``. Onset AND rule: ``p_onset >= onset_threshold_pct AND
+    p_decision >= threshold_pct``; an observation with no ``p_onset`` is
+    judged on the single rule at ``single_threshold_pct`` (else
+    ``threshold_pct``). No ``p_decision`` is never over.
+    """
+    p = obs.p_decision
+    if p is None:
+        return False
+    if onset_threshold_pct is None or obs.p_onset is None:
+        single = threshold_pct
+        if onset_threshold_pct is not None and single_threshold_pct is not None:
+            single = single_threshold_pct
+        return p >= single / 100
+    return obs.p_onset >= onset_threshold_pct / 100 and p >= threshold_pct / 100
+
+
 def evaluate(
     state: SubState,
     obs: Observation,
@@ -298,6 +345,8 @@ def evaluate(
     tz: str,
     now_utc: datetime,
     rules: Rules = Rules(),
+    onset_threshold_pct: int | None = None,
+    single_threshold_pct: int | None = None,
 ) -> Decision:
     """Advance the machine by one radar observation.
 
@@ -305,6 +354,10 @@ def evaluate(
     The caller sends a warning for ``"notify"`` and the silent
     retraction for ``"all_clear"``; ``"already_raining"`` and
     ``"deferred_quiet"`` are state transitions with no delivery.
+
+    ``onset_threshold_pct`` / ``single_threshold_pct`` switch the lead to
+    the onset AND rule (see :func:`is_over`); omitted, the rule is the
+    single threshold it always was.
     """
     # An observation is evaluated exactly once. Restarts, the no-new-frame
     # fast path and replays all arrive here as a timestamp we have seen.
@@ -318,7 +371,7 @@ def evaluate(
     # H-P change on this path is which probability ``p_decision`` returns,
     # and ``evaluate`` stays pure and unaware of the choice.
     decision_p = obs.p_decision
-    over = decision_p is not None and decision_p >= threshold_pct / 100
+    over = is_over(obs, threshold_pct, onset_threshold_pct, single_threshold_pct)
 
     if not state.armed:
         # Disarmed. Settle the arm *before* judging this observation: a

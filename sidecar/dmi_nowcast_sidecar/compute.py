@@ -73,7 +73,7 @@ from .gauge_history import GaugeCycleRead, build_gauge_history
 from .lightning_tracker import LightningTracker
 from .national_artifacts import write_national_artifacts
 from .national_sample import finite_or_none, product_pixel_of
-from .push.paths import resolved_postprocess_path
+from .push.paths import resolved_onset_model_path, resolved_postprocess_path
 from .push.postprocess import (
     CyclePostprocess,
     PostprocessContext,
@@ -517,6 +517,12 @@ class CycleEngine:
         # because both move between cycles. Home is always in, so the
         # cycle has at least one point to answer for.
         self._postprocess = PostprocessTable(resolved_postprocess_path(config))
+        #: S11: the push-only onset-target model, scored on the same rows.
+        #: Feeds ``CyclePostprocess.p_onset`` and nothing the site shows.
+        self._onset_postprocess = PostprocessTable(
+            resolved_onset_model_path(config),
+            target=core_postprocess.TARGET_ONSET,
+        )
         #: v2/F1: the gauge archive behind the ``g_*`` feature block, or
         #: None on a deployment that has no corpus volume or no station
         #: catalogue to resolve a point against. One store read per cycle,
@@ -585,6 +591,11 @@ class CycleEngine:
         can never drift apart.
         """
         return self._postprocess
+
+    @property
+    def onset_postprocess(self) -> PostprocessTable:
+        """The push-only onset model table (S11); the sync task nudges it."""
+        return self._onset_postprocess
 
     @property
     def postprocess_latest(self) -> CyclePostprocess | None:
@@ -1125,6 +1136,7 @@ class CycleEngine:
         # is the 40 km corridor gather, a few megabytes at the point
         # counts this service can reach.
         self._postprocess.maybe_reload()
+        self._onset_postprocess.maybe_reload()
         pp_keys = self._serving_points()
         pp_native: list[Any] = []
         pp_grid: dict[str, np.ndarray] | None = None
@@ -2048,6 +2060,7 @@ class CycleEngine:
                 season=core_postprocess.season_of_month(generated_at_utc.month),
                 hour_utc=generated_at_utc.hour,
                 frame_age_min=frame_age_min,
+                onset_table=self._onset_postprocess,
             )
             self._postprocess_context = (
                 PostprocessContext(
@@ -2089,6 +2102,7 @@ class CycleEngine:
                 active=self._postprocess_latest.active,
                 leads=list(self._postprocess_latest.leads),
                 fitted_at=self._postprocess_latest.fitted_at_utc,
+                onset_leads=sorted(self._postprocess_latest.p_onset),
                 on_demand=self._postprocess_context is not None,
                 # How many points the neighbour block actually answered
                 # for, per cycle. A family that quietly stopped being

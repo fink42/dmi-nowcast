@@ -122,6 +122,7 @@ from .push_rules import DEFAULT_PERSISTENCE_OBS, DEFAULT_REARM_AFTER_MIN
 from .push_thresholds import (
     OBJECTIVE_SPEC as THRESHOLDS_OBJECTIVE_SPEC,
     load_thresholds,
+    onset_rule,
     validate_leads_table,
 )
 from .warning_score import (
@@ -1558,8 +1559,29 @@ def _thresholds_section(inputs: QualityInputs) -> dict | None:
         "fitted_at_utc": doc["fitted_at_utc"],
         "objective": doc["objective"],
         "fallback_threshold_pct": doc["fallback_threshold_pct"],
-        "leads": doc["leads"],
+        "leads": {
+            key: _headline_row(doc, key, entry)
+            for key, entry in doc["leads"].items()
+        },
     }
+
+
+def _headline_row(doc: Mapping[str, Any], key: str, entry: Any) -> Any:
+    """A lead row as the page shows it (S11).
+
+    Verbatim, except on the onset AND rule: the p_post half may be 0
+    ("onset alone decides"), which the page would print as "warns at 0 %".
+    There the headline ``threshold_pct`` is the onset threshold — the same
+    number ``/api/push/options`` shows — and the p_post half moves to
+    ``post_threshold_pct``.
+    """
+    rule = onset_rule(doc, key)
+    if rule is None or not isinstance(entry, dict):
+        return entry
+    row = dict(entry)
+    row["post_threshold_pct"] = row.get("threshold_pct")
+    row["threshold_pct"] = int(rule[0])
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1684,9 @@ def _brier_improvement(
 _SERVED_RULE_NUMBERS = (
     "threshold_pct", "lead_min", "rearm_after_min", "persistence_obs",
     "rows_fallback", "allclear_readings",
+    # S11, additive: the onset AND rule's two halves (absent on the
+    # single-threshold rule; ``threshold_pct`` is then the onset one).
+    "onset_threshold_pct", "post_threshold_pct", "rows_onset_fallback",
 )
 
 #: The all-clear's graded counts in ``methods.subscriber_rule`` (additive;

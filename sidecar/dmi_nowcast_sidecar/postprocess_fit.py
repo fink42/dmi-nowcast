@@ -166,9 +166,14 @@ class ServedModel:
     kind: str
     design: str
     protocol: str
+    #: The fit target (S11): the nightly refit only ever produces ``wet``.
+    target: str = pp.TARGET_WET
 
     def describe(self) -> str:
-        return f"kind={self.kind} design={self.design} protocol={self.protocol}"
+        text = f"kind={self.kind} design={self.design} protocol={self.protocol}"
+        if self.target != pp.TARGET_WET:
+            text += f" target={self.target}"
+        return text
 
 
 def describe_served_model(path: Path) -> ServedModel | None:
@@ -197,10 +202,14 @@ def describe_served_model(path: Path) -> ServedModel | None:
     protocol = raw.get("protocol")
     if not protocol and isinstance(training, dict):
         protocol = training.get("protocol")
+    target = raw.get("target")
+    if not target and isinstance(training, dict):
+        target = training.get("target")
     return ServedModel(
         kind=str(raw.get("kind") or pp.KIND_LOGISTIC),
         design=str(version or pp.DESIGN_V1),
         protocol=str(protocol or NIGHTLY_PROTOCOL),
+        target=str(target or pp.TARGET_WET),
     )
 
 
@@ -247,7 +256,9 @@ def refit_skip_reason(
         protocol=NIGHTLY_PROTOCOL,
     )
     reproducible = (
-        not pp.is_tree_kind(served.kind)
+        # S11: an onset-target model is never the nightly fit's output.
+        served.target == pp.TARGET_WET
+        and not pp.is_tree_kind(served.kind)
         and served.protocol == configured.protocol
         and served.design == configured.design
         and served.kind == configured.kind

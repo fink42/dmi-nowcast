@@ -204,7 +204,18 @@ def extra_schema(leads_min=None):
     return pa.schema(
         list(core_postprocess.feature_schema(leads))
         + list(core_postprocess.post_schema(leads))
+        # S11: the push-only onset model's probability, so a live row
+        # carries both halves of the onset AND rule it was decided under.
+        + [
+            (onset_column(lead), pa.float32())
+            for lead in sorted({int(x) for x in leads})
+        ]
     )
+
+
+def onset_column(lead: int) -> str:
+    """``p_onset_<lead>`` — the onset model's column, named once (core)."""
+    return core_postprocess.ONSET_COLUMN_TEMPLATE.format(lead=int(lead))
 
 
 def _with_extras(
@@ -519,6 +530,21 @@ class StationEvalService:
             allclear_readings=self.config.push.allclear_readings,
         )
 
+    def _onset_rule(self) -> tuple[int, int] | None:
+        """The onset AND rule for the scoreboard's lead, or None (S11).
+
+        Read off the same table :meth:`_threshold` just reloaded, so one
+        cycle is judged under one version of the rule. None — the single
+        threshold — when there is no table or it cannot say.
+        """
+        table = self._thresholds
+        if table is None or not hasattr(table, "onset_rule"):
+            return None
+        try:
+            return table.onset_rule(int(self.config.station_eval.rules.lead_min))
+        except Exception:  # noqa: BLE001 — never cost a cycle
+            return None
+
     def _threshold(self) -> tuple[int, str]:
         """``(percent, source)`` the virtual subscribers warn at this cycle.
 
@@ -600,6 +626,8 @@ class StationEvalService:
         rules = self._rules()
         lead = int(self.config.station_eval.rules.lead_min)
         threshold_pct, threshold_source = self._threshold()
+        onset = self._onset_rule() if threshold_source != "config" else None
+        onset_fallbacks = 0
 
         rows: list[dict] = []
         actions: dict[str, int] = {}
@@ -638,7 +666,18 @@ class StationEvalService:
                     # engine does, under the same per-row fallback.
                     p_post=extras.get(core_postprocess.post_column(lead)),
                     p_source=self.config.push.probability_source,
+                    # S11: the onset AND rule's other half, exactly as the
+                    # push fan-out reads it (only for an onset-rule lead,
+                    # only under the post-processed source).
+                    p_onset=(
+                        extras.get(onset_column(lead))
+                        if onset is not None
+                        and self.config.push.probability_source == "postprocess"
+                        else None
+                    ),
                 )
+                if onset is not None and obs.p_onset is None:
+                    onset_fallbacks += 1
                 decision = evaluate(
                     self._states.get(station, INITIAL_STATE),
                     obs,
@@ -647,6 +686,8 @@ class StationEvalService:
                     tz="UTC",
                     now_utc=generated_at,
                     rules=rules,
+                    onset_threshold_pct=None if onset is None else onset[0],
+                    single_threshold_pct=None if onset is None else onset[1],
                 )
             except Exception as exc:  # noqa: BLE001 — one bad station only
                 errors += 1
@@ -729,6 +770,10 @@ class StationEvalService:
             # is no usable table.
             "threshold_pct": threshold_pct,
             "threshold_source": threshold_source,
+            # S11: the onset AND rule's percent (None = single threshold)
+            # and the rows that fell back to the single rule without p_onset.
+            "onset_threshold_pct": None if onset is None else onset[0],
+            "onset_rule_fallbacks": onset_fallbacks,
         }
         _log.info("station_eval", **summary)
         return summary

@@ -32,6 +32,12 @@ THRESHOLDS_FILENAME = "push_thresholds.json"
 # and by the cycle. Not a secret, so not under ``push/``.
 POSTPROCESS_FILENAME = "postprocess.json"
 
+# The onset-target model the push rule's AND half reads (S11). Push-only:
+# the site never shows it. Installed on the private instance, served at
+# ``/calibration/postprocess_push.json``, pulled by the public sync; never
+# written by the nightly refit.
+ONSET_MODEL_FILENAME = "postprocess_push.json"
+
 
 def push_dir(config: Config) -> Path:
     """``<storage.data_dir>/push`` — the default home of both files."""
@@ -79,8 +85,22 @@ def resolved_postprocess_path(config: Config) -> Path:
     return Path(config.storage.data_dir) / POSTPROCESS_FILENAME
 
 
+def resolved_onset_model_path(config: Config) -> Path:
+    """Configured ``push.onset_model_path``, else ``<data_dir>/<name>``.
+
+    The twin of :func:`resolved_postprocess_path` for the push-only onset
+    model: the sync task writes here, ``/calibration/postprocess_push.json``
+    serves this, and the cycle's second ``PostprocessTable`` reads it.
+    """
+    if config.push.onset_model_path is not None:
+        return Path(config.push.onset_model_path)
+    return Path(config.storage.data_dir) / ONSET_MODEL_FILENAME
+
+
 __all__ = [
     "DB_FILENAME",
+    "ONSET_MODEL_FILENAME",
+    "resolved_onset_model_path",
     "KEY_FILENAME",
     "PUSH_SUBDIR",
     "push_dir",

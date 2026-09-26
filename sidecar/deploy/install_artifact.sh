@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install a fitted artefact — postprocess.json or push_thresholds.json —
+# Install a fitted artefact — postprocess.json, postprocess_push.json (the
+# push-only onset model, S11) or push_thresholds.json —
 # into a running stack's data volume, atomically, keeping one generation.
 #
 # WHY THIS EXISTS
@@ -83,8 +84,9 @@ cd "$REPO_ROOT"
 # data volume and hot-reloaded on (mtime, size); anything else would land
 # somewhere nothing looks at.
 #   postprocess.json      push/paths.py resolved_postprocess_path
+#   postprocess_push.json push/paths.py resolved_onset_model_path (S11)
 #   push_thresholds.json  push/paths.py resolved_thresholds_path
-KNOWN_NAMES=(postprocess.json push_thresholds.json)
+KNOWN_NAMES=(postprocess.json postprocess_push.json push_thresholds.json)
 
 #: uid:gid of the unprivileged ``dmi`` user the container runs as — the
 #: same 10001 deploy.sh chowns the corpus bind-mount to. docker cp brings
@@ -210,7 +212,19 @@ version = doc.get("schema_version")
 if not isinstance(version, int):
     die("no integer schema_version")
 
-if name == "postprocess.json":
+if name in ("postprocess.json", "postprocess_push.json"):
+    # The two model slots serve different targets and each refuses the
+    # other's document at load (push/postprocess.py PostprocessTable):
+    # postprocess.json is what the SITE shows (target wet), and
+    # postprocess_push.json feeds only the push rule's onset AND half.
+    target = str(
+        doc.get("target")
+        or (doc.get("training") or {}).get("target")
+        or "wet"
+    )
+    wanted = "onset" if name == "postprocess_push.json" else "wet"
+    if target != wanted:
+        die(f"target {target!r}, but {name} must be a {wanted!r} model")
     if model_schema and version != int(model_schema):
         die(
             f"schema_version {version}, but this checkout serves "
@@ -240,13 +254,15 @@ if name == "postprocess.json":
         die(f"leads {missing} have no model")
     print(
         f"    schema_version={version} kind={kind} design={design_version} "
-        f"protocol={protocol}"
+        f"protocol={protocol} target={target}"
     )
     print(
         f"    leads={list(leads)} fitted_at={doc.get('fitted_at_utc') or '?'} "
         f"rows={training.get('rows', '?')} stations={training.get('stations', '?')}"
     )
-    if kind.startswith("trees") or design_version != "v1" or protocol != "at-gauge":
+    if name == "postprocess.json" and (
+        kind.startswith("trees") or design_version != "v1" or protocol != "at-gauge"
+    ):
         print(
             "    note: the nightly refit cannot reproduce this document and "
             "will skip itself while it is in service"
@@ -265,12 +281,22 @@ elif name == "push_thresholds.json":
     for lead in sorted(leads, key=lambda value: int(value)):
         entry = leads[lead] if isinstance(leads[lead], dict) else {}
         pct = entry.get("threshold_pct")
-        if isinstance(pct, int) and 0 < pct < 100:
+        # S11: a lead on the onset AND rule may carry threshold_pct 0
+        # (onset alone decides) beside a whole-percent onset_threshold_pct.
+        onset = entry.get("onset_threshold_pct")
+        if onset is not None and not (isinstance(onset, int) and 0 < onset < 100):
+            die(f"lead {lead}: onset_threshold_pct {onset!r} is not a percent")
+        floor = 0 if onset is not None else 1
+        if isinstance(pct, int) and floor <= pct < 100:
             picked += 1
         elif pct is not None:
             die(f"lead {lead}: threshold_pct {pct!r} is not a percent")
+        rule = "" if onset is None else (
+            f" onset_threshold_pct={onset} "
+            f"single_threshold_pct={entry.get('single_threshold_pct', 'fallback')}"
+        )
         print(
-            f"    lead {lead}: threshold_pct={pct if pct is not None else 'none'} "
+            f"    lead {lead}: threshold_pct={pct if pct is not None else 'none'}{rule} "
             f"guard={entry.get('guard', '?')} warnings={entry.get('warnings', '?')} "
             f"f1={entry.get('f1', '?')}"
         )
@@ -371,7 +397,8 @@ if [[ "$dry_run" == 1 ]]; then
 fi
 
 echo "==> Done"
-echo "    postprocess.json is re-read at the start of the next radar cycle;"
+echo "    postprocess.json / postprocess_push.json are re-read at the start"
+echo "    of the next radar cycle;"
 echo "    push_thresholds.json at the start of the next fan-out. No restart."
 echo "    The nightly refit will skip a model it could not have produced —"
 echo "    check tonight's summary for postprocess_skipped."

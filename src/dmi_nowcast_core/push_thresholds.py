@@ -22,6 +22,19 @@ Shape, version 1::
      "fallback_threshold_pct": 40,
      "leads": {"20": {"threshold_pct": 45, "insufficient": false, ...}}}
 
+**The onset AND rule (S11, optional per lead).** A lead row may also carry
+``onset_threshold_pct`` (a whole percent in (0, 100)) and, beside it,
+``single_threshold_pct``. The push rule at that lead is then
+``p_onset >= onset_threshold_pct AND p_post >= threshold_pct``, where
+``p_onset`` comes from the onset-target model (``push.onset_model_path``);
+``threshold_pct`` may be 0 on such a row, which makes the rule onset-only.
+``single_threshold_pct`` is the percent the classic single-threshold rule
+(``p_post >= t``) falls back to for an observation with no ``p_onset`` —
+absent, it is ``fallback_threshold_pct``. A table without the key is the
+single-threshold rule, exactly as before. :func:`onset_rule` is the one
+reader; the nightly sweep only knows single-threshold fitting and refuses
+to overwrite a table that carries one (:func:`carries_onset_rule`).
+
 Two rules make this safe to read at request time:
 
 **A lead the table does not cover falls back.** Not an error, not a
@@ -72,6 +85,8 @@ __all__ = [
     "validate_leads_table",
     "lead_pick",
     "effective_threshold",
+    "onset_rule",
+    "carries_onset_rule",
     "load_thresholds",
 ]
 
@@ -279,11 +294,26 @@ def validate_leads_table(leads: Mapping[str, Any], where: str = "leads") -> list
         if not isinstance(entry, dict):
             continue
         threshold = entry.get("threshold_pct")
+        has_onset = "onset_threshold_pct" in entry
+        for name in ("onset_threshold_pct", "single_threshold_pct"):
+            if name not in entry:
+                continue
+            value = entry[name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 < value < 100
+            ):
+                problems.append(f"{at}.{name}: expected a whole percent in (0, 100)")
+        if "single_threshold_pct" in entry and not has_onset:
+            problems.append(f"{at}.single_threshold_pct: only with onset_threshold_pct")
         if (
             threshold is not None
             and not isinstance(threshold, bool)
             and isinstance(threshold, int)
-            and not 0 < threshold < 100
+            # 0 is a legal p_post threshold under the onset AND rule only:
+            # "onset alone decides".
+            and not (0 <= threshold < 100 if has_onset else 0 < threshold < 100)
         ):
             problems.append(f"{at}.threshold_pct: out of range (0, 100)")
         if entry.get("insufficient") is True and threshold is not None:
@@ -329,13 +359,53 @@ def lead_pick(doc: Any, lead_min: Any) -> int | None:
     if not isinstance(entry, dict) or entry.get("insufficient") is True:
         return None
     threshold = entry.get("threshold_pct")
+    floor = 0 if _onset_pct(entry) is not None else 1
     if (
         isinstance(threshold, bool)
         or not isinstance(threshold, int)
-        or not 0 < threshold < 100
+        or not floor <= threshold < 100
     ):
         return None
     return threshold
+
+
+def _onset_pct(entry: Any) -> int | None:
+    """A lead row's usable ``onset_threshold_pct``, or None."""
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("onset_threshold_pct")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 100:
+        return None
+    return value
+
+
+def onset_rule(doc: Any, lead_min: Any) -> tuple[int, int] | None:
+    """``(onset_threshold_pct, single_threshold_pct)`` for one lead, or None.
+
+    None means the lead is on the single-threshold rule (no onset key, an
+    unusable one, or no usable ``threshold_pct`` beside it — an AND rule
+    with half its numbers missing is not a rule). ``single_threshold_pct``
+    is what an observation with no ``p_onset`` is judged on instead:
+    the row's own value, else the document's fallback. Total, never raises.
+    """
+    if lead_pick(doc, lead_min) is None:
+        return None
+    entry = doc["leads"][str(int(lead_min))]
+    onset = _onset_pct(entry)
+    if onset is None:
+        return None
+    single = entry.get("single_threshold_pct")
+    if isinstance(single, bool) or not isinstance(single, int) or not 0 < single < 100:
+        single = effective_threshold({**doc, "leads": {}}, lead_min)
+    return onset, int(single)
+
+
+def carries_onset_rule(doc: Any) -> bool:
+    """Does any lead of this document serve the onset AND rule?"""
+    if not isinstance(doc, dict) or not isinstance(doc.get("leads"), dict):
+        return False
+    return any(onset_rule(doc, key) is not None
+               for key in doc["leads"] if str(key).isdigit())
 
 
 def effective_threshold(doc: Any, lead_min: Any) -> int:

@@ -88,6 +88,7 @@ from dmi_nowcast_core.push_thresholds import (
     effective_threshold,
     lead_pick,
     load_thresholds,
+    onset_rule,
 )
 from dmi_nowcast_core.quality_report import SCORED_RE_DECIDED
 from dmi_nowcast_core.warning_score import (
@@ -141,6 +142,11 @@ class ServedRuleOptions:
     #: the hours since the serving path shipped carry a probability, and
     #: the page would measure the archive's depth.
     postprocess_model: Path | None = None
+    #: The push-only ONSET model (S11, ``push.onset_model_path``), used to
+    #: fill ``p_onset_<lead>`` the same way when the table puts the lead
+    #: on the onset AND rule. None: only rows that stored it carry it, and
+    #: the rest fall back to the single threshold, as the service does.
+    onset_model: Path | None = None
     #: The leads the model's design reads. Must match the model's own.
     design_leads: tuple[int, ...] = DEFAULT_PRODUCT_LEADS_MIN
     #: The rest of the live subscriber row — the rule's timing from
@@ -172,6 +178,20 @@ def post_column(lead: int) -> str:
     from dmi_nowcast_core import postprocess as core_postprocess
 
     return core_postprocess.post_column(int(lead))
+
+
+def resolve_onset_rule(options: ServedRuleOptions) -> tuple[int, int] | None:
+    """The onset AND rule for this run's lead (S11), or None.
+
+    Only under the post-processed source: the curve rollback turns the
+    onset half off in the service too.
+    """
+    if (
+        options.thresholds_path is None
+        or options.probability_source != PROBABILITY_POSTPROCESS
+    ):
+        return None
+    return onset_rule(load_thresholds(options.thresholds_path), options.lead_min)
 
 
 def resolve_threshold(options: ServedRuleOptions) -> tuple[int, str]:
@@ -232,11 +252,22 @@ class ServedRuleDecider:
             post_column(options.lead_min) if post
             else p_rain_column(options.lead_min)
         )
+        #: S11: ``(onset_threshold_pct, single_threshold_pct)`` when the
+        #: served table puts this lead on the onset AND rule — the page
+        #: then grades that rule, never ``p_post`` alone against its half.
+        self.onset = resolve_onset_rule(options)
+        from dmi_nowcast_core.postprocess import ONSET_COLUMN_TEMPLATE
+
+        self.onset_column = ONSET_COLUMN_TEMPLATE.format(
+            lead=int(options.lead_min),
+        )
         #: Published under ``methods.subscriber_rule`` and logged. Mutated
         #: by :meth:`__call__`; see the class docstring for why that is
         #: the contract rather than a surprise.
         self.stats: dict[str, Any] = {
-            "threshold_pct": int(threshold),
+            "threshold_pct": int(
+                threshold if self.onset is None else self.onset[0]
+            ),
             "threshold_source": source,
             "lead_min": float(options.lead_min),
             "rearm_after_min": float(options.rearm_after_min),
@@ -247,6 +278,18 @@ class ServedRuleDecider:
             ),
             "probability": self.probability,
             "probability_column": self.column,
+            # S11: null on the single-threshold rule. On the onset AND
+            # rule the page's headline ``threshold_pct`` is the onset
+            # threshold — the same number ``/api/push/options`` shows
+            # (``ThresholdTable.headline``) — and the p_post half, which
+            # may be 0, travels as ``post_threshold_pct``.
+            "onset_threshold_pct": (
+                None if self.onset is None else int(self.onset[0])
+            ),
+            "post_threshold_pct": (
+                None if self.onset is None else int(threshold)
+            ),
+            "rows_onset_fallback": 0,
             # The core report's own word for it, imported rather than
             # typed out: the page's methods block and this module must
             # not be able to disagree about what happened.
@@ -294,6 +337,17 @@ class ServedRuleDecider:
         lead = int(self.options.lead_min)
         curve_column = p_rain_column(lead)
         filler = self._filler()
+        onset_filler = self._onset_filler()
+        extra = [] if self.column == curve_column else [self.column]
+        derive = filler
+        if onset_filler is not None:
+            extra.append(self.onset_column)
+            derive = (
+                onset_filler if filler is None
+                else (lambda table: onset_filler(filler(table)))
+            )
+        elif self.onset is not None:
+            extra.append(self.onset_column)
         wide, _leads, counts = load_decisions(
             [Path(d) for d in self.options.decisions_dirs],
             leads_min=(lead,),
@@ -304,14 +358,18 @@ class ServedRuleDecider:
             # live partition written since the serving path shipped
             # STORES it, and dropping that would push those rows onto the
             # fallback for no reason.
-            extra_columns=() if self.column == curve_column else (self.column,),
-            derive=filler,
+            extra_columns=tuple(extra),
+            derive=derive,
             log=self._log,
         )
         self.stats["rows_loaded"] = len(wide)
         if filler is not None:
             self.stats["fill"] = {
                 key: int(value) for key, value in filler.counts.items()
+            }
+        if onset_filler is not None:
+            self.stats["onset_fill"] = {
+                key: int(value) for key, value in onset_filler.counts.items()
             }
 
         # The report's row set, and only it: both halves of the page must
@@ -340,10 +398,19 @@ class ServedRuleDecider:
                     fallbacks += 1
             self.stats["rows_fallback"] = fallbacks
 
+        if self.onset is not None:
+            self.stats["rows_onset_fallback"] = sum(
+                1 for row in kept
+                if row.get(self.onset_column) is None
+                and row.get(self.column) is not None
+            )
         tracks, _frames = build_tracks(
             kept, [lead],
             coverage_gap_min=int(self.options.coverage_gap_min),
             column_for=lambda _lead: self.column,
+            onset_column_for=(
+                None if self.onset is None else (lambda _lead: self.onset_column)
+            ),
         )
         del kept
         out: dict[
@@ -362,15 +429,27 @@ class ServedRuleDecider:
                 with_all_clear=True,
                 allclear_enabled=bool(self.options.allclear_enabled),
                 allclear_readings=int(self.options.allclear_readings),
+                onset_threshold_pct=(
+                    None if self.onset is None else int(self.onset[0])
+                ),
+                single_threshold_pct=(
+                    None if self.onset is None else int(self.onset[1])
+                ),
             )
             if warnings:
                 out[str(station)] = warnings
                 total += len(warnings)
         self.stats["warnings"] = total
         self.stats["stations"] = len(tracks)
+        rule = (
+            "" if self.onset is None
+            else f" AND {self.onset_column} >= {self.onset[0]} % "
+            f"(single {self.onset[1]} % without it, "
+            f"{self.stats['rows_onset_fallback']} row(s))"
+        )
         self._say(
             f"served rule: {self.threshold_pct} % ({self.threshold_source}) "
-            f"at {lead} min on {self.column}; "
+            f"at {lead} min on {self.column}{rule}; "
             f"{counts['files']} file(s), {self.stats['rows_loaded']} row(s) "
             f"loaded, {self.stats['rows_matched']} matched the report, "
             f"{self.stats['rows_fallback']} fell back to the curve, "
@@ -422,6 +501,38 @@ class ServedRuleDecider:
             drop_unfilled=False,
         )
 
+    def _onset_filler(self) -> Any:
+        """The ``ProbabilityFiller`` for ``p_onset_<lead>``, or ``None``.
+
+        Only when this lead is on the onset AND rule and an onset model
+        path was given; rows it cannot fill keep a null and fall back to
+        the single threshold in the replay, as the service does.
+        """
+        if self.onset is None or self.options.onset_model is None:
+            return None
+        from dmi_nowcast_core.postprocess import PostprocessModel
+
+        from .postprocess_fit import ProbabilityFiller
+
+        model = None
+        try:
+            model = PostprocessModel.loads(
+                Path(self.options.onset_model).read_text(encoding="utf-8"),
+            )
+        except Exception as exc:  # noqa: BLE001 — every way a file can be junk
+            self._say(
+                f"served rule: cannot read onset model {self.options.onset_model} "
+                f"({type(exc).__name__}: {exc}); rows without a stored "
+                f"{self.onset_column} fall back to the single threshold"
+            )
+        return ProbabilityFiller(
+            model,
+            (int(self.options.lead_min),),
+            tuple(int(lead) for lead in self.options.design_leads),
+            lambda _lead: self.onset_column,
+            drop_unfilled=False,
+        )
+
     def _say(self, message: str) -> None:
         if self._log:
             self._log(message)
@@ -444,5 +555,6 @@ __all__ = [
     "ServedRuleOptions",
     "decider_for",
     "post_column",
+    "resolve_onset_rule",
     "resolve_threshold",
 ]

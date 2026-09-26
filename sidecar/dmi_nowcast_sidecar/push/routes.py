@@ -37,12 +37,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
+
+from dmi_nowcast_core.postprocess import TARGET_ONSET
 
 from ..config import Config
 from ..national_sample import sample_point
 from .endpoint_policy import validate_endpoint
-from .paths import resolved_postprocess_path, resolved_thresholds_path
+from .paths import (
+    resolved_onset_model_path,
+    resolved_postprocess_path,
+    resolved_thresholds_path,
+)
 from .postprocess import PostprocessTable
 from .store import NewSubscription, PushStore, sub_id
 from .thresholds import ThresholdTable
@@ -184,6 +190,21 @@ class UnsubscribeResponse(BaseModel):
 class ThresholdOut(BaseModel):
     threshold_pct: int
     source: str
+    # S11, additive: set only for a lead on the onset AND rule, where
+    # ``threshold_pct`` is the onset threshold (the headline) and
+    # ``post_threshold_pct`` the p_post half (0 = onset alone decides).
+    onset_threshold_pct: int | None = None
+    post_threshold_pct: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_onset(self, handler: Any) -> dict:
+        # Absent on a single-threshold lead, so its row reads exactly as
+        # it did before S11.
+        data = handler(self)
+        for key in ("onset_threshold_pct", "post_threshold_pct"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class PushOptionsResponse(BaseModel):
@@ -241,6 +262,7 @@ def build_router(
     service: "PushService | None" = None,
     thresholds: ThresholdTable | None = None,
     postprocess: "PostprocessTable | None" = None,
+    onset_postprocess: "PostprocessTable | None" = None,
 ) -> APIRouter:
     """Build the ``/api/push`` router.
 
@@ -264,6 +286,21 @@ def build_router(
     post_table = postprocess if postprocess is not None else PostprocessTable(
         resolved_postprocess_path(config),
     )
+    # S11: the push-only onset model, for the same reason — whether the
+    # onset AND rule can actually be applied decides what /options shows.
+    onset_table = (
+        onset_postprocess if onset_postprocess is not None
+        else PostprocessTable(
+            resolved_onset_model_path(config), target=TARGET_ONSET,
+        )
+    )
+
+    def _onset_active() -> bool:
+        return (
+            config.push.probability_source == "postprocess"
+            and post_table.active
+            and onset_table.active
+        )
 
     def _require_enabled() -> PushStore:
         if not enabled or store is None:
@@ -329,6 +366,7 @@ def build_router(
         leads = lead_options(config)
         await asyncio.to_thread(table.maybe_reload)
         await asyncio.to_thread(post_table.maybe_reload)
+        await asyncio.to_thread(onset_table.maybe_reload)
         active = (
             config.push.probability_source == "postprocess" and post_table.active
         )
@@ -338,7 +376,9 @@ def build_router(
             fitted_at_utc=table.fitted_at_utc,
             thresholds={
                 key: ThresholdOut(**value)
-                for key, value in table.snapshot(leads).items()
+                for key, value in table.snapshot(
+                    leads, onset_active=_onset_active(),
+                ).items()
             },
             # What the rule reads, after the model's own availability:
             # configured for the model but without one, this says
@@ -442,7 +482,12 @@ def build_router(
             effective, source = int(body.threshold_pct), "override"
         else:
             await asyncio.to_thread(table.maybe_reload)
-            effective, source = table.effective(body.lead_min)
+            await asyncio.to_thread(onset_table.maybe_reload)
+            # What the subscriber is shown; on the onset AND rule the
+            # onset threshold (see ``ThresholdTable.headline``).
+            effective, source, _onset = table.headline(
+                body.lead_min, onset_active=_onset_active(),
+            )
         _log.info(
             "push_subscribed",
             sub=sub_id(endpoint),

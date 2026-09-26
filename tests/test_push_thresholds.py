@@ -370,3 +370,71 @@ class TestStabilityGuard:
     def test_a_document_with_no_leads_is_returned_unchanged(self) -> None:
         broken = {"schema_version": SCHEMA_VERSION}
         assert apply_stability_guard(broken, _doc()) is broken
+
+
+# ---------------------------------------------------------------------------
+# The onset AND rule (S11)
+# ---------------------------------------------------------------------------
+
+
+class TestOnsetRule:
+    """An optional per-lead ``onset_threshold_pct`` beside ``threshold_pct``."""
+
+    @staticmethod
+    def _onset_doc(**lead30) -> dict:
+        row = _lead(threshold_pct=35, onset_threshold_pct=22,
+                    single_threshold_pct=45)
+        row.update(lead30)
+        return _doc(leads={
+            "20": _lead(threshold_pct=0, onset_threshold_pct=26),
+            "30": row,
+            "45": _lead(threshold_pct=60),
+        })
+
+    def test_a_table_without_the_key_is_the_single_rule(self) -> None:
+        from dmi_nowcast_core.push_thresholds import carries_onset_rule, onset_rule
+
+        doc = _doc()
+        assert validate_thresholds(doc) == []
+        assert onset_rule(doc, 30) is None
+        assert carries_onset_rule(doc) is False
+
+    def test_the_onset_fields_parse_and_zero_is_legal_beside_them(self) -> None:
+        from dmi_nowcast_core.push_thresholds import (
+            carries_onset_rule, lead_pick, onset_rule,
+        )
+
+        doc = self._onset_doc()
+        assert validate_thresholds(doc) == []
+        assert carries_onset_rule(doc) is True
+        # b = 0 at 20: onset alone decides; no single threshold on the row,
+        # so its fallback is the document's.
+        assert lead_pick(doc, 20) == 0
+        assert effective_threshold(doc, 20) == 0
+        assert onset_rule(doc, 20) == (26, 40)
+        assert onset_rule(doc, 30) == (22, 45)
+        assert effective_threshold(doc, 30) == 35
+        # A lead with no onset key stays on the single rule.
+        assert onset_rule(doc, 45) is None
+        assert effective_threshold(doc, 45) == 60
+
+    @pytest.mark.parametrize("row, message", [
+        ({"threshold_pct": 0, "onset_threshold_pct": None}, "onset_threshold_pct"),
+        ({"onset_threshold_pct": 0}, "onset_threshold_pct"),
+        ({"onset_threshold_pct": 100}, "onset_threshold_pct"),
+        ({"single_threshold_pct": 0}, "single_threshold_pct"),
+    ])
+    def test_bad_onset_fields_are_refused(self, row: dict, message: str) -> None:
+        doc = self._onset_doc(**row)
+        problems = validate_thresholds(doc)
+        assert any(message in p for p in problems), problems
+
+    def test_zero_without_an_onset_threshold_is_still_refused(self) -> None:
+        doc = _doc(leads={"30": _lead(threshold_pct=0)})
+        assert any("threshold_pct" in p for p in validate_thresholds(doc))
+
+    def test_single_threshold_needs_an_onset_threshold(self) -> None:
+        doc = _doc(leads={"30": _lead(single_threshold_pct=45)})
+        assert any(
+            "single_threshold_pct" in p for p in validate_thresholds(doc)
+        )

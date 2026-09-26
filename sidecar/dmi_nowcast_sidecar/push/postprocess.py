@@ -164,8 +164,16 @@ class PostprocessTable:
     fitted one costs nothing.
     """
 
-    def __init__(self, path: Path | str | None) -> None:
+    def __init__(
+        self, path: Path | str | None, *, target: str = core_postprocess.TARGET_WET,
+    ) -> None:
         self.path = None if path is None else Path(path)
+        #: The outcome this SLOT serves (S11): ``wet`` for the display
+        #: model (``postprocess.json``, what the site shows), ``onset`` for
+        #: the push-only onset model. A document fitted to the other
+        #: target is refused, so a mis-installed file can neither change
+        #: the site nor feed the push rule the wrong probability.
+        self.target = str(target)
         self._model: PostprocessModel | None = None
         self._stamp: tuple[int, int] | None = None
         self._loaded = False
@@ -251,6 +259,11 @@ class PostprocessTable:
             )
             return None
         reason = _structural_problem(model)
+        if reason is None and str(model.target) != self.target:
+            reason = (
+                f"the document's target is {model.target!r} but this slot "
+                f"serves {self.target!r}"
+            )
         if reason is not None:
             # ONE line, here, once — not one per cycle from inside
             # ``predict_table``. A document whose design does not fit its
@@ -266,7 +279,12 @@ class PostprocessTable:
                 protocol=model.protocol,
                 columns=len(model.feature_names),
                 fitted_at=model.fitted_at_utc or None,
-                note="falling back to the curve-calibrated probability",
+                slot=self.target,
+                note=(
+                    "the push rule falls back to the single threshold"
+                    if self.target == core_postprocess.TARGET_ONSET
+                    else "falling back to the curve-calibrated probability"
+                ),
             )
             return None
         self._model = model
@@ -446,6 +464,9 @@ class CyclePostprocess:
     #: ``fitted_at_utc`` of the model that produced ``p_post``; None when
     #: no model was active and ``p_post`` is empty.
     fitted_at_utc: str | None = None
+    #: lead → P(rain STARTS within the lead) per point, from the push-only
+    #: onset model on the SAME design rows (S11). Empty without that model.
+    p_onset: dict[int, tuple[float | None, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -488,6 +509,16 @@ class CyclePostprocess:
             return None
         return values[index]
 
+    def onset_probability(
+        self, lat: float, lon: float, lead: int,
+    ) -> float | None:
+        """The onset model's P(rain starts within ``lead``) at a point, or None."""
+        values = self.p_onset.get(int(lead))
+        if values is None:
+            return None
+        index = self.index_of(lat, lon)
+        return None if index is None else values[index]
+
     def columns(self, lat: float, lon: float) -> dict[str, Any]:
         """Everything about a point, as decision-row columns.
 
@@ -502,6 +533,10 @@ class CyclePostprocess:
         out = dict(self.rows[index])
         for lead, values in sorted(self.p_post.items()):
             out[core_postprocess.post_column(lead)] = values[index]
+        for lead, values in sorted(self.p_onset.items()):
+            out[core_postprocess.ONSET_COLUMN_TEMPLATE.format(lead=lead)] = (
+                values[index]
+            )
         return out
 
 
@@ -519,6 +554,7 @@ def build_cycle_postprocess(
     season: str,
     hour_utc: int,
     frame_age_min: float,
+    onset_table: PostprocessTable | None = None,
 ) -> CyclePostprocess:
     """Assemble one cycle's feature rows and score them.
 
@@ -554,20 +590,32 @@ def build_cycle_postprocess(
         for index in range(len(keys))
     )
     p_post: dict[int, tuple[float | None, ...]] = {}
+    p_onset: dict[int, tuple[float | None, ...]] = {}
     fitted_at: str | None = None
-    if rows and table.active:
+    onset_active = onset_table is not None and onset_table.active
+    if rows and (table.active or onset_active):
         columns = _columns_of([
             {**row, **dict(shared[index])} for index, row in enumerate(rows)
         ])
-        predicted = table.predict_table(columns)
-        if predicted:
-            fitted_at = table.fitted_at_utc
-            p_post = {
+
+        def scored(model_table: PostprocessTable) -> dict[int, tuple]:
+            return {
                 int(lead): tuple(
                     core_postprocess.finite_or_none(value) for value in values
                 )
-                for lead, values in sorted(predicted.items())
+                for lead, values in sorted(
+                    model_table.predict_table(columns).items(),
+                )
             }
+
+        if table.active:
+            p_post = scored(table)
+            if p_post:
+                fitted_at = table.fitted_at_utc
+        if onset_active:
+            # The push-only onset model on the same design columns: one
+            # extra predict per cycle, no new feature.
+            p_onset = scored(onset_table)  # type: ignore[arg-type]
     return CyclePostprocess(
         radar_ts_utc=radar_ts_utc,
         generated_at_utc=generated_at_utc,
@@ -575,6 +623,7 @@ def build_cycle_postprocess(
         rows=rows,
         p_post=p_post,
         fitted_at_utc=fitted_at,
+        p_onset=p_onset,
     )
 
 

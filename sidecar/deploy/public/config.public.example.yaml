@@ -141,6 +141,11 @@ push:
   # unreadable means every horizon warns at 40 %, which is the rule this
   # site shipped before the fit existed.
   thresholds_path: null   # -> /var/lib/dmi-nowcast/push_thresholds.json
+  # The push-only onset-target model (S11): the AND half of the push rule
+  # (fire when P(rain starts) and P(rain) are both over their thresholds).
+  # Pulled by `sync` below; never shown on the site. Missing or unusable
+  # means every horizon falls back to the single threshold.
+  onset_model_path: null  # -> /var/lib/dmi-nowcast/postprocess_push.json
   # The bounds and default of the hidden threshold_pct OVERRIDE the
   # subscribe API still accepts. Not offered in the UI any more.
   threshold_options_pct: [40, 60, 80]
@@ -305,6 +310,8 @@ sync:
     # installed on the private stack (sidecar/deploy/install_artifact.sh):
     # this list is how it reaches the public instance.
     - calibration/postprocess.json
+    # The push-only onset model (S11) -> push.onset_model_path.
+    - calibration/postprocess_push.json
     # The gauge catalogue (v2, S5). NOT in the shipped default file list —
     # it is wanted only where a cycle computes ng_* features out of a
     # local store, which is this stack. Without it that block is null and

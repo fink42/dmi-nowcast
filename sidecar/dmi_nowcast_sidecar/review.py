@@ -633,6 +633,14 @@ def rule_from_served_options(
     ``push.persistence_obs`` / ``push.rearm_after_min``. A bundle and the
     scoreboard therefore cannot be about two different rules.
     """
+    if served_rule_module.resolve_onset_rule(options) is not None:
+        # S11: this tool replays ONE probability column; graded against the
+        # table's p_post half alone it would review a rule nobody is on.
+        raise ValueError(
+            f"{options.thresholds_path}: lead {int(options.lead_min)} is on "
+            "the onset AND rule (onset_threshold_pct), which the review "
+            "bundle does not replay yet",
+        )
     threshold, source = served_rule_module.resolve_threshold(options)
     return ReviewRule(
         lead_min=int(options.lead_min),

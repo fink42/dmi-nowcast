@@ -263,6 +263,9 @@ class PushService:
         all_clear_suppressed = 0
         errors = 0
         curve_fallbacks = 0
+        #: Observations on a lead with the onset AND rule (S11) that had no
+        #: ``p_onset`` and were judged on the single threshold instead.
+        onset_fallbacks = 0
         actions: dict[str, int] = {}
 
         for sub in subs:
@@ -272,6 +275,21 @@ class PushService:
                 forecast_mm_h=forecast_mm_h,
             )
             series = sample.forecast_mm_h if sample else None
+            # S11: the onset AND rule, for a lead whose fitted row carries
+            # it. A row-level override is a single-threshold rule, as it
+            # always was. ``p_onset`` is read only for such a lead, and
+            # only off a frame-matched cycle object (``post``), so the
+            # curve rollback also rolls this back.
+            onset = (
+                None if sub.threshold_pct is not None
+                else self.thresholds.onset_rule(sub.lead_min)
+            )
+            p_onset = (
+                None if onset is None or post is None
+                else post.onset_probability(sub.lat, sub.lon, sub.lead_min)
+            )
+            if onset is not None and p_onset is None:
+                onset_fallbacks += 1
             obs = Observation(
                 radar_ts_utc=radar_ts,
                 p_rain=sample.p_rain.get(sub.lead_min) if sample else None,
@@ -284,6 +302,7 @@ class PushService:
                     else post.probability(sub.lat, sub.lon, sub.lead_min)
                 ),
                 p_source="postprocess" if post is not None else "curve",
+                p_onset=p_onset,
             )
             if post is not None and obs.p_post is None:
                 curve_fallbacks += 1
@@ -321,6 +340,8 @@ class PushService:
                     tz=sub.tz,
                     now_utc=now_utc,
                     rules=rules,
+                    onset_threshold_pct=None if onset is None else onset[0],
+                    single_threshold_pct=None if onset is None else onset[1],
                 )
             except Exception as exc:  # noqa: BLE001 - one bad row must not
                 # stop the others; the state is simply left as it was.
@@ -350,6 +371,8 @@ class PushService:
                 p_source=obs.p_decision_source,
                 p_rain=obs.p_rain,
                 p_post=obs.p_post,
+                p_onset=obs.p_onset,
+                onset_threshold_pct=None if onset is None else onset[0],
                 eta_min=obs.eta_min,
                 intensity_mm_h=obs.intensity_mm_h,
                 observed_mm_h=obs.observed_mm_h,
@@ -446,6 +469,9 @@ class PushService:
                 None if post is None else post.fitted_at_utc
             ),
             "postprocess_curve_fallbacks": curve_fallbacks,
+            # S11: onset-rule observations judged on the single threshold
+            # because the onset model had nothing to say for them.
+            "onset_rule_fallbacks": onset_fallbacks,
             "subscriptions": len(subs),
             "notified": notified_count,
             # Silent retractions queued this cycle, beside the warnings;

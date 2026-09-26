@@ -101,7 +101,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Config
-from .push.paths import resolved_postprocess_path, resolved_thresholds_path
+from .push.paths import (
+    resolved_onset_model_path,
+    resolved_postprocess_path,
+    resolved_thresholds_path,
+)
 from .quality_job import (
     JOB_MODULE,
     gauge_reliability_options_to_json,
@@ -412,6 +416,9 @@ class QualityReportTask:
             lead_min=int(rules.lead_min),
             probability_source=self.config.push.probability_source,
             postprocess_model=self.postprocess_out() if post else None,
+            # S11: the push-only onset model the service reads, so rows
+            # that predate the column are graded on the onset AND rule too.
+            onset_model=resolved_onset_model_path(self.config) if post else None,
             design_leads=tuple(
                 int(lead) for lead in self.config.forecast.national.leads_min
             ),
@@ -574,7 +581,20 @@ class QualityReportTask:
         # store, and ``decisions_dirs`` empty means there is nothing to
         # fit on — the same "empty disables it" rule the threshold fit has.
         post_dirs = post.decisions_dirs or fit.decisions_dirs
-        if post.enabled and post_dirs and not live_only:
+        # S11: the push-only onset model is never a refit target. A config
+        # that points the refit's output at it is refused here, before a
+        # child is ever told to write there.
+        onset_slot = (
+            Path(self.postprocess_out()).resolve()
+            == Path(resolved_onset_model_path(self.config)).resolve()
+        )
+        if onset_slot:
+            _log.warning(
+                "postprocess_refit_skipped_onset_slot",
+                path=str(self.postprocess_out()),
+                note="the refit output is the onset model's file; not refitting",
+            )
+        if post.enabled and post_dirs and not live_only and not onset_slot:
             payload["fit_postprocess"] = {
                 "enabled": True,
                 "out": str(self.postprocess_out()),

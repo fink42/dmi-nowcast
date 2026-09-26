@@ -2633,3 +2633,34 @@ class TestAllClearBlock:
         problems = validate_report(report)
         assert any("all_clears_wrong" in p for p in problems)
         assert any("all_clear_median_min" in p for p in problems)
+
+
+class TestThresholdsSectionOnsetRule:
+    """S11: a lead on the onset AND rule is shown at its onset threshold."""
+
+    def test_the_headline_is_the_onset_threshold(self, tmp_path: Path) -> None:
+        path = write_thresholds(tmp_path / "push_thresholds.json")
+        doc = json.loads(path.read_text())
+        doc["leads"]["30"].update(threshold_pct=0, onset_threshold_pct=26)
+        path.write_text(json.dumps(doc))
+        report = build_quality_report(
+            QualityInputs(thresholds_path=path, now=NOW),
+        )
+        row = report["thresholds"]["leads"]["30"]
+        # Never "warns at 0 %": the p_post half travels beside it.
+        assert row["threshold_pct"] == 26
+        assert row["post_threshold_pct"] == 0
+        assert row["onset_threshold_pct"] == 26
+        assert validate_report(report) == []
+
+    def test_the_served_rule_publishes_both_halves(self) -> None:
+        from dmi_nowcast_core.quality_report import _merge_served_rule
+
+        out = _merge_served_rule({}, {
+            "threshold_pct": 22, "onset_threshold_pct": 22,
+            "post_threshold_pct": 35, "rows_onset_fallback": 3,
+        })
+        assert out == {
+            "threshold_pct": 22.0, "onset_threshold_pct": 22.0,
+            "post_threshold_pct": 35.0, "rows_onset_fallback": 3.0,
+        }

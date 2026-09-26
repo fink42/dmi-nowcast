@@ -493,6 +493,9 @@ def load_decisions(
 #: this is the structure a million rows are held in, and it is passed to
 #: worker processes.
 _RADAR_TS, _GENERATED, _ETA, _INTENSITY, _OBSERVED, _FORECAST, _RUN, _P = range(8)
+#: Optional ninth element (S11): ``p_onset`` per lead, present only when
+#: :func:`build_tracks` was asked for it (``onset_column_for``).
+_ONSET = 8
 
 
 def build_tracks(
@@ -501,6 +504,7 @@ def build_tracks(
     *,
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
     column_for: Callable[[int], str] = p_rain_column,
+    onset_column_for: Callable[[int], str] | None = None,
 ) -> tuple[dict[str, list[tuple]], dict[str, list[datetime]]]:
     """Per-station tracks in ``radar_ts`` order, plus the raw frame stamps.
 
@@ -512,6 +516,9 @@ def build_tracks(
     ``column_for`` names the probability column of each lead. The default
     is the served ``p_rain_<lead>``; the benchmark points it at
     ``p_post_<lead>`` to replay the same rule on a post-processed run.
+
+    ``onset_column_for`` (S11) appends a ninth element, ``p_onset`` per
+    lead, which :func:`replay_station` reads under the onset AND rule.
     """
     by_station: dict[str, list[dict]] = {}
     for row in rows:
@@ -522,6 +529,10 @@ def build_tracks(
 
     gap = timedelta(minutes=coverage_gap_min)
     columns = [column_for(lead) for lead in leads]
+    onset_columns = (
+        None if onset_column_for is None
+        else [onset_column_for(lead) for lead in leads]
+    )
     tracks: dict[str, list[tuple]] = {}
     frames: dict[str, list[datetime]] = {}
     for station, station_rows in by_station.items():
@@ -537,7 +548,7 @@ def build_tracks(
             previous = radar_ts
             stamps.append(radar_ts)
             generated = row.get("generated_at") or radar_ts
-            track.append((
+            record = (
                 radar_ts,
                 generated,
                 _opt_float(row.get("eta_min")),
@@ -546,7 +557,12 @@ def build_tracks(
                 _opt_float(row.get("forecast_now_mm_h")),
                 run,
                 tuple(_opt_float(row.get(column)) for column in columns),
-            ))
+            )
+            if onset_columns is not None:
+                record += (
+                    tuple(_opt_float(row.get(column)) for column in onset_columns),
+                )
+            track.append(record)
         tracks[station] = track
         frames[station] = stamps
     return tracks, frames
@@ -801,6 +817,8 @@ def replay_station(
     with_all_clear: bool = False,
     allclear_enabled: bool = DEFAULT_ALLCLEAR_ENABLED,
     allclear_readings: int = DEFAULT_ALLCLEAR_READINGS,
+    onset_threshold_pct: int | None = None,
+    single_threshold_pct: int | None = None,
 ) -> list[tuple]:
     """One station's warnings under one (lead, threshold) rule.
 
@@ -833,6 +851,11 @@ def replay_station(
     and with them the sweep's objective — are identical with it on or
     off; ``allclear_enabled`` / ``allclear_readings`` are the engine's
     ``push.allclear_*`` settings.
+
+    ``onset_threshold_pct`` / ``single_threshold_pct`` (S11) put the replay
+    on the onset AND rule, handed to ``evaluate`` exactly as the service
+    hands them; ``p_onset`` is read from the track's ninth element (a track
+    built without it replays every row on the single-threshold fallback).
     """
     eng = _engine()
     rules = eng.Rules(
@@ -867,12 +890,19 @@ def replay_station(
                 intensity_mm_h=record[_INTENSITY],
                 observed_mm_h=record[_OBSERVED],
                 forecast_now_mm_h=record[_FORECAST],
+                p_onset=(
+                    record[_ONSET][lead_index]
+                    if onset_threshold_pct is not None and len(record) > _ONSET
+                    else None
+                ),
             ),
             threshold_pct=int(threshold_pct),
             quiet=None,
             tz="UTC",
             now_utc=record[_GENERATED],
             rules=rules,
+            onset_threshold_pct=onset_threshold_pct,
+            single_threshold_pct=single_threshold_pct,
         )
         state = decision.state
         if decision.action == "notify":

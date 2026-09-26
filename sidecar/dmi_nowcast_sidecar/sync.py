@@ -21,6 +21,10 @@ Files the public instance serves, or reads, but cannot produce:
     its own push engine but can never fit this, so it only ever serves it.
     Without the copy its notifications fall back to the curve-calibrated
     probability — a working service, with the worse number.
+``calibration/postprocess_push.json``
+    The push-only onset-target model (S11), installed by hand on the
+    private instance. Without it this instance's push rule falls back to
+    the single threshold on every lead.
 ``stations/station_points.json``
     The version-2 catalogue of DMI's rain gauges, built on the private
     instance (``scripts/build_station_points.py``), and the one input the
@@ -73,7 +77,11 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Config
 from .gauge_history import resolved_gauge_points_path
-from .push.paths import resolved_postprocess_path, resolved_thresholds_path
+from .push.paths import (
+    resolved_onset_model_path,
+    resolved_postprocess_path,
+    resolved_thresholds_path,
+)
 
 _log = structlog.get_logger(__name__)
 
@@ -89,6 +97,7 @@ JITTER_SEC = 30
 CURVES_FILE = "calibration/national_curves.json"
 THRESHOLDS_FILE = "calibration/push_thresholds.json"
 POSTPROCESS_FILE = "calibration/postprocess.json"
+ONSET_MODEL_FILE = "calibration/postprocess_push.json"
 STATION_POINTS_FILE = "stations/station_points.json"
 
 
@@ -112,6 +121,8 @@ def target_path(config: Config, name: str) -> Path:
         return resolved_thresholds_path(config)
     if name == POSTPROCESS_FILE:
         return resolved_postprocess_path(config)
+    if name == ONSET_MODEL_FILE:
+        return resolved_onset_model_path(config)
     if name == STATION_POINTS_FILE:
         configured = resolved_gauge_points_path(config)
         if configured is not None:
@@ -355,6 +366,8 @@ def build_artifact_sync(
             target = (push_thresholds, "note_changed")
         elif name == POSTPROCESS_FILE:
             target = (getattr(engine, "postprocess", None), "note_changed")
+        elif name == ONSET_MODEL_FILE:
+            target = (getattr(engine, "onset_postprocess", None), "note_changed")
         if target is None or target[0] is None:
             return
         owner, hook = target
@@ -372,6 +385,7 @@ def build_artifact_sync(
 
 __all__ = [
     "CURVES_FILE",
+    "ONSET_MODEL_FILE",
     "POSTPROCESS_FILE",
     "STATION_POINTS_FILE",
     "THRESHOLDS_FILE",

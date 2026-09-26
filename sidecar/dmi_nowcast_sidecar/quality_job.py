@@ -231,7 +231,9 @@ def gauge_reliability_options_from_json(payload: dict) -> Any:
 
 
 #: ``ServedRuleOptions`` fields that carry a path, or a list of them.
-_SERVED_PATH_FIELDS = frozenset({"thresholds_path", "postprocess_model"})
+_SERVED_PATH_FIELDS = frozenset(
+    {"thresholds_path", "postprocess_model", "onset_model"},
+)
 _SERVED_PATH_LIST_FIELDS = frozenset({"decisions_dirs"})
 _SERVED_TUPLE_FIELDS = frozenset({"design_leads"})
 
@@ -359,12 +361,26 @@ def run_threshold_fit(
     """
     from dmi_nowcast_core.push_thresholds import (
         apply_stability_guard,
+        carries_onset_rule,
         load_thresholds,
     )
 
     from .threshold_sweep import SweepError, run_fit
 
     out = Path(fit["thresholds_out"])
+    # S11: the sweep only knows single-threshold fitting. A served table
+    # that puts any lead on the onset AND rule was installed by hand from
+    # the combined-rule study; overwriting it would silently drop the rule.
+    # Refused before the sweep runs, like the postprocess refit guard.
+    if carries_onset_rule(load_thresholds(out)):
+        reason = (
+            f"served table {out} carries the onset AND rule "
+            "(onset_threshold_pct); the nightly sweep fits single thresholds "
+            "only — left in place"
+        )
+        if log:
+            log(f"threshold_refit_skipped_onset_rule: {reason}")
+        return {"thresholds_skipped": reason}
     try:
         run = fitter or run_fit
         payload = run(sweep_options_from_json(fit.get("options") or {}))
@@ -744,6 +760,9 @@ def run_job(
         "thresholds_path": None,
         "thresholds_guard": {},
         "thresholds_error": None,
+        # Additive (S11): why the threshold refit did NOT run — the served
+        # table carries the onset AND rule the sweep cannot fit.
+        "thresholds_skipped": None,
         # Additive (Phase H): where the refit model landed, its stamp, and
         # its counts. Null throughout when the step is off or skipped.
         "postprocess_path": None,
@@ -859,6 +878,7 @@ def main(argv: list[str] | None = None) -> int:
             "thresholds_path": None,
             "thresholds_guard": {},
             "thresholds_error": None,
+            "thresholds_skipped": None,
             "postprocess_path": None,
             "postprocess_previous_path": None,
             "postprocess_fitted_at": None,

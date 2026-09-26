@@ -534,6 +534,12 @@ class PushConfig(BaseModel):
     # model is not an error: every observation falls back to the served
     # curve-calibrated probability, which is the rule that shipped.
     postprocess_path: Path | None = None
+    # The onset-target model (S11): P(rain STARTS within the lead), read
+    # by the push rule's AND half only — never shown on the site. None ->
+    # ``<storage.data_dir>/postprocess_push.json``; resolved by
+    # ``push.paths.resolved_onset_model_path``. Missing or unusable: every
+    # lead falls back to the single-threshold rule, logged once.
+    onset_model_path: Path | None = None
     # WHICH probability the decision rule compares against the threshold.
     # ``postprocess`` is the gauge-trained model (ΔBSS +0.14…+0.19 at the
     # gauges, ΔF1 +0.03…+0.06 on the warning rule -- see

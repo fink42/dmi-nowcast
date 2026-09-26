@@ -36,6 +36,7 @@ from dmi_nowcast_core.push_thresholds import (
     effective_threshold,
     lead_pick,
     load_thresholds,
+    onset_rule,
 )
 
 _log = structlog.get_logger(__name__)
@@ -202,19 +203,53 @@ class ThresholdTable:
         source: Source = "table" if lead_pick(doc, key) is not None else "fallback"
         return threshold, source
 
-    def snapshot(self, leads: object) -> dict[str, dict]:
+    def onset_rule(self, lead_min: object) -> tuple[int, int] | None:
+        """``(onset_threshold_pct, single_threshold_pct)`` when this lead is
+        on the onset AND rule (S11), else None. Total, never raises."""
+        return onset_rule(self._doc, lead_min)
+
+    def headline(
+        self, lead_min: object, *, onset_active: bool = True,
+    ) -> tuple[int, Source, int | None]:
+        """``(percent, source, onset_percent)`` a subscriber is SHOWN.
+
+        On the single rule it is :meth:`effective`. On the onset AND rule
+        the one percent the site can show is the onset threshold — the
+        p_post half may be 0 ("onset alone decides"), which as a headline
+        would read "warns at 0 %". With no onset model loaded
+        (``onset_active`` False) every observation falls back to the single
+        rule, so that is what is shown.
+        """
+        threshold, source = self.effective(lead_min)
+        rule = self.onset_rule(lead_min)
+        if rule is None:
+            return threshold, source, None
+        onset, single = rule
+        if not onset_active:
+            return single, source, None
+        return onset, source, onset
+
+    def snapshot(
+        self, leads: object, *, onset_active: bool = True,
+    ) -> dict[str, dict]:
         """``{"20": {"threshold_pct": 45, "source": "table"}, ...}``.
 
         What ``GET /api/push/options`` serves: every offered horizon with
         the rule it is on right now, so the browser never has to guess and
-        an operator can diff what is served against what was fitted.
+        an operator can diff what is served against what was fitted. A lead
+        on the onset AND rule (S11) also carries ``onset_threshold_pct`` and
+        ``post_threshold_pct``; its ``threshold_pct`` is :meth:`headline`'s.
         """
         out: dict[str, dict] = {}
         for lead in leads:  # type: ignore[union-attr]
-            threshold, source = self.effective(lead)
-            out[str(int(lead))] = {
-                "threshold_pct": threshold, "source": source,
-            }
+            threshold, source, onset = self.headline(
+                lead, onset_active=onset_active,
+            )
+            row: dict = {"threshold_pct": threshold, "source": source}
+            if onset is not None:
+                row["onset_threshold_pct"] = onset
+                row["post_threshold_pct"] = self.effective(lead)[0]
+            out[str(int(lead))] = row
         return out
 
 

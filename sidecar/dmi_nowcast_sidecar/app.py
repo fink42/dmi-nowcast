@@ -123,6 +123,7 @@ from .national_sample import finite_or_none, sample_point
 from .push.paths import (
     resolved_db_path,
     resolved_key_path,
+    resolved_onset_model_path,
     resolved_postprocess_path,
     resolved_thresholds_path,
 )
@@ -604,6 +605,28 @@ def create_app(
             headers={"Cache-Control": "public, max-age=300"},
         )
 
+    @app.get("/calibration/postprocess_push.json", tags=["calibration"])
+    async def onset_model_file(
+        request: Request, _: None = Depends(require_api_key),
+    ) -> Response:
+        """The push-only onset-target model (S11), as this instance reads it.
+
+        Private exactly like ``/calibration/postprocess.json`` (public mode
+        404s it); it exists so the public instance's ``sync`` task can pull
+        the installed artefact. 503 until one is installed.
+        """
+        path = resolved_onset_model_path(request.app.state.config)
+        if not path.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail="no onset model on this instance yet",
+            )
+        return Response(
+            content=path.read_bytes(),
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
     @app.get("/stations/station_points.json", tags=["stations"])
     async def station_points_file(
         request: Request, _: None = Depends(require_api_key),
@@ -997,6 +1020,7 @@ def create_app(
             service=push_service,
             thresholds=push_thresholds,
             postprocess=engine.postprocess,
+            onset_postprocess=getattr(engine, "onset_postprocess", None),
         ),
     )
 
