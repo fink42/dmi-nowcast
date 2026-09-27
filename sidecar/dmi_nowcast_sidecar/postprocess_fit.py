@@ -527,35 +527,121 @@ def run_postprocess_fit(
     return {"model": model, "summary": summary}
 
 
-class ProbabilityFiller:
-    """Fills ``p_post_<lead>`` on a decision table, and drops what it cannot.
+#: Columns the filler derives from the decision instant rather than reading.
+_DERIVED_COLUMNS = frozenset({"season", "hour_utc"})
 
-    The nightly threshold sweep has to be fitted on the SAME probability
-    the engine decides with, and the rows it reads are a mix: the replay
-    tree (features, no ``p_post``), live partitions written since this
-    shipped (both), and anything older (neither). This class makes one
-    table of them, applied per file inside
-    :func:`threshold_sweep.load_decisions` — before the rows become Python
-    dicts, so the twenty feature columns are numpy for their whole life
-    and never a hundred million float objects.
+
+def required_source_columns(model: Any) -> tuple[str, ...]:
+    """The stored columns ``model``'s design reads, derived from the design.
+
+    Not a hand list: :func:`dmi_nowcast_core.postprocess.build_design` is
+    run once on a one-row probe that records every column it asks for, so
+    a v1 logistic needs the v1 block, a v2 tree ensemble needs its
+    ``g_*`` / ``ng_*`` / ensemble-shape columns too, and a design that grows
+    next week is covered without anyone editing this.
+
+    Two kinds of column are left out because no row has to carry them:
+    ``season`` / ``hour_utc`` (derived from the decision instant) and,
+    for a model that masks the point's own gauge, the columns the mask
+    overwrites anyway.
+    """
+    names = list(dict.fromkeys(
+        list(pp.feature_source_columns(model.design_leads))
+        + list(model.spec.extra_columns)
+    ))
+    seen: list[str] = []
+
+    class _Probe(dict):
+        def get(self, key: Any, default: Any = None) -> Any:
+            seen.append(str(key))
+            return super().get(key, default)
+
+        def __getitem__(self, key: Any) -> Any:
+            seen.append(str(key))
+            return super().__getitem__(key)
+
+    probe = _Probe({name: np.zeros(1, dtype=np.float64) for name in names})
+    probe["season"] = np.array(["summer"])
+    try:
+        pp.build_design(probe, model.design_leads, model.spec)
+        read = [name for name in dict.fromkeys(seen)]
+    except Exception:  # noqa: BLE001 — a design the probe cannot run:
+        # require everything it could read, which only ever makes MORE rows
+        # unfillable, never fills one on a guess.
+        read = names
+    skip = set(_DERIVED_COLUMNS)
+    if model.masks_own_gauge:
+        skip |= set(pp.OWN_GAUGE_COLUMNS) | {pp.GAUGE_KNOWN_COLUMN}
+    return tuple(name for name in read if name not in skip)
+
+
+def _writer_blocks(design_leads: Sequence[int]) -> tuple[tuple[str, ...], ...]:
+    """The feature catalogue's append-only blocks, one per writer generation.
+
+    A writer either computed a block or did not: a row written before the
+    v2 block existed has nulls in ALL of it, while a row whose writer had
+    it carries at least its never-null indicator (``g_known``,
+    ``ng_frame_ok``). That is the per-row test :class:`ProbabilityFiller`
+    applies — any finite value in each block the model reads.
+    """
+    leads = sorted({int(lead) for lead in design_leads})
+    return (
+        tuple(pp.raw_fraction_column(lead) for lead in leads),
+        tuple(name for name, _doc in pp.SCALAR_FEATURE_COLUMNS),
+        tuple(
+            name for lead in leads
+            for name in (pp.ens_mean_column(lead), pp.ens_p90_column(lead))
+        ),
+        tuple(name for name, _doc in pp.SCALAR_FEATURE_COLUMNS_V2),
+        tuple(name for name, _doc in pp.SCALAR_FEATURE_COLUMNS_NG),
+    )
+
+
+def _float_column(table: Any, name: str) -> np.ndarray:
+    import pyarrow as pa
+
+    return np.asarray(
+        table.column(name).combine_chunks()
+        .cast(pa.float64()).to_numpy(zero_copy_only=False),
+        dtype=np.float64,
+    )
+
+
+class ProbabilityFiller:
+    """Fills ``p_post_<lead>`` (or ``p_onset_<lead>``) on a decision table.
+
+    The readers that score the served probability — the nightly threshold
+    sweep, the quality page's scoreboard and gauge curve — read a mix of
+    rows: live partitions that STORE the value the engine used, replay
+    trees that carry the model's feature columns and no value, and older
+    trees that carry neither (or only the v1 block of the features). This
+    class makes one table of them, per file, while the columns are still
+    numpy.
 
     The rule, per row:
 
-    * a stored value wins — it is what the engine actually used;
-    * otherwise, if the row carries features, the freshly fitted model
-      speaks for it (and may honestly answer "unknown" for a point off
-      coverage, exactly as a null ``p_rain`` does);
-    * otherwise the row is DROPPED and counted. Scoring it would mean
-      calling every frame of it below threshold, which is not a
-      measurement of the rule, it is a measurement of the archive's depth.
+    * a stored value wins — it is what the engine actually used — and is
+      never re-predicted;
+    * otherwise the served model speaks for the row ONLY when the row
+      carries every column the model's design reads
+      (:func:`required_source_columns`): the file has the column, and the
+      row has a finite value in every feature block the model reads
+      (:func:`_writer_blocks`). A v2 tree model handed a v1 row would read
+      NaN for its forty gauge and neighbour columns and answer close to
+      zero, which is a number about the archive's depth, not a forecast;
+    * otherwise the row is UNFILLABLE: its value stays null and it is
+      counted. With ``drop_unfilled`` (the default) a row that has no
+      value at all is also removed; ``drop_unfilled=False`` keeps it, for
+      the caller that has a second answer for such a row — the served-rule
+      scorer, where the push engine's own fallback takes over exactly as
+      it does live (``p_post`` null → the curve's ``p_rain``; ``p_onset``
+      null → the single threshold).
 
-    ``drop_unfilled=False`` turns that last step off: the row survives
-    with a null probability and is still counted under ``dropped``. It is
-    for the one caller that has a SECOND answer for such a row — the
-    served-rule scorer, where the push engine's own per-observation
-    fallback puts it back on the curve-calibrated ``p_rain`` rather than
-    excluding it. Dropping there would make the page's rule differ from
-    the service's on exactly the rows the fallback exists for.
+    Only the rows that need a value are predicted. ``counts``: ``rows``
+    read, ``stored`` rows carrying a value, ``computed`` (row, lead) cells
+    the model filled, ``unfillable`` rows that needed a value the model
+    could not give, and ``dropped`` (kept for older readers) rows left
+    with no value at all.
     """
 
     def __init__(
@@ -566,15 +652,52 @@ class ProbabilityFiller:
         column_for: Any,
         *,
         drop_unfilled: bool = True,
+        mark_column: str | None = None,
     ) -> None:
         self.model = model
+        #: When set, each table leaves with this float column: 1.0 on a
+        #: row whose value the model computed here, 0.0 otherwise — the
+        #: provenance a reader needs to call a curve in-sample.
+        self.mark_column = mark_column
         self.leads = tuple(int(lead) for lead in leads)
         self.design_leads = tuple(int(lead) for lead in design_leads)
         self.column_for = column_for
         self.drop_unfilled = bool(drop_unfilled)
+        #: What a row must carry for the model to speak for it; empty
+        #: without a model (nothing can be filled then).
+        self.required: tuple[str, ...] = (
+            () if model is None else required_source_columns(model)
+        )
+        wanted = set(self.required) - pp.SHARED_SOURCE_COLUMNS
+        self._blocks = tuple(
+            block for block in (
+                tuple(name for name in names if name in wanted)
+                for names in _writer_blocks(self.design_leads)
+            ) if block
+        )
         self.counts: dict[str, int] = {
-            "rows": 0, "stored": 0, "computed": 0, "dropped": 0,
+            "rows": 0, "stored": 0, "computed": 0, "unfillable": 0,
+            "dropped": 0,
         }
+
+    @property
+    def source_columns(self) -> tuple[str, ...]:
+        """The columns a caller must hand over for this filler to predict."""
+        return self.required
+
+    def fillable(self, table: Any) -> np.ndarray:
+        """Rows the model can speak for — see the class docstring."""
+        n = table.num_rows
+        names = set(table.schema.names)
+        if self.model is None or not set(self.required) <= names:
+            return np.zeros(n, dtype=bool)
+        out = np.ones(n, dtype=bool)
+        for block in self._blocks:
+            present = np.zeros(n, dtype=bool)
+            for name in block:
+                present |= np.isfinite(_float_column(table, name))
+            out &= present
+        return out
 
     def __call__(self, table: Any) -> Any:
         import pyarrow as pa
@@ -586,32 +709,39 @@ class ProbabilityFiller:
         for lead in self.leads:
             name = self.column_for(lead)
             stored[lead] = (
-                np.asarray(
-                    table.column(name).combine_chunks()
-                    .cast(pa.float64()).to_numpy(zero_copy_only=False),
-                    dtype=np.float64,
-                )
-                if name in names
+                _float_column(table, name) if name in names
                 else np.full(n, np.nan, dtype=np.float64)
             )
-        featured = self._featured(table, names)
         has_stored = np.zeros(n, dtype=bool)
+        need = np.zeros(n, dtype=bool)
         for values in stored.values():
-            has_stored |= np.isfinite(values)
+            finite = np.isfinite(values)
+            has_stored |= finite
+            need |= ~finite
         self.counts["stored"] += int(has_stored.sum())
 
-        if self.model is not None and featured.any():
-            predicted = self._predict(table, names)
+        fillable = self.fillable(table) if need.any() else np.zeros(n, bool)
+        predict = need & fillable
+        computed_any = np.zeros(n, dtype=bool)
+        if predict.any():
+            index = np.flatnonzero(predict)
+            predicted = self._predict(table.take(pa.array(index)))
             for lead, values in predicted.items():
                 if lead not in stored:
                     continue
-                fill = featured & ~np.isfinite(stored[lead])
-                stored[lead] = np.where(fill, values, stored[lead])
-                self.counts["computed"] += int(
-                    (fill & np.isfinite(values)).sum(),
-                )
+                fill = np.zeros(n, dtype=bool)
+                fill[index] = np.isfinite(values)
+                fill &= ~np.isfinite(stored[lead])
+                column = np.array(stored[lead], dtype=np.float64)
+                full = np.full(n, np.nan, dtype=np.float64)
+                full[index] = values
+                column[fill] = full[fill]
+                stored[lead] = column
+                computed_any |= fill
+                self.counts["computed"] += int(fill.sum())
+        self.counts["unfillable"] += int((need & ~fillable).sum())
 
-        keep = featured | has_stored
+        keep = has_stored | fillable
         self.counts["dropped"] += int(n - keep.sum())
         for lead in self.leads:
             name = self.column_for(lead)
@@ -624,40 +754,34 @@ class ProbabilityFiller:
             table = table.append_column(name, pa.array(
                 values, type=pa.float64(), mask=~np.isfinite(values),
             ))
+        if self.mark_column is not None:
+            if self.mark_column in names:
+                table = table.drop_columns([self.mark_column])
+            table = table.append_column(
+                self.mark_column, pa.array(computed_any.astype(np.float64)),
+            )
         if self.drop_unfilled and not keep.all():
             table = table.filter(pa.array(keep))
         return table
 
-    def _featured(self, table: Any, names: set) -> np.ndarray:
-        import pyarrow as pa
-
-        n = table.num_rows
-        out = np.zeros(n, dtype=bool)
-        for name in pp.feature_only_columns(self.design_leads):
-            if name not in names:
-                continue
-            values = np.asarray(
-                table.column(name).combine_chunks()
-                .cast(pa.float64()).to_numpy(zero_copy_only=False),
-                dtype=np.float64,
-            )
-            out |= np.isfinite(values)
-        return out
-
-    def _predict(self, table: Any, names: set) -> dict[int, np.ndarray]:
+    def _predict(self, table: Any) -> dict[int, np.ndarray]:
         import pyarrow as pa
         import pyarrow.compute as pc
 
+        names = set(table.schema.names)
         n = table.num_rows
         features: dict[str, Any] = {}
-        for name in pp.feature_source_columns(self.design_leads):
+        # Every name the design could read gets a key (NaN when absent):
+        # the own-gauge mask only overwrites keys that exist, and a model
+        # that masks must see ``g_known`` = 0, not a missing column.
+        for name in dict.fromkeys(
+            list(pp.feature_source_columns(self.design_leads))
+            + list(self.model.spec.extra_columns)
+        ):
+            if name in _DERIVED_COLUMNS:
+                continue
             features[name] = (
-                np.asarray(
-                    table.column(name).combine_chunks()
-                    .cast(pa.float64()).to_numpy(zero_copy_only=False),
-                    dtype=np.float64,
-                )
-                if name in names
+                _float_column(table, name) if name in names
                 else np.full(n, np.nan, dtype=np.float64)
             )
         # ``season`` and ``hour_utc`` from the decision instant, the same
@@ -703,5 +827,6 @@ __all__ = [
     "options_from_json",
     "options_to_json",
     "refit_skip_reason",
+    "required_source_columns",
     "run_postprocess_fit",
 ]

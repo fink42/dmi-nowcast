@@ -139,7 +139,7 @@ from .warning_score import (
     pooled_summary,
     raining_now_agreement,
     score_warnings,
-    slot_end_of,
+    slot_ends_of_us,
 )
 
 __all__ = [
@@ -155,6 +155,7 @@ __all__ = [
     "reliability_from_corpus",
     "bin_statistics",
     "decision_bounds",
+    "DecisionRows",
     "CORPUS_COLUMNS",
     "RADAR_POINT_SET",
     "DECISION_COLUMNS_READ",
@@ -867,8 +868,8 @@ def _headline_reliability(curves: Sequence[dict], inputs: QualityInputs) -> dict
 # ---------------------------------------------------------------------------
 
 
-def _read_decision_parquet(path: Path) -> list[dict]:
-    """One decision file as row dicts, narrowed to what the report reads.
+def _read_decision_table(path: Path) -> Any:
+    """One decision file as an Arrow table, narrowed to what the report reads.
 
     ``schema=`` aligns a day written before a column existed (it reads
     back null rather than raising); ``columns=`` then keeps only
@@ -882,33 +883,208 @@ def _read_decision_parquet(path: Path) -> list[dict]:
 
     return pq.read_table(
         path, schema=decision_schema(), columns=list(DECISION_COLUMNS_READ),
-    ).to_pylist()
+    )
 
 
-def _load_decisions(inputs: QualityInputs) -> tuple[list[dict], dict[str, int]]:
+def _read_decision_parquet(path: Path) -> list[dict]:
+    """:func:`_read_decision_table` as row dicts."""
+    return _read_decision_table(path).to_pylist()
+
+
+#: Null in an int64 microsecond timestamp column.
+_NAT_US = np.iinfo(np.int64).min
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+#: The decision columns held as timestamps, strings, and floats.
+_ROW_TIMESTAMPS = ("radar_ts", "generated_at")
+_ROW_STRINGS = ("station_id", "action")
+
+
+def _datetimes(micros: "np.ndarray") -> list[datetime | None]:
+    """int64 UTC microseconds → aware datetimes; the null sentinel → None.
+
+    One object per DISTINCT instant, shared by every row that has it: a
+    season of decision rows is millions of stamps but only tens of
+    thousands of radar cycles, and a datetime is 48 bytes.
+    """
+    unique, inverse = np.unique(
+        np.asarray(micros, dtype=np.int64), return_inverse=True,
+    )
+    objects = [
+        None if m == _NAT_US else _EPOCH + timedelta(microseconds=m)
+        for m in unique.tolist()
+    ]
+    return [objects[i] for i in inverse.reshape(-1).tolist()]
+
+
+class DecisionRows(Sequence):
+    """The report's decision rows held as columns; row ``i`` is a view.
+
+    A season of replay rows is millions of them, and as one dict each they
+    were the largest object in the build. Here each column is one numpy
+    array — timestamps as int64 UTC microseconds, the two string columns
+    as codes into a short list of distinct values, the numbers as float64
+    with NaN for null — and indexing hands out a read-only mapping that
+    answers exactly what the row dict did (``None`` for a null, an aware
+    UTC ``datetime`` for a stamp). Code that iterates rows keeps working;
+    code that can use the columns (the served-rule hook, the scoreboard's
+    hot loops) reads :attr:`columns` directly.
+    """
+
+    def __init__(
+        self,
+        columns: Mapping[str, "np.ndarray"],
+        strings: Mapping[str, tuple["np.ndarray", list[Any]]],
+    ) -> None:
+        #: name → numpy column (timestamps and floats).
+        self.columns = dict(columns)
+        #: name → ``(int32 codes, distinct values)``.
+        self.strings = dict(strings)
+        first = next(iter(self.columns.values()), None)
+        if first is None:
+            first = next(iter(self.strings.values()), (np.zeros(0),))[0]
+        self._n = int(len(first))
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return [_RowView(self, i) for i in range(*index.indices(self._n))]
+        i = int(index)
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError(index)
+        return _RowView(self, i)
+
+    def __iter__(self):
+        for i in range(self._n):
+            yield _RowView(self, i)
+
+    def keys(self) -> tuple[str, ...]:
+        return tuple(self.columns) + tuple(self.strings)
+
+    def value(self, name: str, i: int) -> Any:
+        if name in self.strings:
+            codes, values = self.strings[name]
+            return values[int(codes[i])]
+        column = self.columns[name]
+        raw = column[i]
+        if name in _ROW_TIMESTAMPS:
+            raw = int(raw)
+            return None if raw == _NAT_US else _EPOCH + timedelta(microseconds=raw)
+        raw = float(raw)
+        return None if raw != raw else raw
+
+    def datetimes(self, name: str) -> list[datetime | None]:
+        """A whole timestamp column as aware datetimes, ``None`` for null."""
+        return _datetimes(self.columns[name])
+
+    def string_list(self, name: str) -> list[Any]:
+        """A whole string column as its values (shared objects, not copies)."""
+        codes, values = self.strings[name]
+        return [values[c] for c in codes.tolist()]
+
+
+class _RowView(Mapping):
+    """One row of :class:`DecisionRows`, as the dict it replaces."""
+
+    __slots__ = ("_rows", "_i")
+
+    def __init__(self, rows: DecisionRows, i: int) -> None:
+        self._rows = rows
+        self._i = i
+
+    def __getitem__(self, key: str) -> Any:
+        rows = self._rows
+        if key not in rows.columns and key not in rows.strings:
+            raise KeyError(key)
+        return rows.value(key, self._i)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        rows = self._rows
+        if key not in rows.columns and key not in rows.strings:
+            return default
+        return rows.value(key, self._i)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._rows.columns or key in self._rows.strings
+
+    def __iter__(self):
+        return iter(self._rows.keys())
+
+    def __len__(self) -> int:
+        return len(self._rows.keys())
+
+
+def _rows_from_tables(tables: Sequence[Any]) -> DecisionRows:
+    """Aligned decision tables → :class:`DecisionRows` (no dedup, no order)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    names = list(DECISION_COLUMNS_READ)
+    if tables:
+        merged = pa.concat_tables(list(tables))
+    else:
+        from .warning_score import decision_schema
+
+        schema = decision_schema()
+        merged = pa.table(
+            {name: pa.array([], schema.field(name).type) for name in names},
+        )
+    columns: dict[str, np.ndarray] = {}
+    strings: dict[str, tuple[np.ndarray, list[Any]]] = {}
+    for name in names:
+        column = merged.column(name)
+        if name in _ROW_TIMESTAMPS:
+            values = pc.fill_null(
+                column.cast(pa.timestamp("us", tz="UTC")).cast(pa.int64()),
+                _NAT_US,
+            )
+            columns[name] = np.asarray(
+                values.to_numpy(), dtype=np.int64,
+            )
+        elif name in _ROW_STRINGS:
+            encoded = column.cast(pa.string()).dictionary_encode().combine_chunks()
+            dictionary = encoded.dictionary.to_pylist()
+            codes = np.asarray(
+                pc.fill_null(encoded.indices, len(dictionary))
+                .to_numpy(zero_copy_only=False),
+                dtype=np.int32,
+            )
+            strings[name] = (codes, dictionary + [None])
+        else:
+            columns[name] = np.asarray(
+                column.cast(pa.float64()).to_numpy(), dtype=np.float64,
+            )
+    return DecisionRows(columns, strings)
+
+
+def _load_decisions(inputs: QualityInputs) -> tuple[DecisionRows, dict[str, int]]:
     """Replay + live decision rows, deduplicated on ``(radar_ts, station_id)``.
 
     The live row wins: it is the decision the running service actually
     took, while the replay's is a reconstruction of what it would have
-    taken. Where both cover a frame the live one is the record.
+    taken. Where both cover a frame the live one is the record. Rows come
+    back ordered by ``(generated_at, station_id)``, a row with no stamp
+    first, as :class:`DecisionRows` — columns, not a dict per row.
     """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
     counts = {"replay": 0, "live": 0, "duplicates": 0}
-    merged: dict[tuple[Any, str], dict] = {}
+    tables: list[Any] = []
 
     if inputs.replay_dir is not None:
         decisions_dir = Path(inputs.replay_dir) / "decisions"
         if decisions_dir.is_dir():
             for path in sorted(decisions_dir.glob("*.parquet")):
                 try:
-                    rows = _read_decision_parquet(path)
+                    table = _read_decision_table(path)
                 except Exception:  # noqa: BLE001 — one unreadable day
                     continue
-                counts["replay"] += len(rows)
-                for row in rows:
-                    key = (row.get("radar_ts"), str(row.get("station_id")))
-                    if key in merged:
-                        counts["duplicates"] += 1
-                    merged[key] = row
+                counts["replay"] += table.num_rows
+                tables.append(table)
 
     if inputs.corpus_dir is not None:
         eval_dir = Path(inputs.corpus_dir) / "stations" / "eval"
@@ -919,25 +1095,54 @@ def _load_decisions(inputs: QualityInputs) -> tuple[list[dict], dict[str, int]]:
                 if not path.is_file():
                     continue
                 try:
-                    rows = _read_decision_parquet(path)
+                    table = _read_decision_table(path)
                 except Exception:  # noqa: BLE001
                     continue
-                for row in rows:
-                    stamp = _parse_ts(row.get("generated_at"))
-                    if stamp is not None and stamp < cutoff:
-                        continue
-                    counts["live"] += 1
-                    key = (row.get("radar_ts"), str(row.get("station_id")))
-                    if key in merged:
-                        counts["duplicates"] += 1
-                    merged[key] = row
+                # A row older than the cutoff is out; one with no stamp is
+                # kept, as the row-at-a-time loop kept it.
+                stamp = table.column("generated_at")
+                keep = pc.fill_null(
+                    pc.greater_equal(
+                        stamp, pa.scalar(cutoff, stamp.type),
+                    ),
+                    True,
+                )
+                table = table.filter(keep)
+                counts["live"] += table.num_rows
+                tables.append(table)
 
-    rows = sorted(
-        merged.values(),
-        key=lambda r: (_parse_ts(r.get("generated_at")) or datetime.min.replace(
-            tzinfo=timezone.utc), str(r.get("station_id"))),
+    rows = _rows_from_tables(tables)
+    del tables
+    n = len(rows)
+    radar = rows.columns["radar_ts"]
+    station_codes, station_values = rows.strings["station_id"]
+    # One key per (radar_ts, station_id); the LAST row read wins, which is
+    # the replay-then-live order the tables were appended in.
+    rank = np.argsort(
+        np.array([str(v) for v in station_values], dtype=object), kind="stable",
     )
-    return rows, counts
+    station_rank = np.empty(len(station_values), dtype=np.int64)
+    station_rank[rank] = np.arange(len(station_values))
+    code = station_rank[station_codes]
+    arrival = np.arange(n)
+    order = np.lexsort((arrival, radar, code))
+    last = np.ones(n, dtype=bool)
+    if n:
+        last[:-1] = (code[order][1:] != code[order][:-1]) | (
+            radar[order][1:] != radar[order][:-1]
+        )
+    counts["duplicates"] = int(n - last.sum())
+    winners = order[last]
+    # (generated_at, station_id), a stampless row first.
+    generated = rows.columns["generated_at"][winners]
+    winners = winners[np.lexsort((code[winners], generated))]
+    return DecisionRows(
+        {name: values[winners] for name, values in rows.columns.items()},
+        {
+            name: (codes[winners], values)
+            for name, (codes, values) in rows.strings.items()
+        },
+    ), counts
 
 
 def _live_window(inputs: QualityInputs) -> dict | None:
@@ -953,28 +1158,30 @@ def _live_window(inputs: QualityInputs) -> dict | None:
     if not eval_dir.is_dir():
         return None
     cutoff = _now(inputs) - timedelta(days=max(1, inputs.live_days))
-    stamps: list[datetime] = []
-    days: set[date] = set()
+    lo: int | None = None
+    hi: int | None = None
+    days: set[int] = set()
     for (year, month) in _months_between(cutoff, _now(inputs)):
         path = eval_dir / f"{year:04d}" / f"{month:02d}.parquet"
         if not path.is_file():
             continue
         try:
-            rows = _read_decision_parquet(path)
+            table = _read_decision_table(path)
         except Exception:  # noqa: BLE001
             continue
-        for row in rows:
-            stamp = _parse_ts(row.get("generated_at"))
-            if stamp is None or stamp < cutoff:
-                continue
-            stamps.append(stamp)
-            days.add(stamp.date())
-    if not stamps:
+        micros = _rows_from_tables([table]).columns["generated_at"]
+        cutoff_us = (cutoff - _EPOCH) // timedelta(microseconds=1)
+        micros = micros[(micros != _NAT_US) & (micros >= cutoff_us)]
+        if micros.size:
+            lo = int(micros.min()) if lo is None else min(lo, int(micros.min()))
+            hi = int(micros.max()) if hi is None else max(hi, int(micros.max()))
+            days.update(np.unique(micros // 86_400_000_000).tolist())
+    if lo is None or hi is None:
         return None
     return {
         "days": len(days),
-        "from": _iso(min(stamps)),
-        "to": _iso(max(stamps)),
+        "from": _iso(_EPOCH + timedelta(microseconds=lo)),
+        "to": _iso(_EPOCH + timedelta(microseconds=hi)),
     }
 
 
@@ -1112,6 +1319,55 @@ class _Scoreboard:
     all_clear: dict | None = None
 
 
+class _WithGauge(Mapping):
+    """A decision row plus its ``gauge_wet`` flag, without copying the row.
+
+    What ``raining_now_agreement`` reads: the row's own keys, and
+    ``gauge_wet`` answered from the slot the caller resolved.
+    """
+
+    __slots__ = ("_row", "_wet")
+
+    def __init__(self, row: Mapping[str, Any], wet: bool | None) -> None:
+        self._row = row
+        self._wet = wet
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "gauge_wet":
+            return self._wet
+        return self._row[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key == "gauge_wet" or key in self._row
+
+    def __iter__(self):
+        yield from self._row
+        if "gauge_wet" not in self._row:
+            yield "gauge_wet"
+
+    def __len__(self) -> int:
+        return len(self._row) + (0 if "gauge_wet" in self._row else 1)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key == "gauge_wet":
+            return self._wet
+        return self._row.get(key, default)
+
+
+def _slot_ends(stamps: Sequence[datetime | None]) -> list[datetime | None]:
+    """``slot_end_of`` for every stamp, vectorised; ``None`` stays ``None``."""
+    micros = np.fromiter(
+        (
+            _NAT_US if s is None
+            else (s - _EPOCH) // timedelta(microseconds=1)
+            for s in stamps
+        ),
+        dtype=np.int64, count=len(stamps),
+    )
+    ends = np.where(micros == _NAT_US, _NAT_US, slot_ends_of_us(micros))
+    return _datetimes(ends)
+
+
 def _score_decisions(
     rows: Sequence[dict], inputs: QualityInputs,
 ) -> _Scoreboard:
@@ -1139,19 +1395,32 @@ def _score_decisions(
     if not rows or inputs.corpus_dir is None:
         return board
 
-    bounds = decision_bounds(rows)
-    if bounds is None:
+    # Each row's decision instant, station and gauge slot, once: a season
+    # is millions of rows, and every section below asks for all three.
+    columnar = isinstance(rows, DecisionRows)
+    if columnar:
+        parsed = rows.datetimes("generated_at")
+        station_of = [str(v) for v in rows.string_list("station_id")]
+    else:
+        parsed = [_parse_ts(r.get("generated_at")) for r in rows]
+        station_of = [str(r.get("station_id")) for r in rows]
+    stamps = [s for s in parsed if s is not None]
+    if not stamps:
         return board
-    window_from, window_to, station_ids = bounds
-    stamps = [s for s in (_parse_ts(r.get("generated_at")) for r in rows) if s]
+    # ``decision_bounds``, from the columns already in hand.
+    window_from, window_to = min(stamps), max(stamps)
+    station_ids = sorted(set(station_of))
     board.window_days = len({s.date() for s in stamps})
+    slots = _slot_ends(parsed)
+    radar_of = (
+        rows.datetimes("radar_ts") if columnar
+        else [_parse_ts(r.get("radar_ts")) for r in rows]
+    )
 
     needed = {
-        (str(r.get("station_id")), slot_end_of(stamp))
-        for r, stamp in (
-            (r, _parse_ts(r.get("generated_at"))) for r in rows
-        )
-        if stamp is not None
+        (station, slot)
+        for station, slot in zip(station_of, slots)
+        if slot is not None
     }
     # Months and stations the rows cover, never the whole archive.
     truth = _gauge_truth(
@@ -1177,13 +1446,11 @@ def _score_decisions(
     # The frames are the coverage runs, and they come from every row
     # regardless of how the warnings are decided: a cycle that decided
     # "no" is still a cycle the service was watching.
-    for row in rows:
-        stamp = _parse_ts(row.get("generated_at"))
+    for radar, stamp, station in zip(radar_of, parsed, station_of):
         if stamp is None:
             continue
-        station = str(row.get("station_id"))
-        frame = _parse_ts(row.get("radar_ts")) or stamp
-        frames_by_station[station].append(frame)
+        frames_by_station[station].append(radar or stamp)
+    del radar_of
 
     if inputs.decide_warnings is not None:
         for station, sent_rows in inputs.decide_warnings(rows).items():
@@ -1199,13 +1466,11 @@ def _score_decisions(
                     None if probability is None else float(probability)
                 )
     else:
-        for row in rows:
+        for row, stamp, station in zip(rows, parsed, station_of):
             if row.get("action") != "notify":
                 continue
-            stamp = _parse_ts(row.get("generated_at"))
             if stamp is None:
                 continue
-            station = str(row.get("station_id"))
             eta = row.get("eta_min")
             warnings_by_station[station].append(
                 (stamp, None if eta is None else float(eta), None),
@@ -1289,15 +1554,16 @@ def _score_decisions(
         }
 
     # --- "is it raining now" ---------------------------------------------
-    resolved = []
-    for row in rows:
-        stamp = _parse_ts(row.get("generated_at"))
-        if stamp is None:
+    # The row with its gauge flag beside it — a two-slot view, not a copy
+    # of the row: a season of copies was a third full set of dicts.
+    resolved: list[_WithGauge] = []
+    for row, station, slot in zip(rows, station_of, slots):
+        if slot is None:
             continue
-        key = (str(row.get("station_id")), slot_end_of(stamp))
+        key = (station, slot)
         if key not in truth.wet_at:
             continue
-        resolved.append({**row, "gauge_wet": truth.wet_at[key]})
+        resolved.append(_WithGauge(row, truth.wet_at[key]))
     agreement = raining_now_agreement(
         resolved, threshold_mm_h=inputs.raining_now_mm_h,
     )
@@ -1320,12 +1586,12 @@ def _score_decisions(
         }
 
     # --- per station ------------------------------------------------------
-    rows_by_station: dict[str, list[dict]] = defaultdict(list)
+    rows_by_station: dict[str, list[_WithGauge]] = defaultdict(list)
     for row in resolved:
         rows_by_station[str(row.get("station_id"))].append(row)
     counts_by_station: dict[str, int] = defaultdict(int)
-    for row in rows:
-        counts_by_station[str(row.get("station_id"))] += 1
+    for station in station_of:
+        counts_by_station[station] += 1
     for station in station_ids:
         result = results[station]
         summary = result.summary
@@ -1621,9 +1887,20 @@ _MODE_WORDS = {
         "the gauge-trained post-processed probability the site serves, "
         "in-sample"
     ),
+    # Retired 2026-09-27 (it refitted a v1 logistic, not the served
+    # model); kept so an archived document still reads.
     "postprocess_cv": (
         "the gauge-trained post-processed probability the site serves, "
         "refitted out-of-sample leave-one-{fold}-out"
+    ),
+    "postprocess_oof": (
+        "the gauge-trained post-processed probability the site serves, "
+        "the served model's stored out-of-fold predictions"
+    ),
+    "postprocess_stored": (
+        "the gauge-trained post-processed probability as the decision "
+        "rows store it (served live, or written back offline), not "
+        "recomputed"
     ),
     "raw": "the raw ensemble exceedance fraction, uncalibrated",
     "mixed": "a mix of calibrated and raw leads",
@@ -1687,7 +1964,14 @@ _SERVED_RULE_NUMBERS = (
     # S11, additive: the onset AND rule's two halves (absent on the
     # single-threshold rule; ``threshold_pct`` is then the onset one).
     "onset_threshold_pct", "post_threshold_pct", "rows_onset_fallback",
+    # Additive: where each scored row's model probability came from —
+    # stored by the writer, computed by the served model from the row's
+    # features, or unfillable (the row lacks a column the model reads, so
+    # the engine's fallback decided it). Absent when the rule reads none.
+    "rows_post_stored", "rows_post_computed", "rows_post_unfillable",
+    "rows_onset_stored", "rows_onset_computed", "rows_onset_unfillable",
 )
+_SERVED_RULE_SOURCE_COUNTS = _SERVED_RULE_NUMBERS[-6:]
 
 #: The all-clear's graded counts in ``methods.subscriber_rule`` (additive;
 #: the client ignores them). Counts are integers; the median is minutes
@@ -1749,6 +2033,11 @@ def _merge_served_rule(
     """
     if not isinstance(served, Mapping):
         return subscriber
+    for key in _SERVED_RULE_SOURCE_COUNTS:
+        # An explicit null says "this run read no such column": a count a
+        # carried document holds from an earlier run must not survive it.
+        if key in served and served.get(key) is None:
+            subscriber.pop(key, None)
     for key in _SERVED_RULE_NUMBERS:
         value = served.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):

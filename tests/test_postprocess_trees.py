@@ -257,6 +257,38 @@ def _big_ensemble(n_trees: int = 300, n_features: int = 40) -> pt.TreeEnsemble:
     )
 
 
+def test_an_infinite_value_walks_as_the_largest_finite_one() -> None:
+    """The walker maps NaN to 0 with ``np.where`` and leaves ±inf alone;
+    the ``nan_to_num`` it replaced turned ±inf into ±max-float. Every
+    comparison it makes (``<= threshold``, ``|x| <= 1e-35``) answers the
+    same for both, so the score is bit-identical — pinned here on every
+    missing type and on a large random ensemble with NaN, 0 and ±inf."""
+    big = np.finfo(np.float64).max
+    for missing in (pt.MISSING_NAN, pt.MISSING_ZERO, pt.MISSING_NONE):
+        ensemble = pt.TreeEnsemble(
+            trees=(_stump(0, 1.0, -1.0, +1.0, missing=missing),),
+            n_features=1,
+        )
+        infinite = np.array([[np.inf], [-np.inf], [np.nan], [0.0]])
+        finite = np.array([[big], [-big], [np.nan], [0.0]])
+        assert ensemble.raw_score(infinite).tolist() == (
+            ensemble.raw_score(finite).tolist()
+        )
+    ensemble = _big_ensemble(n_trees=60)
+    rng = np.random.default_rng(11)
+    design = rng.normal(size=(5_000, 40))
+    design[rng.uniform(size=design.shape) < 0.2] = np.nan
+    design[rng.uniform(size=design.shape) < 0.05] = 0.0
+    design[rng.uniform(size=design.shape) < 0.01] = np.inf
+    design[rng.uniform(size=design.shape) < 0.01] = -np.inf
+    reference = np.where(
+        np.isposinf(design), big, np.where(np.isneginf(design), -big, design),
+    )
+    assert np.array_equal(
+        ensemble.raw_score(design), ensemble.raw_score(reference),
+    )
+
+
 def test_a_live_cycle_scores_inside_its_budget() -> None:
     """~110 points at four leads, in well under a radar cycle's slack."""
     ensemble = _big_ensemble()

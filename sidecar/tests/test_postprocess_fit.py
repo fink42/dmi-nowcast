@@ -323,11 +323,122 @@ class TestProbabilityFiller:
         self, corpus: Path,
     ) -> None:
         filler = ProbabilityFiller(None, LEADS, LEADS, pp.post_column)
-        out = filler(self._table(corpus))
-        # Featured rows are kept — the model simply had nothing to add.
-        assert out.num_rows == self._table(corpus).num_rows
+        table = self._table(corpus)
+        out = filler(table)
+        # Nothing is stored and nothing can be computed: nothing survives,
+        # and every row is counted as one the model could not speak for.
+        assert out.num_rows == 0
         assert filler.counts["computed"] == 0
+        assert filler.counts["unfillable"] == table.num_rows
+        kept = ProbabilityFiller(
+            None, LEADS, LEADS, pp.post_column, drop_unfilled=False,
+        )(table)
+        assert kept.num_rows == table.num_rows
+        assert all(v is None for v in kept.column("p_post_30").to_pylist())
+
+    def test_the_required_columns_come_from_the_models_design(
+        self, corpus: Path,
+    ) -> None:
+        import dataclasses
+
+        from dmi_nowcast_sidecar.postprocess_fit import required_source_columns
+
+        model = run_postprocess_fit(_options(corpus))["model"]
+        v1 = set(required_source_columns(model))
+        assert {pp.raw_fraction_column(lead) for lead in LEADS} <= v1
+        assert "obs_max_5km_mm_h" in v1
+        assert not {"season", "hour_utc"} & v1
+        assert not any(name.startswith(("g_", "ng_")) for name in v1)
+        v2 = dataclasses.replace(model, spec=dataclasses.replace(
+            model.spec, extra_columns=("g_mm_30", "g_known", "ng_frame_ok"),
+        ))
+        assert {"g_mm_30", "g_known", "ng_frame_ok"} <= set(
+            required_source_columns(v2),
+        )
+        # A model that masks the point's own gauge never needs it.
+        masked = dataclasses.replace(v2, protocol=pp.PROTOCOL_RANDOM_POINT)
+        need = set(required_source_columns(masked))
+        assert "ng_frame_ok" in need
+        assert not {"g_mm_30", "g_known"} & need
+
+    def test_a_row_without_a_column_the_model_reads_is_unfillable(
+        self, corpus: Path,
+    ) -> None:
+        """A v2 model on a v1 row would read NaN for the whole block and
+        answer near zero; the row keeps its null and follows the fallback."""
+        import dataclasses
+
+        import pyarrow as pa
+
+        model = run_postprocess_fit(_options(corpus))["model"]
+        v2 = dataclasses.replace(model, spec=dataclasses.replace(
+            model.spec, extra_columns=("ng_frame_ok",),
+        ))
+        table = self._table(corpus)
+        # The file has no ``ng_*`` column at all: nothing is fillable.
+        v1_file = table.drop_columns(
+            [n for n in table.schema.names if n.startswith("ng_")],
+        )
+        filler = ProbabilityFiller(
+            v2, LEADS, LEADS, pp.post_column, drop_unfilled=False,
+        )
+        out = filler(v1_file)
+        assert filler.counts["computed"] == 0
+        assert filler.counts["unfillable"] == table.num_rows
         assert all(v is None for v in out.column("p_post_30").to_pylist())
+        # The column exists but the row's block is all null (a writer that
+        # predates it): unfillable too — per row, not per file.
+        values = [None] * table.num_rows
+        values[0] = 1.0
+        with_block = table.drop_columns(["ng_frame_ok"]).append_column(
+            "ng_frame_ok", pa.array(values, pa.float32()),
+        )
+        assert filler.fillable(with_block).tolist() == [
+            v is not None for v in values
+        ]
+
+    def test_only_the_rows_that_need_a_value_are_predicted(
+        self, corpus: Path,
+    ) -> None:
+        """A stored value is never re-predicted, and a subset prediction is
+        the full prediction on those rows (the model is row-independent)."""
+        import pyarrow as pa
+
+        model = run_postprocess_fit(_options(corpus))["model"]
+        seen: list[int] = []
+
+        class Counting:
+            def __getattr__(self, name):
+                return getattr(model, name)
+
+            def predict(self, features):
+                seen.append(len(features["season"]))
+                return model.predict(features)
+
+        table = self._table(corpus)
+        n = table.num_rows
+        stored = [0.5 if i % 2 else None for i in range(n)]
+        full = ProbabilityFiller(model, LEADS, LEADS, pp.post_column)(table)
+        filler = ProbabilityFiller(
+            Counting(), (30,), LEADS, pp.post_column,
+            mark_column="__computed",
+        )
+        out = filler(table.append_column(
+            "p_post_30", pa.array(stored, pa.float32()),
+        ))
+        assert seen == [sum(v is None for v in stored)]
+        got = out.column("p_post_30").to_pylist()
+        want = full.column("p_post_30").to_pylist()
+        for i in range(n):
+            if stored[i] is None:
+                assert got[i] == want[i]
+            else:
+                assert got[i] == pytest.approx(0.5)
+        assert out.column("__computed").to_pylist() == [
+            1.0 if v is None else 0.0 for v in stored
+        ]
+        assert filler.counts["stored"] == n - seen[0]
+        assert filler.counts["computed"] == seen[0]
 
 
 # ---------------------------------------------------------------------------

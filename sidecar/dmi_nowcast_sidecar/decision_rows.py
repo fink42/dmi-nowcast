@@ -83,6 +83,7 @@ def load_probabilities(
     extra_columns: Sequence[str] = (),
     derive: Callable[[Any], Any] | None = None,
     derive_columns: Sequence[str] = (),
+    tag_directory: bool = False,
     log=None,
 ) -> dict:
     """Decision rows as columns: ``t``, station code, and one p per lead.
@@ -125,6 +126,11 @@ def load_probabilities(
     into the merged table would cost twenty times the memory for numbers
     nothing downstream reads.
 
+    ``tag_directory`` adds ``"directory"`` to the result: the index into
+    ``directories`` of the directory each surviving row was read from,
+    after the dedup — so a caller can tell a row's provenance (an
+    out-of-fold write-back, say) without a second read.
+
     Returns ``{"t": int64 epoch seconds of the decision instant,
     "radar_ts": int64 epoch seconds of the anchor frame, "station": int32
     codes, "stations": [id], "p": {lead: float64 with NaN for null},
@@ -149,7 +155,7 @@ def load_probabilities(
     ]
     tables: list[Any] = []
     counts = {"files": 0, "skipped": 0, "rows": 0}
-    for directory in directories:
+    for directory_index, directory in enumerate(directories):
         for path in decision_parquets(Path(directory)):
             try:
                 schema = pq.read_schema(path)
@@ -187,6 +193,10 @@ def load_probabilities(
             table = table.select(
                 ["radar_ts", "generated_at", "station_id"] + asked
             )
+            if tag_directory:
+                table = table.append_column("__dir", pa.array(
+                    np.full(table.num_rows, directory_index, dtype=np.int32),
+                ))
             counts["files"] += 1
             counts["rows"] += table.num_rows
             tables.append(table.cast(pa.schema([
@@ -194,6 +204,7 @@ def load_probabilities(
                 ("generated_at", pa.timestamp("us", tz="UTC")),
                 ("station_id", pa.string()),
                 *[(name, pa.float64()) for name in asked],
+                *([("__dir", pa.int32())] if tag_directory else []),
             ])))
     if not tables:
         raise SweepError("no decision rows found")
@@ -264,6 +275,12 @@ def load_probabilities(
         "rows": int(merged.num_rows),
         "duplicates": int(duplicates),
     }
+    if tag_directory:
+        out["directory"] = np.asarray(
+            merged.column("__dir").combine_chunks()
+            .to_numpy(zero_copy_only=False),
+            dtype=np.int64,
+        )
     if log:
         log(
             f"layer B: {out['rows']} unique row(s) from {counts['files']} "

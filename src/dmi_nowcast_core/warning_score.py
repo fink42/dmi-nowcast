@@ -192,6 +192,7 @@ __all__ = [
     "per_lead_columns",
     "DEFAULT_COVERAGE_GAP_MIN",
     "slot_end_of",
+    "slot_ends_of_us",
     "gauge_slots",
     "gauge_slot_amounts",
     "onsets",
@@ -481,6 +482,25 @@ def slot_end_of(ts: datetime, *, slot_min: int = SLOT_MIN) -> datetime:
     if remainder == 0 and ts == base:
         return base
     return base - timedelta(minutes=remainder) + timedelta(minutes=slot_min)
+
+
+def slot_ends_of_us(stamps_us: Any, *, slot_min: int = SLOT_MIN) -> Any:
+    """:func:`slot_end_of` over int64 UTC epoch microseconds, vectorised.
+
+    The same rule, as arithmetic: drop the sub-minute part, and a stamp
+    exactly on a slot boundary is that slot's end; anything else rolls up
+    to the next boundary. Returns int64 microseconds. For the scorers that
+    hold a season of decision instants and would otherwise call
+    :func:`slot_end_of` once per row.
+    """
+    import numpy as np
+
+    t = np.asarray(stamps_us, dtype=np.int64)
+    minute = 60_000_000
+    slot = int(slot_min) * minute
+    base = t - np.mod(t, minute)
+    on_edge = (np.mod(base, slot) == 0) & (t == base)
+    return np.where(on_edge, base, base - np.mod(base, slot) + slot)
 
 
 def _rows_of(table: Any) -> list[Mapping[str, Any]]:

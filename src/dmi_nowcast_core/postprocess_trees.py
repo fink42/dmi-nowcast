@@ -376,9 +376,12 @@ class TreeEnsemble:
                     here = here[internal]
                     column = column[internal]
                 values = matrix[rows[live], column]
-                filled = np.nan_to_num(values, nan=0.0)
+                # NaN → 0 for the comparisons; ±inf kept, which decides
+                # every split exactly as ``nan_to_num``'s ±max-float did.
+                nan = np.isnan(values)
+                filled = np.where(nan, 0.0, values)
                 kind = missing[here]
-                to_default = (np.isnan(values) & (kind != MISSING_NONE)) | (
+                to_default = (nan & (kind != MISSING_NONE)) | (
                     (kind == MISSING_ZERO) & (np.abs(filled) <= ZERO_THRESHOLD)
                 )
                 go_left = np.where(

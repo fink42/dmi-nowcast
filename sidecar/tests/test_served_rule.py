@@ -621,7 +621,7 @@ class TestServedRuleDecider:
         stored = _stored(self._tree(tmp_path))
         decider = ServedRuleDecider(options)
         monkeypatch.setattr(
-            "dmi_nowcast_sidecar.threshold_sweep.load_decisions",
+            ServedRuleDecider, "_read",
             lambda *a, **k: (_ for _ in ()).throw(OSError("disk went away")),
         )
         assert decider(stored) == {}
@@ -658,3 +658,158 @@ def test_the_decider_publishes_its_all_clear_setting(tmp_path: Path, model) -> N
     assert off.stats["allclear_readings"] == 0.0
     assert ServedRuleOptions().allclear_enabled is True
     assert ServedRuleOptions().allclear_readings == 2
+
+
+# ---------------------------------------------------------------------------
+# R1 (2026-09-27): fill only what can be filled, grade what is served
+# ---------------------------------------------------------------------------
+
+
+def _onset_doc(path: Path, *, post: int, onset: int, single: int) -> Path:
+    """A served table whose report lead is on the onset AND rule."""
+    _thresholds_doc(path, pct=post)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["leads"][str(LEAD)].update(
+        onset_threshold_pct=onset, single_threshold_pct=single,
+    )
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _append(path: Path, name: str, values: list) -> None:
+    import pyarrow as pa
+
+    table = pq.read_table(path)
+    if name in table.schema.names:
+        table = table.drop_columns([name])
+    pq.write_table(
+        table.append_column(name, pa.array(values, type=pa.float32())), path,
+    )
+
+
+class TestR1:
+    def test_the_curve_rollback_grades_the_single_threshold(
+        self, tmp_path: Path, model,
+    ) -> None:
+        """Under ``curve`` the service hands the engine no ``p_onset``, so
+        an onset-rule lead is judged on ``single_threshold_pct`` — never on
+        the table's p_post half (which may be 0)."""
+        doc = _onset_doc(tmp_path / "t.json", post=0, onset=22, single=60)
+        options = _options(
+            tmp_path, model, thresholds_path=doc,
+            probability_source="curve", postprocess_model=None,
+        )
+        assert resolve_threshold(options) == (60, "table")
+        stored = _stored(self._tree(tmp_path))
+        decider = ServedRuleDecider(options)
+        got = decider(stored)
+        assert decider.stats["threshold_pct"] == 60
+        assert decider.stats["onset_threshold_pct"] is None
+        assert got == _expected_warnings(
+            stored, {(r["radar_ts"], r["station_id"]): r[CURVE] for r in stored},
+            60,
+        )
+        # And under ``postprocess`` the AND rule's halves are what is shown.
+        post = ServedRuleDecider(_options(
+            tmp_path / "post", model, thresholds_path=doc,
+        ))
+        assert post.stats["threshold_pct"] == 22
+        assert post.stats["post_threshold_pct"] == 0
+
+    @staticmethod
+    def _tree(tmp_path: Path) -> Path:
+        return tmp_path / "replay" / "decisions"
+
+    def test_a_row_without_a_column_the_model_reads_is_unfillable(
+        self, tmp_path: Path, model,
+    ) -> None:
+        """A model that reads ``ng_frame_ok`` on rows whose writer never
+        computed it: nothing is predicted (a tree would read NaN and answer
+        near zero), every row takes the engine's fallback to the curve."""
+        import dataclasses
+
+        wider = dataclasses.replace(model, spec=dataclasses.replace(
+            model.spec, extra_columns=("ng_frame_ok",),
+        ))
+        options = _options(
+            tmp_path, model,
+            postprocess_model=_model_file(tmp_path / "wide.json", wider),
+        )
+        stored = _stored(self._tree(tmp_path))
+        decider = ServedRuleDecider(options)
+        got = decider(stored)
+        assert decider.stats["rows_post_computed"] == 0
+        assert decider.stats["rows_post_unfillable"] == len(stored)
+        assert decider.stats["rows_post_stored"] == 0
+        assert decider.stats["rows_fallback"] == len(stored)
+        assert got == _expected_warnings(
+            stored, {(r["radar_ts"], r["station_id"]): r[CURVE] for r in stored},
+            SERVED_PCT,
+        )
+
+    def test_stored_computed_and_unfillable_are_counted(
+        self, tmp_path: Path, model,
+    ) -> None:
+        options = _options(tmp_path, model)
+        path = next(self._tree(tmp_path).glob("*.parquet"))
+        rows = pq.read_table(path).to_pylist()
+        # A stores a value on even frames; B never (and has no features).
+        stored_values = [
+            0.99 if r["station_id"] == STATION_A and i % 4 == 0 else None
+            for i, r in enumerate(rows)
+        ]
+        _append(path, POST, stored_values)
+        stored = _stored(self._tree(tmp_path))
+        decider = ServedRuleDecider(options)
+        got = decider(stored)
+        n_stored = sum(v is not None for v in stored_values)
+        assert decider.stats["rows_post_stored"] == n_stored
+        assert decider.stats["rows_post_computed"] == FRAMES - n_stored
+        assert decider.stats["rows_post_unfillable"] == FRAMES
+        assert decider.stats["rows_fallback"] == FRAMES
+        expected = _expected_column(stored, model)
+        for row in stored:
+            if row.get(POST) is not None:
+                expected[(row["radar_ts"], row["station_id"])] = row[POST]
+        assert got == _expected_warnings(stored, expected, SERVED_PCT)
+
+    def test_the_later_directory_wins_a_key(
+        self, tmp_path: Path, model,
+    ) -> None:
+        import shutil
+
+        options = _options(tmp_path, model)
+        live = tmp_path / "eval"
+        live.mkdir()
+        source = next(self._tree(tmp_path).glob("*.parquet"))
+        shutil.copy(source, live / source.name)
+        n = pq.read_metadata(source).num_rows
+        _append(live / source.name, POST, [0.01] * n)
+        options = ServedRuleOptions(**{
+            **options.__dict__,
+            "decisions_dirs": [self._tree(tmp_path), live],
+        })
+        stored = _stored(self._tree(tmp_path))
+        decider = ServedRuleDecider(options)
+        assert decider(stored) == {}
+        assert decider.stats["rows_loaded"] == 2 * n
+        assert decider.stats["rows_matched"] == n
+        assert decider.stats["rows_post_stored"] == n
+
+
+def test_the_reports_columnar_rows_give_the_same_warnings(
+    tmp_path: Path, model,
+) -> None:
+    """The core hands over ``DecisionRows``; the keys are read as columns."""
+    from dmi_nowcast_core import quality_report as qr
+
+    options = _options(tmp_path, model)
+    tree = tmp_path / "replay" / "decisions"
+    stored = _stored(tree)
+    columnar = qr._rows_from_tables(
+        [qr._read_decision_table(p) for p in sorted(tree.glob("*.parquet"))],
+    )
+    assert len(columnar) == len(stored)
+    by_dicts = ServedRuleDecider(options)(stored)
+    by_columns = ServedRuleDecider(options)(columnar)
+    assert by_columns == by_dicts and by_columns

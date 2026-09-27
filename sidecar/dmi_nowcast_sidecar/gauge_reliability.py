@@ -30,10 +30,6 @@ it. Every piece of that is borrowed rather than restated:
   :func:`~dmi_nowcast_core.benchmark.brier_decomposition` do the binning
   and the score.
 
-* :func:`~dmi_nowcast_core.postprocess.leave_one_month_out` decides what
-  "out-of-sample" means, so the page's diagram and the offline evidence
-  are honest in the same way.
-
 Those are exactly the calls ``scripts/benchmark_report.py``'s Layer B and
 ``scripts/fit_postprocess.py`` make, on the same rows — which is the
 point. The page
@@ -42,8 +38,8 @@ probability verifies at the gauges, because they are one computation
 invoked twice. ``sidecar/tests/test_gauge_reliability.py`` pins the two
 against each other on synthetic rows.
 
-Out-of-fold, or it measures nothing
------------------------------------
+Out-of-fold, or labelled as what it is
+--------------------------------------
 
 The nightly refit fits on ALL rows (``training.held_out: false``) — no
 folds, because the out-of-sample evidence is the offline script's job.
@@ -51,21 +47,26 @@ Scoring that model's predictions on the very rows it was fitted on draws
 a perfect diagonal and calls it a measurement: the first live build came
 back 0.149 → 0.149, 0.754 → 0.753, 0.949 → 0.949 over hundreds of
 thousands of rows, which says only that isotonic regression can describe
-its own training data. It is the same trap the radar curve had, removed
-there by leave-one-month-out CV.
+its own training data.
 
-So the probability this module bins is an OUT-OF-FOLD one. For each
-``(year, month)`` the whole two-stage fit — logistic then isotonic — is
-redone on the other months and applied to the held-out one, through
-:func:`~dmi_nowcast_core.postprocess.leave_one_month_out` with the
-bootstrap and the strata switched off: this wants the fold predictions,
-not a report. A fold that cannot be fitted at all falls back to the
-served model's own prediction for those rows and is counted, because a
-gap in the curve would be a quieter lie than a labelled fallback.
+Until 2026-09-27 this module "fixed" that with a leave-one-month-out
+refit — of a pooled v1 LOGISTIC, because that is all the sidecar image can
+fit (it has no LightGBM). The served model is a v2 tree ensemble, so the
+diagram labelled "out-of-fold" was of a different model altogether. That
+refit is gone. What the diagram is of now depends only on where each
+scored row's probability came from, and the block says so:
 
-That costs one logistic fit per fold per lead — about ten folds by four
-leads on the current archive — which is why it runs in the nightly
-child process and never on the hourly refresh.
+* ``out-of-fold`` — every scored row carries a stored value from an
+  out-of-fold write-back of the SERVED model (``scripts/fit_postprocess.py
+  --write-back``; its ``summary.json`` ``postprocess`` block names the
+  model's ``fitted_at_utc`` and the column), so each prediction came from
+  a fold that never saw the row;
+* ``stored`` — every scored row carries a stored value, but not all of
+  them are such a write-back: values the service stored live (forecasts
+  issued before the outcome), or a write-back of another model;
+* ``in-sample`` — at least one scored row's value was computed here by
+  the served model from the row's features, i.e. the model on rows it may
+  have been fitted on. ``in_sample_fallbacks`` counts those cells.
 
 The output is shaped like
 :func:`~dmi_nowcast_core.quality_report.reliability_from_corpus`'s, so it
@@ -106,10 +107,21 @@ DAY_SEC = 86_400
 #: What ``methods.reliability_probability`` calls each probability. The
 #: report turns these into the sentence; they are named here because this
 #: module is the only thing that knows which column it actually read.
+#: The served model's output, at least partly computed here: in-sample.
 MODE_POSTPROCESS = "postprocess"
-#: The same model, refitted per fold and scored on the month it never saw.
+#: Retired: the leave-one-month-out refit of a v1 logistic. Kept so an
+#: archived document's word still has a meaning.
 MODE_POSTPROCESS_CV = "postprocess_cv"
+#: Every scored value an out-of-fold write-back of the served model.
+MODE_POSTPROCESS_OOF = "postprocess_oof"
+#: Every scored value stored in the rows (served live, or written back),
+#: none computed here, not all of them the served model's out-of-fold.
+MODE_POSTPROCESS_STORED = "postprocess_stored"
 MODE_CURVE = "served"
+
+#: The per-row provenance column the filler marks (see ``ProbabilityFiller.
+#: mark_column``); carried through the read, never published.
+_COMPUTED_MARK = "__computed_here"
 
 
 @dataclass(frozen=True)
@@ -150,14 +162,13 @@ class GaugeReliabilityOptions:
     dry_min: int = DEFAULT_DRY_MIN
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM
     min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS
-    #: Score OUT-OF-FOLD predictions (leave-one-month-out refit) rather
-    #: than the served model's own. On by default and effectively
-    #: mandatory: the nightly model is fitted on all rows, so its in-sample
-    #: diagram is a tautology. Off only to reproduce that tautology
-    #: deliberately, or to cut ~40 logistic fits out of a build.
+    #: Retained for config compatibility and ignored. It used to trigger a
+    #: leave-one-month-out refit — of a pooled v1 logistic, a different
+    #: model from the served one — whose diagram was then labelled
+    #: out-of-fold. The out-of-fold claim is now made only from stored
+    #: write-backs of the served model (see the module docstring).
     out_of_fold: bool = True
-    #: Ridge strength of the out-of-fold refits. The served fit's, so a
-    #: fold model differs from the shipped one only in what it saw.
+    #: Retained with ``out_of_fold``; ignored.
     l2: float = 1.0
     #: Stations to restrict to; ``None`` scores every station in the rows.
     stations: Sequence[str] | None = None
@@ -218,111 +229,78 @@ def _filler(
         tuple(sorted({int(lead) for lead in options.leads})),
         tuple(int(lead) for lead in options.design_leads),
         column_for,
+        mark_column=_COMPUTED_MARK,
     )
 
 
-def _out_of_fold(
-    options: GaugeReliabilityOptions,
-    filler: Any,
-    rows: dict,
-    outcomes: dict[int, tuple[np.ndarray, np.ndarray]],
-    leads: Sequence[int],
-    *,
-    log: Callable[[str], None] | None = None,
-) -> tuple[dict[int, np.ndarray], int] | None:
-    """``({lead: held-out prediction}, n_folds)``, or ``None``.
+def _oof_directories(
+    options: GaugeReliabilityOptions, model: Any,
+) -> set[int]:
+    """Indices of ``decisions_dirs`` holding an out-of-fold write-back of
+    the SERVED model's column.
 
-    One fold per ``(year, month)``, the whole two-stage fit redone on the
-    other months — :func:`~dmi_nowcast_core.postprocess.leave_one_month_out`
-    does it, and does it the way the offline evidence was produced. Two of
-    its knobs are turned off here on purpose:
-
-    ``n_resamples=0``
-        No bootstrap. The confidence interval on a difference is what the
-        shipping decision is written in; this is a reliability diagram,
-        and the interval would cost far more than the fits.
-    ``strata={}``
-        Pooled only. The per-season split is the report's business, and
-        computing it would score every lead four times over for numbers
-        nothing here publishes.
-
-    ``None`` when the refit cannot happen at all: no model to refit, no
-    feature columns to refit on, or fewer than two months in the rows —
-    one fold is no fold, and pretending otherwise would be the tautology
-    this exists to remove.
+    ``scripts/fit_postprocess.py --write-back`` copies the run with its
+    out-of-fold predictions and records, in the copy's ``summary.json``
+    ``postprocess`` block, which model (``fitted_at_utc``), which column
+    template and what kind of prediction it wrote. A directory counts only
+    when all three match the model being scored and the probability column
+    — a write-back of last month's model is some other model's number.
+    ``summary.json`` is looked for in the directory and in its parent (a
+    run's ``decisions/`` sits under it).
     """
-    if filler is None or getattr(filler, "model", None) is None:
-        return None
-    t = rows["t"]
-    months = core_postprocess.year_months_from_epoch(t)
-    n_folds = int(np.unique(months).size)
-    if n_folds < 2:
-        if log:
-            log(
-                f"gauge reliability: {n_folds} month(s) of rows — too few to "
-                "hold one out, scoring the served model in-sample"
-            )
-        return None
-    design_leads = tuple(int(lead) for lead in options.design_leads)
-    features: dict[str, Any] = {}
-    for name in core_postprocess.feature_source_columns(design_leads):
-        values = rows["extra"].get(name)
-        if values is not None:
-            features[name] = values
-    if not features:
-        return None
-    # ``season`` and ``hour_utc`` from the decision instant, exactly as
-    # ``ProbabilityFiller._predict`` derives them — never a stored column,
-    # so a row written by a writer that had one scores identically to a
-    # row written by one that did not.
-    features["season"] = core_postprocess.seasons_from_epoch(t)
-    features["hour_utc"] = core_postprocess.hours_from_epoch(t).astype(
-        np.float64,
-    )
-    baseline = {
-        int(lead): np.asarray(rows["p"][int(lead)], dtype=np.float64)
-        for lead in leads
-    }
-    if log:
-        log(
-            f"gauge reliability: refitting out-of-fold over {n_folds} "
-            f"month(s) x {len(leads)} lead(s)"
-        )
-    evaluation = core_postprocess.leave_one_month_out(
-        features,
-        {int(lead): outcomes[int(lead)] for lead in leads},
-        [int(lead) for lead in leads],
-        month=months,
-        day=t // DAY_SEC,
-        baseline=baseline,
-        l2=float(options.l2),
-        design_leads=design_leads,
-        strata={},
-        n_resamples=0,
-        log=log,
-    )
-    return {
-        int(lead): np.asarray(values, dtype=np.float64)
-        for lead, values in evaluation["out_of_fold"].items()
-    }, n_folds
+    import json
+
+    if model is None or options.probability_column is None:
+        return set()
+    fitted = str(getattr(model, "fitted_at_utc", "") or "")
+    found: set[int] = set()
+    for index, directory in enumerate(options.decisions_dirs):
+        root = Path(directory)
+        for candidate in (root / "summary.json", root.parent / "summary.json"):
+            if not candidate.is_file():
+                continue
+            try:
+                block = json.loads(candidate.read_text(encoding="utf-8"))
+                block = block.get("postprocess") or {}
+            except Exception:  # noqa: BLE001 — unreadable is "not proven"
+                break
+            if (
+                "out-of-fold" in str(block.get("kind") or "")
+                and fitted
+                and str(block.get("fitted_at_utc") or "") == fitted
+                and str(block.get("column_template") or "")
+                == str(options.probability_column)
+            ):
+                found.add(index)
+            break
+    return found
 
 
-def _mode(
-    options: GaugeReliabilityOptions, held_out: dict | None,
-) -> str:
+def _mode(options: GaugeReliabilityOptions, calibration: str) -> str:
     """Which probability the diagram is OF, for the methods sentence."""
     if options.probability_column is None:
         return MODE_CURVE
-    return MODE_POSTPROCESS if held_out is None else MODE_POSTPROCESS_CV
+    return {
+        "out-of-fold": MODE_POSTPROCESS_OOF,
+        "stored": MODE_POSTPROCESS_STORED,
+    }.get(calibration, MODE_POSTPROCESS)
 
 
 def _calibration(
-    options: GaugeReliabilityOptions, held_out: dict | None,
+    options: GaugeReliabilityOptions, *, scored: int, computed: int, oof: int,
 ) -> str:
-    """Whether the diagram is a measurement or a description of a fit."""
+    """Whether the diagram is a measurement or a description of a fit.
+
+    ``scored`` rows in the diagram, ``computed`` of them predicted here by
+    the served model, ``oof`` of them an out-of-fold write-back of it.
+    """
     if options.probability_column is None:
         return "served"
-    return "in-sample" if held_out is None else "out-of-fold"
+    if computed > 0:
+        return "in-sample"
+    if scored > 0 and oof == scored:
+        return "out-of-fold"
+    return "stored"
 
 
 def _bins(prob: np.ndarray, outcome: np.ndarray) -> list[dict]:
@@ -417,17 +395,15 @@ def gauge_reliability_from_decisions(
     # instead of a stored probability. Filling happens inside the read,
     # per file, through the very class the nightly sweep uses.
     filler = _filler(options, column_for, log)
+    # Read for the filler alone — the columns the served model's design
+    # needs — and dropped before the merge.
     feature_columns = (
-        [] if filler is None
-        else core_postprocess.feature_source_columns(options.design_leads)
+        [] if filler is None or filler.model is None
+        else list(filler.source_columns)
     )
-    # The out-of-fold refit needs the features to SURVIVE the read, not
-    # just to pass through it — it fits on them. Without it they are read
-    # for the filler and dropped again, which is twenty columns of the
-    # merged table saved on a build that will not refit.
     carried = sorted(set(baseline_names.values()))
-    if options.out_of_fold and feature_columns:
-        carried = sorted(set(carried) | set(feature_columns))
+    if filler is not None:
+        carried.append(_COMPUTED_MARK)
     try:
         rows = load_probabilities(
             dirs, leads,
@@ -436,6 +412,7 @@ def gauge_reliability_from_decisions(
             extra_columns=carried,
             derive=filler,
             derive_columns=feature_columns,
+            tag_directory=True,
             log=log,
         )
     except SweepError as exc:
@@ -453,7 +430,8 @@ def gauge_reliability_from_decisions(
             f"gauge reliability: {options.probability_column} — "
             f"{filler.counts['stored']} stored, "
             f"{filler.counts['computed']} computed from features, "
-            f"{filler.counts['dropped']} row(s) excluded (no features)"
+            f"{filler.counts['unfillable']} unfillable, "
+            f"{filler.counts['dropped']} row(s) excluded (no value)"
         )
 
     try:
@@ -482,9 +460,7 @@ def gauge_reliability_from_decisions(
     t = rows["t"]
     station = rows["station"]
 
-    # The gauge outcome per lead, once: the refit below is fitted on it
-    # and the diagram is scored against it, and a second opinion about
-    # which rows are gradable would make those two different claims.
+    # The gauge outcome per lead, once.
     outcomes: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for lead in leads:
         outcome, usable = grid.outcome(t, station, lead)
@@ -492,45 +468,32 @@ def gauge_reliability_from_decisions(
             usable = usable & ~dropped
         outcomes[int(lead)] = (outcome, usable)
 
-    held_out: dict[int, np.ndarray] | None = None
-    n_folds = 0
-    if options.out_of_fold:
-        try:
-            folded = _out_of_fold(
-                options, filler, rows, outcomes, leads, log=log,
-            )
-        except Exception as exc:  # noqa: BLE001 — a refit failure costs the
-            # out-of-sample claim, not the build. The block then says
-            # ``in-sample`` rather than quietly labelling a tautology
-            # out-of-fold, which is the failure that matters.
-            if log:
-                log(
-                    "gauge reliability: the out-of-fold refit failed "
-                    f"({type(exc).__name__}: {exc}); falling back to the "
-                    "served model's own predictions, labelled in-sample"
-                )
-            folded = None
-        if folded is not None:
-            held_out, n_folds = folded
+    # Where each row's value came from — see the module docstring.
+    mark = rows["extra"].get(_COMPUTED_MARK)
+    computed_here = (
+        np.zeros(t.size, dtype=bool) if mark is None
+        else np.nan_to_num(mark, nan=0.0) > 0
+    )
+    oof_dirs = _oof_directories(
+        options, None if filler is None else filler.model,
+    )
+    from_oof = (
+        np.isin(rows["directory"], sorted(oof_dirs)) & ~computed_here
+        if oof_dirs else np.zeros(t.size, dtype=bool)
+    )
+    if log and oof_dirs:
+        log(
+            "gauge reliability: out-of-fold write-back(s) of the served "
+            f"model in {', '.join(str(dirs[i]) for i in sorted(oof_dirs))}"
+        )
 
     curves: list[dict] = []
     per_point_brier: dict[int, dict[str, float]] = {}
     fallbacks = 0
+    scored_rows = np.zeros(t.size, dtype=bool)
     for lead in leads:
-        served = np.asarray(rows["p"][lead], dtype=np.float64)
+        prob = np.asarray(rows["p"][lead], dtype=np.float64)
         outcome, usable = outcomes[int(lead)]
-        if held_out is None:
-            prob = served
-        else:
-            # A fold the refit could not fit leaves NaN. Those rows fall
-            # back to the served model — in-sample for them, and counted,
-            # because a hole in the curve would be the quieter lie.
-            fold_prob = held_out.get(int(lead))
-            if fold_prob is None:
-                fold_prob = np.full(served.shape, np.nan, dtype=np.float64)
-            gap = usable & ~np.isfinite(fold_prob) & np.isfinite(served)
-            fallbacks += int(gap.sum())
-            prob = np.where(np.isfinite(fold_prob), fold_prob, served)
         keep = usable & np.isfinite(prob)
         # A row the gauge CAN answer for but whose probability column the
         # file never carried is excluded and counted. Scoring it would
@@ -538,6 +501,9 @@ def gauge_reliability_from_decisions(
         excluded = int((usable & ~np.isfinite(prob)).sum())
         if not keep.any():
             continue
+        scored_rows |= keep
+        # Cells the served model predicted here: in-sample, and counted.
+        fallbacks += int((keep & computed_here).sum())
         p = prob[keep]
         y = outcome[keep]
         brier = _brier(p, y)
@@ -581,6 +547,24 @@ def gauge_reliability_from_decisions(
         if log:
             log("gauge reliability: no lead could be scored")
         return None
+    n_scored = int(scored_rows.sum())
+    n_computed = int((scored_rows & computed_here).sum())
+    n_oof = int((scored_rows & from_oof).sum())
+    calibration = _calibration(
+        options, scored=n_scored, computed=n_computed, oof=n_oof,
+    )
+    months = (
+        int(np.unique(
+            core_postprocess.year_months_from_epoch(t[scored_rows & from_oof]),
+        ).size)
+        if calibration == "out-of-fold" else 0
+    )
+    if log:
+        log(
+            f"gauge reliability: {calibration} — {n_scored} scored row(s): "
+            f"{n_oof} out-of-fold write-back, {n_computed} computed here, "
+            f"{n_scored - n_oof - n_computed} stored otherwise"
+        )
     return {
         "curves": curves,
         "window": {
@@ -599,20 +583,27 @@ def gauge_reliability_from_decisions(
         "frame_age": None,
         "threshold_mm_h": None,
         "per_point_brier": per_point_brier,
-        "mode": _mode(options, held_out),
-        # Which claim the diagram is: ``out-of-fold`` means every
-        # prediction was made by a model refitted without the month it
-        # was scored on; ``in-sample`` means it was the served model's own
-        # output on its own training rows, which is a tautology and is
-        # labelled as one rather than quietly shown. ``served`` is the
-        # curve path, where the fit never saw a gauge at all.
-        "calibration": _calibration(options, held_out),
-        "cv_folds": int(n_folds),
-        "fold": "month" if n_folds else None,
-        # Rows a fold could not be fitted for, which fell back to the
-        # served model's own prediction. Non-zero means that many rows of
-        # the diagram are in-sample.
+        "mode": _mode(options, calibration),
+        # Which claim the diagram is — ``out-of-fold`` (every scored
+        # value an out-of-fold write-back of the served model), ``stored``
+        # (every value stored in the rows, none computed here), or
+        # ``in-sample`` (some computed here by the served model, which may
+        # have been fitted on them). ``served`` is the curve path, where
+        # the fit never saw a gauge at all.
+        "calibration": calibration,
+        # Months the out-of-fold rows span (0 unless ``out-of-fold``).
+        "cv_folds": months,
+        "fold": "month" if months else None,
+        # Scored (row, lead) cells whose value the served model computed
+        # here — in-sample. Non-zero means that many cells of the diagram
+        # describe the fit rather than measure the service.
         "in_sample_fallbacks": int(fallbacks),
+        # Additive: the scored rows by provenance.
+        "sources": {
+            "out_of_fold": n_oof,
+            "computed": n_computed,
+            "stored": n_scored - n_oof - n_computed,
+        },
         # Additive provenance: which column was scored, and over how many
         # files. The page ignores both; a human reading the archived
         # document should not have to guess.
@@ -655,6 +646,8 @@ __all__ = [
     "MODE_CURVE",
     "MODE_POSTPROCESS",
     "MODE_POSTPROCESS_CV",
+    "MODE_POSTPROCESS_OOF",
+    "MODE_POSTPROCESS_STORED",
     "N_BINS",
     "gauge_reliability_from_decisions",
 ]
