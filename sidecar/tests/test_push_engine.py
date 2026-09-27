@@ -155,12 +155,106 @@ def test_none_probability_never_counts_as_over() -> None:
     assert states[-1].streak == 0
 
 
-def test_none_probability_breaks_a_streak() -> None:
+def test_none_probability_is_no_observation() -> None:
     # A lead that went missing is not evidence of rain, and not evidence
-    # of dry either — but it must not carry a streak across the gap.
+    # of dry either. It is skipped, exactly as every replay skips a null
+    # row: the streak neither breaks nor advances across the gap.
     actions, states, _ = _drive([0.9, None, 0.9])
-    assert "notify" not in actions
-    assert states[-1].streak == 1
+    assert actions == ["none", "none", "notify"]
+    assert states[1].streak == 1
+
+
+def test_none_while_disarmed_does_not_start_the_dry_clock() -> None:
+    """A nodata gap after a push must not re-arm the subscription.
+
+    Before R2 a None reading started (or kept) the 60-minute dry clock, so
+    a six-frame nodata gap straight after a warning re-armed it and the
+    first wet frame after the gap warned again.
+    """
+    rules = Rules(persistence_obs=1, allclear_enabled=False)
+    probs = [0.9] + [None] * 7 + [0.9]
+    actions, states, _ = _drive(probs, rules=rules)
+    assert actions[0] == "notify"
+    assert all(s.below_since_utc is None for s in states[1:8])
+    assert all(s.streak == states[0].streak for s in states[1:8])
+    assert actions[-1] == "none" and states[-1].armed is False
+
+
+def _replay_skipping_nulls(probs, rules, *, threshold_pct=60, eta=None):
+    """The replays' contract: rows with a null probability are skipped."""
+    state = INITIAL_STATE
+    out = []
+    for i, p in enumerate(probs):
+        if p is None:
+            continue
+        obs = _obs(i, p, eta=eta)
+        decision = evaluate(
+            state, obs, threshold_pct=threshold_pct, quiet=None, tz=CPH,
+            now_utc=obs.radar_ts_utc + timedelta(minutes=2), rules=rules,
+        )
+        state = decision.state
+        out.append((i, decision.action, decision.state))
+    return out
+
+
+def _engine_over_everything(probs, rules, *, threshold_pct=60, eta=None):
+    state = INITIAL_STATE
+    out = []
+    for i, p in enumerate(probs):
+        obs = _obs(i, p, eta=eta)
+        decision = evaluate(
+            state, obs, threshold_pct=threshold_pct, quiet=None, tz=CPH,
+            now_utc=obs.radar_ts_utc + timedelta(minutes=2), rules=rules,
+        )
+        state = decision.state
+        if p is None:
+            assert decision.action == "none"
+            continue
+        out.append((i, decision.action, decision.state))
+    return out
+
+
+def _without_bookkeeping(state: SubState) -> SubState:
+    return SubState(
+        armed=state.armed, streak=state.streak,
+        below_since_utc=state.below_since_utc, last_eval_radar_ts=None,
+        notified=state.notified, below_streak=state.below_streak,
+        all_clear_sent=state.all_clear_sent,
+    )
+
+
+@pytest.mark.parametrize("seed", range(40))
+@pytest.mark.parametrize("persistence", [1, 2])
+def test_none_rows_are_equivalent_to_skipping_them(seed, persistence) -> None:
+    """Engine over a series WITH None rows == engine over the same series
+    with those rows REMOVED (the replays' behaviour), decision for decision
+    and state for state — apart from ``last_eval_radar_ts`` bookkeeping.
+
+    Random series mixing wet runs, dry spells long enough to re-arm and
+    nodata gaps both short and long, with the all-clear on.
+    """
+    rng = random.Random(seed * 7 + persistence)
+    probs: list[float | None] = []
+    while len(probs) < 300:
+        kind = rng.random()
+        run = rng.randint(1, 9)
+        if kind < 0.25:
+            probs += [None] * run
+        elif kind < 0.55:
+            probs += [rng.uniform(0.6, 1.0) for _ in range(run)]
+        else:
+            probs += [rng.uniform(0.0, 0.59) for _ in range(run)]
+    rules = Rules(persistence_obs=persistence, allclear_enabled=True)
+    eta = rng.choice([None, 20.0, 1.0])
+    engine = _engine_over_everything(probs, rules, eta=eta)
+    replay = _replay_skipping_nulls(probs, rules, eta=eta)
+    assert [(i, a) for i, a, _ in engine] == [(i, a) for i, a, _ in replay]
+    assert [_without_bookkeeping(s) for _, _, s in engine] == [
+        _without_bookkeeping(s) for _, _, s in replay
+    ]
+    # And the property is not vacuous: the series did fire and did re-arm.
+    actions = [a for _, a, _ in replay]
+    assert actions.count("notify") + actions.count("already_raining") >= 1
 
 
 def test_persistence_one_fires_on_the_first_wet_observation() -> None:

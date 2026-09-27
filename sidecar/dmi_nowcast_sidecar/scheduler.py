@@ -59,11 +59,24 @@ class CycleScheduler:
             except Exception as exc:  # noqa: BLE001
                 _log.warning("after_cycle_hook_failed", error=str(exc))
 
-    async def start(self, *, run_immediately: bool = True) -> None:
-        """Run an initial cycle (optional), then start the recurring trigger."""
-        if run_immediately:
+    async def start(
+        self, *, run_immediately: bool = True, wait: bool = True,
+    ) -> None:
+        """Run an initial cycle (optional), then start the recurring trigger.
+
+        ``wait=False`` does not await that first cycle: it is scheduled as
+        the job's first firing, right now, and runs in the background under
+        the same ``max_instances=1`` guard as every later one — so the app
+        can serve (``state.json`` from disk, ``/healthz``) while a cold
+        first cycle takes its minute.
+        """
+        first_run: dict = {}
+        if run_immediately and wait:
             _log.info("scheduler_starting", initial_cycle=True)
             await self._run_once()
+        elif run_immediately:
+            _log.info("scheduler_starting", initial_cycle=True, background=True)
+            first_run["next_run_time"] = datetime.now(timezone.utc)
         self._scheduler.add_job(
             self._run_once,
             trigger=IntervalTrigger(
@@ -74,6 +87,7 @@ class CycleScheduler:
             replace_existing=True,
             max_instances=1,  # don't overlap if a cycle runs long
             coalesce=True,    # drop missed firings instead of running them all
+            **first_run,
         )
         self._scheduler.start()
         _log.info(

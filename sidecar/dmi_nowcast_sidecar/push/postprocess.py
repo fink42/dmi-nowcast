@@ -156,6 +156,31 @@ def _structural_problem(model: PostprocessModel) -> str | None:
     return None
 
 
+def document_problem(text: str, target: str) -> str | None:
+    """Why ``text`` cannot be served in a ``target`` slot, or None.
+
+    The same checks :meth:`PostprocessTable.load` makes — parse, at least
+    one fitted lead, :func:`_structural_problem`, the slot's target — as
+    one reason string, for a writer (``sync``) that must refuse a file
+    BEFORE it replaces the one in service.
+    """
+    try:
+        model = PostprocessModel.loads(text)
+    except Exception as exc:  # noqa: BLE001 — every way a file can be junk
+        return f"{type(exc).__name__}: {exc}"
+    if not model.models:
+        return "the document carries no fitted lead"
+    reason = _structural_problem(model)
+    if reason is not None:
+        return reason
+    if str(model.target) != str(target):
+        return (
+            f"the document's target is {model.target!r} but this slot "
+            f"serves {str(target)!r}"
+        )
+    return None
+
+
 class PostprocessTable:
     """The fitted model, hot-reloaded from one file.
 
@@ -225,22 +250,57 @@ class PostprocessTable:
     # -- loading -----------------------------------------------------------
 
     def load(self) -> PostprocessModel | None:
-        """Read and validate the file. Never raises; logs one line."""
+        """Read and validate the file. Never raises; logs one line.
+
+        **One assignment, after validation.** The parse takes seconds on
+        the production model, and readers on other threads (``/forecast``,
+        the routes) look at :attr:`model` meanwhile — so the new document
+        is parsed and checked into a local and swapped in only when it is
+        good. A file that is present but unusable keeps the model already
+        in service (and says so); only a file that is GONE clears it,
+        because then the operator removed it on purpose. Returns the newly
+        loaded model, or None when nothing new was loaded.
+        """
         self._loaded = True
         self._dirty = False
         self._stamp = None if self.path is None else _file_stamp(self.path)
-        self._model = None
         if self.path is None:
+            self._model = None
             _log.info("push_postprocess_missing", path=None)
             return None
         try:
             text = self.path.read_text(encoding="utf-8")
-        except OSError:
+        except FileNotFoundError:
             # Not an error: a deployment that has not fitted yet, or the
             # public instance before its first sync. The engine falls back
             # to the curve, which is the rule that shipped.
+            self._model = None
             _log.info("push_postprocess_missing", path=str(self.path))
             return None
+        except OSError as exc:
+            self._keep_previous(f"{type(exc).__name__}: {exc}")
+            return None
+        model = self._parse(text)
+        if model is None:
+            self._keep_previous("the document failed validation")
+            return None
+        self._model = model
+        self._log_loaded(model)
+        return model
+
+    def _keep_previous(self, why: str) -> None:
+        """The new file is unusable: keep serving what is loaded, loudly."""
+        if self._model is not None:
+            _log.warning(
+                "push_postprocess_kept_previous",
+                path=str(self.path),
+                error=why,
+                kept_fitted_at=self.fitted_at_utc,
+                slot=self.target,
+            )
+
+    def _parse(self, text: str) -> PostprocessModel | None:
+        """``text`` → a model this slot can serve, or None (logged)."""
         try:
             model = PostprocessModel.loads(text)
         except Exception as exc:  # noqa: BLE001 — every way a file can be junk
@@ -287,7 +347,9 @@ class PostprocessTable:
                 ),
             )
             return None
-        self._model = model
+        return model
+
+    def _log_loaded(self, model: PostprocessModel) -> None:
         _log.info(
             "push_postprocess_loaded",
             path=str(self.path),
@@ -313,7 +375,6 @@ class PostprocessTable:
             masks_own_gauge=model.masks_own_gauge,
             columns=len(model.feature_names),
         )
-        return model
 
     def note_changed(self) -> None:
         """Ask for a re-read at the next :meth:`maybe_reload`.
@@ -864,6 +925,7 @@ __all__ = [
     "PostprocessTable",
     "ProbabilitySource",
     "build_cycle_postprocess",
+    "document_problem",
     "neighbour_features_for",
     "point_key",
     "score_point",

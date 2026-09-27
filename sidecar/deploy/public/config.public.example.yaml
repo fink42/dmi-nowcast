@@ -157,11 +157,23 @@ push:
   default_lead_min: 30
   default_quiet_start: "22:00"
   default_quiet_end: "07:00"
-  # Fan-out is sequential inside the cycle, so this is a latency budget as
-  # much as a storage one. Raise both together if it is ever reached.
+  # The fan-out runs inside the cycle's budget (fanout_workers concurrent
+  # sends), so this is a latency budget as much as a storage one. Raise
+  # them together if it is ever reached.
   max_subscriptions: 200
   fanout_budget_s: 20.0
+  fanout_workers: 8
   ttl_s: 900
+  # Abuse limits on /api/push/* (push.limits): 413 over max_request_bytes
+  # before any parsing; subscribe/unsubscribe/test limited per client
+  # (CF-Connecting-IP behind Cloudflare) to rate_limit_per_min, 0 = off.
+  max_request_bytes: 16384
+  rate_limit_per_min: 10
+  # Dead-row collection (push.store.record_send): gc_max_failures
+  # consecutive 4xx answers (404/410 delete at once; 408/429 and 5xx are
+  # transient), or gc_stale_days of nothing but failed sends.
+  gc_max_failures: 5
+  gc_stale_days: 14
   # The rule's timing, configured once here and read by everything that
   # replays it. Both values are the defaults from
   # dmi_nowcast_core.push_rules and are spelled out only because this

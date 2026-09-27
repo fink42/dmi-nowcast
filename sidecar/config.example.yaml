@@ -189,6 +189,17 @@ lightning:
 #     - notify.windows.com
 #   ttl_s: 900              # push service holds an undelivered message this long
 #   fanout_budget_s: 20.0   # per-cycle wall-clock budget for the fan-out
+#   fanout_workers: 8       # concurrent sends (one keep-alive session per host)
+#   # Abuse limits on /api/push/*: bodies over max_request_bytes are 413
+#   # before parsing; subscribe/unsubscribe/test are rate-limited per client
+#   # (CF-Connecting-IP, else the peer) to rate_limit_per_min (0 = off).
+#   max_request_bytes: 16384
+#   rate_limit_per_min: 10
+#   # Dead-row collection: delete after gc_max_failures consecutive 4xx
+#   # (not 404/410, which delete at once; not 408/429), or when every send
+#   # for gc_stale_days has failed. Rows never sent to are never collected.
+#   gc_max_failures: 5
+#   gc_stale_days: 14
 #   # The rule's timing, and the ONLY place either number is configured:
 #   # the station scoreboard, the quality page's scoreboard, the nightly
 #   # threshold fit and the manual fit script all read these two rather

@@ -596,6 +596,25 @@ class PushConfig(BaseModel):
     # queued when it expires is dropped (and counted), never allowed to
     # delay the next cycle.
     fanout_budget_s: Annotated[float, Field(gt=0, le=300)] = 20.0
+    # Concurrent sends within that budget (one keep-alive session per push
+    # host, shared by these workers).
+    fanout_workers: Annotated[int, Field(ge=1, le=64)] = 8
+    # Abuse limits on the /api/push/* routes. A request body larger than
+    # ``max_request_bytes`` is answered 413 before any JSON parsing (a real
+    # subscribe body is well under 2 KB). ``rate_limit_per_min`` is an
+    # in-process token bucket per client (``CF-Connecting-IP`` when
+    # present, else the peer address) over subscribe / unsubscribe / test:
+    # that many requests of burst, refilled at that many per minute; 0
+    # turns it off. 429 with ``Retry-After`` when empty.
+    max_request_bytes: Annotated[int, Field(ge=1024, le=1_048_576)] = 16_384
+    rate_limit_per_min: Annotated[int, Field(ge=0, le=10_000)] = 10
+    # Garbage collection of dead subscriptions (``push.store.record_send``):
+    # a row is deleted after ``gc_max_failures`` consecutive NON-transient
+    # send failures (any 4xx or 3xx except 408/429; a 404/410 deletes the
+    # row at once), or when every delivery attempt for ``gc_stale_days``
+    # has failed. A row nobody tried to send to is never collected.
+    gc_max_failures: Annotated[int, Field(ge=1, le=100)] = 5
+    gc_stale_days: Annotated[float, Field(gt=0, le=365)] = 14.0
     # Decision-engine rules (see ``push.engine``): how long a notified
     # subscription stays disarmed, and how many consecutive observations
     # above threshold are required before firing.

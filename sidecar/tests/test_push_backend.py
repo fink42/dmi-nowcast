@@ -64,8 +64,12 @@ SUBJECT = "mailto:ops@example.com"
 
 ENDPOINT_A = "https://fcm.googleapis.com/fcm/send/AAAAAAAAAAA-token-a"
 ENDPOINT_B = "https://updates.push.services.mozilla.com/wpush/v2/token-b"
-P256DH = "B" + "x" * 86
-AUTH = "y" * 22
+# A real uncompressed P-256 point and a 16-byte auth secret: the
+# subscribe route decodes and checks both.
+P256DH = (
+    "BD7Xoo7GSO3OXVt-JS9rKq-7RINRFKJLPKqPcQ9kmTvCVxGjTNySKQgLY58Jl3_rfKkezOFkm_6orYXHKyBq3n4"
+)
+AUTH = "AAECAwQFBgcICQoLDA0ODw"
 
 PEM_HEADER = b"-----BEGIN PRIVATE KEY-----"
 SQLITE_MAGIC = b"SQLite format 3"
@@ -489,8 +493,9 @@ ALLOWED = [
     "https://notify.windows.com/w/?token=abc",
     # A subdomain of an allowed suffix is fine.
     "https://eu.fcm.googleapis.com/fcm/send/abc",
-    # Trailing-dot FQDN and an uppercase host normalise.
-    "https://FCM.googleapis.com./fcm/send/abc",
+    # An uppercase host normalises; an explicit :443 is the default port.
+    "https://FCM.googleapis.com/fcm/send/abc",
+    "https://fcm.googleapis.com:443/fcm/send/abc",
 ])
 def test_endpoint_policy_accepts_vendor_hosts(url: str) -> None:
     assert validate_endpoint(url, ALLOWED) is None
@@ -511,6 +516,25 @@ def test_endpoint_policy_accepts_vendor_hosts(url: str) -> None:
     "file:///etc/passwd",
     "",
     "   ",
+    # Parser-differential bypasses (R2): urllib.parse reads an allowed
+    # suffix, urllib3/requests would connect to 127.0.0.1.
+    "https://127.0.0.1\\.fcm.googleapis.com/x",
+    "https://127.0.0.1%5C.fcm.googleapis.com/x",
+    "https://127.0.0.1%2Efcm.googleapis.com/x",
+    "https://127.0.0.1\u3002fcm.googleapis.com/x",     # ideographic full stop
+    "https://127.0.0.1\uff0efcm.googleapis.com/x",     # fullwidth full stop
+    "https://fcm.googleapis.com./fcm/send/abc",          # trailing dot
+    "https://127.0.0.1./x",
+    "https://fcm.googleapis.com@127.0.0.1/x",            # userinfo
+    "https://fcm.googleapis.com:@127.0.0.1/x",
+    "https://127.0.0.1#@fcm.googleapis.com/x",
+    "https://127.0.0.1?@fcm.googleapis.com/x",
+    "https://fcm.googleapis.com\t/x",
+    " https://fcm.googleapis.com/x",
+    "https://fcm.googleapis.com/x\n",
+    "https://fcm..googleapis.com/x",
+    "https://0x7f000001/x",
+    "https://2130706433/x",
 ])
 def test_endpoint_policy_rejects(url: str) -> None:
     reason = validate_endpoint(url, ALLOWED)
@@ -1418,16 +1442,35 @@ async def test_no_all_clear_for_a_warning_that_was_never_delivered(
     assert suppressed[0]["reason"] == "warning_not_delivered"
 
 
-async def test_no_all_clear_when_the_budget_skipped_the_warning(
+async def test_a_warning_the_budget_skipped_is_retried_not_marked_sent(
     service: PushService, seeded_engine: CycleEngine, sends: list[dict],
 ) -> None:
-    """A warning the fan-out budget dropped was decided but never sent."""
+    """A warning the fan-out budget dropped was decided but never ATTEMPTED.
+
+    Since R2 its row is written back to the state before the observation
+    (still armed, no ``last_notified_utc``), so the next wet observation
+    fires it — rather than the row reading "notified" for a warning that
+    was never sent, and the subscriber hearing nothing.
+    """
+    service.config.push.persistence_obs = DEFAULT_PERSISTENCE_OBS
     service.config.push.fanout_budget_s = 1e-9
-    await _warn_then_two_dry_frames(service, seeded_engine)
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS)))
     assert sends == []
+    assert service.last_fanout["skipped"] == 1  # type: ignore[index]
     row = service.store.get(ENDPOINT_A)
-    assert row is not None and row.last_warning_delivered is False
-    assert service.last_fanout["all_clear_suppressed"] == 1  # type: ignore[index]
+    assert row is not None
+    assert row.armed is True and row.notified is False
+    assert row.last_notified_utc is None and row.last_eval_radar_ts is None
+
+    service.config.push.fanout_budget_s = 20.0
+    seeded_engine._national_latest = (
+        seeded_engine.national_latest[0], RADAR_TS2,  # type: ignore[index]
+    )
+    await service.after_cycle(CycleResult(state=_state_with(RADAR_TS2)))
+    assert [c["payload"]["type"] for c in sends] == ["rain_incoming"]
+    row = service.store.get(ENDPOINT_A)
+    assert row is not None and row.last_warning_delivered is True
+    assert row.armed is False
 
 
 async def test_all_clear_off_sends_only_the_warning(

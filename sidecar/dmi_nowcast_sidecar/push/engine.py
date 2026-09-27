@@ -53,6 +53,12 @@ The contract mirrors the Home Assistant integration:
   all-clear changes no arming decision, so every notify the machine
   makes is the one it made before the all-clear existed. Quiet hours do
   not defer it — it is delivered silently.
+- **no reading is no observation.** An observation whose decision
+  probability is ``None`` (nodata, off coverage, an unserved lead) changes
+  nothing but ``last_eval_radar_ts``: armed or disarmed, streak, dry clock
+  and all-clear count stay exactly as they were. That is the replays'
+  rule — they skip such rows — so the engine over a series with gaps and
+  the replay over the same series without them make the same decisions.
 
 Since Phase H the *probability* the rule reads is a choice, not a
 constant: ``Observation.p_source`` selects between the served
@@ -371,6 +377,28 @@ def evaluate(
     # H-P change on this path is which probability ``p_decision`` returns,
     # and ``evaluate`` stays pure and unaware of the choice.
     decision_p = obs.p_decision
+    if decision_p is None:
+        # No reading is no observation: nodata, off coverage, a lead this
+        # cycle did not serve. It neither advances nor breaks anything —
+        # not the persistence streak, not the dry clock that re-arms a
+        # disarmed subscription, not the all-clear count — exactly as the
+        # replays (``threshold_sweep.replay_station``, the ETA-revision
+        # study) SKIP a row with a null probability. Starting the dry clock
+        # here would re-arm during a nodata gap and repeat the warning.
+        # Only the evaluated-timestamp bookkeeping moves, so the frame is
+        # not looked at twice.
+        return Decision(
+            SubState(
+                armed=state.armed,
+                streak=state.streak,
+                below_since_utc=state.below_since_utc,
+                last_eval_radar_ts=obs.radar_ts_utc,
+                notified=state.notified,
+                below_streak=state.below_streak,
+                all_clear_sent=state.all_clear_sent,
+            ),
+            "none",
+        )
     over = is_over(obs, threshold_pct, onset_threshold_pct, single_threshold_pct)
 
     if not state.armed:

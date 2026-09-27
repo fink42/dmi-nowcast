@@ -24,19 +24,34 @@ allow-list, so in public mode they 404 without the key):
 Every route answers ``503`` while push is disabled (or failed to
 initialise), never ``404`` — the routes exist, the feature does not.
 
-Validation is layered: pydantic handles shapes and bounds (422), the
-handler handles anything that depends on configuration or on the radar
-grid (400 with a readable ``detail``). Nothing is written unless every
-check passed.
+Validation is layered: ``push.limits`` answers an oversize body (413) or
+a client over its rate (429) before anything is parsed; pydantic handles
+shapes and bounds (422); the handler handles anything that depends on
+configuration, on the radar grid or on the key material (400 with a
+readable ``detail``) — ``p256dh`` must decode to an uncompressed point on
+P-256 and ``auth`` to 16 bytes, as every browser sends them. Nothing is
+written unless every check passed.
+
+**The routes never reload the engine's tables.** The two
+post-processing tables they are handed are the ones the cycle scores
+with, and the cycle is their only reloader: a request that re-parsed a
+7 MB model on a worker thread while the cycle scored with it would be two
+writers racing one swap. A router built WITHOUT them (a test, a script)
+owns its own and loads each once. The threshold table is different — a
+small JSON document swapped in one assignment, which the routes may
+re-stat as they always did, so a refit is visible without a cycle.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from cryptography.hazmat.primitives.asymmetric import ec
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 from dmi_nowcast_core.postprocess import TARGET_ONSET
@@ -69,6 +84,42 @@ _HHMM = r"^(?:[01]\d|2[0-3]):[0-5]\d$"
 # cannot fill the SQLite file.
 _MAX_ENDPOINT = 2048
 _MAX_KEY = 512
+
+
+_B64URL = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+
+def _b64url_decode(value: str) -> bytes | None:
+    """Strict base64url (trailing padding optional) → bytes, or None."""
+    text = value.rstrip("=")
+    if not text or any(ch not in _B64URL for ch in text):
+        return None
+    try:
+        return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (binascii.Error, ValueError):
+        return None
+
+
+def key_problem(p256dh: str, auth: str) -> str | None:
+    """Why these subscription keys cannot be used, or None.
+
+    ``p256dh`` is the browser's ECDH public key: 65 bytes, uncompressed
+    (``0x04``), and a real point on P-256 — anything else would fail at
+    encryption time on every send. ``auth`` is the 16-byte auth secret.
+    """
+    raw = _b64url_decode(p256dh)
+    if raw is None or len(raw) != 65 or raw[0] != 0x04:
+        return "keys.p256dh must be a base64url uncompressed P-256 point"
+    try:
+        ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
+    except ValueError:
+        return "keys.p256dh is not a point on P-256"
+    secret = _b64url_decode(auth)
+    if secret is None or len(secret) != 16:
+        return "keys.auth must be 16 bytes, base64url"
+    return None
 
 
 def _require_api_key(request: Request) -> None:
@@ -278,6 +329,8 @@ def build_router(
     table = thresholds if thresholds is not None else ThresholdTable(
         resolved_thresholds_path(config),
     )
+    #: Model tables this router constructed itself — the only ones it loads.
+    own_tables: list[Any] = []
     # The engine's own post-processing table (Phase H), so what /options
     # reports is the model the fan-out actually scored with. A router
     # built without one reports the file on disk; one built with neither
@@ -286,6 +339,8 @@ def build_router(
     post_table = postprocess if postprocess is not None else PostprocessTable(
         resolved_postprocess_path(config),
     )
+    if postprocess is None:
+        own_tables.append(post_table)
     # S11: the push-only onset model, for the same reason — whether the
     # onset AND rule can actually be applied decides what /options shows.
     onset_table = (
@@ -294,6 +349,14 @@ def build_router(
             resolved_onset_model_path(config), target=TARGET_ONSET,
         )
     )
+    if onset_postprocess is None:
+        own_tables.append(onset_table)
+
+    async def _load_own_tables() -> None:
+        """Load (once) the tables nobody else loads. Never a shared one."""
+        for own in own_tables:
+            if not own.loaded:
+                await asyncio.to_thread(own.maybe_reload)
 
     def _onset_active() -> bool:
         return (
@@ -365,8 +428,7 @@ def build_router(
         response.headers.update(_CACHE_5_MIN)
         leads = lead_options(config)
         await asyncio.to_thread(table.maybe_reload)
-        await asyncio.to_thread(post_table.maybe_reload)
-        await asyncio.to_thread(onset_table.maybe_reload)
+        await _load_own_tables()
         active = (
             config.push.probability_source == "postprocess" and post_table.active
         )
@@ -431,6 +493,8 @@ def build_router(
 
         reason = validate_endpoint(
             body.subscription.endpoint, pc.allowed_endpoint_host_suffixes,
+        ) or key_problem(
+            body.subscription.keys.p256dh, body.subscription.keys.auth,
         )
         if reason is not None:
             raise HTTPException(status_code=400, detail=reason)
@@ -482,7 +546,7 @@ def build_router(
             effective, source = int(body.threshold_pct), "override"
         else:
             await asyncio.to_thread(table.maybe_reload)
-            await asyncio.to_thread(onset_table.maybe_reload)
+            await _load_own_tables()
             # What the subscriber is shown; on the onset AND rule the
             # onset threshold (see ``ThresholdTable.headline``).
             effective, source, _onset = table.headline(
@@ -565,5 +629,6 @@ __all__ = [
     "PushOptionsResponse",
     "SubscribeRequest",
     "build_router",
+    "key_problem",
     "lead_options",
 ]

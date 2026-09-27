@@ -53,8 +53,12 @@ SUBJECT = "mailto:ops@example.com"
 HOME_LAT, HOME_LON = 55.33, 10.32
 ENDPOINT_A = "https://fcm.googleapis.com/fcm/send/AAAAAAAAAAA-token-a"
 ENDPOINT_B = "https://updates.push.services.mozilla.com/wpush/v2/token-b"
-P256DH = "B" + "x" * 86
-AUTH = "y" * 22
+# A real uncompressed P-256 point and a 16-byte auth secret: the
+# subscribe route decodes and checks both.
+P256DH = (
+    "BD7Xoo7GSO3OXVt-JS9rKq-7RINRFKJLPKqPcQ9kmTvCVxGjTNySKQgLY58Jl3_rfKkezOFkm_6orYXHKyBq3n4"
+)
+AUTH = "AAECAwQFBgcICQoLDA0ODw"
 RADAR_TS = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
 
 

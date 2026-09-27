@@ -75,8 +75,12 @@ LEADS = (10, 20, 30, 45, 60)
 HOME_LAT, HOME_LON = 55.33, 10.32
 ENDPOINT_A = "https://fcm.googleapis.com/fcm/send/AAAAAAAAAAA-token-a"
 ENDPOINT_B = "https://updates.push.services.mozilla.com/wpush/v2/token-b"
-P256DH = "B" + "x" * 86
-AUTH = "y" * 22
+# A real uncompressed P-256 point and a 16-byte auth secret: the
+# subscribe route decodes and checks both.
+P256DH = (
+    "BD7Xoo7GSO3OXVt-JS9rKq-7RINRFKJLPKqPcQ9kmTvCVxGjTNySKQgLY58Jl3_rfKkezOFkm_6orYXHKyBq3n4"
+)
+AUTH = "AAECAwQFBgcICQoLDA0ODw"
 SUBJECT = "mailto:ops@example.com"
 
 
@@ -1460,8 +1464,8 @@ class TestTheFanOutUsesTheModel:
         sent: list[dict] = []
         monkeypatch.setattr(
             service_mod.PushService, "_fanout",
-            lambda self, pending: (
-                sent.extend(payload for _sub, payload, *_ in pending)
+            lambda self, pending, now_utc: (
+                sent.extend(item.payload for item in pending)
                 or {"sent": len(pending), "failed": 0,
                     "removed": 0, "skipped": 0}
             ),
@@ -1765,6 +1769,8 @@ class TestTheServedModel:
         assert body["postprocess_fitted_at_utc"] is None
 
         _write_model(resolved_postprocess_path(served_config))
+        # The routes never reload the engine's table; the next cycle does.
+        served_client.app.state.engine.postprocess.maybe_reload()
         body = served_client.get("/api/push/options").json()
         assert body["probability_source"] == "postprocess"
         assert body["postprocess_fitted_at_utc"] == "2026-09-11T03:40:00+00:00"

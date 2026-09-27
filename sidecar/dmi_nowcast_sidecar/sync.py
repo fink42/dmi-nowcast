@@ -52,8 +52,24 @@ keeps serving yesterday's report; the document carries its own
 truncating or blanking a served file because a fetch failed, turns one
 instance's outage into the other's.
 
-Writes are tmp + rename in the target directory, so a route reading the
-file concurrently sees either the old document or the new one.
+**Validated before it is swapped in.** "Valid JSON" is not "a file the
+reader can use": a curve file with no curves, a thresholds document of the
+wrong schema, a post-processing model fitted to the other target, all
+parse. So each body is written to a temporary file (fsynced), checked with
+the loader the consumer itself uses — ``load_calibration_curves`` for the
+curves, ``validate_thresholds`` for the thresholds, the
+``PostprocessTable`` checks (structure + the slot's target: ``wet`` for
+``postprocess.json``, ``onset`` for ``postprocess_push.json``) for the two
+models, a minimal shape for the catalogue and the quality report — and
+only then renamed over the target. The replaced file is kept beside it as
+``<name>.prev`` (hard link, so there is never an instant with no file).
+A rejected body leaves the file in service untouched; its ETag is
+remembered and sent back, so the same bad body is not re-downloaded every
+interval. Hashing, parsing and writing all run in ``asyncio.to_thread`` —
+the model is ~7 MB and takes seconds to parse.
+
+The private routes answer ``If-None-Match`` with ``304`` (``app.py``), so
+an unchanged file costs one round trip, not a download.
 
 Async discipline: httpx async for the fetch, ``asyncio.to_thread`` for
 every disk write, its own ``AsyncIOScheduler`` so a slow private instance
@@ -65,15 +81,20 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import httpx
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+
+from dmi_nowcast_core.calibrate import load_calibration_curves
+from dmi_nowcast_core.postprocess import TARGET_ONSET, TARGET_WET
+from dmi_nowcast_core.push_thresholds import validate_thresholds
 
 from .config import Config
 from .gauge_history import resolved_gauge_points_path
@@ -99,6 +120,7 @@ THRESHOLDS_FILE = "calibration/push_thresholds.json"
 POSTPROCESS_FILE = "calibration/postprocess.json"
 ONSET_MODEL_FILE = "calibration/postprocess_push.json"
 STATION_POINTS_FILE = "stations/station_points.json"
+QUALITY_FILE = "nowcast/quality.json"
 
 
 def target_path(config: Config, name: str) -> Path:
@@ -130,16 +152,133 @@ def target_path(config: Config, name: str) -> Path:
     return Path(config.storage.data_dir).joinpath(*PurePosixPath(name).parts)
 
 
-def _write_atomic(path: Path, data: bytes) -> None:
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def validation_problem(name: str, path: Path) -> str | None:
+    """Why the file at ``path`` must not be installed as ``name``, or None.
+
+    Uses the consumer's own loader wherever there is one. ``path`` is the
+    candidate (a temporary file), never the file in service.
+    """
+    if not name.endswith(".json"):
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+        doc = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"not valid JSON: {exc}"
+    if name == CURVES_FILE:
+        curves_block = doc.get("curves") if isinstance(doc, dict) else None
+        if not isinstance(curves_block, dict) or not curves_block:
+            return "rejected: not a calibration-curve document (no curves)"
+        try:
+            curves = load_calibration_curves(path)
+        except Exception as exc:  # noqa: BLE001 — every way a curve is junk
+            return f"rejected: curves do not load: {type(exc).__name__}: {exc}"
+        if len(curves) != len(curves_block):
+            return "rejected: curves do not load"
+        return None
+    if name == THRESHOLDS_FILE:
+        problems = validate_thresholds(doc)
+        if problems:
+            return "rejected: " + "; ".join(problems[:3])
+        return None
+    if name in (POSTPROCESS_FILE, ONSET_MODEL_FILE):
+        # Imported here: the push package pulls numpy-heavy model code that
+        # an instance syncing only the quality report never needs.
+        from .push.postprocess import document_problem
+
+        target = TARGET_WET if name == POSTPROCESS_FILE else TARGET_ONSET
+        problem = document_problem(text, target)
+        return None if problem is None else f"rejected: {problem}"
+    if name == STATION_POINTS_FILE:
+        points = doc.get("points") if isinstance(doc, dict) else None
+        if not isinstance(points, list) or not points:
+            return "rejected: no points"
+        try:
+            for entry in points:
+                str(entry["id"])
+                float(entry["lat"])
+                float(entry["lon"])
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"rejected: malformed point: {type(exc).__name__}"
+        return None
+    if name == QUALITY_FILE:
+        if not isinstance(doc, dict) or "schema_version" not in doc:
+            return "rejected: not a quality report (no schema_version)"
+        return None
+    return None
+
+
+def _keep_previous(path: Path) -> None:
+    """``path`` → ``path.prev``, leaving ``path`` itself in place."""
+    prev = path.with_name(path.name + ".prev")
+    staging = path.with_name(f".{path.name}.prev.tmp")
+    try:
+        if staging.exists():
+            staging.unlink()
+        os.link(path, staging)
+        os.replace(staging, prev)
+    except OSError:
+        shutil.copy2(path, prev)
+
+
+def _fsync_dir(directory: Path) -> None:
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def install_file(
+    path: Path, name: str, body: bytes, known_digest: str | None,
+) -> tuple[str, str | None, str]:
+    """Validate ``body`` and swap it in. ``(status, error, sha256)``. Blocking.
+
+    ``status`` is ``"unchanged"`` (same bytes as the file in service),
+    ``"updated"`` or ``"failed"`` (``error`` says why; nothing touched).
+    Order: hash → tmp write + fsync → validate the tmp with the real
+    loader → hard-link the old file to ``.prev`` → rename → fsync the dir.
+    """
+    digest = hashlib.sha256(body).hexdigest()
+    current = known_digest if known_digest is not None else _sha256_file(path)
+    if digest == current and path.is_file():
+        return "unchanged", None, digest
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp",
+    )
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        problem = validation_problem(name, Path(tmp))
+        if problem is not None:
+            return "failed", problem, digest
+        if path.is_file():
+            _keep_previous(path)
         os.replace(tmp, path)
+        _fsync_dir(path.parent)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+    return "updated", None, digest
 
 
 @dataclass
@@ -190,6 +329,9 @@ class ArtifactSync:
         self._owns_client = client is None
         #: file name → (etag, sha256) of the copy currently on disk.
         self._seen: dict[str, tuple[str | None, str | None]] = {}
+        #: file name → ETag of the last body REJECTED by validation, sent
+        #: back so the same bad body is answered 304, not re-downloaded.
+        self._rejected: dict[str, str] = {}
         self._on_file_updated = on_file_updated
         self._scheduler = AsyncIOScheduler(timezone=timezone.utc)
         self._started = False
@@ -215,7 +357,8 @@ class ArtifactSync:
     async def sync_file(self, name: str) -> SyncFileResult:
         """Fetch one file if it changed; never raise, never clobber on failure."""
         etag, digest = self._seen.get(name, (None, None))
-        headers = {"If-None-Match": etag} if etag else {}
+        tags = [tag for tag in (etag, self._rejected.get(name)) if tag]
+        headers = {"If-None-Match": ", ".join(tags)} if tags else {}
         try:
             response = await self._get_client().get(
                 self.url_for(name), headers=headers,
@@ -238,29 +381,29 @@ class ArtifactSync:
                 error=f"body of {len(body)} bytes exceeds max_bytes "
                       f"{self.settings.max_bytes}",
             )
-        if name.endswith(".json"):
-            # A body that is not the document it claims to be — a proxy's
-            # HTML error page, a truncated write at the source — must not
-            # replace a good file.
-            try:
-                json.loads(body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                return SyncFileResult(
-                    name, "failed", 200, error=f"not valid JSON: {exc}",
-                )
-        new_digest = hashlib.sha256(body).hexdigest()
+        # A body that is not the document it claims to be — a proxy's HTML
+        # error page, a truncated write, a model of the wrong target — must
+        # not replace a good file: ``install_file`` validates it with the
+        # consumer's own loader first, off the loop.
         path = target_path(self.config, name)
-        if new_digest == digest and path.is_file():
-            # No ETag from the source, but the bytes are the ones we have.
-            self._seen[name] = (response.headers.get("ETag"), new_digest)
-            return SyncFileResult(name, "unchanged", 200)
         try:
-            await asyncio.to_thread(_write_atomic, path, body)
+            status, problem, new_digest = await asyncio.to_thread(
+                install_file, path, name, body, digest,
+            )
         except Exception as exc:  # noqa: BLE001
             return SyncFileResult(
                 name, "failed", 200, error=f"{type(exc).__name__}: {exc}",
             )
-        self._seen[name] = (response.headers.get("ETag"), new_digest)
+        new_etag = response.headers.get("ETag")
+        if status == "failed":
+            if new_etag:
+                self._rejected[name] = new_etag
+            return SyncFileResult(name, "failed", 200, error=problem)
+        self._rejected.pop(name, None)
+        self._seen[name] = (new_etag, new_digest)
+        if status == "unchanged":
+            # No ETag from the source, but the bytes are the ones we have.
+            return SyncFileResult(name, "unchanged", 200)
         return SyncFileResult(name, "updated", 200, bytes_written=len(body))
 
     # -- one cycle --------------------------------------------------------
@@ -301,9 +444,17 @@ class ArtifactSync:
 
     # -- lifecycle --------------------------------------------------------
 
-    async def start(self, *, run_immediately: bool = True) -> None:
-        if run_immediately:
+    async def start(
+        self, *, run_immediately: bool = True, wait: bool = True,
+    ) -> None:
+        """Start the interval job; the first pass awaited, or (``wait=False``)
+        scheduled right now in the background so app start-up is not held
+        by a slow or absent peer."""
+        first_run: dict = {}
+        if run_immediately and wait:
             await self._run_once()
+        elif run_immediately:
+            first_run["next_run_time"] = datetime.now(timezone.utc)
         self._scheduler.add_job(
             self._run_once,
             trigger=IntervalTrigger(
@@ -313,6 +464,7 @@ class ArtifactSync:
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            **first_run,
         )
         self._scheduler.start()
         self._started = True
@@ -387,11 +539,14 @@ __all__ = [
     "CURVES_FILE",
     "ONSET_MODEL_FILE",
     "POSTPROCESS_FILE",
+    "QUALITY_FILE",
     "STATION_POINTS_FILE",
     "THRESHOLDS_FILE",
     "ArtifactSync",
     "SyncFileResult",
     "SyncResult",
     "build_artifact_sync",
+    "install_file",
     "target_path",
+    "validation_problem",
 ]

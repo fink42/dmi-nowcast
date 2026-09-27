@@ -1326,8 +1326,12 @@ class TestArtifactSync:
     def test_a_200_lands_every_file_in_its_own_place(
         self, tmp_path: Path,
     ) -> None:
+        from tests import test_push_postprocess as tpp
+
         config = _sync_config(tmp_path)
-        model = {"schema_version": 1, "models": {}}
+        # A real wet-target model: since R2 the sync validates a model with
+        # the slot's own checks before it replaces the file in service.
+        model = json.loads(tpp._model().dumps())
         peer = _Peer({
             QUALITY_FILE: [_ok(DOC)],
             CURVES_FILE: [_ok(CURVES)],

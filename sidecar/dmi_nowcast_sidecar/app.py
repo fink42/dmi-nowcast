@@ -2,7 +2,11 @@
 
 Endpoints (phase B):
 
-- ``GET /healthz`` — liveness; reports ``last_cycle`` timestamp.
+- ``GET /healthz`` — liveness; reports ``last_cycle`` timestamp. 200 as
+  soon as the app serves: the first cycle runs in the background after
+  start-up (``last_cycle`` is seeded from ``state.json`` on disk, null on
+  a first-ever start), so readiness for data is ``last_cycle``, not the
+  status code.
 - ``GET /state.json`` — latest nowcast state per :class:`State` schema.
 
 Website Phase A (§A3) adds the national surface:
@@ -23,6 +27,11 @@ Phase F (F4) adds the verification surface:
 - ``GET /stations/station_points.json`` — the gauge catalogue the
   ``ng_*`` features resolve stations with (v2, S5). PRIVATE, and for the
   same reason: the public instance pulls it rather than building it.
+
+Those published files carry an ``ETag`` (``mtime_ns``-``size``) and
+answer a matching ``If-None-Match`` with ``304``, so the public
+instance's ``sync`` does not re-download a 7 MB model every interval.
+Every file route reads its bytes in a worker thread, never on the loop.
 
 Website Phase D adds the Web Push surface (see ``push/routes.py``):
 
@@ -82,6 +91,7 @@ fetch in the cycle (see ``compute.py``): both exist only to feed
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -127,6 +137,7 @@ from .push.paths import (
     resolved_postprocess_path,
     resolved_thresholds_path,
 )
+from .push.limits import PushLimitsMiddleware
 from .push.routes import build_router as build_push_router
 from .push.thresholds import ThresholdTable
 from .quality_report import (
@@ -214,11 +225,15 @@ def create_app(
         app.state.started_at = datetime.now(timezone.utc)
         app.state.last_cycle_at = None
         app.state.last_error = None
-        # Seed last_cycle_at from any persisted state.json so /healthz
-        # is honest immediately after restart.
-        existing = engine.store.load()
+        #: The global confidence scalar ``/forecast`` serves, refreshed on
+        #: every completed cycle — never re-read from disk per request.
+        app.state.confidence = None
+        # Seed last_cycle_at (and the confidence) from any persisted
+        # state.json so /healthz is honest immediately after restart.
+        existing = await asyncio.to_thread(engine.store.load)
         if existing is not None:
             app.state.last_cycle_at = existing.generated_at
+            app.state.confidence = _confidence_of(existing)
 
         # Build scheduler now that we have an app reference to bind the
         # on-complete callback to.
@@ -266,13 +281,17 @@ def create_app(
         )
         app.state.artifact_sync = sync_task
         if auto_start_scheduler:
-            await local_scheduler.start(run_immediately=True)
+            # The first cycle is NOT awaited: it is the job's first firing,
+            # now, in the background (a cold cycle takes a minute and the
+            # app should serve state.json from disk meanwhile). Same for
+            # the artifact pull, which waits on a peer.
+            await local_scheduler.start(run_immediately=True, wait=False)
             if station_poller is not None:
                 await station_poller.start(run_immediately=True)
             if quality_task is not None:
                 await quality_task.start()
             if sync_task is not None:
-                await sync_task.start(run_immediately=True)
+                await sync_task.start(run_immediately=True, wait=False)
         try:
             yield
         finally:
@@ -284,6 +303,8 @@ def create_app(
                     await quality_task.shutdown()
                 if sync_task is not None:
                     await sync_task.shutdown()
+            if push_service is not None:
+                push_service.close()
             if push_store is not None:
                 # Close the SQLite handle explicitly; the WAL files are
                 # checkpointed on close, so a restart never inherits a
@@ -404,7 +425,13 @@ def create_app(
 
     @app.get("/healthz", response_model=HealthResponse, tags=["public"])
     async def healthz(request: Request) -> HealthResponse:
-        """Liveness probe. Always 200 if the process is up."""
+        """Liveness probe. Always 200 if the process is up.
+
+        Healthy means "serving", from the moment start-up yields — which
+        is before the first cycle has finished (it runs in the background).
+        ``last_cycle`` is the data-freshness signal: seeded from the
+        persisted ``state.json``, null only on a first-ever start.
+        """
         last_cycle = getattr(request.app.state, "last_cycle_at", None)
         started_at = getattr(request.app.state, "started_at", datetime.now(timezone.utc))
         return HealthResponse(
@@ -425,10 +452,8 @@ def create_app(
                 status_code=503,
                 detail="no frames available yet — first cycle has not completed",
             )
-        return Response(
-            content=manifest_path.read_bytes(),
-            media_type="application/json",
-        )
+        content = await _read_or_404(manifest_path)
+        return Response(content=content, media_type="application/json")
 
     @app.get("/frames/{filename}", tags=["public"])
     async def frame_png(request: Request, filename: str) -> Response:
@@ -441,7 +466,7 @@ def create_app(
         if not path.is_file():
             raise HTTPException(status_code=404, detail="frame not found")
         return Response(
-            content=path.read_bytes(),
+            content=await _read_or_404(path),
             media_type="image/png",
             headers={
                 # 60s cache — frames refresh on each cycle (~5 min) and HA
@@ -460,7 +485,7 @@ def create_app(
         rather than zeros.
         """
         store: StateStore = request.app.state.engine.store
-        state = store.load()
+        state = await asyncio.to_thread(store.load)
         if state is None:
             raise HTTPException(
                 status_code=503,
@@ -491,7 +516,7 @@ def create_app(
                 detail="no national artifacts yet — first national cycle has not completed",
             )
         return Response(
-            content=path.read_bytes(),
+            content=await _read_or_404(path),
             media_type="application/json",
             headers={"Cache-Control": "public, max-age=30"},
         )
@@ -522,11 +547,7 @@ def create_app(
                 status_code=503,
                 detail="no quality report yet — the nightly build has not run",
             )
-        return Response(
-            content=path.read_bytes(),
-            media_type="application/json",
-            headers={"Cache-Control": "public, max-age=300"},
-        )
+        return await _published_file(request, path)
 
     @app.get("/calibration/national_curves.json", tags=["calibration"])
     async def national_curves(
@@ -546,11 +567,7 @@ def create_app(
                 status_code=503,
                 detail="no national calibration curves on this instance yet",
             )
-        return Response(
-            content=path.read_bytes(),
-            media_type="application/json",
-            headers={"Cache-Control": "public, max-age=300"},
-        )
+        return await _published_file(request, path)
 
     @app.get("/calibration/push_thresholds.json", tags=["calibration"])
     async def push_thresholds_file(
@@ -573,11 +590,7 @@ def create_app(
                 status_code=503,
                 detail="no fitted push thresholds on this instance yet",
             )
-        return Response(
-            content=path.read_bytes(),
-            media_type="application/json",
-            headers={"Cache-Control": "public, max-age=300"},
-        )
+        return await _published_file(request, path)
 
     @app.get("/calibration/postprocess.json", tags=["calibration"])
     async def postprocess_file(
@@ -599,11 +612,7 @@ def create_app(
                 status_code=503,
                 detail="no fitted post-processing model on this instance yet",
             )
-        return Response(
-            content=path.read_bytes(),
-            media_type="application/json",
-            headers={"Cache-Control": "public, max-age=300"},
-        )
+        return await _published_file(request, path)
 
     @app.get("/calibration/postprocess_push.json", tags=["calibration"])
     async def onset_model_file(
@@ -621,11 +630,7 @@ def create_app(
                 status_code=503,
                 detail="no onset model on this instance yet",
             )
-        return Response(
-            content=path.read_bytes(),
-            media_type="application/json",
-            headers={"Cache-Control": "public, max-age=300"},
-        )
+        return await _published_file(request, path)
 
     @app.get("/stations/station_points.json", tags=["stations"])
     async def station_points_file(
@@ -657,11 +662,7 @@ def create_app(
                 status_code=503,
                 detail="no station points file on this instance",
             )
-        return Response(
-            content=path.read_bytes(),
-            media_type="application/json",
-            headers={"Cache-Control": "public, max-age=300"},
-        )
+        return await _published_file(request, path)
 
     @app.get("/nowcast/{filename}", tags=["public"])
     async def nowcast_artifact(
@@ -681,7 +682,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="artifact not found")
         media_type = "image/png" if filename.endswith(".png") else "application/json"
         return Response(
-            content=path.read_bytes(),
+            content=await _read_or_404(path),
             media_type=media_type,
             headers={"Cache-Control": "public, max-age=300, immutable"},
         )
@@ -760,9 +761,11 @@ def create_app(
                 )
                 for lead, mm_h in sorted(sample.forecast_mm_h.items())
             ]
-        # Confidence stays the global scalar in Phase A — sourced from the
-        # same store /state.json serves; null before the first state exists.
-        state = engine.store.load()
+        # Confidence stays the global scalar in Phase A — the value of the
+        # state /state.json serves, cached on app.state at cycle completion
+        # (and seeded from disk at start-up) rather than re-read and
+        # re-validated per request; null before the first state exists.
+        confidence = getattr(request.app.state, "confidence", None)
         # §B4 truthful flags: the held grids were calibrated with the
         # process's static national curves (loaded once at init, before any
         # cycle), so the calibrated subset of the served leads derives
@@ -802,7 +805,7 @@ def create_app(
             ),
             generated_at_utc=generated_at,
             forecast_mm_h=forecast_series,
-            confidence=float(state.confidence) if state is not None else None,
+            confidence=confidence,
         )
 
     @app.post("/lightning/strikes", response_model=StrikesAccepted, tags=["lightning"])
@@ -1033,6 +1036,15 @@ def create_app(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
+    # Body cap + rate limit on /api/push/* (push.limits). Added BEFORE the
+    # public-mode gate so the gate stays the outermost layer: a hidden
+    # operator route answers 404 to an anonymous probe, never 413/429.
+    app.add_middleware(
+        PushLimitsMiddleware,
+        max_bytes=config.push.max_request_bytes,
+        rate_per_min=config.push.rate_limit_per_min,
+    )
+
     # Public mode: install the default-deny gate over the API route table
     # BEFORE the frontend is mounted, so the catch-all "/" mount is not part
     # of the snapshot (see module docstring, rule 3).
@@ -1074,10 +1086,72 @@ def _parse_stamp(value: str | None) -> datetime | None:
         return None
 
 
+def _confidence_of(state: Any) -> float | None:
+    value = getattr(state, "confidence", None)
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _read_or_404(path: Path) -> bytes:
+    """A file's bytes, read in a worker thread; 404 if it vanished."""
+    try:
+        return await asyncio.to_thread(path.read_bytes)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found") from None
+
+
+def _read_with_stat(path: Path) -> tuple[bytes, Any]:
+    """Bytes and the ``fstat`` of the SAME open file (no replace race)."""
+    with path.open("rb") as fh:
+        return fh.read(), os.fstat(fh.fileno())
+
+
+def _etag_of(stat: Any) -> str:
+    return f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    if not header:
+        return False
+    tags = [t.strip() for t in header.split(",")]
+    return "*" in tags or etag in tags or f"W/{etag}" in tags
+
+
+async def _published_file(request: Request, path: Path) -> Response:
+    """A published JSON artefact with an ETag, and 304 on ``If-None-Match``.
+
+    The ETag is ``mtime_ns``-``size`` of the file actually read — cheap
+    (no hashing a 7 MB model per request) and stable across restarts of
+    this process, which is what the peer's ``sync`` needs.
+    """
+    headers = {"Cache-Control": "public, max-age=300"}
+    inm = request.headers.get("if-none-match")
+    if inm:
+        try:
+            stat = await asyncio.to_thread(path.stat)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="not found") from None
+        etag = _etag_of(stat)
+        if _etag_matches(inm, etag):
+            return Response(status_code=304, headers={**headers, "ETag": etag})
+    try:
+        content, stat = await asyncio.to_thread(_read_with_stat, path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found") from None
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={**headers, "ETag": _etag_of(stat)},
+    )
+
+
 def _on_cycle_complete(app: Any, result: CycleResult) -> None:
     """Update app.state after a cycle. Called from the scheduler thread."""
     if result.state is not None:
         app.state.last_cycle_at = result.state.generated_at
+        app.state.confidence = _confidence_of(result.state)
         app.state.last_error = None
     else:
         app.state.last_error = result.error

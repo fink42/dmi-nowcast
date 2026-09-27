@@ -205,7 +205,7 @@ def _seed_artifacts(config: Config) -> dict:
     return manifest
 
 
-def _write_minimal_state(config: Config, confidence: float) -> None:
+def _write_minimal_state(config: Config, confidence: float):
     """Persist a minimal valid state.json so /forecast can source confidence."""
     from dmi_nowcast_sidecar.state_schema import (
         CalibrationBlock,
@@ -245,6 +245,7 @@ def _write_minimal_state(config: Config, confidence: float) -> None:
         ),
     )
     StateStore(config.storage.data_dir).write(state)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -397,11 +398,30 @@ def test_forecast_values_at_known_pixel(client: TestClient) -> None:
 def test_forecast_confidence_from_state(
     minimal_config: Config, client: TestClient,
 ) -> None:
-    """Confidence comes from the same store /state.json serves."""
-    _write_minimal_state(minimal_config, confidence=0.71)
+    """Confidence is the scalar of the state /state.json serves — cached on
+    app.state when a cycle completes, never re-read per request (R2)."""
+    from dmi_nowcast_sidecar.app import _on_cycle_complete
+    from dmi_nowcast_sidecar.compute import CycleResult
+
+    state = _write_minimal_state(minimal_config, confidence=0.71)
+    # On disk but no cycle completed since start-up: not read per request.
     r = client.get("/forecast", params={"lat": HOME_LAT, "lon": HOME_LON})
     assert r.status_code == 200
+    assert r.json()["confidence"] is None
+
+    _on_cycle_complete(client.app, CycleResult(state=state))
+    r = client.get("/forecast", params={"lat": HOME_LAT, "lon": HOME_LON})
     assert r.json()["confidence"] == pytest.approx(0.71)
+
+
+def test_forecast_confidence_is_seeded_from_disk_at_startup(
+    minimal_config: Config, engine: CycleEngine,
+) -> None:
+    _write_minimal_state(minimal_config, confidence=0.42)
+    app = create_app(minimal_config, engine=engine, auto_start_scheduler=False)
+    with TestClient(app) as c:
+        r = c.get("/forecast", params={"lat": HOME_LAT, "lon": HOME_LON})
+        assert r.json()["confidence"] == pytest.approx(0.42)
 
 
 def test_forecast_nan_pixel_returns_nulls(

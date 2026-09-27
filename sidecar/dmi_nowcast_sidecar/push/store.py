@@ -17,6 +17,13 @@ Two halves per row:
   ``last_eval_radar_ts``, ``last_notified_utc``, and since the all-clear
   ``notified``, ``below_streak``, ``all_clear_sent``) — what
   ``push.engine.evaluate`` carries between radar observations;
+- **bookkeeping** (``version``, ``fail_streak``, ``first_fail_utc``) —
+  ``version`` is bumped by every :meth:`PushStore.upsert`, and the cycle's
+  state write is conditional on it (see :meth:`PushStore.update_state`), so
+  a subscribe that lands while a cycle is evaluating is never overwritten
+  by a decision taken on the row as it was. ``fail_streak`` /
+  ``first_fail_utc`` drive the garbage collection of dead rows (see
+  :meth:`PushStore.record_send`);
 - **delivery** (``last_delivered_utc``) — the ``last_notified_utc`` stamp
   of the newest WARNING the push service actually accepted.
   ``last_notified_utc`` is written BEFORE the send (persist first, send
@@ -31,9 +38,13 @@ Columns added after the first release are added in place on open
 store written before them loads unchanged; an old row reads
 ``notified = 0`` and can never retract a push it has no record of.
 
-Editing preferences restarts the state machine (see :meth:`PushStore.upsert`):
-a subscriber who lowers their threshold expects the new setting to be
-evaluated from scratch, not against a streak accumulated under the old one.
+Editing what the rule is ABOUT — the point, the lead, the threshold
+override — restarts the state machine (see :meth:`PushStore.upsert`): a
+subscriber who moves their point expects it to be evaluated from scratch,
+not against a streak accumulated somewhere else. Editing anything else
+(quiet hours, time zone, language, rotated keys) keeps the state: a
+browser that re-sends its subscription on every page load must not re-arm
+a warning it has already had.
 
 Datetimes are stored as ISO-8601 UTC strings and always come back
 timezone-aware. Every access goes through one connection behind a lock, so
@@ -77,7 +88,10 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     notified            INTEGER NOT NULL DEFAULT 0,
     below_streak        INTEGER NOT NULL DEFAULT 0,
     all_clear_sent      INTEGER NOT NULL DEFAULT 0,
-    last_delivered_utc  TEXT
+    last_delivered_utc  TEXT,
+    version             INTEGER NOT NULL DEFAULT 0,
+    fail_streak         INTEGER NOT NULL DEFAULT 0,
+    first_fail_utc      TEXT
 )
 """
 
@@ -85,7 +99,8 @@ _COLUMNS: Final = (
     "endpoint, p256dh, auth, lat, lon, threshold_pct, lead_min, "
     "quiet_enabled, quiet_start, quiet_end, tz, lang, created_utc, "
     "last_notified_utc, armed, streak, below_since_utc, last_eval_radar_ts, "
-    "notified, below_streak, all_clear_sent, last_delivered_utc"
+    "notified, below_streak, all_clear_sent, last_delivered_utc, "
+    "version, fail_streak, first_fail_utc"
 )
 
 #: Columns added after the first release: ``(name, declaration)``, added in
@@ -96,6 +111,9 @@ _ADDED_COLUMNS: Final = (
     ("below_streak", "INTEGER NOT NULL DEFAULT 0"),
     ("all_clear_sent", "INTEGER NOT NULL DEFAULT 0"),
     ("last_delivered_utc", "TEXT"),
+    ("version", "INTEGER NOT NULL DEFAULT 0"),
+    ("fail_streak", "INTEGER NOT NULL DEFAULT 0"),
+    ("first_fail_utc", "TEXT"),
 )
 
 
@@ -166,6 +184,12 @@ class Subscription:
     #: The ``last_notified_utc`` stamp of the newest warning the push
     #: service accepted; ``None`` = none ever delivered.
     last_delivered_utc: datetime | None = None
+    #: Bumped by every upsert; the cycle's state write is conditional on it.
+    version: int = 0
+    #: Consecutive NON-transient send failures (see ``fanout.is_transient``).
+    fail_streak: int = 0
+    #: First failed send since the last successful one; ``None`` = none.
+    first_fail_utc: datetime | None = None
 
     @property
     def last_warning_delivered(self) -> bool:
@@ -231,6 +255,9 @@ def _row_to_subscription(row: sqlite3.Row) -> Subscription:
         below_streak=int(row["below_streak"]),
         all_clear_sent=bool(row["all_clear_sent"]),
         last_delivered_utc=_from_iso(row["last_delivered_utc"]),
+        version=int(row["version"]),
+        fail_streak=int(row["fail_streak"]),
+        first_fail_utc=_from_iso(row["first_fail_utc"]),
     )
 
 
@@ -357,32 +384,48 @@ class PushStore:
         clearing an override is a thing a subscriber can do by
         re-subscribing without one.
 
-        An update rewrites the preferences and **restarts the state
-        machine** (``armed=1, streak=0``, both timestamps cleared):
-        continuing a streak accumulated under different preferences would
-        fire against a rule the subscriber no longer has. ``created_utc``
-        and ``last_notified_utc`` survive — the first is history, the
-        second is the anti-spam floor and must not be resettable by
-        re-subscribing.
+        An update rewrites the preferences and bumps ``version``. It
+        **restarts the state machine** (``armed=1, streak=0``, timestamps
+        and the all-clear memory cleared) only when the rule itself
+        changed — ``lat``/``lon``, ``lead_min`` or the ``threshold_pct``
+        override: continuing a streak accumulated under a different rule
+        would fire against a rule the subscriber no longer has. Any other
+        edit (quiet hours, tz, lang, keys) keeps the state, so a browser
+        re-sending the same subscription cannot re-arm itself into a
+        repeat warning. ``created_utc`` and ``last_notified_utc`` always
+        survive — the first is history, the second is the anti-spam floor
+        and must not be resettable by re-subscribing.
         """
         now = now_utc or datetime.now(timezone.utc)
         with self._lock:
             cur = self._conn.execute(
-                "SELECT endpoint FROM subscriptions WHERE endpoint = ?",
+                "SELECT lat, lon, lead_min, threshold_pct FROM subscriptions "
+                "WHERE endpoint = ?",
                 (sub.endpoint,),
             )
-            exists = cur.fetchone() is not None
+            old = cur.fetchone()
+            exists = old is not None
             if exists:
+                rule_changed = (
+                    float(old["lat"]) != float(sub.lat)
+                    or float(old["lon"]) != float(sub.lon)
+                    or int(old["lead_min"]) != int(sub.lead_min)
+                    or old["threshold_pct"] != sub.threshold_pct
+                )
+                reset = (
+                    ", armed = 1, streak = 0, "
+                    "below_since_utc = NULL, last_eval_radar_ts = NULL, "
+                    "notified = 0, below_streak = 0, all_clear_sent = 0"
+                    if rule_changed else ""
+                )
                 self._conn.execute(
-                    """
+                    f"""
                     UPDATE subscriptions SET
                         p256dh = ?, auth = ?, lat = ?, lon = ?,
                         threshold_pct = ?, lead_min = ?,
                         quiet_enabled = ?, quiet_start = ?, quiet_end = ?,
                         tz = ?, lang = ?,
-                        armed = 1, streak = 0,
-                        below_since_utc = NULL, last_eval_radar_ts = NULL,
-                        notified = 0, below_streak = 0, all_clear_sent = 0
+                        version = version + 1{reset}
                     WHERE endpoint = ?
                     """,
                     (
@@ -397,7 +440,7 @@ class PushStore:
                 self._conn.execute(
                     f"INSERT INTO subscriptions ({_COLUMNS}) VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?)",
+                    "?, ?, ?, ?, ?, ?, ?)",
                     (
                         sub.endpoint, sub.p256dh, sub.auth, sub.lat, sub.lon,
                         sub.threshold_pct, sub.lead_min,
@@ -405,6 +448,7 @@ class PushStore:
                         sub.tz, sub.lang, _to_iso(now),
                         None, 1, 0, None, None,
                         0, 0, 0, None,
+                        0, 0, None,
                     ),
                 )
             self._conn.commit()
@@ -431,13 +475,20 @@ class PushStore:
         notified: bool | _Unchanged = UNCHANGED,
         below_streak: int | _Unchanged = UNCHANGED,
         all_clear_sent: bool | _Unchanged = UNCHANGED,
-    ) -> None:
+        expected_version: int | None = None,
+    ) -> bool:
         """Persist the decision state machine for one subscription.
 
         ``last_notified_utc`` defaults to :data:`UNCHANGED` — only a cycle
         that actually notified passes it. The three all-clear fields
         default to :data:`UNCHANGED` too, so a caller that predates them
         cannot clobber them.
+
+        ``expected_version`` makes the write conditional: it lands only if
+        no upsert bumped the row's ``version`` since the caller read it.
+        Returns whether a row was written — False means the row is gone or
+        was edited mid-cycle, and the caller must not act on a decision it
+        could not persist.
         """
         sets = [
             "armed = ?", "streak = ?",
@@ -459,13 +510,18 @@ class PushStore:
         if not isinstance(all_clear_sent, _Unchanged):
             sets.append("all_clear_sent = ?")
             params.append(int(bool(all_clear_sent)))
+        where = "endpoint = ?"
         params.append(endpoint)
+        if expected_version is not None:
+            where += " AND version = ?"
+            params.append(int(expected_version))
         with self._lock:
-            self._conn.execute(
-                f"UPDATE subscriptions SET {', '.join(sets)} WHERE endpoint = ?",
+            cur = self._conn.execute(
+                f"UPDATE subscriptions SET {', '.join(sets)} WHERE {where}",
                 params,
             )
             self._conn.commit()
+            return cur.rowcount > 0
 
     def mark_delivered(self, endpoint: str, notified_utc: datetime) -> None:
         """Record that the warning stamped ``notified_utc`` was accepted.
@@ -482,6 +538,71 @@ class PushStore:
                 (_to_iso(notified_utc), endpoint),
             )
             self._conn.commit()
+
+    def record_send(
+        self,
+        endpoint: str,
+        *,
+        ok: bool,
+        transient: bool,
+        now_utc: datetime,
+        max_failures: int,
+        stale_days: float,
+    ) -> bool:
+        """Book one delivery attempt; True when the row was garbage-collected.
+
+        A success clears the failure record. A failure starts
+        ``first_fail_utc`` (if not already running) and, when it is not
+        transient (``fanout.is_transient``), adds one to ``fail_streak``.
+        The row is then deleted when EITHER ``fail_streak`` reaches
+        ``max_failures`` OR the failure run is ``stale_days`` old — every
+        attempt in that time failed, transient or not, and not one reached
+        the device. A row nobody tried to send to is never collected: a
+        quiet month is not a dead subscription. ``404``/``410`` do not come
+        through here; the caller deletes on those at once.
+
+        Collection is deliberately blunt and per row. The one way it can
+        misfire at scale is a fault of OURS that every push service
+        answers with a 4xx (a broken VAPID key): each row would then go
+        after ``max_failures`` warnings. ``push_send_failed`` lines with
+        the status make that visible long before it completes.
+        """
+        now_iso = _to_iso(now_utc)
+        with self._lock:
+            if ok:
+                self._conn.execute(
+                    "UPDATE subscriptions SET fail_streak = 0, "
+                    "first_fail_utc = NULL WHERE endpoint = ?",
+                    (endpoint,),
+                )
+                self._conn.commit()
+                return False
+            self._conn.execute(
+                "UPDATE subscriptions SET "
+                "fail_streak = fail_streak + ?, "
+                "first_fail_utc = COALESCE(first_fail_utc, ?) "
+                "WHERE endpoint = ?",
+                (0 if transient else 1, now_iso, endpoint),
+            )
+            row = self._conn.execute(
+                "SELECT fail_streak, first_fail_utc FROM subscriptions "
+                "WHERE endpoint = ?",
+                (endpoint,),
+            ).fetchone()
+            collect = False
+            if row is not None:
+                first = _from_iso(row["first_fail_utc"])
+                collect = int(row["fail_streak"]) >= max(1, int(max_failures)) or (
+                    first is not None
+                    and (now_utc - first).total_seconds()
+                    >= float(stale_days) * 86400.0
+                )
+            if collect:
+                self._conn.execute(
+                    "DELETE FROM subscriptions WHERE endpoint = ?", (endpoint,),
+                )
+            self._conn.commit()
+            return collect
 
     # -- reads -------------------------------------------------------------
 

@@ -627,7 +627,9 @@ class TestRefits:
 
 
 class TestSync:
-    def test_the_onset_model_lands_where_the_cycle_reads_it(self, tmp_path):
+    def test_the_onset_model_lands_where_the_cycle_reads_it(
+        self, tmp_path, onset_model,
+    ):
         from tests import test_quality_publication as tqp
 
         from dmi_nowcast_sidecar.sync import (
@@ -646,7 +648,9 @@ class TestSync:
             onset_postprocess=SimpleNamespace(note_changed=lambda: nudged.append(1)),
         )
         sync = build_artifact_sync(config, engine)
-        model = {"schema_version": 1, "target": "onset", "models": {}}
+        # A real onset-target model: since R2 the sync validates a model
+        # with the slot's own checks before it replaces the file in service.
+        model = json.loads(onset_model.dumps())
         peer = tqp._Peer({ONSET_MODEL_FILE: [tqp._ok(model)]})
         sync._client = peer.client()
         sync._owns_client = False
