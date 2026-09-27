@@ -43,6 +43,14 @@
 #   BATCH_CAP_DELAY_S   seconds to wait for the container (default 25)
 #   BATCH_FORCE         1 to bypass require_no_batch_running
 #   BATCH_PYTHONPATH    PYTHONPATH inside the container (default /repo/src)
+#   BATCH_POOL_WORKERS  DMI_NOWCAST_POOL_WORKERS inside the container
+#                       (default 1). The STEPS member pool
+#                       (dmi_nowcast_core/_vendor/pysteps_steps/parallel.py)
+#                       defaults to 4 threads per process — right for the
+#                       live service, wrong for a batch job that already
+#                       runs BATCH_WORKERS processes on a 7-core VM beside
+#                       the live sidecar (2 x 4 threads + the service's 4).
+#                       Review R5.
 #   BATCH_RUN_ARGS      bash array of extra ``docker compose run`` flags,
 #                       e.g. BATCH_RUN_ARGS=(-v "$HOME/days.txt:/tmp/d:ro")
 #   DOCKER              docker binary (default ``docker``; the tests
@@ -65,6 +73,7 @@ BATCH_CAP_DELAY_S=${BATCH_CAP_DELAY_S:-25}
 BATCH_CONTAINER_FILTER=${BATCH_CONTAINER_FILTER:-deploy-sidecar-run}
 BATCH_PYTHONPATH=${BATCH_PYTHONPATH:-/repo/src}
 BATCH_FORCE=${BATCH_FORCE:-0}
+BATCH_POOL_WORKERS=${BATCH_POOL_WORKERS:-1}
 # Extra flags for ``docker compose run`` (additional -v mounts, -e vars).
 # Guarded so a caller can set it before sourcing.
 if [[ -z "${BATCH_RUN_ARGS+x}" ]]; then
@@ -93,6 +102,7 @@ run_in_repo() {
         ${BATCH_RUN_ARGS[@]+"${BATCH_RUN_ARGS[@]}"} \
         --workdir /repo \
         -e PYTHONPATH="$BATCH_PYTHONPATH" \
+        -e DMI_NOWCAST_POOL_WORKERS="$BATCH_POOL_WORKERS" \
         sidecar \
         "$@" )
 }

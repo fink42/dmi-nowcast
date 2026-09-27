@@ -338,7 +338,67 @@ async def test_start_schedules_the_job_and_runs_one_immediately(tmp_path: Path) 
         assert len(client.calls) == 2  # one per configured parameter
         job = poller._scheduler.get_job("station_obs_poll")
         assert job is not None
-        assert job.trigger.interval == timedelta(minutes=10)
+        # Review R5: on the slot grid, 8 min 30 s after each slot ends.
+        fields = {f.name: str(f) for f in job.trigger.fields}
+        assert fields["minute"] == "8,18,28,38,48,58"
+        assert fields["second"] == "30"
+    finally:
+        await poller.shutdown()
+
+
+def test_the_poll_trigger_sits_on_the_slot_grid() -> None:
+    """Every fire time is ``poll_offset_sec`` after a slot end (± jitter)."""
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    from dmi_nowcast_sidecar.station_obs import poll_trigger
+
+    trigger = poll_trigger(10, 510)
+    assert isinstance(trigger, CronTrigger)
+    assert trigger.jitter == 30
+    trigger.jitter = None  # the grid itself, without the spread
+    fire = trigger.get_next_fire_time(None, NOW)
+    fires = []
+    for _ in range(12):
+        fires.append(fire)
+        fire = trigger.get_next_fire_time(fire, fire + timedelta(seconds=1))
+    assert all(f.minute % 10 == 8 and f.second == 30 for f in fires)
+    assert all(b - a == timedelta(minutes=10) for a, b in zip(fires, fires[1:]))
+    # 15-minute interval: offset taken modulo the interval.
+    fields = {f.name: str(f) for f in poll_trigger(15, 510).fields}
+    assert fields["minute"] == "8,23,38,53"
+    # An interval that does not divide the hour free-runs, as before.
+    assert isinstance(poll_trigger(7, 510), IntervalTrigger)
+
+
+@pytest.mark.asyncio
+async def test_one_append_per_poll(tmp_path: Path) -> None:
+    """Review R5: both parameters land in ONE store append."""
+    calls: list[int] = []
+    real_store = StationObsStore(tmp_path / "corpus")
+
+    class RecordingStore(StationObsStore):
+        def append(self, observations):  # type: ignore[override]
+            observations = list(observations)
+            calls.append(len(observations))
+            return real_store.append(observations)
+
+    client = FakeClient({
+        "precip_past10min": [
+            Observation("06126", NOW, "precip_past10min", 0.2),
+        ],
+        "precip_dur_past10min": [
+            Observation("06126", NOW, "precip_dur_past10min", 3.0),
+        ],
+    })
+    poller = StationObsPoller(
+        _config(tmp_path), client=client,  # type: ignore[arg-type]
+        store=RecordingStore(tmp_path / "corpus"),
+    )
+    try:
+        result = await poller.poll_once(now=NOW)
+        assert calls == [2]
+        assert result.new_rows == 2
     finally:
         await poller.shutdown()
 

@@ -38,6 +38,30 @@ services:
     #     the one process that must not die.
     oom_score_adj: -500
     mem_reservation: 1500m
+    # Container hardening (review R5). The service runs as uid 10001 and
+    # needs no Linux capability: it binds 8081 (> 1024) and writes only
+    # into its volumes. ``no-new-privileges`` stops a setuid binary from
+    # regaining any. ``pids_limit`` bounds a runaway fork/thread storm; a
+    # wet cycle peaks at a few hundred tasks (uvicorn, the STEPS pool,
+    # BLAS/OpenCV/Arrow thread pools, the quality build's child), so 1024
+    # is headroom, not a squeeze. Batch jobs started with
+    # ``docker compose run sidecar`` inherit all three, which is intended.
+    # No ``read_only`` root filesystem: the same service definition runs
+    # the batch jobs, and those write outside the volumes (duckdb's and
+    # matplotlib's caches under $HOME, tempfiles) — see the R5 report.
+    cap_drop:
+      - ALL
+    # The app runs as the unprivileged `dmi` user, so it holds no
+    # capabilities either way. These three exist only for the operator's
+    # `docker exec -u 0` steps (install_artifact.sh's chown + mv into the
+    # dmi-owned data dir, corpus uploads).
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - "no-new-privileges:true"
+    pids_limit: 1024
     ports:
       # Publish only where you mean to. Set HOST_PORT to an explicit
       # ``address:port`` (e.g. 127.0.0.1:8081) to bind one interface

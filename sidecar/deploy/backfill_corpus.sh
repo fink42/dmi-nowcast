@@ -39,6 +39,7 @@ docker compose run --rm \
     -v "${corpus_host}:${corpus_mount}" \
     --workdir /repo \
     -e PYTHONPATH=/repo/src \
+    -e DMI_NOWCAST_POOL_WORKERS="${BATCH_POOL_WORKERS:-1}" \
     sidecar \
     python scripts/backfill_corpus.py \
         --corpus-dir "${corpus_mount}" \

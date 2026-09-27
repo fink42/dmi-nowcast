@@ -4,9 +4,10 @@
 One request per (UTC day × parameter) — a whole day of
 ``precip_past10min`` is ~15.7k features and comes back in a single
 response, so the day is the natural unit of work. Results land in the
-corpus's ``stations/obs/YYYY/MM.parquet`` partitions via
+corpus's ``stations/obs/YYYY/MM_DD.parquet`` day files via
 :class:`~dmi_nowcast_core.station_store.StationObsStore`, which dedupes
-on ``(station_id, observed_utc, parameter_id)``. Re-running is therefore
+on ``(station_id, observed_utc, parameter_id)`` and takes the store's
+file lock, so it can run beside the live poller. Re-running is therefore
 a no-op for days already stored, and ``--progress`` makes a resumed run
 skip the requests too.
 

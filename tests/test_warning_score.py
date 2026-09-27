@@ -1448,3 +1448,101 @@ def test_pooled_all_clear_counts_and_median() -> None:
 def test_a_naive_all_clear_is_a_programming_error() -> None:
     with pytest.raises(ValueError):
         _score([(_m(0), 20.0, datetime(2026, 9, 5, 6, 20))], [])
+
+
+# ---------------------------------------------------------------------------
+# Unscorable: a gauge hole in the window is not a false alarm (review R5)
+# ---------------------------------------------------------------------------
+
+
+def _grid(first: datetime, known: list[bool]):
+    """A KnownGrid whose first slot END is ``first``."""
+    from dmi_nowcast_core.warning_score import KnownGrid
+
+    return KnownGrid(int(first.timestamp()), 600, known)
+
+
+def test_known_grid_all_known_takes_slot_ends_in_the_half_open_window() -> None:
+    grid = _grid(T0, [True, True, False, True])        # ends 6:00 6:10 6:20 6:30
+    # (6:00, 6:10] holds the 6:10 end only.
+    assert grid.all_known(T0, T0 + timedelta(minutes=10))
+    # (6:05, 6:25] holds 6:10 and 6:20 — and 6:20 is unknown.
+    assert not grid.all_known(T0 + timedelta(minutes=5), T0 + timedelta(minutes=25))
+    # (6:20, 6:30]: 6:20 itself is excluded.
+    assert grid.all_known(T0 + timedelta(minutes=20), T0 + timedelta(minutes=30))
+    # Outside the grid is unknown: the grid is the archive's reach.
+    assert not grid.all_known(T0 + timedelta(minutes=20), T0 + timedelta(minutes=45))
+    assert not grid.all_known(T0 - timedelta(minutes=20), T0)
+    # A window holding no slot end at all has nothing unknown in it.
+    assert grid.all_known(T0 + timedelta(minutes=1), T0 + timedelta(minutes=9))
+
+
+def test_a_warning_over_a_gauge_hole_is_unscorable_not_a_false_alarm() -> None:
+    sent = T0 + timedelta(hours=2)
+    # Everything known except one slot inside the 40-minute window.
+    known = [True] * 30
+    hole = int(((sent + timedelta(minutes=20)) - T0).total_seconds() // 600)
+    known[hole] = False
+    grid = _grid(T0, known)
+    result = score_warnings([(sent, 20.0)], [], lead_min=30, tolerance_min=10,
+                            gauge_known=grid)
+    assert [w.outcome for w in result.warnings] == ["unscorable"]
+    s = result.summary
+    assert (s["unscorable"], s["false_alarms"], s["warnings"], s["n_sent"]) == (1, 0, 0, 1)
+    assert s["precision"] is None and s["far"] is None
+    # Without the grid it is exactly the old answer: a false alarm.
+    old = score_warnings([(sent, 20.0)], [], lead_min=30, tolerance_min=10)
+    assert [w.outcome for w in old.warnings] == ["false_alarm"]
+    assert old.summary["unscorable"] == 0
+
+
+def test_a_hole_in_the_dry_lead_in_makes_it_unscorable_too() -> None:
+    sent = T0 + timedelta(hours=2, minutes=3)
+    known = [True] * 30
+    # 60 min lead-in: a hole at sent - 30 min.
+    hole = int(((sent - timedelta(minutes=30)) - T0).total_seconds() // 600) + 1
+    known[hole] = False
+    result = score_warnings([(sent, 20.0)], [], lead_min=30, tolerance_min=10,
+                            dry_min=60, gauge_known=_grid(T0, known))
+    assert result.summary["unscorable"] == 1
+    # The same hole just before the lead-in changes nothing.
+    known = [True] * 30
+    known[hole - 4] = False
+    result = score_warnings([(sent, 20.0)], [], lead_min=30, tolerance_min=10,
+                            dry_min=60, gauge_known=_grid(T0, known))
+    assert result.summary["false_alarms"] == 1
+
+
+def test_a_claimed_onset_is_never_unscorable_and_pending_comes_first() -> None:
+    sent = T0 + timedelta(hours=2)
+    grid = _grid(T0, [False] * 30)                     # nothing known at all
+    hit = score_warnings([(sent, 20.0)], [sent + timedelta(minutes=20)],
+                         lead_min=30, tolerance_min=10, gauge_known=grid)
+    assert [w.outcome for w in hit.warnings] == ["hit"]
+    pending = score_warnings([(sent, 20.0)], [], lead_min=30, tolerance_min=10,
+                             known_until=sent, gauge_known=grid)
+    assert [w.outcome for w in pending.warnings] == ["pending"]
+
+
+def test_pooled_summary_counts_unscorable_outside_every_rate() -> None:
+    sent = T0 + timedelta(hours=2)
+    good = _grid(T0, [True] * 30)
+    holey = _grid(T0, [False] * 30)
+    a = score_warnings([(sent, 20.0)], [], lead_min=30, tolerance_min=10,
+                       gauge_known=good)
+    b = score_warnings([(sent, 20.0)], [], lead_min=30, tolerance_min=10,
+                       gauge_known=holey)
+    pooled = pooled_summary([a, b])
+    assert (pooled["n_sent"], pooled["warnings"], pooled["false_alarms"],
+            pooled["unscorable"]) == (2, 1, 1, 1)
+    assert pooled["far"] == 1.0
+
+
+def test_an_unscorable_warning_s_all_clear_is_not_graded() -> None:
+    sent = T0 + timedelta(hours=2)
+    result = score_warnings(
+        [(sent, 20.0, sent + timedelta(minutes=15))], [],
+        lead_min=30, tolerance_min=10, gauge_known=_grid(T0, [False] * 30),
+    )
+    assert result.warnings[0].all_clear == "unscorable"
+    assert result.summary["all_clears"] == 0

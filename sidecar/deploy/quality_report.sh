@@ -183,6 +183,7 @@ run_in_repo() {
         -v "$DEPLOY_DIR/../..:/repo:ro" \
         --workdir /repo \
         -e PYTHONPATH=/repo/src:/repo/sidecar \
+        -e DMI_NOWCAST_POOL_WORKERS="${BATCH_POOL_WORKERS:-1}" \
         sidecar \
         "$@"
 }

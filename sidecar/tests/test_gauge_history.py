@@ -305,3 +305,50 @@ class TestAPointThatIsNotAGauge:
         assert math.isnan(float(block["ng_up_mm_max_t30"][0]))
         # Geometry survives a dead flow: it never needed a direction.
         assert math.isfinite(float(block["ng_near_km"][0]))
+
+
+def test_the_arrow_bucketing_equals_the_row_by_row_reference() -> None:
+    """Review R5: ``slots_by_station`` on a table is numpy, and identical.
+
+    Random readings over a pinned grid, with every awkward case the
+    reference handles: traces (negative), NaN and null values, a third
+    parameter riding along, sub-minute stamps that roll to the next slot,
+    rows outside the grid, a station with no rows, and a repeated id.
+    """
+    import random
+
+    import pyarrow as pa
+
+    from dmi_nowcast_core.station_store import obs_schema
+    from dmi_nowcast_sidecar.gauge_history import (
+        _slots_by_station_rows,
+        slots_by_station,
+    )
+
+    rng = random.Random(4)
+    now = datetime(2026, 9, 27, 12, 3, 17, tzinfo=timezone.utc)
+    start, end = now - timedelta(minutes=370), now
+    stations = [f"06{n:03d}" for n in range(15)]
+    cols: dict[str, list] = {name: [] for name in obs_schema().names}
+    for station in stations:
+        for k in range(42):
+            for param in ("precip_past10min", "precip_dur_past10min", "temp_dry"):
+                if rng.random() < 0.2:
+                    continue
+                cols["station_id"].append(station)
+                cols["observed_utc"].append(
+                    start - timedelta(minutes=15) + timedelta(
+                        minutes=10 * k, seconds=rng.choice([0, 0, 0, 30, 0.5]),
+                    ),
+                )
+                cols["parameter_id"].append(param)
+                cols["value"].append(rng.choice(
+                    [0.0, 0.0, -0.1, 0.1, 0.3, 2.0, float("nan"), None, 10.0],
+                ))
+                cols["created_utc"].append(None)
+    table = pa.table(cols, schema=obs_schema())
+    wanted = stations + ["06999", stations[0]]
+    fast = slots_by_station(table, wanted, start_utc=start, end_utc=end)
+    slow = _slots_by_station_rows(table, wanted, start_utc=start, end_utc=end)
+    assert fast == slow
+    assert fast["06999"] and all(w is None for _e, w, _m in fast["06999"])

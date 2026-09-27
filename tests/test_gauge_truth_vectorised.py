@@ -484,11 +484,16 @@ def _local_month() -> tuple[Path, int, int]:
     if not LOCAL_CORPUS:
         pytest.skip("set DMI_NOWCAST_TEST_CORPUS to a corpus root to run this")
     root = Path(LOCAL_CORPUS)
-    months = sorted((root / "stations" / "obs").glob("*/*.parquet"))
+    # Month files and (since review R5) day files alike.
+    store = StationObsStore(root)
+    months = sorted({
+        (span[0].year, span[0].month)
+        for span in map(store.partition_span, store.partitions()) if span
+    })
     if not months:
         pytest.skip(f"no station observations under {root}")
-    newest = months[-1]
-    return root, int(newest.parent.name), int(newest.stem)
+    year, month = months[-1]
+    return root, year, month
 
 
 @pytest.mark.slow
@@ -501,13 +506,8 @@ def test_a_real_month_matches_the_reference() -> None:
     go — and it is far too slow for CI, because the reference side is the
     half-hour loop this whole change exists to remove.
     """
-    import pyarrow.compute as pc
-    import pyarrow.parquet as pq
-
     root, year, month = _local_month()
-    path = StationObsStore(root).partition_path(year, month)
-    column = pq.read_table(path, columns=["station_id"]).column("station_id")
-    stations = sorted(pc.unique(column.combine_chunks()).to_pylist())[:12]
+    stations = StationObsStore(root).station_ids_in_month(year, month)[:12]
     start = datetime(year, month, 1, tzinfo=UTC)
     assert_same(root, stations, start, start + timedelta(days=1))
 
@@ -527,12 +527,16 @@ def test_the_whole_local_corpus_loads_in_seconds() -> None:
     if not LOCAL_CORPUS:
         pytest.skip("set DMI_NOWCAST_TEST_CORPUS to a corpus root to run this")
     root = Path(LOCAL_CORPUS)
-    months = sorted((root / "stations" / "obs").glob("*/*.parquet"))
+    store = StationObsStore(root)
+    months = sorted({
+        (span[0].year, span[0].month)
+        for span in map(store.partition_span, store.partitions()) if span
+    })
     if len(months) < 2:
-        pytest.skip("need at least two month partitions to be worth timing")
-    first, last = months[0], months[-1]
-    start = datetime(int(first.parent.name), int(first.stem), 1, tzinfo=UTC)
-    end = datetime(int(last.parent.name), int(last.stem), 28, tzinfo=UTC)
+        pytest.skip("need at least two months of observations to be worth timing")
+    (first_y, first_m), (last_y, last_m) = months[0], months[-1]
+    start = datetime(first_y, first_m, 1, tzinfo=UTC)
+    end = datetime(last_y, last_m, 28, tzinfo=UTC)
 
     before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     started = time.perf_counter()

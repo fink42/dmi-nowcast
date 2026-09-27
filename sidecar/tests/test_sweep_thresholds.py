@@ -429,6 +429,7 @@ def test_lead_30_at_40_percent_scores_the_planted_events(
     assert cell["false_alarms"] == 1
     assert cell["misses"] == 1
     assert cell["pending"] == 0
+    assert cell["unscorable"] == 0
     assert cell["uncovered_onsets"] == 0
     assert cell["n_onsets"] == 2
     assert cell["pod"] == pytest.approx(0.5)
@@ -436,6 +437,32 @@ def test_lead_30_at_40_percent_scores_the_planted_events(
     assert cell["csi"] == pytest.approx(1 / 3)
     # eta 25 min against a 30-minute wait: the warning was 5 minutes early.
     assert cell["lead_error_min"]["p50"] == pytest.approx(-5.0)
+
+
+def test_a_false_alarm_over_a_gauge_hole_is_unscorable(tmp_path: Path) -> None:
+    """Review R5: the day-2 false alarm (A, 08:00) loses one gauge slot
+    inside its window, so the gauge cannot say it was wrong."""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    root = tmp_path / "holed"
+    _write_gauge(root / "corpus")
+    store = StationObsStore(root / "corpus")
+    hole = _at(2, 8 * 60 + 20)
+    path = store.day_path(hole.date())
+    table = pq.read_table(path)
+    keep = pc.invert(pc.and_(
+        pc.equal(table.column("station_id"), STATION_A),
+        pc.equal(table.column("observed_utc"), hole),
+    ))
+    pq.write_table(table.filter(keep), path)
+    decisions = root / "decisions"
+    for day in DAYS:
+        _write_decisions(decisions, _decision_rows(day), f"2026-06-{day:02d}.parquet")
+    cell = _cell(_run(tmp_path, root), 30, 40)
+    assert cell["n_sent"] == 2
+    assert (cell["hits"], cell["false_alarms"], cell["unscorable"]) == (1, 0, 1)
+    assert cell["far"] == pytest.approx(0.0)
 
 
 def test_lead_10_skips_the_null_row_and_fires_one_frame_later(

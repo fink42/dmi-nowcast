@@ -1060,6 +1060,30 @@ def _rows_from_tables(tables: Sequence[Any]) -> DecisionRows:
     return DecisionRows(columns, strings)
 
 
+def _eval_files(eval_dir: Path, start: datetime, end: datetime) -> list[Path]:
+    """The live ``stations/eval`` files covering ``[start, end]``'s months.
+
+    Per month: the pre-R5 month file ``YYYY/MM.parquet`` first, then the
+    day files ``YYYY/MM_DD.parquet`` the service writes since review R5,
+    in day order. That is the order the rows must be read in, because the
+    dedupe below lets the LAST row read win a ``(radar_ts, station_id)``
+    — and a day file is always the later write. It is also the order
+    ``threshold_sweep.decision_parquets`` sorts them into.
+    """
+    out: list[Path] = []
+    for (year, month) in _months_between(start, end):
+        year_dir = eval_dir / f"{year:04d}"
+        base = year_dir / f"{month:02d}.parquet"
+        if base.is_file():
+            out.append(base)
+        if year_dir.is_dir():
+            out.extend(sorted(
+                path for path in year_dir.glob(f"{month:02d}_*.parquet")
+                if path.is_file()
+            ))
+    return out
+
+
 def _load_decisions(inputs: QualityInputs) -> tuple[DecisionRows, dict[str, int]]:
     """Replay + live decision rows, deduplicated on ``(radar_ts, station_id)``.
 
@@ -1090,10 +1114,7 @@ def _load_decisions(inputs: QualityInputs) -> tuple[DecisionRows, dict[str, int]
         eval_dir = Path(inputs.corpus_dir) / "stations" / "eval"
         cutoff = _now(inputs) - timedelta(days=max(1, inputs.live_days))
         if eval_dir.is_dir():
-            for (year, month) in _months_between(cutoff, _now(inputs)):
-                path = eval_dir / f"{year:04d}" / f"{month:02d}.parquet"
-                if not path.is_file():
-                    continue
+            for path in _eval_files(eval_dir, cutoff, _now(inputs)):
                 try:
                     table = _read_decision_table(path)
                 except Exception:  # noqa: BLE001
@@ -1161,10 +1182,7 @@ def _live_window(inputs: QualityInputs) -> dict | None:
     lo: int | None = None
     hi: int | None = None
     days: set[int] = set()
-    for (year, month) in _months_between(cutoff, _now(inputs)):
-        path = eval_dir / f"{year:04d}" / f"{month:02d}.parquet"
-        if not path.is_file():
-            continue
+    for path in _eval_files(eval_dir, cutoff, _now(inputs)):
         try:
             table = _read_decision_table(path)
         except Exception:  # noqa: BLE001
@@ -1208,6 +1226,9 @@ class _GaugeTruth:
     #: counts — the evidence, so the report can name them rather than
     #: quietly dropping them.
     dead: tuple[Any, ...] = ()
+    #: ``{station: KnownGrid}`` — which slots each station reported, so a
+    #: warning over a hole is graded ``unscorable`` (review R5).
+    known: dict[str, Any] = field(default_factory=dict)
 
 
 def decision_bounds(
@@ -1287,6 +1308,10 @@ def _gauge_truth(
         },
         known_slots=loaded.known_slots,
         dead=tuple(dead),
+        known={
+            s: series.known_grid() for s, series in loaded.series.items()
+            if s not in excluded
+        },
     )
     for key in needed:
         if key[0] in excluded:
@@ -1502,6 +1527,7 @@ def _score_decisions(
             onset_min_mm=inputs.onset_min_mm,
             known_until=truth.known_until.get(station),
             coverage=coverage_by_station.get(station, []),
+            gauge_known=truth.known.get(station),
         )
         for station in station_ids
     }
@@ -1537,6 +1563,9 @@ def _score_decisions(
             # ignores them) rather than being graded early.
             "warnings": int(pooled["warnings"]),
             "pending": int(pooled["pending"]),
+            # Additive (review R5): no claim, and the gauge left a slot of
+            # the window or its dry lead-in unreported — out of every rate.
+            "unscorable": int(pooled["unscorable"]),
             "n_sent": int(pooled["n_sent"]),
             # Onsets outside every decision run: rain that fell while the
             # service was not watching. Reported, never scored.
@@ -1617,10 +1646,10 @@ def _score_decisions(
         for warning in result.warnings:
             if warning.sent_utc < cutoff:
                 continue
-            if warning.outcome == "pending":
-                # Its window has not closed. The schema's outcome enum is
-                # hit|false_alarm, and there is no honest third answer to
-                # put in the table yet.
+            if warning.outcome in ("pending", "unscorable"):
+                # Its window has not closed, or the gauge left a hole in
+                # it. The schema's outcome enum is hit|false_alarm, and
+                # there is no honest third answer to put in the table.
                 continue
             probability = p_rain_at.get((station, warning.sent_utc))
             if warning.eta_min is None or probability is None:
@@ -2132,6 +2161,13 @@ def _methods_section(
             "the last gauge slot the station reported, and which has "
             "claimed no onset, is pending: excluded from hits, false "
             "alarms, POD and FAR until the gauge can answer"
+        ),
+        "unscorable_rule": (
+            f"a warning that claimed no onset, and whose window or the "
+            f"{inputs.dry_min} min dry lead-in before it contains a gauge "
+            f"slot the station never reported, is unscorable: the missing "
+            f"slot may hold the very onset it promised, so it is neither a "
+            f"hit nor a false alarm, and it is excluded from every rate"
         ),
         # Additive, like the two keys above: the client ignores it, the
         # archive does not. A station dropped from the scoreboard has to
@@ -2946,6 +2982,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"{warnings['misses']:,} misses"
             + (f", {pending:,} still pending (window not closed)"
                if pending else "")
+            + (f", {warnings['unscorable']:,} unscorable (gauge gap)"
+               if warnings.get("unscorable") else "")
             + (f", {warnings['uncovered_onsets']:,} gauge onsets outside "
                f"any decision run (not scored)"
                if warnings.get("uncovered_onsets") else "")
@@ -3106,6 +3144,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             add(f"- Coverage: {methods['coverage_rule']}.")
         if methods.get("pending_rule"):
             add(f"- Pending: {methods['pending_rule']}.")
+        if methods.get("unscorable_rule"):
+            add(f"- Unscorable: {methods['unscorable_rule']}.")
         add(f"- Sources: {methods['sources']['radar']}; "
             f"{methods['sources']['gauges']}.")
     else:

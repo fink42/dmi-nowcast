@@ -378,7 +378,10 @@ corpus volume.
 $CORPUS_HOST_DIR/
   stations/
     catalogue.parquet                    294 stations, current version of each
-    obs/YYYY/MM.parquet                  one row per (station, parameter, stamp)
+    obs/YYYY/MM_DD.parquet               one row per (station, parameter, stamp);
+                                         one file per UTC day (pre-R5 archives
+                                         also hold YYYY/MM.parquet, still read)
+    obs/.lock                            flock taken by every writer
 ```
 
 Turn it on in `config.yaml` (off by default, and **refused** together with
@@ -388,6 +391,7 @@ Turn it on in `config.yaml` (off by default, and **refused** together with
 station_obs:
   enabled: true
   interval_min: 10       # poll cadence
+  poll_offset_sec: 510   # fire 8:30 after each slot ends (review R5)
   lookback_min: 40       # re-read window; must be >= interval_min
   parameters: [precip_past10min, precip_dur_past10min]
 ```

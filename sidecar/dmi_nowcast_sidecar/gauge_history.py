@@ -98,17 +98,90 @@ def slots_by_station(
 ) -> dict[str, list]:
     """``{station_id: [(slot_end, wet, mm), ...]}`` from one read.
 
-    :func:`~dmi_nowcast_core.warning_score.gauge_slot_amounts` scans the
-    rows it is given once per station, which is the right shape when a
-    caller wants one station and the wrong one at a hundred: the table is
-    converted and walked N times for an answer that needs one pass. This
-    buckets the rows by station first and hands each call only its own,
-    which is what lets the live cycle do this every radar frame and the
-    replay do it for a whole day at once.
+    Exactly :func:`~dmi_nowcast_core.warning_score.gauge_slot_amounts`
+    per station — the wet rule, the contiguous grid pinned to
+    ``[start_utc, end_utc]``, the trace sentinel — computed in one pass.
 
-    The slot semantics are entirely ``gauge_slot_amounts``' — the wet
-    rule, the contiguous grid, the trace sentinel. This only decides who
-    sees which rows.
+    An Arrow table (what the store returns) is bucketed with Arrow and
+    numpy (review R5): station → row of a grid by hash lookup, instant →
+    slot by integer ceiling, readings scattered by maximum — the very
+    fold ``warning_score.gauge_truth_vectorised`` uses, which is pinned
+    equal to the reference. The per-row ``to_pylist`` path it replaces
+    cost ~80 ms a cycle. Anything else (a list of row mappings) takes the
+    reference path, :func:`_slots_by_station_rows`.
+    """
+    if not hasattr(table, "to_batches"):
+        return _slots_by_station_rows(
+            table, station_ids, start_utc=start_utc, end_utc=end_utc,
+        )
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    from dmi_nowcast_core.warning_score import (
+        WET_DUR_MIN,
+        WET_PRECIP_MM,
+        _absorb_batch,
+        slot_end_of,
+    )
+
+    wanted = [str(sid) for sid in station_ids]
+    first = slot_end_of(start_utc, slot_min=SLOT_MIN)
+    last = slot_end_of(end_utc, slot_min=SLOT_MIN)
+    if last < first:
+        return {sid: [] for sid in wanted}
+    step = timedelta(minutes=SLOT_MIN)
+    step_sec = SLOT_MIN * 60
+    first_sec = int(first.timestamp())
+    n_slots = (int(last.timestamp()) - first_sec) // step_sec + 1
+    # Unique ids for the hash lookup; a repeated id in ``station_ids`` gets
+    # the same series, as the reference gives it.
+    index_ids = list(dict.fromkeys(wanted))
+    row_of = {sid: i for i, sid in enumerate(index_ids)}
+    mm = np.full((len(index_ids), n_slots), -1.0, dtype=np.float32)
+    dur = np.full((len(index_ids), n_slots), -1.0, dtype=np.float32)
+    if index_ids and table.num_rows:
+        # Only the two gauge parameters: the fold reads anything that is
+        # not an amount as a duration.
+        table = table.filter(pc.is_in(
+            table.column("parameter_id"),
+            value_set=pa.array([PRECIP_PARAM, PRECIP_DUR_PARAM], pa.string()),
+        ))
+        station_index = pa.array(index_ids, type=pa.string())
+        for batch in table.to_batches():
+            _absorb_batch(
+                batch, station_index, mm.reshape(-1), dur.reshape(-1),
+                first_sec=first_sec, step_sec=step_sec,
+                step_us=step_sec * 1_000_000, n_slots=n_slots,
+            )
+    slot_ends = [first + k * step for k in range(n_slots)]
+    out: dict[str, list] = {}
+    for sid in index_ids:
+        i = row_of[sid]
+        series = []
+        for slot, m, d in zip(slot_ends, mm[i].tolist(), dur[i].tolist()):
+            amount = None if m < 0.0 else m
+            duration = None if d < 0.0 else d
+            if amount is None and duration is None:
+                wet = None
+            else:
+                wet = (amount is not None and amount >= WET_PRECIP_MM) or (
+                    duration is not None and duration >= WET_DUR_MIN
+                )
+            series.append((slot, wet, amount))
+        out[sid] = series
+    return {sid: out[sid] for sid in wanted}
+
+
+def _slots_by_station_rows(
+    table: Any,
+    station_ids: Sequence[str],
+    *,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> dict[str, list]:
+    """The reference :func:`slots_by_station`: bucket row dicts, then
+    :func:`~dmi_nowcast_core.warning_score.gauge_slot_amounts` per station.
     """
     wanted = [str(sid) for sid in station_ids]
     buckets: dict[str, list] = {sid: [] for sid in wanted}

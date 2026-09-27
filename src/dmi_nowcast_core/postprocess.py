@@ -1706,6 +1706,16 @@ class GaugeSlotTable:
         that horizon, and ``min_since_wet`` is measured from the decision
         instant because "how long since it last rained there" is a physical
         age that the lag is part of.
+
+        ``min_since_wet`` looks back :data:`GAUGE_SINCE_CAP_MIN` from the
+        decision instant and no further (review R5): a station counts as
+        having said anything only for slots ending at or after
+        ``now − GAUGE_SINCE_CAP_MIN``. Before, any older slot the CALLER
+        happened to read made it "known, dry for the cap" — so a gauge
+        silent for more than six hours read 360 in the replay (a day plus
+        six hours of slots) and NaN live (six hours and one slot). A wet
+        slot older than the cap was already capped to it, so the rule
+        changes nothing else.
         """
         now = _slot_utc(now_utc)
         now_s = now.timestamp()
@@ -1725,7 +1735,10 @@ class GaugeSlotTable:
         since = np.where(
             is_wet, age[None, :], np.inf,
         ).min(1) if self.ends.size else np.full(len(self.stations), np.inf)
-        known_any = known.any(1)
+        # Only the slots the cap can see: the answer must not depend on how
+        # far back the caller's read reached.
+        within_cap = self.ends >= now_s - GAUGE_SINCE_CAP_MIN * 60.0
+        known_any = (known & within_cap[None, :]).any(1)
         return {
             "known_30": (known & recent[None, :]).any(1),
             "wet_30": (is_wet & recent[None, :]).any(1),

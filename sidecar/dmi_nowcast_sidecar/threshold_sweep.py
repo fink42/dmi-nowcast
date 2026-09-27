@@ -265,7 +265,7 @@ CSV_COLUMNS = (
     "n_onsets", "pod", "far", "precision", "recall", "f1", "f_beta_0.5",
     "f_beta_2", "csi", "lead_error_p25", "lead_error_p50",
     "lead_error_p75", "lead_error_n", "warnings_per_station_day",
-    "n_stations", "n_days", "n_rows", "stratum",
+    "n_stations", "n_days", "n_rows", "unscorable", "stratum",
 )
 
 
@@ -669,8 +669,15 @@ def gauge_truth(
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
     min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS,
     log=None,
+    known_out: dict | None = None,
 ) -> tuple[dict[str, list[datetime]], dict[str, datetime], int, list[str]]:
     """``(onsets, known_until, known slot count, dead gauges)`` per station.
+
+    ``known_out``, when given, is filled with ``{station: KnownGrid}`` for
+    the same (non-dead) stations — what ``score_warnings`` needs to grade a
+    warning over a gauge hole ``unscorable`` (review R5). An out-parameter
+    rather than a fifth return value, so every existing caller unpacks
+    exactly what it did.
 
     One vectorised pass over the archive
     (``warning_score.gauge_truth_vectorised``): each month partition is
@@ -713,6 +720,11 @@ def gauge_truth(
     excluded = set(dead)
     onsets = {s: v for s, v in truth.onsets.items() if s not in excluded}
     known_until = {s: v for s, v in truth.known_until.items() if s not in excluded}
+    if known_out is not None:
+        known_out.update({
+            s: series.known_grid() for s, series in truth.series.items()
+            if s not in excluded
+        })
     if log:
         log(
             f"gauge truth: {truth.known_slots} known slot(s), "
@@ -963,6 +975,7 @@ def score_cell(shared: dict, lead: int, threshold_pct: int | None) -> dict:
             known_until=shared["known_until"].get(station),
             coverage=shared["coverage"][int(lead)].get(station, ()),
             min_useful_lead_min=shared["min_useful_lead_min"],
+            gauge_known=shared.get("known_grids", {}).get(station),
         ))
     pooled = pooled_summary(results)
     return _cell(pooled, lead, threshold_pct, shared)
@@ -986,6 +999,9 @@ def _cell(pooled: dict, lead: int, threshold_pct: int | None, shared: dict) -> d
         "warnings": pooled["warnings"],
         "n_sent": pooled["n_sent"],
         "pending": pooled["pending"],
+        # Additive (review R5): no claim, and a gauge hole in the window or
+        # its dry lead-in — held out of every rate, like pending.
+        "unscorable": pooled.get("unscorable", 0),
         "hits": pooled["hits"],
         "false_alarms": pooled["false_alarms"],
         "late": pooled["late"],
@@ -1027,6 +1043,7 @@ def build_shared(
     *,
     onsets: Mapping[str, Sequence[datetime]],
     known_until: Mapping[str, datetime],
+    known_grids: Mapping[str, Any] | None = None,
     coverage_gap_min: int = DEFAULT_COVERAGE_GAP_MIN,
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
@@ -1065,6 +1082,12 @@ def build_shared(
         "tracks": {station: tracks[station] for station in stations},
         "onsets": dict(onsets),
         "known_until": dict(known_until),
+        # ``{station: KnownGrid}``; empty = nothing is ever unscorable
+        # (radar truth, and callers that predate review R5).
+        "known_grids": {
+            station: grid for station, grid in (known_grids or {}).items()
+            if station in set(stations)
+        },
         "coverage": {
             lead: {
                 station: coverage_runs(
@@ -1445,6 +1468,7 @@ def run_strata(
     known_until: Mapping[str, datetime],
     options: "SweepOptions",
     log=None,
+    known_grids: Mapping[str, Any] | None = None,
 ) -> dict[str, dict]:
     """Score every requested stratum, each as a self-contained replay.
 
@@ -1504,6 +1528,7 @@ def run_strata(
                 sliced, slice_stations, leads,
                 onsets=slice_onsets,
                 known_until=known_until,
+                known_grids=known_grids,
                 coverage_gap_min=options.coverage_gap_min,
                 tolerance_min=options.tolerance_min,
                 dry_min=options.dry_min,
@@ -1746,8 +1771,10 @@ def render_markdown(payload: dict) -> str:
         "is kept for comparison with the meteorological literature. Lead "
         "error is `eta − (onset − sent)` in minutes over the hits: positive "
         "means the rain beat the ETA. Every column adds up: `hits + late + "
-        "false alarms + pending = sent`, and a pending warning is one whose "
-        "window the gauge record does not yet cover, held out of every rate "
+        "false alarms + pending + unscorable = sent`. A pending warning is "
+        "one whose window the gauge record does not yet cover, and an "
+        "unscorable one claimed no onset while the gauge left a slot of its "
+        "window or dry lead-in unreported; both are held out of every rate "
         "rather than graded on evidence that does not exist."
     )
     lines.append("")
@@ -1762,16 +1789,16 @@ def render_markdown(payload: dict) -> str:
         lines.append("")
         lines.append(
             "| threshold | sent | hits | late | false alarms | pending | "
-            "misses | precision | recall (POD) | F1 | F0.5 | F2 | FAR | CSI "
-            "| lead err p50 | sent / station-day |"
+            "unscorable | misses | precision | recall (POD) | F1 | F0.5 | F2 "
+            "| FAR | CSI | lead err p50 | sent / station-day |"
         )
         lines.append(
             "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         )
         if nothing:
             lines.append(
-                f"| no rule | 0 | 0 | 0 | 0 | 0 | {nothing['misses']} | – | "
+                f"| no rule | 0 | 0 | 0 | 0 | 0 | 0 | {nothing['misses']} | – | "
                 f"{_fmt(nothing['pod'])} | – | – | – | – | "
                 f"{_fmt(nothing['csi'])} | – | 0.00 |"
             )
@@ -1786,7 +1813,7 @@ def render_markdown(payload: dict) -> str:
             lines.append(
                 f"| {label} | {cell['n_sent']} | {cell['hits']} | "
                 f"{cell['late']} | {cell['false_alarms']} | {cell['pending']} | "
-                f"{cell['misses']} | "
+                f"{cell.get('unscorable', 0)} | {cell['misses']} | "
                 f"{_fmt(cell['precision'])} | {_fmt(cell['recall'])} | "
                 f"{_fmt(cell['f1'])} | {_fmt(cell['f_beta_0.5'])} | "
                 f"{_fmt(cell['f_beta_2'])} | {_fmt(cell['far'])} | "
@@ -2282,10 +2309,12 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
 
     window_from, window_to = min(stamps), max(stamps)
     del stamps
+    known_grids: dict = {}
     onsets_by_station, known_until, known_slots, dead = gauge_truth(
         Path(options.corpus_dir), station_ids, (window_from, window_to),
         dry_min=options.dry_min, onset_min_mm=options.onset_min_mm,
         min_known_slots=options.min_known_slots, log=log,
+        known_out=known_grids,
     )
     if known_slots == 0:
         raise SweepError("the gauge store has no observations over this window")
@@ -2309,6 +2338,7 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
         scored_tracks, scored_stations, leads,
         onsets=onsets_by_station,
         known_until=known_until,
+        known_grids=known_grids,
         coverage_gap_min=options.coverage_gap_min,
         tolerance_min=options.tolerance_min,
         dry_min=options.dry_min,
@@ -2333,6 +2363,7 @@ def run_fit(options: SweepOptions, *, log=None) -> dict:
         known_until=known_until,
         options=options,
         log=log,
+        known_grids=known_grids,
     )
     del scored_tracks
 

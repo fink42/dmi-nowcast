@@ -334,8 +334,10 @@ async def test_the_step_appends_one_row_per_station(config: Config) -> None:
     service = StationEvalService(config, _engine(_products(), observed=0.0))
     await service.after_cycle(_cycle_result())
 
+    # Review R5: a day file, not the month partition.
     assert partition_path(config, RADAR_TS) == (
-        Path(config.storage.corpus_dir) / "stations" / "eval" / "2026" / "09.parquet"
+        Path(config.storage.corpus_dir) / "stations" / "eval" / "2026"
+        / "09_05.parquet"
     )
     rows = _read_partition(config)
     assert len(rows) == 2
@@ -382,15 +384,43 @@ async def test_the_append_is_idempotent_on_radar_ts_and_station(
     await service.after_cycle(_cycle_result())
     assert len(_read_partition(config)) == 2
 
-    # A second service (fresh process) re-evaluating the same frame must
-    # correct the rows, never double them.
-    again = StationEvalService(config, _engine(_products()))
-    await again.after_cycle(_cycle_result())
+    # Re-writing the same frame must correct the rows, never double them.
+    append_rows(
+        partition_path(config, RADAR_TS),
+        [_row("06180", RADAR_TS, action="notify")],
+    )
     rows = _read_partition(config)
     assert len(rows) == 2
     assert {(r["radar_ts"], r["station_id"]) for r in rows} == {
         (RADAR_TS, "06180"), (RADAR_TS, "06120"),
     }
+
+
+async def test_a_restart_does_not_overwrite_the_last_frames_actions(
+    config: Config,
+) -> None:
+    """Review R5: the frame the previous process scored stays as scored.
+
+    A fresh process's first cycle used to re-evaluate the last frame; the
+    engine, idempotent on ``last_eval_radar_ts``, answered ``none`` for
+    every station, and the append replaced the stored ``notify`` with it.
+    The marker is now seeded from the persisted state, so the frame is
+    skipped — and the NEXT frame is still evaluated normally.
+    """
+    service = StationEvalService(config, _engine(_products()))
+    await service.after_cycle(_cycle_result())
+    assert {r["action"] for r in _read_partition(config)} == {"notify"}
+
+    reborn = StationEvalService(config, _engine(_products()))
+    await reborn.after_cycle(_cycle_result())
+    assert reborn.last_summary is None
+    assert {r["action"] for r in _read_partition(config)} == {"notify"}
+
+    later = RADAR_TS + timedelta(minutes=10)
+    reborn.engine = _engine(_products(), radar_ts=later)
+    await reborn.after_cycle(_cycle_result(later))
+    assert reborn.last_summary is not None
+    assert reborn.last_summary["radar_ts"] == later.isoformat()
 
 
 async def test_rows_from_two_frames_accumulate_in_one_month(

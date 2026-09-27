@@ -3,8 +3,26 @@
 Keeps a gauge archive current so the benchmark has ground truth that the
 radar did not produce. Every ``station_obs.interval_min`` the poller asks
 DMI's metObs API for the last ``lookback_min`` of each configured
-parameter and merges the result into
-``<root>/stations/obs/YYYY/MM.parquet``.
+parameter and merges the result into the store's day files,
+``<root>/stations/obs/YYYY/MM_DD.parquet`` (one append per poll, review
+R5).
+
+**When** (review R5). The poll is pinned to the 10-minute slot grid, at
+``poll_offset_sec`` after each slot ends (default 8 min 30 s, so minutes
+08:30, 18:30, … 58:30 ± :data:`JITTER_SEC`). The cycle's gauge features
+may read a slot from ``slot end + gauge_lag_min`` (10 min) — the
+``generated_at`` wall clock, see ``compute._postprocess_context`` — and
+DMI publishes a slot ~1.5 min after it ends (``created`` − ``observed``:
+p50 1.5 / p90 1.6 / p99 21.6 min, measured 2026-09-14). A poll at +8.5 min
+has therefore seen every slot published within 8.5 min of its end before
+the first cycle that may use it, whatever phase the process started in.
+The old ``IntervalTrigger`` ran at the start-up phase: a phase just
+before DMI published left the newest slot out of the store until the next
+poll, and every cycle in between ran on features the replay would have
+had one slot fresher. Same request budget as before (one GET per
+parameter per poll); an early poll plus a retry would have doubled it for
+the same availability, since nothing reads a slot before ``slot end +
+gauge_lag_min``.
 
 Two roots, and the difference is retention, not shape:
 
@@ -42,10 +60,10 @@ Async discipline, as everywhere in this service: the HTTP call is async,
 and every Parquet read/rewrite goes to a worker thread. Nothing touches
 the filesystem on the event loop.
 
-Memory: the rewrite reads the whole current month, concatenates, dedupes,
-sorts and writes it back, and it does that every ten minutes — by the end
-of a month that is well over a million rows of Arrow buffers, six times a
-day, in the process that also serves the API. Nothing holds on to them
+Memory: the rewrite reads the current DAY file (review R5; it was the
+whole month until then — well over a million rows of Arrow buffers by the
+end of a month, twice per poll), concatenates, dedupes, sorts and writes
+it back, in the process that also serves the API. Nothing holds on to them
 (``StationObsStore`` keeps a root path and no cached table, and this
 poller keeps neither), but two things have to be asked for explicitly.
 Arrow's pool does not return the high-water mark to the kernel on its
@@ -67,6 +85,7 @@ from pathlib import Path
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from dmi_nowcast_core.metobs import AsyncMetObsClient, is_trace
@@ -79,6 +98,28 @@ _log = structlog.get_logger(__name__)
 
 #: Spread the poll off the exact minute boundary, as the radar cycle does.
 JITTER_SEC = 30
+
+
+def poll_trigger(interval_min: int, offset_sec: int):
+    """The poll's trigger: on the slot grid when the interval allows it.
+
+    An interval that divides the hour gets a ``CronTrigger`` at
+    ``offset_sec`` past each interval boundary (``offset_sec`` is taken
+    modulo the interval); anything else keeps the old free-running
+    ``IntervalTrigger``, because a cron minute list cannot express it.
+    """
+    interval = int(interval_min)
+    if interval <= 0 or 60 % interval != 0:
+        return IntervalTrigger(minutes=interval, jitter=JITTER_SEC)
+    offset = int(offset_sec) % (interval * 60)
+    first_minute, second = divmod(offset, 60)
+    minutes = ",".join(
+        str(first_minute + k * interval) for k in range(60 // interval)
+    )
+    return CronTrigger(
+        minute=minutes, second=second, timezone=timezone.utc,
+        jitter=JITTER_SEC,
+    )
 
 
 def month_partition_end(year: int, month: int) -> datetime:
@@ -104,8 +145,9 @@ class StationObsPollResult:
     new_rows: int = 0
     traces: int = 0
     skipped: int = 0
-    #: Month partitions retention deleted after this poll. Always 0 on the
-    #: private instance, which prunes nothing.
+    #: Store files (day files, or pre-R5 month files) retention deleted
+    #: after this poll. Always 0 on the private instance, which prunes
+    #: nothing.
     pruned: int = 0
     errors: dict[str, str] = field(default_factory=dict)
 
@@ -162,7 +204,7 @@ class StationObsPoller:
         return self._client
 
     def _append_and_release(self, observations) -> dict[str, int]:
-        """Merge one parameter's rows, then give the buffers back."""
+        """Merge one poll's rows (every parameter), then give the buffers back."""
         try:
             return self.store.append(observations)
         finally:
@@ -180,49 +222,46 @@ class StationObsPoller:
     # -- retention (bounded store only) -----------------------------------
 
     def prune_once(self, now: datetime | None = None) -> list[Path]:
-        """Delete month partitions that ended before the retention cutoff.
+        """Delete store files whose whole span ended before the cutoff.
 
         Blocking (``unlink``), so callers put it on the ``"station_obs"``
         worker with the append. Returns the files it removed.
 
-        Month granularity, deliberately: a partition is the unit the store
-        writes atomically, and trimming rows out of the *current* month
-        would mean rewriting the file the next append is about to rewrite.
-        So retention keeps whole months, and the window it actually holds
-        is ``retention_days`` rounded up to the containing months — a week
-        holds between 7 and 38 days. At ~0.3 MiB per month of real gauge
-        data that is the cheapest safe rule there is.
+        File granularity: a day file goes once its day has ended before
+        the cutoff, a pre-R5 month file once its month has. Nothing is
+        ever trimmed row by row, so retention never rewrites a file an
+        append might be rewriting. It runs under the store's lock all the
+        same, so it cannot unlink a day file between an append's read and
+        its rename.
 
         Two refusals, both about deleting the wrong thing. WHICH store may
         be pruned is :attr:`prunes`, decided from the config once and
         checked by the caller, so a poller over the corpus never reaches
         this method at all. And a file whose path does not parse as
-        ``YYYY/MM`` is left where it is: an unrecognised name is not
-        evidence of age.
+        ``YYYY/MM.parquet`` or ``YYYY/MM_DD.parquet`` is left where it is:
+        an unrecognised name is not evidence of age.
         """
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(
             days=self.settings.retention_days,
         )
         removed: list[Path] = []
-        for path in self.store.partitions():
-            try:
-                end = month_partition_end(int(path.parent.name), int(path.stem))
-            except ValueError:
-                continue
-            if end > cutoff:
-                continue
-            try:
-                path.unlink()
-            except OSError as exc:
-                _log.warning(
-                    "station_obs_prune_failed", path=str(path), error=str(exc),
-                )
-                continue
-            removed.append(path)
+        with self.store.locked():
+            for path in self.store.partitions():
+                span = self.store.partition_span(path)
+                if span is None or span[1] > cutoff:
+                    continue
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    _log.warning(
+                        "station_obs_prune_failed", path=str(path), error=str(exc),
+                    )
+                    continue
+                removed.append(path)
         for year_dir in {path.parent for path in removed}:
             # An emptied year directory is litter, not data. Anything still
-            # in it (a partition retention kept) makes rmdir fail, which is
-            # the check.
+            # in it (a file retention kept) makes rmdir fail, which is the
+            # check.
             try:
                 year_dir.rmdir()
             except OSError:
@@ -247,6 +286,8 @@ class StationObsPoller:
         start, end = self.window(now)
         client = self._get_client()
         result = StationObsPollResult()
+        batch: list = []
+        contributed: list[str] = []
         for parameter in self.settings.parameters:
             try:
                 observations = await client.fetch_observations(parameter, start, end)
@@ -259,23 +300,29 @@ class StationObsPoller:
             result.fetched += len(observations)
             result.traces += sum(1 for o in observations if is_trace(o.value))
             result.skipped += client.last_stats.skipped
-            if not observations:
-                continue
+            if observations:
+                batch.extend(observations)
+                contributed.append(parameter)
+        if batch:
             try:
-                # Parquet rewrite — blocking, so off the loop it goes,
-                # onto this task's own worker (see .workers). The pool
-                # release rides in the same thread: it is a C call of
-                # microseconds, but it belongs where the buffers died.
+                # ONE store append for every parameter of the poll (review
+                # R5: it was one per parameter, each rewriting the month).
+                # Blocking, so off the loop it goes, onto this task's own
+                # worker (see .workers). The pool release rides in the
+                # same thread: it is a C call of microseconds, but it
+                # belongs where the buffers died.
                 written = await run_in_pool(
-                    "station_obs", self._append_and_release, observations,
+                    "station_obs", self._append_and_release, batch,
                 )
             except Exception as exc:  # noqa: BLE001
-                result.errors[parameter] = f"{type(exc).__name__}: {exc}"
+                for parameter in contributed:
+                    result.errors[parameter] = f"{type(exc).__name__}: {exc}"
                 _log.warning(
-                    "station_obs_append_failed", parameter=parameter, error=str(exc),
+                    "station_obs_append_failed",
+                    parameters=contributed, error=str(exc),
                 )
-                continue
-            result.new_rows += int(written.get("new", 0))
+            else:
+                result.new_rows += int(written.get("new", 0))
         if self.prunes:
             try:
                 # Same worker as the append, for the same reason: it is
@@ -318,9 +365,8 @@ class StationObsPoller:
             await self._run_once()
         self._scheduler.add_job(
             self._run_once,
-            trigger=IntervalTrigger(
-                minutes=self.settings.interval_min,
-                jitter=JITTER_SEC,
+            trigger=poll_trigger(
+                self.settings.interval_min, self.settings.poll_offset_sec,
             ),
             id="station_obs_poll",
             replace_existing=True,
@@ -332,6 +378,7 @@ class StationObsPoller:
         _log.info(
             "station_obs_poller_running",
             interval_min=self.settings.interval_min,
+            poll_offset_sec=self.settings.poll_offset_sec,
             lookback_min=self.settings.lookback_min,
             parameters=list(self.settings.parameters),
             store=str(self.store.obs_dir),
@@ -383,5 +430,6 @@ __all__ = [
     "StationObsPollResult",
     "build_station_obs_poller",
     "month_partition_end",
+    "poll_trigger",
     "release_arrow_pool",
 ]

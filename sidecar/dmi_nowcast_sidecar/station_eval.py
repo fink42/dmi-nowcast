@@ -29,10 +29,22 @@ Design constraints, in the order they bite:
   streak — the same trap ``push.service`` documents, guarded the same way
   (last-evaluated radar timestamp, plus the engine's own idempotence on
   ``last_eval_radar_ts``).
-- **Idempotent appends.** A month partition is rewritten atomically with
-  the cycle's rows replacing any existing row for the same
-  ``(radar_ts, station_id)``. Restarting the service, or replaying a
-  frame, can add rows but can never duplicate one.
+- **Idempotent appends.** A DAY file (``eval/YYYY/MM_DD.parquet``,
+  review R5 — it was the whole month partition until then, read, sorted
+  and rewritten every cycle) is rewritten atomically with the cycle's
+  rows replacing any existing row for the same ``(radar_ts, station_id)``.
+  Restarting the service, or replaying a frame, can add rows but can
+  never duplicate one. A pre-R5 month file ``eval/YYYY/MM.parquet`` is
+  still read and never written: it sorts before its month's day files,
+  and every reader lets the later file win a key, so a frame re-written
+  after the upgrade reads back as the day file's row — the same row the
+  old in-place merge would have left.
+- **One evaluation per frame across restarts** (review R5). The
+  last-evaluated marker is seeded from the persisted state's newest
+  ``last_eval_radar_ts`` on the first cycle after a start, so the frame
+  the previous process already scored is not re-evaluated — which used
+  to overwrite its stored ``notify`` / ``already_raining`` /
+  ``all_clear`` with the engine's idempotent ``none``.
 - **Private instance only.** ``server.public_mode`` refuses at config
   load (``Config._station_eval_is_private``); this module checks again
   before it does anything, because a guard that exists in one place is a
@@ -101,6 +113,17 @@ def state_path(config: Config) -> Path:
 
 
 def partition_path(config: Config, instant: datetime) -> Path:
+    """The DAY file a frame's rows are written to (review R5)."""
+    return (
+        stations_dir(config)
+        / "eval"
+        / f"{instant.year:04d}"
+        / f"{instant.month:02d}_{instant.day:02d}.parquet"
+    )
+
+
+def month_partition_path(config: Config, instant: datetime) -> Path:
+    """The pre-R5 month file for ``instant`` — read by readers, never written."""
     return (
         stations_dir(config)
         / "eval"
@@ -271,12 +294,13 @@ def _conform(table, leads, schema) -> Any:
 
 
 def append_rows(path: Path, rows: Sequence[dict], leads_min=None) -> int:
-    """Merge ``rows`` into a month partition, keyed on (radar_ts, station_id).
+    """Merge ``rows`` into a partition file, keyed on (radar_ts, station_id).
 
-    Read-modify-write of one month rather than an append: parquet has no
-    in-place append, the partition is small (a month of 10-min frames ×
-    ~100 stations is ~430k rows) and a full rewrite is the only way to
-    make the key idempotent. Existing rows for a key the cycle is writing
+    The live service passes a DAY file (:func:`partition_path`, review
+    R5); the function itself does not care which file it is handed.
+    Read-modify-write rather than an append: parquet has no in-place
+    append, a day is small (~110 stations × 144-288 frames) and a full
+    rewrite is the only way to make the key idempotent. Existing rows for a key the cycle is writing
     are dropped, so re-running a frame corrects it instead of doubling it.
 
     The existing partition is aligned to the UNION of its own lead columns
@@ -599,6 +623,20 @@ class StationEvalService:
             return {}
         return {str(k): state_from_json(v) for k, v in stations.items()}
 
+    def _persisted_radar_ts(self) -> datetime | None:
+        """The newest ``last_eval_radar_ts`` in the loaded state, or None."""
+        stamps = [
+            s.last_eval_radar_ts for s in (self._states or {}).values()
+            if s.last_eval_radar_ts is not None
+        ]
+        if not stamps:
+            return None
+        newest = max(
+            ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+            for ts in stamps
+        )
+        return newest
+
     def _write_state(self, states: dict[str, SubState], generated_at: datetime) -> None:
         payload = {
             "version": STATE_VERSION,
@@ -623,6 +661,23 @@ class StationEvalService:
         """Sample, decide, persist. Blocking; returns None when it did nothing."""
         self._ensure_loaded()
         assert self._points is not None and self._states is not None
+        if self._last_radar_ts is None:
+            # First cycle of this process (review R5): the previous one may
+            # already have scored this frame. Re-evaluating it would find
+            # every station idempotent (``last_eval_radar_ts`` == this
+            # frame), decide ``none`` everywhere and overwrite the frame's
+            # stored notify / already_raining / all_clear with it.
+            seeded = self._persisted_radar_ts()
+            if seeded is not None:
+                self._last_radar_ts = seeded
+                if radar_ts <= seeded:
+                    _log.info(
+                        "station_eval_skipped",
+                        reason="already_evaluated_before_restart",
+                        radar_ts=radar_ts.isoformat(),
+                        last_eval_radar_ts=seeded.isoformat(),
+                    )
+                    return None
         rules = self._rules()
         lead = int(self.config.station_eval.rules.lead_min)
         threshold_pct, threshold_source = self._threshold()
@@ -787,6 +842,7 @@ __all__ = [
     "append_rows",
     "extra_schema",
     "load_points",
+    "month_partition_path",
     "partition_path",
     "state_from_json",
     "state_path",

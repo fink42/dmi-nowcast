@@ -96,6 +96,19 @@ DMI backfills late station reports and a slot near the edge can still
 change. Without ``known_until`` nothing is pending and the scoring is
 exactly what it was.
 
+**Unscorable** (review R5, 2026-09-27) is the same argument about a
+hole rather than an edge. A warning that claims nothing, whose truth
+window ``(sent, sent + lead + tolerance]`` or whose dry lead-in
+``(sent − dry_min, sent]`` contains a slot the gauge never reported,
+cannot be called a false alarm either: the onset it promised may be
+exactly what the missing slots would have shown, and the lead-in is what
+an onset needs to be recognised as one at all. Pass ``gauge_known`` (a
+:class:`KnownGrid` for the station) and such a warning is UNSCORABLE —
+excluded from hits, false alarms, precision, recall, POD, FAR and CSI
+alike, and counted on its own (``unscorable``). Without ``gauge_known``
+nothing is unscorable and the scoring is exactly what it was. A warning
+that claimed an onset is never unscorable: the claim is its evidence.
+
 A warning that HAS claimed an onset is never pending, even with its
 window still open: the onset is in the record, the claim is settled, and
 no later slot can unmake it. Demoting it would take a confirmed hit out
@@ -197,6 +210,7 @@ __all__ = [
     "gauge_slot_amounts",
     "onsets",
     "DEFAULT_GAUGE_PAD_MIN",
+    "KnownGrid",
     "StationSlots",
     "GaugeTruth",
     "gauge_truth_vectorised",
@@ -828,6 +842,48 @@ def _month_window(
     return start, end
 
 
+class KnownGrid:
+    """Which of one station's slots the gauge reported — nothing else.
+
+    What :func:`score_warnings` needs to grade a warning ``unscorable``:
+    a contiguous slot grid (``first_sec`` + ``step_sec`` × index, epoch
+    seconds of slot ENDS) and a boolean per slot. Small enough to ship to
+    a sweep's worker processes (a season is ~44k bytes a station). A slot
+    outside the grid is unknown — the grid is the archive's reach.
+    """
+
+    __slots__ = ("first_sec", "step_sec", "known")
+
+    def __init__(self, first_sec: int, step_sec: int, known: Any) -> None:
+        import numpy as np
+
+        self.first_sec = int(first_sec)
+        self.step_sec = int(step_sec)
+        self.known = np.asarray(known, dtype=bool)
+
+    def __reduce__(self):
+        return (KnownGrid, (self.first_sec, self.step_sec, self.known))
+
+    def all_known(self, after: datetime, until: datetime) -> bool:
+        """Did the gauge report EVERY slot ending in ``(after, until]``?
+
+        Slot ends, so a slot is inside when its end is: ``after`` itself
+        is excluded, ``until`` included, both taken as instants (a window
+        edge between two slot ends needs the slot that ends after it).
+        """
+        step = self.step_sec
+        a = int(_as_utc(after, "after").timestamp())
+        b = int(_as_utc(until, "until").timestamp())
+        # First slot end strictly after ``a``; last slot end <= ``b``.
+        lo = -(-(a + 1 - self.first_sec) // step)
+        hi = (b - self.first_sec) // step
+        if hi < lo:
+            return True
+        if lo < 0 or hi >= self.known.size:
+            return False
+        return bool(self.known[lo:hi + 1].all())
+
+
 @dataclass(frozen=True)
 class StationSlots:
     """One station's contiguous slot grid, held as numpy arrays.
@@ -892,6 +948,11 @@ class StationSlots:
         if index is None or not self.known[index]:
             return None
         return bool(self.wet[index])
+
+    def known_grid(self) -> KnownGrid:
+        """The ``known`` column alone, as :func:`score_warnings` reads it."""
+        first = int(self.slot_end[0]) if self.slot_end.size else 0
+        return KnownGrid(first, self.slot_min * 60, self.known)
 
     def known_until(self) -> datetime | None:
         """The last slot this station actually reported, or ``None``."""
@@ -1275,17 +1336,11 @@ def _stations_in(store: Any, months: Sequence[tuple[int, int]]) -> list[str]:
     archive. The three consumers all name their stations, because the
     decision rows decide which stations there is anything to score at.
     """
-    import pyarrow.compute as pc
-    import pyarrow.parquet as pq
-
     found: set[str] = set()
     for year, month in months:
-        path = store.partition_path(int(year), int(month))
-        if not path.exists():
-            continue
-        column = pq.read_table(path, columns=["station_id"]).column("station_id")
-        found.update(pc.unique(column.combine_chunks()).to_pylist())
-    return sorted(str(s) for s in found if s is not None)
+        # The month file and the day files alike (review R5).
+        found.update(store.station_ids_in_month(int(year), int(month)))
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------
@@ -1491,9 +1546,10 @@ class WarningOutcome:
     sent_utc: datetime
     eta_min: float | None
     #: ``"hit"``, ``"late"`` (an onset claimed with less than
-    #: ``min_useful_lead_min`` of realised lead), ``"false_alarm"``, or
-    #: ``"pending"`` — the last only when ``known_until`` says the window
-    #: has not closed yet.
+    #: ``min_useful_lead_min`` of realised lead), ``"false_alarm"``,
+    #: ``"pending"`` — only when ``known_until`` says the window has not
+    #: closed yet — or ``"unscorable"`` — only with ``gauge_known``, when
+    #: the window or its dry lead-in has a slot the gauge never reported.
     outcome: str
     onset_utc: datetime | None = None
     #: ``eta - (onset - sent)``, minutes. POSITIVE = the rain arrived
@@ -1613,8 +1669,8 @@ def _all_clear_grade(
     """``right`` / ``wrong`` / ``after_onset`` / ``pending`` / ``None``."""
     if all_clear is None:
         return None
-    if outcome == "pending":
-        return "pending"
+    if outcome in ("pending", "unscorable"):
+        return outcome
     if outcome == "false_alarm":
         return "right"
     # A hit or late: wrong when the rain came after we said it would not.
@@ -1629,7 +1685,8 @@ def _all_clear_summary(rows: Sequence[WarningOutcome]) -> dict[str, Any]:
     """The all-clear counts and the push → all-clear median over ``rows``."""
     graded = [
         w for w in rows
-        if w.all_clear is not None and w.all_clear != "pending"
+        if w.all_clear is not None
+        and w.all_clear not in ("pending", "unscorable")
     ]
     pending = sum(1 for w in rows if w.all_clear == "pending")
     minutes = [
@@ -1670,6 +1727,7 @@ def score_warnings(
     known_until: datetime | None = None,
     coverage: Sequence[tuple[datetime, datetime]] | None = None,
     min_useful_lead_min: float = DEFAULT_MIN_USEFUL_LEAD_MIN,
+    gauge_known: KnownGrid | None = None,
 ) -> ScoreResult:
     """Match warnings to onsets; return per-warning, per-onset and totals.
 
@@ -1715,6 +1773,13 @@ def score_warnings(
     default) and nothing is pending, which is the right behaviour for a
     closed historical window.
 
+    ``gauge_known`` is that station's :class:`KnownGrid`. Give it and a
+    warning that claims nothing, whose window or dry lead-in
+    ``(sent − dry_min, sent + lead + tolerance]`` has an unreported slot,
+    is ``unscorable`` rather than a false alarm (module docstring) —
+    excluded from every rate and counted as ``unscorable``. Pending is
+    tested first: a window that has not closed is pending, not unscorable.
+
     A second warning cannot inherit an onset an earlier warning already
     took: two warnings for one rain event means one of them was noise, and
     counting it as a hit would hide exactly the spam this scoring exists
@@ -1747,8 +1812,10 @@ def score_warnings(
     lead_errors: list[float] = []
     hits = 0
     pending = 0
+    unscorable = 0
     late = 0
     useful = float(min_useful_lead_min)
+    lead_in = timedelta(minutes=int(dry_min))
     for sent, eta, all_clear in sent_list:
         pick: int | None = None
         for i, onset in enumerate(onset_list):
@@ -1768,6 +1835,17 @@ def score_warnings(
                 warning_rows.append(WarningOutcome(
                     sent, eta, "pending", all_clear_utc=all_clear,
                     all_clear=_all_clear_grade("pending", None, all_clear),
+                ))
+                continue
+            if gauge_known is not None and not gauge_known.all_known(
+                sent - lead_in, sent + window,
+            ):
+                # A hole in the evidence, not a wrong warning: the onset it
+                # promised may be what the missing slots would have shown.
+                unscorable += 1
+                warning_rows.append(WarningOutcome(
+                    sent, eta, "unscorable", all_clear_utc=all_clear,
+                    all_clear=_all_clear_grade("unscorable", None, all_clear),
                 ))
                 continue
             warning_rows.append(WarningOutcome(
@@ -1813,7 +1891,7 @@ def score_warnings(
         for i, onset in enumerate(onset_list)
     )
     n_sent = len(warning_rows)
-    scored = n_sent - pending
+    scored = n_sent - pending - unscorable
     false_alarms = scored - hits - late
     pending_onsets = sum(1 for row in onset_rows if row.outcome == "pending")
     uncovered = sum(1 for row in onset_rows if row.outcome == "uncovered")
@@ -1826,6 +1904,9 @@ def score_warnings(
         "warnings": scored,
         "n_sent": n_sent,
         "pending": pending,
+        # Additive (review R5): warnings with no claim whose window had an
+        # unreported gauge slot — out of every rate, like ``pending``.
+        "unscorable": unscorable,
         "hits": hits,
         "late": late,
         "false_alarms": false_alarms,
@@ -1906,7 +1987,8 @@ def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
     hits = sum(1 for w in warnings if w.outcome == "hit")
     late = sum(1 for w in warnings if w.outcome == "late")
     pending = sum(1 for w in warnings if w.outcome == "pending")
-    scored = len(warnings) - pending
+    unscorable = sum(1 for w in warnings if w.outcome == "unscorable")
+    scored = len(warnings) - pending - unscorable
     false_alarms = scored - hits - late
     misses = sum(1 for o in onset_rows if o.outcome == "miss")
     pending_onsets = sum(1 for o in onset_rows if o.outcome == "pending")
@@ -1923,6 +2005,7 @@ def pooled_summary(results: Iterable[ScoreResult], **params: Any) -> dict:
         "warnings": scored,
         "n_sent": len(warnings),
         "pending": pending,
+        "unscorable": unscorable,
         "hits": hits,
         "late": late,
         "false_alarms": false_alarms,

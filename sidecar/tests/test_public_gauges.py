@@ -225,7 +225,7 @@ class TestTheBoundedStore:
         )
         result = await poller.poll_once(now=NOW)
         assert result.new_rows == 1
-        assert poller.store.partition_path(2026, 6).is_file()
+        assert poller.store.day_path(NOW.date()).is_file()
         # And nowhere else — there is no corpus on this instance.
         assert not (tmp_path / "corpus").exists()
 
@@ -233,12 +233,12 @@ class TestTheBoundedStore:
     async def test_retention_deletes_the_months_that_have_ended(
         self, tmp_path: Path,
     ) -> None:
-        """Whole partitions, and only once every row in them is past the cutoff.
+        """Whole files, and only once every row in them is past the cutoff.
 
-        Three months seeded: January (long gone), May (ended a fortnight
-        before the cutoff) and the current June. A week of retention keeps
-        June alone — the current month is never at risk, because its end is
-        in the future.
+        Three day files seeded (review R5): January (long gone), May
+        (ended weeks before the cutoff) and today. A week of retention
+        keeps today alone — the current day is never at risk, because its
+        end is in the future.
         """
         poller = StationObsPoller(
             _public_config(tmp_path), client=FakeClient(),  # type: ignore[arg-type]
@@ -253,7 +253,7 @@ class TestTheBoundedStore:
         result = await poller.poll_once(now=NOW)
 
         assert result.pruned == 2
-        assert [p.name for p in poller.store.partitions()] == ["06.parquet"]
+        assert [p.name for p in poller.store.partitions()] == ["06_15.parquet"]
         # The rows that survived are the rows the features would read.
         kept = poller.store.read(NOW - timedelta(days=1), NOW)
         assert kept.num_rows == 1
@@ -279,7 +279,7 @@ class TestTheBoundedStore:
         result = await poller.poll_once(now=NOW)
         assert result.pruned == 1
         assert [p.name for p in poller.store.partitions()] == [
-            "05.parquet", "06.parquet",
+            "05_06.parquet", "06_15.parquet",
         ]
 
     def test_a_file_it_cannot_date_is_left_alone(self, tmp_path: Path) -> None:
@@ -296,8 +296,33 @@ class TestTheBoundedStore:
 
         removed = poller.prune_once(NOW)
 
-        assert [p.name for p in removed] == ["01.parquet"]
+        assert [p.name for p in removed] == ["01_15.parquet"]
         assert stranger.is_file()
+
+    def test_a_pre_r5_month_file_goes_by_its_month(self, tmp_path: Path) -> None:
+        """A month file left from before the day files: month granularity.
+
+        May's file ended on 1 June — before a 7-day cutoff on 15 June, so
+        it goes; June's month file (seeded directly, the old layout) still
+        has days in the future and stays.
+        """
+        import pyarrow.parquet as pq
+
+        from dmi_nowcast_core.station_store import _observations_table
+
+        poller = StationObsPoller(
+            _public_config(tmp_path), client=FakeClient(),  # type: ignore[arg-type]
+        )
+        for when in (
+            datetime(2026, 5, 20, 12, 0, tzinfo=timezone.utc),
+            NOW - timedelta(days=10),
+        ):
+            path = poller.store.partition_path(when.year, when.month)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(_observations_table([_reading(when)]), path)
+        removed = poller.prune_once(NOW)
+        assert [p.name for p in removed] == ["05.parquet"]
+        assert poller.store.partition_path(2026, 6).is_file()
 
     def test_an_emptied_year_directory_goes_with_it(
         self, tmp_path: Path,
@@ -326,7 +351,9 @@ class TestTheBoundedStore:
         ])
         result = await poller.poll_once(now=NOW)
         assert result.pruned == 0
-        assert poller.store.partition_path(2025, 12).is_file()
+        assert poller.store.day_path(
+            datetime(2025, 12, 7, tzinfo=timezone.utc).date(),
+        ).is_file()
 
     @pytest.mark.asyncio
     async def test_retention_runs_off_the_event_loop(

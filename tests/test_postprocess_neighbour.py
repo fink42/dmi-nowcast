@@ -745,3 +745,63 @@ class TestTheExpectation:
         got = pp.random_point_expectation({"0-10 km": None}, self.WEIGHTS)
         assert got["value"] is None
         assert got["covered"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Review R5: min_since_wet does not depend on how far back the caller read
+# ---------------------------------------------------------------------------
+
+
+def _series(first: datetime, last: datetime, report_until: datetime,
+            wet_at: set[datetime] = frozenset()) -> list:
+    """A contiguous grid; the gauge reported (dry, or wet at ``wet_at``) up to
+    ``report_until`` and nothing after it."""
+    out = []
+    cursor = first
+    while cursor <= last:
+        if cursor <= report_until:
+            wet = cursor in wet_at
+            out.append((cursor, wet, 1.0 if wet else 0.0))
+        else:
+            out.append((cursor, None, None))
+        cursor += timedelta(minutes=10)
+    return out
+
+
+class TestMinSinceWetIsWindowIndependent:
+    LAG = 10.0
+
+    def _since(self, first: datetime, report_until: datetime, wet_at=frozenset()):
+        horizon = NOW - timedelta(minutes=self.LAG)
+        table = pp.GaugeSlotTable.from_slots(
+            {"G": _series(first, horizon, report_until, set(wet_at))},
+        )
+        return float(table.stats(NOW, self.LAG)["min_since_wet"][0])
+
+    def test_a_gauge_silent_for_more_than_the_cap_is_unknown_whatever_was_read(
+        self,
+    ) -> None:
+        """The replay reads a day plus six hours, the cycle six hours and a
+        slot. A gauge whose last word is seven hours old used to read 360
+        (known, dry for the cap) from the long read and NaN from the short
+        one; now both say NaN."""
+        silent_since = NOW - timedelta(hours=7)
+        long_read = self._since(NOW - timedelta(hours=30), silent_since)
+        short_read = self._since(
+            NOW - timedelta(minutes=pp.GAUGE_SINCE_CAP_MIN + self.LAG + 10),
+            silent_since,
+        )
+        assert math.isnan(long_read) and math.isnan(short_read)
+
+    def test_inside_the_cap_the_answer_is_unchanged(self) -> None:
+        # Reported until 5 h ago, dry: known, capped at 360 from either read.
+        dry_until = NOW - timedelta(hours=5)
+        for first in (NOW - timedelta(hours=30), NOW - timedelta(hours=6, minutes=20)):
+            assert self._since(first, dry_until) == pp.GAUGE_SINCE_CAP_MIN
+        # Wet 90 min ago: 90 from either read.
+        wet = NOW - timedelta(minutes=90)
+        for first in (NOW - timedelta(hours=30), NOW - timedelta(hours=6, minutes=20)):
+            assert self._since(first, NOW - timedelta(minutes=10), {wet}) == pytest.approx(90.0)
+        # Wet 8 h ago and silent since: unknown now (it was 360 before).
+        old_wet = NOW - timedelta(hours=8)
+        assert math.isnan(self._since(NOW - timedelta(hours=30), old_wet, {old_wet}))

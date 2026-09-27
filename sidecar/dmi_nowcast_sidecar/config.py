@@ -326,11 +326,14 @@ class StationObsConfig(BaseModel):
 
     Gauge truth for the benchmark: every ``interval_min`` the service
     re-reads the last ``lookback_min`` of each parameter and merges it
-    into ``storage.corpus_dir``'s ``stations/obs/YYYY/MM.parquet``. The
+    into ``storage.corpus_dir``'s ``stations/obs/`` day files. The
     lookback deliberately overlaps several intervals — DMI backfills late
     station reports, and the store dedupes on
     ``(station_id, observed_utc, parameter_id)``, so re-reading a slot is
     free and a missed cycle heals itself.
+
+    The poll is aligned to the slot grid at ``poll_offset_sec`` (review
+    R5); see :mod:`dmi_nowcast_sidecar.station_obs`.
 
     **Off by default.** Two deployments turn it on, for two different
     reasons (see ``Config._station_obs_not_public``):
@@ -361,6 +364,13 @@ class StationObsConfig(BaseModel):
 
     enabled: bool = False
     interval_min: Annotated[int, Field(ge=1, le=180)] = 10
+    #: Where in each interval the poll fires (review R5): seconds after an
+    #: interval boundary, i.e. after a 10-minute slot ends. 510 = 8 min
+    #: 30 s — after DMI has published the slot (p90 1.6 min) and before the
+    #: first cycle allowed to read it (slot end + ``gauge_lag_min``, 10).
+    #: Keep it below ``postprocess.gauge_lag_min`` × 60. Only honoured when
+    #: ``interval_min`` divides the hour; otherwise the poll free-runs.
+    poll_offset_sec: Annotated[int, Field(ge=0, le=3599)] = 510
     # Must exceed interval_min, or a cycle that slips leaves a hole no
     # later poll ever revisits.
     lookback_min: Annotated[int, Field(ge=10, le=1440)] = 40
@@ -372,13 +382,11 @@ class StationObsConfig(BaseModel):
     #: How much history the bounded store keeps. **Only honoured with
     #: ``store_dir`` set**: the corpus archive is never pruned.
     #:
-    #: Pruning deletes whole month partitions, because a month partition
-    #: is the unit the store writes and rewriting one to drop its oldest
-    #: rows would race the append. So the retained window is this many
-    #: days rounded up to the containing months — 7 days holds between 7
-    #: and 38 of them, which is ~0.3 MiB of real gauge data per month
-    #: (1.4M rows at ~0.2 bytes/row; ~1.5 MiB if every reading in the
-    #: month were distinct) against the 6 hours the features read.
+    #: Pruning deletes whole files, never rows: a day file once its day
+    #: ended before the cutoff (review R5), and a pre-R5 month file once
+    #: its month did. So the retained window is this many days rounded up
+    #: to whole days (whole months for a month file left from before R5),
+    #: against the 6 hours the features read.
     retention_days: Annotated[int, Field(ge=1, le=3650)] = 7
     parameters: list[str] = Field(
         default_factory=lambda: ["precip_past10min", "precip_dur_past10min"],

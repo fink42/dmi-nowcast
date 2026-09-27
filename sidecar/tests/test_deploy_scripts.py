@@ -233,6 +233,27 @@ def test_run_in_repo_mounts_the_tree_read_only(tmp_path: Path) -> None:
     assert "-e PYTHONPATH=/repo/src" in log
 
 
+def test_run_in_repo_runs_one_steps_pool_thread_per_worker(tmp_path: Path) -> None:
+    """Review R5: two batch workers x the live default of 4 pool threads
+    would oversubscribe the 7-core VM; batch containers get 1."""
+    proc, log = _shell("run_in_repo python -c pass", tmp_path, FAKE_DOCKER_PS="")
+    assert proc.returncode == 0, proc.stderr
+    assert "-e DMI_NOWCAST_POOL_WORKERS=1" in log
+    proc, log = _shell(
+        "BATCH_POOL_WORKERS=2\nrun_in_repo python -c pass",
+        tmp_path, FAKE_DOCKER_PS="",
+    )
+    assert "-e DMI_NOWCAST_POOL_WORKERS=2" in log
+
+
+@pytest.mark.parametrize(
+    "script", ["quality_report.sh", "backfill_corpus.sh", "build_corpus_manifest.sh"],
+)
+def test_the_other_batch_wrappers_set_the_pool_size_too(script: str) -> None:
+    text = (DEPLOY_DIR / script).read_text()
+    assert 'DMI_NOWCAST_POOL_WORKERS="${BATCH_POOL_WORKERS:-1}"' in text
+
+
 def test_run_in_repo_takes_extra_mounts(tmp_path: Path) -> None:
     """The replay scripts bind their days file in this way."""
     proc, log = _shell(

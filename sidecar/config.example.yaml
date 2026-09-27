@@ -231,8 +231,11 @@ lightning:
 
 # --- Rain-gauge polling (Phase F) -------------------------------------
 # Mirrors DMI metObs station observations into
-# <storage.corpus_dir>/stations/obs/YYYY/MM.parquet, which is the gauge
-# truth scripts/join_gauge_truth.py joins onto the calibration corpus.
+# <storage.corpus_dir>/stations/obs/YYYY/MM_DD.parquet (one file per UTC
+# day since review R5; older YYYY/MM.parquet month files are still read),
+# which is the gauge truth scripts/join_gauge_truth.py joins onto the
+# calibration corpus. The poll fires poll_offset_sec (default 510 = 8:30)
+# after each 10-minute slot ends.
 # Without it the benchmark verifies the radar against the radar.
 #
 # ON for this (LAN / private) instance: it is the one that owns the
@@ -273,7 +276,8 @@ station_obs:
 # Gauge scoreboard (Phase F). A virtual subscriber at every DMI rain
 # gauge, evaluated once per cycle by the same push decision engine the
 # real subscriptions go through, appended to
-# <corpus_dir>/stations/eval/YYYY/MM.parquet in the same row shape
+# <corpus_dir>/stations/eval/YYYY/MM_DD.parquet (per UTC day since review
+# R5; a YYYY/MM.parquet month file from before is still read) in the same row shape
 # scripts/replay_warnings.py writes for history. Turn it on and the
 # historical replay and the live record become one continuous table.
 #

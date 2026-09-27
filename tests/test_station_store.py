@@ -49,11 +49,13 @@ def _station(station_id: str = "06074", **kw) -> Station:
 # ---------------------------------------------------------------------------
 
 
-def test_append_writes_the_expected_month_partition(tmp_path: Path) -> None:
+def test_append_writes_the_expected_day_file(tmp_path: Path) -> None:
+    """Review R5: a day file per UTC day, never the month file."""
     store = StationObsStore(tmp_path)
     store.append([_obs("06074", 0), _obs("06074", 10)])
-    partition = tmp_path / "stations" / "obs" / "2026" / "06.parquet"
+    partition = tmp_path / "stations" / "obs" / "2026" / "06_01.parquet"
     assert partition.exists()
+    assert not store.partition_path(2026, 6).exists()
     assert store.partitions() == [partition]
 
 
@@ -99,8 +101,8 @@ def test_append_splits_across_month_boundaries(tmp_path: Path) -> None:
         Observation("06074", june, "precip_past10min", 0.1),
         Observation("06074", july, "precip_past10min", 0.2),
     ])
-    assert (tmp_path / "stations" / "obs" / "2026" / "06.parquet").exists()
-    assert (tmp_path / "stations" / "obs" / "2026" / "07.parquet").exists()
+    assert (tmp_path / "stations" / "obs" / "2026" / "06_30.parquet").exists()
+    assert (tmp_path / "stations" / "obs" / "2026" / "07_01.parquet").exists()
     assert store.read(june, july).num_rows == 2
 
 
@@ -115,7 +117,7 @@ def test_stored_schema_is_explicit(tmp_path: Path) -> None:
 
     store = StationObsStore(tmp_path)
     store.append([_obs("06074", 0, value=1.5)])
-    schema = pq.read_schema(store.partition_path(2026, 6))
+    schema = pq.read_schema(store.day_path(T0.date()))
     assert schema.equals(obs_schema())
     field = schema.field("observed_utc")
     assert str(field.type.tz) == "UTC"
