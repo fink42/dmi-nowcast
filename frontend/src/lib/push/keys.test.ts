@@ -4,7 +4,7 @@
  * `subscribe()` fails in the browser with an opaque error.
  */
 import { describe, expect, it } from 'vitest';
-import { isPlausibleVapidKey, urlBase64ToUint8Array } from './keys';
+import { isPlausibleVapidKey, sameApplicationServerKey, urlBase64ToUint8Array } from './keys';
 
 describe('urlBase64ToUint8Array', () => {
 	it('decodes a padded-length string', () => {
@@ -61,5 +61,21 @@ describe('isPlausibleVapidKey', () => {
 		const b64url = btoa(String.fromCharCode(...compressed)).replace(/=+$/, '');
 		expect(isPlausibleVapidKey(b64url)).toBe(false);
 		expect(isPlausibleVapidKey('not base64 at all!!')).toBe(false);
+	});
+});
+
+describe('sameApplicationServerKey', () => {
+	const key = new Uint8Array([4, 1, 2, 3]);
+
+	it('compares the bytes, whether the browser hands back a buffer or a view', () => {
+		expect(sameApplicationServerKey(new Uint8Array([4, 1, 2, 3]).buffer, key)).toBe(true);
+		expect(sameApplicationServerKey(new Uint8Array([9, 4, 1, 2, 3]).subarray(1), key)).toBe(true);
+		expect(sameApplicationServerKey(new Uint8Array([4, 1, 2, 9]).buffer, key)).toBe(false);
+		expect(sameApplicationServerKey(new Uint8Array([4, 1, 2]).buffer, key)).toBe(false);
+	});
+
+	it('says "unknown" when the browser does not report the key', () => {
+		expect(sameApplicationServerKey(null, key)).toBeNull();
+		expect(sameApplicationServerKey(undefined, key)).toBeNull();
 	});
 });

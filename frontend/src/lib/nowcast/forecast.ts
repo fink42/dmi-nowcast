@@ -51,10 +51,9 @@ interface ForecastPointResponse {
 	 */
 	observed_mm_h?: number | null;
 	/**
-	 * When the cycle behind this answer was computed. Additive, and read here
-	 * only to document the contract: the countdown the panel applies uses the
-	 * manifest's stamp, which is available on this path too (the fallback
-	 * exists because the *grids* could not be read, not the manifest).
+	 * When the cycle behind this answer was computed. Additive: absent from
+	 * an older sidecar, in which case the panel counts the ETA down from the
+	 * manifest's stamp instead.
 	 */
 	generated_at_utc?: string | null;
 	/**
@@ -108,6 +107,7 @@ export async function fetchPointForecast(
 		lat: body.lat,
 		lon: body.lon,
 		radarTsUtc: body.radar_ts_utc,
+		generatedAtUtc: body.generated_at_utc ?? null,
 		perLead: body.per_lead.map((l) => ({
 			leadMin: l.lead_min,
 			pRain: l.p_rain,

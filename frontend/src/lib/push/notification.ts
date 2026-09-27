@@ -168,3 +168,45 @@ export function pointFromUrl(search: string): { lat: number; lon: number } | nul
 	if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
 	return { lat, lon };
 }
+
+/**
+ * What a notification tap does with the windows already open.
+ *
+ *  - `message`: a tab already on the map page is focused and told the point
+ *    (`open-point`); only that page listens for the message.
+ *  - `navigate`: no map tab, but another page of the site is open (About,
+ *    Quality …). It is focused and sent to the notification's URL — a
+ *    message to it would be dropped, and the tap would appear to do nothing.
+ *  - `open`: no window of this origin at all; a new one opens at the URL.
+ *
+ * `index` points into `clientUrls`. A map tab wins over an earlier non-map
+ * one, so the tap never uproots a page the reader is on when it does not
+ * have to.
+ */
+export type NotificationClickAction =
+	| { kind: 'message'; index: number }
+	| { kind: 'navigate'; index: number }
+	| { kind: 'open' };
+
+export function notificationClickAction(
+	clientUrls: readonly string[],
+	origin: string,
+	mapPath: string
+): NotificationClickAction {
+	// `/`, and for a site under a base path both `/base` and `/base/`.
+	const bare = mapPath.replace(/\/+$/, '');
+	const mapPaths = new Set([`${bare}/`, bare || '/', `${bare}/index.html`]);
+	let fallback = -1;
+	for (const [index, raw] of clientUrls.entries()) {
+		let url: URL;
+		try {
+			url = new URL(raw);
+		} catch {
+			continue;
+		}
+		if (url.origin !== origin) continue;
+		if (mapPaths.has(url.pathname)) return { kind: 'message', index };
+		if (fallback < 0) fallback = index;
+	}
+	return fallback >= 0 ? { kind: 'navigate', index: fallback } : { kind: 'open' };
+}

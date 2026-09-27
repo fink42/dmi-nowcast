@@ -16,11 +16,11 @@
 		arrivalClock,
 		clockTime,
 		confidenceWord,
-		countdownEtaMin,
 		headline,
 		headlineDecision,
 		intensityWord,
 		percent,
+		pointClock,
 		probabilityWithin,
 		servedProbabilities
 	} from '$lib/format';
@@ -48,16 +48,19 @@
 	 */
 	const motion = $derived(forecast?.motion ?? null);
 	/**
-	 * The ETA counted down to right now. The cycle's own `etaMin` is minutes
-	 * from the moment it was computed, and cycles are 5–10 min apart, so the
-	 * store's 15 s clock is what keeps "rain in 12 min" from still saying 12
-	 * when it is due. Only the headline and the ETA fact use it — the
+	 * The ETA counted down to right now, and the age of the radar image the
+	 * forecast was read from. The cycle's own `etaMin` is minutes from the
+	 * moment it was computed, and cycles are 5–10 min apart, so the store's
+	 * 15 s clock is what keeps "rain in 12 min" from still saying 12 when it
+	 * is due. Both count from the forecast's OWN cycle stamps, not the
+	 * manifest on screen: at a cycle change the new manifest lands before the
+	 * point is re-sampled, and mixing the two would shave a cycle off the old
+	 * ETA. Only the headline, the ETA fact and the age line use these — the
 	 * probability bars, intensity and motion belong to the cycle, not to the
 	 * viewer's clock.
 	 */
-	const etaNow = $derived(
-		countdownEtaMin(forecast?.etaMin ?? null, nowcast.manifest?.generated_at_utc, nowcast.now)
-	);
+	const clock = $derived(pointClock(forecast, nowcast.manifest, nowcast.now));
+	const etaNow = $derived(clock.etaNow);
 	/**
 	 * The headline and the arrival it implies, decided together and once.
 	 *
@@ -76,7 +79,7 @@
 		kind === 'eta' ? arrivalClock(decision.etaMin, nowcast.now, locale()) : null
 	);
 	const confidence = $derived(forecast?.confidence ?? nowcast.confidence);
-	const ageMin = $derived(nowcast.radarAgeMin);
+	const ageMin = $derived(clock.radarAgeMin);
 	/**
 	 * The probabilities come from the server, so they arrive one round trip
 	 * after everything else. While they are in flight the bars and the

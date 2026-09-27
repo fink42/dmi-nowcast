@@ -145,6 +145,15 @@ export interface PointForecast {
 	lon: number;
 	/** Radar timestamp the products were computed from (ISO 8601, UTC). */
 	radarTsUtc: string;
+	/**
+	 * When the cycle this forecast was read from was computed (ISO 8601,
+	 * UTC) — the instant `etaMin` counts from. Carried on the forecast rather
+	 * than read off the manifest on screen, because at a cycle change the two
+	 * belong to different cycles until the point is re-sampled. Absent or
+	 * null from a sidecar that does not state it; the panel then falls back
+	 * to the manifest's stamp.
+	 */
+	generatedAtUtc?: string | null;
 	perLead: LeadProbability[];
 	/** Minutes until rain arrives; null when no rain within the horizon. */
 	etaMin: number | null;
@@ -251,6 +260,7 @@ export function samplePoint(
 		lat,
 		lon,
 		radarTsUtc: manifest.radar_ts_utc,
+		generatedAtUtc: manifest.generated_at_utc,
 		perLead,
 		etaMin: grids.eta ? sampleArtifact(grids.eta.image, grids.eta.entry, pixel) : null,
 		intensityMmH: grids.intensity

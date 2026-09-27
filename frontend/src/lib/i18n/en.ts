@@ -177,12 +177,18 @@ export const en: Catalog = {
 			'Notifications are blocked for this site. You can allow them again in your browser settings.',
 		capacity: 'No room for more devices right now. Please try again later.',
 		retry: 'Try again',
+		retryAfter: (min: number) =>
+			min <= 1 ? 'You can try again in a minute.' : `You can try again in ${min} minutes.`,
 		fallbackTitle: 'Rain radar',
 		fallbackBody: 'New notification',
 		errors: {
 			permission: 'You did not give the browser permission to show notifications.',
 			offCoverage: 'That point is outside radar coverage — nothing can be sent from there.',
 			unavailable: 'The server is not sending notifications at the moment.',
+			invalid:
+				'The server could not use this browser’s notification subscription. Try again — or in another browser if it keeps happening.',
+			tooLarge: 'The server rejected the request as too large. Please try again shortly.',
+			rateLimited: 'Too many attempts in a short time. Wait a little, then try again.',
 			failed: 'Notifications could not be turned on. Please try again shortly.'
 		}
 	},

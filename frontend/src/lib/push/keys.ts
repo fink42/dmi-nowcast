@@ -31,3 +31,24 @@ export function isPlausibleVapidKey(b64url: string): boolean {
 		return false;
 	}
 }
+
+/**
+ * Is an existing subscription bound to the server's current key?
+ *
+ * `true`/`false` when the browser tells us the key the subscription was made
+ * with (`PushSubscription.options.applicationServerKey`); `null` when it
+ * does not — an older browser — and the question cannot be answered. Only a
+ * definite `false` justifies throwing a working subscription away.
+ */
+export function sameApplicationServerKey(
+	existing: ArrayBuffer | ArrayBufferView | null | undefined,
+	serverKey: Uint8Array
+): boolean | null {
+	if (!existing) return null;
+	const bytes = ArrayBuffer.isView(existing)
+		? new Uint8Array(existing.buffer, existing.byteOffset, existing.byteLength)
+		: new Uint8Array(existing);
+	if (bytes.length !== serverKey.length) return false;
+	for (let i = 0; i < bytes.length; i++) if (bytes[i] !== serverKey[i]) return false;
+	return true;
+}

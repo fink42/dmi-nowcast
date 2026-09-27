@@ -8,10 +8,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	fetchPushConfig,
 	fetchPushOptions,
+	InvalidSubscriptionError,
 	OffCoverageError,
+	parseRetryAfter,
 	postSubscribe,
 	postUnsubscribe,
-	PushUnavailableError
+	PushUnavailableError,
+	RateLimitedError,
+	RequestTooLargeError
 } from './api';
 import { FALLBACK_PREFS, subscribeBody } from './prefs';
 
@@ -202,6 +206,37 @@ describe('postSubscribe', () => {
 		await expect(postSubscribe(BODY)).rejects.toBeInstanceOf(OffCoverageError);
 	});
 
+	it('maps a 400 about the subscription itself to InvalidSubscriptionError, not off-coverage', async () => {
+		stubFetch(() => json({ detail: 'p256dh is not a P-256 public key' }, 400));
+		const err = await postSubscribe(BODY).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(InvalidSubscriptionError);
+		expect(err).not.toBeInstanceOf(OffCoverageError);
+	});
+
+	it('maps 413 to RequestTooLargeError', async () => {
+		stubFetch(() => json({ detail: 'request body too large' }, 413));
+		await expect(postSubscribe(BODY)).rejects.toBeInstanceOf(RequestTooLargeError);
+	});
+
+	it('maps 429 to RateLimitedError carrying Retry-After', async () => {
+		stubFetch(
+			() =>
+				new Response(JSON.stringify({ detail: 'rate limited' }), {
+					status: 429,
+					headers: { 'content-type': 'application/json', 'retry-after': '42' }
+				})
+		);
+		const err = await postSubscribe(BODY).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(RateLimitedError);
+		expect((err as RateLimitedError).retryAfterSec).toBe(42);
+	});
+
+	it('maps 429 without Retry-After to a RateLimitedError with no wait', async () => {
+		stubFetch(() => new Response('slow down', { status: 429 }));
+		const err = await postSubscribe(BODY).catch((e: unknown) => e);
+		expect((err as RateLimitedError).retryAfterSec).toBeNull();
+	});
+
 	it('maps 503 to PushUnavailableError', async () => {
 		stubFetch(() => json({ detail: 'push disabled' }, 503));
 		await expect(postSubscribe(BODY)).rejects.toBeInstanceOf(PushUnavailableError);
@@ -232,5 +267,23 @@ describe('postUnsubscribe', () => {
 	it('throws on a non-2xx', async () => {
 		stubFetch(() => json({ detail: 'nope' }, 500));
 		await expect(postUnsubscribe('https://push.example/abc')).rejects.toThrow('500');
+	});
+});
+
+describe('parseRetryAfter', () => {
+	const now = Date.parse('2026-09-27T12:00:00Z');
+
+	it('reads seconds and HTTP dates', () => {
+		expect(parseRetryAfter('30', now)).toBe(30);
+		expect(parseRetryAfter(' 5 ', now)).toBe(5);
+		expect(parseRetryAfter('Sun, 27 Sep 2026 12:01:30 GMT', now)).toBe(90);
+	});
+
+	it('never waits a negative time, and reads junk as unknown', () => {
+		expect(parseRetryAfter('Sun, 27 Sep 2026 11:00:00 GMT', now)).toBe(0);
+		expect(parseRetryAfter(null, now)).toBeNull();
+		expect(parseRetryAfter('', now)).toBeNull();
+		expect(parseRetryAfter('soon', now)).toBeNull();
+		expect(parseRetryAfter('-5', now)).toBeNull();
 	});
 });

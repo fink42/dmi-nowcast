@@ -20,10 +20,11 @@
  * imports of its own — a worker that pulls in the app's reactive state or its
  * DOM helpers is a worker that fails to install.
  */
-import { build, files, version } from '$service-worker';
+import { base, build, files, version } from '$service-worker';
 import { da } from '$lib/i18n/da';
 import { en } from '$lib/i18n/en';
 import {
+	notificationClickAction,
 	notificationFromPayload,
 	parsePushPayload,
 	payloadLang,
@@ -33,16 +34,31 @@ import {
 const sw = self as unknown as ServiceWorkerGlobalScope;
 const CACHE = `app-shell-${version}`;
 
-/** Static assets that are too big or too range-y to precache. */
-const EXCLUDED = /^\/(basemap\.pmtiles|basemap-assets\/)/;
+/**
+ * Static assets that are too big or too range-y to precache. The build
+ * already leaves them out of `files` (`serviceWorker.files` in
+ * vite.config.ts — ~700 glyph paths that only bloated this script); the
+ * pattern stays because the fetch handler must also stay out of their way.
+ */
+const EXCLUDED = new RegExp(`^${base}/(basemap\\.pmtiles|basemap-assets/)`);
 
+/** Hashed build output and static files: immutable per version, cache-first. */
 const SHELL = [...build, ...files.filter((f) => !EXCLUDED.test(f))];
+
+/**
+ * The page an offline navigation falls back to: the prerendered map page.
+ * It is precached but deliberately NOT in `SHELL`, so online navigations
+ * stay network-first and a deploy is picked up on the next load. Every
+ * route renders client-side (`ssr = false`), so this one document can stand
+ * in for any of them — the router takes over from the path.
+ */
+const OFFLINE_PAGE = `${base}/`;
 
 sw.addEventListener('install', (event) => {
 	event.waitUntil(
 		caches
 			.open(CACHE)
-			.then((cache) => cache.addAll(SHELL))
+			.then((cache) => cache.addAll([...SHELL, OFFLINE_PAGE]))
 			.then(() => sw.skipWaiting())
 	);
 });
@@ -89,7 +105,7 @@ sw.addEventListener('fetch', (event) => {
 		event.respondWith(
 			fetch(request).catch(async () => {
 				const cache = await caches.open(CACHE);
-				return (await cache.match('/')) ?? (await cache.match('/index.html')) ?? Response.error();
+				return (await cache.match(OFFLINE_PAGE)) ?? Response.error();
 			})
 		);
 	}
@@ -142,9 +158,11 @@ sw.addEventListener('push', (event) => {
 /**
  * Open the point the notification is about.
  *
- * Focusing the tab the user already has open beats opening a second one, so a
- * window of this origin is preferred and told where to go by message; only
- * with no window at all is a new one opened at the URL.
+ * Focusing the tab the user already has open beats opening a second one. A
+ * tab on the map page is told the point by message; a tab on any other page
+ * of the site is sent to the URL (only the map page listens for the
+ * message); only with no window at all is a new one opened. The choice is
+ * `notificationClickAction`, which is unit-tested.
  */
 async function openFromNotification(url: string): Promise<void> {
 	let target: URL;
@@ -162,17 +180,33 @@ async function openFromNotification(url: string): Promise<void> {
 		type: 'window',
 		includeUncontrolled: true
 	})) as readonly WindowClient[];
-	const existing = clients.find((client) => new URL(client.url).origin === sw.location.origin);
-	if (existing) {
-		try {
-			await existing.focus();
-		} catch {
-			// Focus can be refused; the message below is still worth sending.
-		}
+	const action = notificationClickAction(
+		clients.map((client) => client.url),
+		sw.location.origin,
+		`${base}/`
+	);
+	if (action.kind === 'open') {
+		await sw.clients.openWindow(target.href);
+		return;
+	}
+	const existing = clients[action.index];
+	try {
+		await existing.focus();
+	} catch {
+		// Focus can be refused; moving the tab is still worth doing.
+	}
+	if (action.kind === 'message') {
 		if (point) existing.postMessage({ type: 'open-point', lat: point.lat, lon: point.lon });
 		return;
 	}
-	await sw.clients.openWindow(target.href);
+	try {
+		// `navigate` works only on a window this worker controls; an
+		// uncontrolled one (opened before the worker installed) gets a new
+		// window instead of a tap that does nothing.
+		await existing.navigate(target.href);
+	} catch {
+		await sw.clients.openWindow(target.href);
+	}
 }
 
 sw.addEventListener('notificationclick', (event) => {

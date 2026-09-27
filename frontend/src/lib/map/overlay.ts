@@ -8,6 +8,7 @@
  * frame is on screen while the rest are still downloading.
  */
 import { artifactUrl, overlayFrames, type Manifest } from '$lib/nowcast/manifest';
+import { inOrder } from './ordered';
 import { buildMesh, targetCorners, warpImage, warpTarget, type Corners } from './warp';
 
 export interface OverlayFrame {
@@ -54,8 +55,26 @@ export function overlayGeometry(manifest: Manifest): OverlayGeometry | null {
 }
 
 /**
+ * Downloads in flight at once. Enough to hide the round trip on a phone
+ * (the frames are a few tens of kB each), few enough not to crowd out the
+ * manifest poll, the grids and the basemap tiles loading alongside.
+ */
+const MAX_IN_FLIGHT = 4;
+
+async function fetchSource(filename: string, signal?: AbortSignal): Promise<ImageBitmap> {
+	const res = await fetch(artifactUrl(filename), { signal });
+	if (!res.ok) throw new Error(`${filename}: HTTP ${res.status}`);
+	return createImageBitmap(await res.blob());
+}
+
+/**
  * Load and reproject every overlay frame of a cycle, yielding each as soon as
- * it is ready. Aborting the signal stops between frames.
+ * it is ready and always in timeline order.
+ *
+ * The downloads and decodes overlap (a few at a time, see `MAX_IN_FLIGHT`);
+ * the warp stays sequential, because every frame is drawn through the one
+ * canvas. Aborting the signal cancels the downloads in flight and stops
+ * between frames; decoded sources nobody reached are closed, not leaked.
  */
 export async function* loadOverlayFrames(
 	manifest: Manifest,
@@ -70,12 +89,16 @@ export async function* loadOverlayFrames(
 	const mesh = buildMesh(grid, target);
 	const surface = createCanvas(target.width, target.height);
 
-	for (const entry of entries) {
-		if (signal?.aborted) return;
-		const res = await fetch(artifactUrl(entry.filename), { signal });
-		if (!res.ok) throw new Error(`${entry.filename}: HTTP ${res.status}`);
-		const source = await createImageBitmap(await res.blob());
+	let index = 0;
+	for await (const source of inOrder(
+		entries.length,
+		(i) => fetchSource(entries[i].filename, signal),
+		MAX_IN_FLIGHT,
+		(bitmap) => bitmap.close()
+	)) {
+		const entry = entries[index++];
 		try {
+			if (signal?.aborted) return;
 			warpImage(surface.ctx, source, mesh);
 			yield {
 				leadMin: entry.lead_min ?? 0,

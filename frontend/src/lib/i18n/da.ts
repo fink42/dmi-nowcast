@@ -191,12 +191,18 @@ export const da = {
 			'Beskeder er blokeret for denne side. Du kan tillade dem igen i browserens indstillinger.',
 		capacity: 'Der er ikke plads til flere enheder lige nu. Prøv igen senere.',
 		retry: 'Prøv igen',
+		retryAfter: (min: number) =>
+			min <= 1 ? 'Du kan prøve igen om et minut.' : `Du kan prøve igen om ${min} minutter.`,
 		fallbackTitle: 'Regnradar',
 		fallbackBody: 'Ny besked',
 		errors: {
 			permission: 'Du gav ikke browseren lov til at vise beskeder.',
 			offCoverage: 'Punktet ligger uden for radarens dækning — derfra kan der ikke sendes besked.',
 			unavailable: 'Serveren sender ingen beskeder lige nu.',
+			invalid:
+				'Serveren kunne ikke bruge browserens beskedabonnement. Prøv igen — eller i en anden browser, hvis det bliver ved.',
+			tooLarge: 'Serveren afviste forespørgslen, fordi den var for stor. Prøv igen om lidt.',
+			rateLimited: 'For mange forsøg på kort tid. Vent lidt, og prøv så igen.',
 			failed: 'Beskeden kunne ikke slås til. Prøv igen om lidt.'
 		}
 	},

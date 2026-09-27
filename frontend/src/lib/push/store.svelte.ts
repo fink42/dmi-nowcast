@@ -22,13 +22,16 @@ import { locale } from '$lib/i18n';
 import {
 	fetchPushConfig,
 	fetchPushOptions,
+	InvalidSubscriptionError,
 	OffCoverageError,
 	postSubscribe,
 	postUnsubscribe,
 	PushUnavailableError,
+	RateLimitedError,
+	RequestTooLargeError,
 	type SubscribeResult
 } from './api';
-import { urlBase64ToUint8Array } from './keys';
+import { sameApplicationServerKey, urlBase64ToUint8Array } from './keys';
 import {
 	clearStored,
 	loadStored,
@@ -51,7 +54,14 @@ import {
 export type PushStatus = 'idle' | 'loading' | 'subscribing' | 'subscribed' | 'error';
 
 /** Keys into `t().push.errors` — never a sentence. */
-export type PushErrorKey = 'permission' | 'offCoverage' | 'unavailable' | 'failed';
+export type PushErrorKey =
+	| 'permission'
+	| 'offCoverage'
+	| 'unavailable'
+	| 'invalid'
+	| 'tooLarge'
+	| 'rateLimited'
+	| 'failed';
 
 /**
  * `navigator.serviceWorker.ready` never rejects: on a page whose worker
@@ -80,7 +90,8 @@ function readPermission(): NotificationPermission | 'unknown' {
 	}
 }
 
-class PushStore {
+/** Exported for tests; the app uses the `push` singleton below. */
+export class PushStore {
 	config = $state<PushConfig | null>(null);
 	/** The horizons on offer and the threshold fitted for each. */
 	options = $state<PushOptions>(FALLBACK_OPTIONS);
@@ -95,6 +106,11 @@ class PushStore {
 	status = $state<PushStatus>('idle');
 	stored = $state<StoredSubscription | null>(null);
 	error = $state<PushErrorKey | null>(null);
+	/**
+	 * With `error: 'rateLimited'`, how long the server asked us to wait, in
+	 * seconds — null when it did not say. Cleared with the error.
+	 */
+	retryAfterSec = $state<number | null>(null);
 
 	#initialised = false;
 
@@ -105,6 +121,7 @@ class PushStore {
 
 	clearError(): void {
 		this.error = null;
+		this.retryAfterSec = null;
 		if (this.status === 'error') this.status = this.stored ? 'subscribed' : 'idle';
 	}
 
@@ -185,19 +202,23 @@ class PushStore {
 			applicationServerKey: key as BufferSource
 		};
 		const existing = await registration.pushManager.getSubscription();
-		try {
-			// With a subscription already bound to this key, the browser hands
-			// the same one back; with a different key it throws, which is the
-			// case below.
-			const subscription = await registration.pushManager.subscribe(options);
-			return { subscription, created: existing === null };
-		} catch (err) {
-			if (!existing) throw err;
-			// The server rotated its VAPID key: the old subscription can never
-			// receive another message, so it goes.
+		// The server rotated its VAPID key: the old subscription can never
+		// receive another message, so it goes. Decided on the key itself, not
+		// on `subscribe()` failing — that also fails for reasons that have
+		// nothing to do with the key (a flaky push service, a storage error),
+		// and unsubscribing then would destroy a subscription that works.
+		const bound = existing
+			? sameApplicationServerKey(existing.options?.applicationServerKey, key)
+			: null;
+		if (existing && bound === false) {
 			await existing.unsubscribe();
 			return { subscription: await registration.pushManager.subscribe(options), created: true };
 		}
+		// Same key (or a browser that will not say): the browser hands the
+		// existing subscription back. Any failure is rethrown with the
+		// existing subscription left exactly as it was.
+		const subscription = await registration.pushManager.subscribe(options);
+		return { subscription, created: existing === null };
 	}
 
 	/** Turn notifications on for a point, with the given preferences. */
@@ -263,7 +284,7 @@ class PushStore {
 					/* best effort */
 				}
 			}
-			this.#fail(errorKey(err));
+			this.#fail(errorKey(err), err);
 			return;
 		}
 
@@ -304,7 +325,7 @@ class PushStore {
 				subscribeBody(subscription.toJSON(), stored.lat, stored.lon, prefs, lang, tz)
 			);
 		} catch (err) {
-			this.#fail(errorKey(err));
+			this.#fail(errorKey(err), err);
 			return;
 		}
 		const next: StoredSubscription = {
@@ -378,15 +399,20 @@ class PushStore {
 		};
 	}
 
-	#fail(key: PushErrorKey): void {
+	#fail(key: PushErrorKey, err?: unknown): void {
 		this.status = 'error';
 		this.error = key;
+		this.retryAfterSec = err instanceof RateLimitedError ? err.retryAfterSec : null;
 	}
 }
 
-function errorKey(err: unknown): PushErrorKey {
+/** Exported for tests. */
+export function errorKey(err: unknown): PushErrorKey {
 	if (err instanceof OffCoverageError) return 'offCoverage';
 	if (err instanceof PushUnavailableError) return 'unavailable';
+	if (err instanceof InvalidSubscriptionError) return 'invalid';
+	if (err instanceof RequestTooLargeError) return 'tooLarge';
+	if (err instanceof RateLimitedError) return 'rateLimited';
 	return 'failed';
 }
 

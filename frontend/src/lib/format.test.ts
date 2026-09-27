@@ -16,7 +16,7 @@
  *     instant, so the sentence and the picture cannot disagree.
  */
 import { describe, expect, it } from 'vitest';
-import { RAINING_NOW_MIN, RAINING_NOW_MM_H, arrivalClock, clockTime, countdownEtaMin, headline, headlineDecision, nextWetMinutes, probabilityWithin, rainNowMmH, servedProbabilities } from './format';
+import { RAINING_NOW_MIN, RAINING_NOW_MM_H, arrivalClock, clockTime, countdownEtaMin, headline, headlineDecision, nextWetMinutes, pointClock, probabilityWithin, rainNowMmH, servedProbabilities } from './format';
 import type { LeadProbability, PointForecast, RainSample } from './nowcast/sampler';
 import { da } from './i18n/da';
 import { en } from './i18n/en';
@@ -420,5 +420,41 @@ describe('servedProbabilities', () => {
 			20
 		);
 		expect(highlight).toEqual({ leadMin: 20, pRain: 0.51 });
+	});
+});
+
+describe('pointClock', () => {
+	// Cycle A was computed at 10:00 from a 09:45 image; cycle B at 10:05
+	// from a 09:55 image. At 10:06 the manifest on screen is B's, but the
+	// point has not been re-sampled yet and still holds A's forecast.
+	const now = Date.parse('2026-09-27T10:06:00Z');
+	const manifestB = {
+		generated_at_utc: '2026-09-27T10:05:00Z',
+		radar_ts_utc: '2026-09-27T09:55:00Z'
+	};
+	const forecastA = {
+		etaMin: 20,
+		radarTsUtc: '2026-09-27T09:45:00Z',
+		generatedAtUtc: '2026-09-27T10:00:00Z'
+	};
+
+	it("counts the ETA and the radar age from the forecast's own cycle", () => {
+		const clock = pointClock(forecastA, manifestB, now);
+		// 20 min from 10:00 is 14 min from 10:06 — not 19 (from B's 10:05).
+		expect(clock.etaNow).toBe(14);
+		// A's image is 21 min old; B's would have said 11.
+		expect(clock.radarAgeMin).toBe(21);
+	});
+
+	it("falls back to the manifest's stamps for a forecast that carries none", () => {
+		const legacy = { etaMin: 20, radarTsUtc: 'garbled', generatedAtUtc: undefined };
+		const clock = pointClock(legacy, manifestB, now);
+		expect(clock.etaNow).toBe(19);
+		expect(clock.radarAgeMin).toBe(11);
+	});
+
+	it('has no ETA without a forecast', () => {
+		expect(pointClock(null, manifestB, now)).toEqual({ etaNow: null, radarAgeMin: 11 });
+		expect(pointClock(null, null, now)).toEqual({ etaNow: null, radarAgeMin: null });
 	});
 });

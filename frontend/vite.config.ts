@@ -46,7 +46,16 @@ export default defineConfig({
 				fallback: 'index.html',
 				pages: 'build',
 				assets: 'build'
-			})
+			}),
+			// What `$service-worker`'s `files` lists. The basemap archive and
+			// its ~700 glyph/sprite files are never precached (the worker
+			// filtered them at runtime), so listing them only bloated the
+			// worker script every browser downloads. `.DS_Store` is the
+			// default filter, kept.
+			serviceWorker: {
+				files: (file: string) =>
+					!/\.DS_Store/.test(file) && !/^(basemap\.pmtiles|basemap-assets\/)/.test(file)
+			}
 		})
 	],
 	// MapLibre creates a *module* worker, so the bundled worker must be ESM.

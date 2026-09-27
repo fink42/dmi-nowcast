@@ -55,6 +55,8 @@ describe('fetchPointForecast', () => {
 			lat: 55.6761,
 			lon: 12.5683,
 			radarTsUtc: '2026-08-28T12:00:00+00:00',
+			// The cycle's own stamp: the panel counts the ETA down from it.
+			generatedAtUtc: '2026-08-28T12:01:30+00:00',
 			perLead: [
 				{ leadMin: 10, pRain: 0.62, pPost: null },
 				{ leadMin: 20, pRain: null, pPost: null }

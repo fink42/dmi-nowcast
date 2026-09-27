@@ -68,6 +68,41 @@ export function countdownEtaMin(
 	return Math.max(0, etaMin - elapsed);
 }
 
+/** The two clocks the panel runs off one point forecast. */
+export interface PointClock {
+	/** The forecast's ETA counted down to now; null when it has none. */
+	etaNow: number | null;
+	/** Age of the radar image behind the forecast, in minutes; null when unknown. */
+	radarAgeMin: number | null;
+}
+
+/**
+ * Count a point forecast's ETA and radar age from the stamps of the cycle it
+ * was *sampled from*, not from whatever manifest is on screen.
+ *
+ * The two differ for a moment at every cycle change: the store adopts the new
+ * manifest at once, but the selected point is only re-sampled once the new
+ * grids are in. Counting the old ETA down from the new `generated_at_utc`
+ * would take up to a whole cycle off it, and the radar age would describe an
+ * image the numbers were not read from. The manifest's stamps are only the
+ * fallback for a forecast that carries none (an older sidecar's answer).
+ */
+export function pointClock(
+	forecast: Pick<PointForecast, 'etaMin' | 'radarTsUtc' | 'generatedAtUtc'> | null,
+	manifest: { generated_at_utc?: string; radar_ts_utc?: string } | null,
+	nowMs: number
+): PointClock {
+	if (!forecast) {
+		return { etaNow: null, radarAgeMin: minutesSince(manifest?.radar_ts_utc, nowMs) };
+	}
+	const generated = forecast.generatedAtUtc ?? manifest?.generated_at_utc;
+	return {
+		etaNow: countdownEtaMin(forecast.etaMin, generated, nowMs),
+		radarAgeMin:
+			minutesSince(forecast.radarTsUtc, nowMs) ?? minutesSince(manifest?.radar_ts_utc, nowMs)
+	};
+}
+
 export type Headline = 'raining-now' | 'eta' | 'no-rain';
 
 /** The instants of a rain series, or null when any of them is unusable. */

@@ -230,6 +230,9 @@
 		{#if push.error && !blocked}
 			<p class="error" aria-live="polite">
 				{t().push.errors[push.error]}
+				{#if push.error === 'rateLimited' && push.retryAfterSec !== null}
+					{t().push.retryAfter(Math.max(1, Math.ceil(push.retryAfterSec / 60)))}
+				{/if}
 				<button type="button" class="link" onclick={retry} disabled={busy}>{t().push.retry}</button>
 			</p>
 		{/if}

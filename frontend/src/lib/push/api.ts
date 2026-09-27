@@ -1,5 +1,5 @@
 /**
- * The three `/api/push/*` calls, and the two failures worth their own type.
+ * The three `/api/push/*` calls, and the failures worth their own type.
  *
  * Same-origin like everything else the app fetches, so the Cloudflare Access
  * cookie rides along without being touched here.
@@ -18,6 +18,49 @@ export class OffCoverageError extends Error {}
 
 /** The server refuses subscriptions right now — switched off, or full. */
 export class PushUnavailableError extends Error {}
+
+/**
+ * A 400 that is not about the point: the server could not use the
+ * subscription itself (its keys, a push service it does not accept, the
+ * time zone). Trying again with the same browser state will not help.
+ */
+export class InvalidSubscriptionError extends Error {}
+
+/** 413: the request body was larger than the server accepts. */
+export class RequestTooLargeError extends Error {}
+
+/** 429: too many requests from this client; `retryAfterSec` when stated. */
+export class RateLimitedError extends Error {
+	constructor(
+		message: string,
+		readonly retryAfterSec: number | null
+	) {
+		super(message);
+	}
+}
+
+/**
+ * `Retry-After` in seconds: the header is either a number of seconds or an
+ * HTTP date. Null when absent or unreadable — never a negative wait.
+ */
+export function parseRetryAfter(value: string | null, nowMs: number = Date.now()): number | null {
+	if (value === null || value.trim() === '') return null;
+	const trimmed = value.trim();
+	if (/^\d+$/.test(trimmed)) return Number(trimmed);
+	// An HTTP date always names its day and month; without letters this is
+	// junk like "-5", which `Date.parse` would happily read as a year.
+	if (!/[a-z]/i.test(trimmed)) return null;
+	const at = Date.parse(trimmed);
+	if (!Number.isFinite(at)) return null;
+	return Math.max(0, Math.ceil((at - nowMs) / 1000));
+}
+
+/**
+ * The sidecar answers 400 for an off-coverage point and for a subscription it
+ * cannot use, and only the `detail` tells them apart. Its off-coverage detail
+ * is "coordinates outside the radar composite grid".
+ */
+const OFF_COVERAGE_DETAIL = /outside|coverage/i;
 
 export interface SubscribeResult {
 	ok: boolean;
@@ -103,7 +146,16 @@ export async function postSubscribe(
 ): Promise<SubscribeResult> {
 	const res = await postJson('/api/push/subscribe', body, signal);
 	if (res.status === 400) {
-		throw new OffCoverageError(await detail(res, 'coordinates outside the radar composite grid'));
+		const reason = await detail(res, 'bad request');
+		if (OFF_COVERAGE_DETAIL.test(reason)) throw new OffCoverageError(reason);
+		throw new InvalidSubscriptionError(reason);
+	}
+	if (res.status === 413) {
+		throw new RequestTooLargeError(await detail(res, 'request too large'));
+	}
+	if (res.status === 429) {
+		const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
+		throw new RateLimitedError(await detail(res, 'rate limited'), retryAfter);
 	}
 	if (res.status === 503) {
 		throw new PushUnavailableError(await detail(res, 'push notifications unavailable'));

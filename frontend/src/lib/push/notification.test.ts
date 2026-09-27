@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+	notificationClickAction,
 	notificationFromPayload,
 	parsePushPayload,
 	payloadLang,
@@ -243,5 +244,49 @@ describe('pointFromUrl', () => {
 		expect(pointFromUrl('?lat=here&lon=there')).toBeNull();
 		expect(pointFromUrl('?lat=91&lon=12')).toBeNull();
 		expect(pointFromUrl('?lat=55&lon=181')).toBeNull();
+	});
+});
+
+describe('notificationClickAction', () => {
+	const ORIGIN = 'https://regn.example';
+
+	it('messages a tab already on the map page', () => {
+		expect(notificationClickAction([`${ORIGIN}/?lat=55&lon=12`], ORIGIN, '/')).toEqual({
+			kind: 'message',
+			index: 0
+		});
+	});
+
+	it('navigates a tab on another page instead of messaging it', () => {
+		// Only the map page listens for `open-point`; a message to /about/
+		// would be dropped and the tap would do nothing visible.
+		expect(notificationClickAction([`${ORIGIN}/about/`], ORIGIN, '/')).toEqual({
+			kind: 'navigate',
+			index: 0
+		});
+	});
+
+	it('prefers a map tab over an earlier non-map one', () => {
+		expect(
+			notificationClickAction([`${ORIGIN}/quality/`, `${ORIGIN}/`], ORIGIN, '/')
+		).toEqual({ kind: 'message', index: 1 });
+	});
+
+	it('ignores other origins and unparseable URLs, and opens a window when nothing is left', () => {
+		expect(notificationClickAction(['https://other.example/', 'not a url'], ORIGIN, '/')).toEqual({
+			kind: 'open'
+		});
+		expect(notificationClickAction([], ORIGIN, '/')).toEqual({ kind: 'open' });
+	});
+
+	it('understands a base path, with or without the trailing slash', () => {
+		expect(notificationClickAction([`${ORIGIN}/regn`], ORIGIN, '/regn/')).toEqual({
+			kind: 'message',
+			index: 0
+		});
+		expect(notificationClickAction([`${ORIGIN}/regn/about/`], ORIGIN, '/regn/')).toEqual({
+			kind: 'navigate',
+			index: 0
+		});
 	});
 });
