@@ -179,6 +179,12 @@ class PointProducts:
     #: pass as the fractions above and before it is dropped. Empty when
     #: the cycle had no ensemble to read.
     ens_features: dict[str, np.ndarray] = field(default_factory=dict)
+    #: Review R4a — the same ensemble-shape columns at EVERY product pixel
+    #: (``ensemble_grid_features``), for the on-demand ``/forecast`` path.
+    #: Kept only beside ``raw_grids`` (i.e. only while a model is loaded):
+    #: ~9.4 MB of float32 at 432×496 and 5 leads. None when not kept or
+    #: when the reduction failed.
+    ens_grids: dict[str, np.ndarray] | None = None
 
 
 @dataclass(frozen=True)
@@ -534,6 +540,9 @@ class CycleEngine:
         #: so a point the cycle never heard of can still be scored (see
         #: :class:`~dmi_nowcast_sidecar.push.postprocess.PostprocessContext`).
         self._postprocess_context: PostprocessContext | None = None
+        #: On-demand rows answered from a context missing a feature family
+        #: (review R4a); reported and reset in each ``postprocess_cycle``.
+        self._pp_incomplete_served = 0
         #: ``(lat, lon)`` → km to the nearest radar. A property of the
         #: point, not of the cycle, and the cycle asks for it once per
         #: point per frame.
@@ -696,9 +705,12 @@ class CycleEngine:
                     products.intensity_mm_h[row, col],
                 ),
             }
+            if context.missing_families():
+                self._pp_incomplete_served += 1
             scored, _features = score_point(
                 table, context,
                 row=idx.row, col=idx.col,
+                product_pixel=(int(row), int(col)),
                 raw_fractions=raw,
                 shared=shared,
                 station_radar_km=nearest_radar_km(float(lat), float(lon)),
@@ -1196,6 +1208,7 @@ class CycleEngine:
         pp_keys = self._serving_points()
         pp_native: list[Any] = []
         pp_grid: dict[str, np.ndarray] | None = None
+        rain_prev20: np.ndarray | None = None
         if pp_keys:
             try:
                 pp_native = [geo.lonlat_to_grid(lon, lat) for lat, lon in pp_keys]
@@ -1225,13 +1238,17 @@ class CycleEngine:
                     rain_prev20_mm_h=rain_prev20,
                 )
                 # ~14 MB on the native grid, and STEPS below is the
-                # cycle's memory high-water mark.
-                del rain_prev20
+                # cycle's memory high-water mark — so it is only carried
+                # past this point where the on-demand ``/forecast`` path
+                # can use it (review R4a: a model is loaded).
+                if not self._postprocess.active:
+                    rain_prev20 = None
             except Exception as exc:  # noqa: BLE001 — a feature failure costs
                 # the post-processed probability for one cycle, never the
                 # cycle: the engine falls back to the served curve.
                 _log.warning("postprocess_features_failed", error=str(exc))
                 pp_grid = None
+                rain_prev20 = None
 
         # ``motion`` also holds the two RAW native grids (~14 MB each) that
         # only the stall diagnostic needed; the served arrows now show the
@@ -1308,10 +1325,14 @@ class CycleEngine:
             and series_horizons[:len(loop_horizons)] == loop_horizons
             else None
         )
+        # ``advection_backend`` (review R4b): ``cv2`` is the same scheme on
+        # cv2.remap, ~9x faster and within hundredths of a mm/h of
+        # ``scipy``, which stays the config rollback.
         advected = iter(advect_field_series(
             rain_now, vy, vx,
             horizons_minutes=series_horizons,
             dt_minutes=dt_min,
+            backend=self.config.forecast.advection_backend,
         ))
         forecast_now_field = next(advected)
         if render_fields is not None:
@@ -1408,6 +1429,7 @@ class CycleEngine:
                     disc_motion_bearing_from=bearing_compass,
                     basemap=self._basemap,
                     forecast_fields=render_fields,
+                    advection_backend=self.config.forecast.advection_backend,
                 )
                 # APNG to disk too — served at /frames/loop.png so the HA
                 # image entity can fetch a single self-animating artifact.
@@ -1501,6 +1523,8 @@ class CycleEngine:
                 bulk_vy=motion_bulk_vy,
                 bulk_vx=motion_bulk_vx,
                 stalled_share=motion_stalled_share,
+                rain_prev10_mm_h=rain_prev,
+                rain_prev20_mm_h=rain_prev20,
             )
             # R2 cell-motion grids: the display product, on the product
             # grid, in km/h. Fed the COMPLETED flow — the same array the
@@ -1797,6 +1821,14 @@ class CycleEngine:
                 threshold_mm_h=self._rain_threshold,
                 downsample_factor=steps_cfg.downsample_factor,
                 pixel_scale_m=float(composite_now.xscale_m),
+                # Seed stays run_ensemble's fixed default (42) for now.
+                # Review R4b measured a per-cycle seed
+                # (``ensemble_seed(composite_now.timestamp_utc)``) on a
+                # 30-day replay: raw-curve BSS +0.011..+0.016 and push
+                # precision +0.007..+0.011, but served p_post BSS
+                # -0.0004..-0.0016 (CI excludes 0) — the post-processor
+                # was fitted on fixed-seed rows. Switch together with a
+                # refit on per-cycle-seed replays.
             )
         except Exception as exc:  # noqa: BLE001 — includes EnsembleUnavailable
             _log.warning(
@@ -2013,6 +2045,8 @@ class CycleEngine:
         bulk_vy: float,
         bulk_vx: float,
         stalled_share: float,
+        rain_prev10_mm_h: np.ndarray | None = None,
+        rain_prev20_mm_h: np.ndarray | None = None,
     ) -> None:
         """Assemble and score this cycle's feature rows; publish the result.
 
@@ -2038,8 +2072,12 @@ class CycleEngine:
 
         The grids and flow are published alongside as a
         :class:`~dmi_nowcast_sidecar.push.postprocess.PostprocessContext`,
-        and ONLY while a model is loaded: they are ~45 MB held for the
-        life of the cycle, and without a model nothing could read them.
+        and ONLY while a model is loaded: they are ~80 MB held for the
+        life of the cycle (since review R4a, which added the two previous
+        rain fields and the ensemble-shape grids so a clicked pixel no
+        longer serves those columns NaN), and without a model nothing
+        could read them. A context missing one of those families is logged
+        once (``postprocess_point_incomplete``).
         A cycle that publishes nothing leaves the previous context in
         place, stamped with the previous frame — which is exactly how
         every reader already decides not to use it.
@@ -2180,18 +2218,51 @@ class CycleEngine:
                     bulk_kmh=bulk_kmh,
                     bulk_dir_deg=bulk_dir_deg,
                     gauge_lag_min=gauge_lag_min,
+                    # Review R4a: the history and ensemble blocks, so a
+                    # clicked pixel no longer serves them NaN (which the
+                    # trees read as 0). By reference; the cycle is done
+                    # with them.
+                    rain_prev10_mm_h=rain_prev10_mm_h,
+                    rain_prev20_mm_h=rain_prev20_mm_h,
+                    ens_grids=dict(points.ens_grids or {}),
                 )
                 if self._postprocess.active and points.raw_grids
                 else None
             )
+            # Requests the on-demand path answered with a family missing
+            # during the PREVIOUS context's life; reset for this one.
+            incomplete_served = self._pp_incomplete_served
+            self._pp_incomplete_served = 0
+            context = self._postprocess_context
+            missing = () if context is None else context.missing_families()
+            if missing:
+                _log.warning(
+                    "postprocess_point_incomplete",
+                    families=list(missing),
+                    radar_ts=radar_ts_utc.isoformat(),
+                    note=(
+                        "on-demand /forecast rows serve these columns NaN "
+                        "this cycle; the trees read NaN there as 0"
+                    ),
+                )
+            latest = self._postprocess_latest
             _log.info(
                 "postprocess_cycle",
                 points=len(keys),
-                active=self._postprocess_latest.active,
-                leads=list(self._postprocess_latest.leads),
-                fitted_at=self._postprocess_latest.fitted_at_utc,
-                onset_leads=sorted(self._postprocess_latest.p_onset),
-                on_demand=self._postprocess_context is not None,
+                active=latest.active,
+                leads=list(latest.leads),
+                fitted_at=latest.fitted_at_utc,
+                onset_leads=sorted(latest.p_onset),
+                on_demand=context is not None,
+                # Review R4a: NaN cells this cycle's table handed the models
+                # in design columns they never saw a NaN in (the trees read
+                # them as 0). Non-zero is a silent input fault — typically
+                # a failed ensemble-feature read — never a legitimate null.
+                nan_blind_cells=sum(latest.blind_nan.values()),
+                nan_blind_columns=dict(sorted(latest.blind_nan.items())),
+                onset_nan_blind_cells=sum(latest.onset_blind_nan.values()),
+                on_demand_incomplete_missing=list(missing),
+                on_demand_incomplete_served_prev=incomplete_served,
                 # How many points the neighbour block actually answered
                 # for, per cycle. A family that quietly stopped being
                 # computed is indistinguishable from one that is honestly
@@ -2388,6 +2459,26 @@ def _read_points(
             )
         except Exception as exc:  # noqa: BLE001
             _log.warning("postprocess_ensemble_features_failed", error=str(exc))
+    # Review R4a: the same columns at every pixel, for a point the cycle
+    # never heard of — only where something can read them (``keep_grids``,
+    # i.e. a model is loaded). Same arguments as the point call above, so
+    # each pixel is bit-identical to what a served point there got.
+    ens_grids: dict[str, np.ndarray] | None = None
+    if ensemble is not None and keep_grids:
+        try:
+            ens_grids = core_postprocess.ensemble_grid_features(
+                ensemble,
+                leads_min=products.leads_min,
+                threshold_mm_h=(
+                    products.threshold_mm_h if threshold_mm_h is None
+                    else float(threshold_mm_h)
+                ),
+                timestep_min=products.timestep_min,
+                frame_age_min=products.frame_age_min,
+            )
+        except Exception as exc:  # noqa: BLE001 — costs the on-demand
+            # block only; ``PostprocessContext.missing_families`` says so.
+            _log.warning("postprocess_ensemble_grids_failed", error=str(exc))
     return PointProducts(
         pixels=pixels,
         raw_fractions=raw,
@@ -2396,6 +2487,7 @@ def _read_points(
             if keep_grids else None
         ),
         ens_features=ens,
+        ens_grids=ens_grids,
     )
 
 

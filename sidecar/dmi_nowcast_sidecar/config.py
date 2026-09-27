@@ -200,6 +200,19 @@ class ForecastConfig(BaseModel):
     # ``flow_completion``, which stays the H-F rollback knob.
     flow_variant: str = DEFAULT_FLOW_VARIANT
 
+    # Review R4b (2026-09-27). Which interpolator the deterministic
+    # native-grid advection (the per-lead forecast series, overlays, the
+    # loop render's fields and lead 0 of the point series) runs on:
+    # ``cv2`` is the same midpoint scheme through ``cv2.remap`` in float32,
+    # ~9x faster than ``scipy`` (map_coordinates, float64) and NOT
+    # bit-identical — values move by hundredths of a mm/h (p99.9 |d| ~0.02
+    # mm/h, wet/dry agreement at 0.5 mm/h 99.99 %). Gated on a 30-day
+    # paired replay before it became the default; see
+    # ``dmi_nowcast_core.advect``. The STEPS ensemble is unaffected.
+    #
+    # ROLLBACK: set it to ``scipy`` and restart.
+    advection_backend: Literal["scipy", "cv2"] = "cv2"
+
     @field_validator("flow_variant")
     @classmethod
     def _flow_variant_registered(cls, v: str) -> str:

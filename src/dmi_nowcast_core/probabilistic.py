@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Iterable
 
 import numpy as np
@@ -108,6 +109,22 @@ def db_to_rain(db: np.ndarray) -> np.ndarray:
     return out
 
 
+def ensemble_seed(radar_ts_utc: datetime) -> int:
+    """The STEPS seed for the cycle standing on ``radar_ts_utc``.
+
+    Whole minutes since the epoch: different for every radar frame, so
+    consecutive cycles draw fresh member noise instead of the identical
+    fields a constant seed gave them (review R4b), and the same for every
+    run on the same frame, so a replay reproduces the cycle. Floored to
+    the minute so DMI's occasional ``:01 s`` stamps do not change it. A
+    naive timestamp is taken as UTC.
+    """
+    ts = radar_ts_utc
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return int(ts.timestamp()) // 60
+
+
 def run_ensemble(
     dbz_frames: list[np.ndarray],
     vy: np.ndarray,
@@ -144,6 +161,17 @@ def run_ensemble(
     needed so velocity perturbation gets a sensible km/pixel after the
     downsample.
 
+    ``seed`` seeds every member's noise generators. The default (42) is
+    what the live cycle uses today, so every cycle draws the SAME noise
+    fields, fixed in grid coordinates. :func:`ensemble_seed` is the
+    per-cycle alternative; review R4b measured it better on the raw
+    ensemble fraction but held it back until the post-processor is refit
+    on per-cycle-seed replays (see the call in the sidecar's compute).
+
+    Pixels outside the newest input frame's radar coverage (NaN in its
+    rain field) are NaN in the output, in every member and timestep —
+    "no data", never "dry".
+
     ``num_workers`` is how many members run at once, on the vendored
     subset's one persistent thread pool (``_vendor.pysteps_steps.parallel``;
     ``None`` = that pool's size, 4 by default). Every member owns its random
@@ -173,6 +201,13 @@ def run_ensemble(
     rain_frames = np.stack([
         dbz_to_rain_rate(d, zr_a=zr_a, zr_b=zr_b) for d in frames_in
     ])
+    # Radar coverage of the newest frame, on the forecast grid. Taken off
+    # the RAIN field, where nodata is NaN and undetect (dBZ ``-inf``) is a
+    # finite 0 mm/h — ``isfinite`` on the dBZ frame would call every dry
+    # pixel "off coverage". ``rain_to_db`` below turns NaN into ZERO_DB,
+    # so without this mask STEPS sees off-coverage pixels as confidently
+    # dry and every product downstream reads them as data (review R4b).
+    coverage = np.isfinite(rain_frames[-1])
     db_frames = rain_to_db(rain_frames, threshold_mm_h=threshold_mm_h)
     del rain_frames, frames_in
 
@@ -215,7 +250,17 @@ def run_ensemble(
             ps_parallel.workers() if num_workers is None else max(1, int(num_workers))
         ),
     )
-    return db_to_rain(forecast_db)
+    forecast = db_to_rain(forecast_db)
+    del forecast_db
+    if not coverage.all():
+        # NaN = "no data" outside the newest frame's coverage, in every
+        # member at every timestep: ``national_products`` then reads those
+        # pixels as invalid (NaN p_rain / ETA / intensity) instead of a
+        # confident 0 % — or a spurious high p where rain advected out of
+        # coverage. In place, over the trailing two axes; values inside
+        # coverage are untouched.
+        forecast[:, :, ~coverage] = np.nan
+    return forecast
 
 
 def frame_age_corrected_leads(

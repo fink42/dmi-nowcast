@@ -151,6 +151,7 @@ __all__ = [
     "ENS_P90_PREFIX",
     "ens_mean_column",
     "ens_p90_column",
+    "ensemble_grid_features",
     "upstream_bin_column",
     "POST_PREFIX",
     "POST_COLUMN_TEMPLATE",
@@ -2049,6 +2050,138 @@ def ensemble_point_features(
             out["ens_eta_spread_min"] = np.where(
                 enough & inside, spread, np.nan,
             ).astype(np.float32)
+    return out
+
+
+def _nanpercentile_columns(values: np.ndarray, q: float) -> np.ndarray:
+    """``np.nanpercentile(values, q, axis=0)``, bit for bit, without the loop.
+
+    ``np.nanpercentile`` along an axis is ``apply_along_axis`` over one
+    Python call per column — ~25 µs each, i.e. ~40 s for the seven
+    reductions over a 432×496 grid. Per column it is exactly
+    ``np.percentile`` of that column's non-NaN values (numpy's
+    ``_nanquantile_1d``), so this groups the columns by how many non-NaN
+    values they hold, sorts NaN to the end, and asks ``np.percentile``
+    along the axis once per group: the same values, the same arithmetic,
+    the same dtype. ``tests/test_postprocess_ensemble_grid.py`` pins the
+    equality against ``np.nanpercentile`` itself.
+    """
+    count = (~np.isnan(values)).sum(axis=0)
+    out = np.full(values.shape[1], np.nan, dtype=values.dtype)
+    ordered = np.sort(values, axis=0)  # NaN sorts last
+    for k in np.unique(count):
+        k = int(k)
+        if k == 0:
+            continue
+        cols = count == k
+        out[cols] = np.percentile(ordered[:k][:, cols], q, axis=0)
+    return out
+
+
+def ensemble_grid_features(
+    ensemble: np.ndarray,
+    *,
+    leads_min: Sequence[int],
+    threshold_mm_h: float,
+    timestep_min: float,
+    frame_age_min: float,
+    chunk_rows: int = 32,
+) -> dict[str, np.ndarray]:
+    """:func:`ensemble_point_features` at EVERY pixel of the ensemble grid.
+
+    Returns ``{column: float32 (h, w) grid}`` such that ``grid[r, c]`` is
+    bit for bit the value :func:`ensemble_point_features` gives a point at
+    pixel ``(r, c)`` — the same cumulative maximum, the same
+    ``_steps_in_lead`` bucket, the same arrival arithmetic and the same
+    ``>= 4 members`` rule; nothing about the definition lives here. It
+    exists so a point the cycle did not score in advance (the
+    ``/forecast`` on-demand path) can read its ``ens_*`` columns off grids
+    kept after the ~150 MB ensemble is dropped (review R4a, 2026-09-27):
+    ``2 × len(leads) + 1`` float32 grids, ~9.4 MB at 432×496 and 5 leads.
+
+    Worked in bands of ``chunk_rows`` grid rows so the transient is a few
+    tens of MB, never a copy of the whole ensemble. Each band is gathered
+    with the point function's own fancy index, so every reduction sees the
+    same memory layout and ``np.nanmean`` adds the members in the same
+    order (see the comment in the loop).
+    """
+    forecast = np.asarray(ensemble)
+    if forecast.ndim != 4:
+        raise ValueError(
+            "ensemble must be (n_members, n_timesteps, h, w); got shape "
+            f"{forecast.shape}",
+        )
+    if timestep_min <= 0:
+        raise ValueError(f"timestep_min must be > 0, got {timestep_min}")
+    leads = sorted({int(lead) for lead in leads_min})
+    n_members, n_timesteps, height, width = (int(s) for s in forecast.shape)
+    steps = {
+        lead: _steps_in_lead(
+            lead, float(frame_age_min), float(timestep_min), n_timesteps,
+        )
+        for lead in leads
+    }
+    out: dict[str, np.ndarray] = {}
+    for lead in leads:
+        out[ens_mean_column(lead)] = np.full(
+            (height, width), np.nan, dtype=np.float32,
+        )
+        out[ens_p90_column(lead)] = np.full(
+            (height, width), np.nan, dtype=np.float32,
+        )
+    out["ens_eta_spread_min"] = np.full(
+        (height, width), np.nan, dtype=np.float32,
+    )
+    band = max(1, int(chunk_rows))
+    with warnings.catch_warnings():
+        # All-NaN member slices legitimately yield NaN.
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        for r0 in range(0, height, band):
+            r1 = min(height, r0 + band)
+            n = (r1 - r0) * width
+            # The SAME fancy-index gather the point function does, not a
+            # slice: advanced indexing lays the result out point-major, so
+            # the member reductions below run along a contiguous axis
+            # (pairwise summation) exactly as they do there. A reshaped
+            # slice is member-major and sums the members sequentially —
+            # a last-bit difference in ``ens_mean_*`` on ~6 % of pixels,
+            # measured on a real 16-member ensemble.
+            rows = np.repeat(np.arange(r0, r1, dtype=np.int64), width)
+            cols = np.tile(np.arange(width, dtype=np.int64), r1 - r0)
+            series = np.asarray(forecast[:, :, rows, cols], dtype=np.float32)
+            del rows, cols
+            cumulative = np.fmax.accumulate(series, axis=1)
+            for lead in leads:
+                at_lead = cumulative[:, steps[lead] - 1, :]
+                out[ens_mean_column(lead)][r0:r1] = np.nanmean(
+                    at_lead, axis=0,
+                ).astype(np.float32).reshape(r1 - r0, width)
+                out[ens_p90_column(lead)][r0:r1] = _nanpercentile_columns(
+                    at_lead, 90.0,
+                ).astype(np.float32).reshape(r1 - r0, width)
+            del cumulative
+            with np.errstate(invalid="ignore"):
+                exceed = series >= float(threshold_mm_h)
+            del series
+            arrives = exceed.any(axis=1)
+            first = np.argmax(exceed, axis=1)
+            del exceed
+            arrival = (first + 1).astype(np.float32) * np.float32(timestep_min)
+            arrival = np.maximum(
+                arrival - np.float32(frame_age_min), np.float32(0.0),
+            )
+            arrival = np.where(arrives, arrival, np.nan)
+            enough = arrives.sum(axis=0) >= 4
+            if enough.any():
+                picked = arrival[:, enough]
+                spread = _nanpercentile_columns(
+                    picked, 75.0,
+                ) - _nanpercentile_columns(picked, 25.0)
+                flat = np.full(n, np.nan, dtype=np.float32)
+                flat[enough] = spread.astype(np.float32)
+                out["ens_eta_spread_min"][r0:r1] = flat.reshape(
+                    r1 - r0, width,
+                )
     return out
 
 

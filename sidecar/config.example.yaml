@@ -55,6 +55,13 @@ forecast:
   #
   # ROLLBACK: set it back to `production` (or delete the line) and restart.
   # flow_variant: production
+  #
+  # Interpolator for the deterministic native-grid advection (review R4b,
+  # 2026-09-27): `cv2` (default) runs the same midpoint scheme through
+  # cv2.remap in float32, ~9x faster than `scipy` (map_coordinates) and
+  # within hundredths of a mm/h of it. The STEPS ensemble is unaffected.
+  # ROLLBACK: set it to `scipy` and restart.
+  # advection_backend: cv2
   steps:
     ensemble_size: 16
     n_cascade_levels: 6

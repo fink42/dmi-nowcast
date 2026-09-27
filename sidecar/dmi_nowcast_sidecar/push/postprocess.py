@@ -407,6 +407,72 @@ class PostprocessTable:
         self.load()
         return True
 
+    @property
+    def nan_blind_columns(self) -> frozenset[str]:
+        """Design columns the loaded model never saw a NaN in (review R4a).
+
+        A LightGBM node records ``missing_type``; ``None`` means the column
+        had no missing value in that node's training rows, and a NaN served
+        to it is read as 0.0 — "no rain", "no ensemble rain" — rather than
+        sent down a learned default branch. A column whose EVERY split node
+        is ``None`` is one the model has no missing-value handling for at
+        all, so a NaN there is a silent wrong input, not an honest unknown.
+
+        For a shared-lead design a blind ``<family>_own`` column is copied
+        per lead from its per-lead sources, so the sources are what the
+        rows must fill and what is named here. Empty for a logistic (it
+        imputes) and without a model. Cached per loaded model object.
+        """
+        model = self._model
+        if model is None or not model.is_trees:
+            return frozenset()
+        cached = self.__dict__.get("_blind")
+        if cached is not None and cached[0] is model:
+            return cached[1]
+        names = list(model.feature_names)
+        kinds: dict[int, set[int]] = {}
+        for lead_model in model.models.values():
+            trees = getattr(lead_model, "trees", None)
+            for tree in getattr(trees, "trees", ()):
+                for feature, missing in zip(tree.feature, tree.missing):
+                    if feature >= 0:
+                        kinds.setdefault(int(feature), set()).add(int(missing))
+        blind = {
+            names[index] for index, seen in kinds.items()
+            if index < len(names) and seen == {0}
+        }
+        own = {name: sources for name, sources in model.spec.own_columns}
+        for name in list(blind):
+            if name in own:
+                blind.discard(name)
+                blind.update(str(source) for _lead, source in own[name])
+        result = frozenset(blind)
+        self.__dict__["_blind"] = (model, result)
+        return result
+
+    def blind_nan_counts(self, features: Mapping[str, Any]) -> dict[str, int]:
+        """``{design column: NaN cells}`` over :attr:`nan_blind_columns`.
+
+        Only non-zero counts. The design is built exactly as the predict
+        builds it (``PostprocessModel.design``), once, for a whole cycle's
+        table — a few hundred rows, a millisecond. Never raises: a counter
+        must not cost the cycle anything.
+        """
+        blind = self.nan_blind_columns
+        if not blind or self._model is None:
+            return {}
+        try:
+            design = self._model.design(features)
+        except Exception:  # noqa: BLE001 — a diagnostic, never the cycle
+            return {}
+        out: dict[str, int] = {}
+        for index, name in enumerate(self._model.feature_names):
+            if name in blind and index < design.shape[1]:
+                count = int(np.isnan(design[:, index]).sum())
+                if count:
+                    out[name] = count
+        return out
+
     # -- reading -----------------------------------------------------------
 
     def predict_table(
@@ -528,6 +594,13 @@ class CyclePostprocess:
     #: lead → P(rain STARTS within the lead) per point, from the push-only
     #: onset model on the SAME design rows (S11). Empty without that model.
     p_onset: dict[int, tuple[float | None, ...]] = field(default_factory=dict)
+    #: Review R4a: ``{design column: NaN cells}`` this cycle's table handed
+    #: the display model in columns it never saw a NaN in
+    #: (:attr:`PostprocessTable.nan_blind_columns`), non-zero only — a
+    #: diagnostic for the ``postprocess_cycle`` log line, not a value any
+    #: consumer reads. ``onset_blind_nan`` is the same for the onset model.
+    blind_nan: dict[str, int] = field(default_factory=dict)
+    onset_blind_nan: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -653,6 +726,8 @@ def build_cycle_postprocess(
     p_post: dict[int, tuple[float | None, ...]] = {}
     p_onset: dict[int, tuple[float | None, ...]] = {}
     fitted_at: str | None = None
+    blind_nan: dict[str, int] = {}
+    onset_blind_nan: dict[str, int] = {}
     onset_active = onset_table is not None and onset_table.active
     if rows and (table.active or onset_active):
         columns = _columns_of([
@@ -673,10 +748,14 @@ def build_cycle_postprocess(
             p_post = scored(table)
             if p_post:
                 fitted_at = table.fitted_at_utc
+            blind_nan = table.blind_nan_counts(columns)
         if onset_active:
             # The push-only onset model on the same design columns: one
             # extra predict per cycle, no new feature.
             p_onset = scored(onset_table)  # type: ignore[arg-type]
+            onset_blind_nan = onset_table.blind_nan_counts(  # type: ignore[union-attr]
+                columns,
+            )
     return CyclePostprocess(
         radar_ts_utc=radar_ts_utc,
         generated_at_utc=generated_at_utc,
@@ -685,6 +764,8 @@ def build_cycle_postprocess(
         p_post=p_post,
         fitted_at_utc=fitted_at,
         p_onset=p_onset,
+        blind_nan=blind_nan,
+        onset_blind_nan=onset_blind_nan,
     )
 
 
@@ -708,11 +789,14 @@ class PostprocessContext:
 
     So the cycle keeps them, as one immutable object swapped beside
     :class:`CyclePostprocess` — and ONLY when a model is loaded, because
-    without one the arrays would be ~45 MB of resident memory (41 MB of
-    native fields plus ~4 MB of raw product grids, measured on the
-    production composite) answering a question nobody can ask. ``radar_ts_utc`` is the same guard every
-    other published object carries: a reader refuses to pair one frame's
-    grids with another frame's stamp.
+    without one the arrays would be resident memory answering a question
+    nobody can ask: ~45 MB before review R4a (41 MB of native fields plus
+    ~4 MB of raw product grids, measured on the production composite),
+    plus since R4a the two previous native rain fields (~27 MB) and the
+    ensemble-shape grids (~9 MB on the 432×496 product grid).
+    ``radar_ts_utc`` is the same guard every other published object
+    carries: a reader refuses to pair one frame's grids with another
+    frame's stamp.
 
     The arrays are held by reference, never copied. They are the cycle's
     own, and the cycle is done with them by the time this is published.
@@ -772,6 +856,40 @@ class PostprocessContext:
     bulk_dir_deg: float = float("nan")
     #: The gauge availability lag the block was computed under, minutes.
     gauge_lag_min: float = core_postprocess.DEFAULT_GAUGE_LAG_MIN
+    # -- the history and ensemble blocks (review R4a, 2026-09-27) ----------
+    #
+    # Before R4a these columns were served NaN on this path, and the tree
+    # models — whose nodes on them have ``missing_type`` None — read that
+    # as 0: "no rain ten minutes ago", "no ensemble rain". Measured on the
+    # display model that biased a clicked wet pixel by −0.04…−0.08.
+    #: The anchor's rain field ONE and TWO frames earlier, native grid,
+    #: mm/h, each converted with its own Z-R — exactly the arrays the
+    #: cycle handed ``station_features`` for its own points. None when the
+    #: cycle did not have that frame (<3 composites for the t-20 one).
+    rain_prev10_mm_h: np.ndarray | None = None
+    rain_prev20_mm_h: np.ndarray | None = None
+    #: ``{ens_mean_<L> | ens_p90_<L> | ens_eta_spread_min: product grid}``
+    #: from :func:`~dmi_nowcast_core.postprocess.ensemble_grid_features`,
+    #: bit-identical at every pixel to what the cycle's point function
+    #: gave a served point there. Empty when that reduction failed.
+    ens_grids: Mapping[str, np.ndarray] = field(default_factory=dict)
+
+    def missing_families(self) -> tuple[str, ...]:
+        """Which R4a feature families this context cannot fill, if any.
+
+        ``prev10`` / ``prev20`` (the history columns) and ``ensemble``
+        (the ``ens_*`` block). Anything named here is served NaN on the
+        on-demand path — today's pre-R4a behaviour for that family — and
+        the cycle logs it once (``postprocess_point_incomplete``).
+        """
+        out: list[str] = []
+        if self.rain_prev10_mm_h is None:
+            out.append("prev10")
+        if self.rain_prev20_mm_h is None:
+            out.append("prev20")
+        if not self.ens_grids:
+            out.append("ensemble")
+        return tuple(out)
 
 
 def neighbour_features_for(
@@ -811,6 +929,7 @@ def score_point(
     station_radar_km: float,
     lat: float | None = None,
     lon: float | None = None,
+    product_pixel: tuple[int, int] | None = None,
 ) -> tuple[dict[int, float | None], dict[str, Any]]:
     """One point's ``({lead: p_post}, feature_row)``, computed on demand.
 
@@ -822,30 +941,39 @@ def score_point(
     invisible in the output.
 
     ``row``/``col`` are the FRACTIONAL native index of the point,
-    ``raw_fractions`` the uncalibrated ensemble fractions already read at
-    its product pixel, and ``shared`` the three decision columns the
-    design also reads (``observed_mm_h``, ``eta_min``,
-    ``intensity_mm_h``) — the caller reads all of those off the pixel,
-    because only the caller knows which pixel the served numbers came from.
+    ``product_pixel`` its ``(row, col)`` on the product grid (the pixel
+    ``raw_fractions`` were read at, and where the ``ens_*`` grids are
+    read), ``raw_fractions`` the uncalibrated ensemble fractions already
+    read there, and ``shared`` the three decision columns the design also
+    reads (``observed_mm_h``, ``eta_min``, ``intensity_mm_h``) — the
+    caller reads all of those off the pixel, because only the caller knows
+    which pixel the served numbers came from.
 
-    Cost is a 40 km corridor gather and a 5 km disc around one point plus
-    a one-row design — local windows, not whole-grid passes. Measured at
-    **0.42 ms per point** on the production 1728x1984 composite, which is
-    why it stays on the event loop beside the rest of ``/forecast``'s
-    arithmetic rather than paying for a thread hop.
+    Cost is a 40 km corridor gather and two 5 km discs (now and ten
+    minutes ago) around one point, eleven ensemble-grid lookups, plus a
+    one-row design — local windows, not whole-grid passes. Measured at
+    **0.42 ms per point** on the production 1728x1984 composite before
+    R4a; the whole ``postprocess_point`` call (design and 300-tree
+    forest included) went from a median ~1.45 ms to ~1.55 ms with R4a on
+    the Mac, which is why it stays on the event loop beside the rest of
+    ``/forecast``'s arithmetic rather than paying for a thread hop.
 
-    **What this row cannot carry** (v2, 2026-09-16). The context keeps the
-    anchor field and the flow, so every feature taken off those is here —
-    including the wet fractions and the whole resolved corridor. The three
-    blocks that need something the cycle has already dropped are not:
-    ``obs_prev10_mm_h`` / ``obs_prev20_mm_h`` / ``obs_max_5km_prev10_mm_h``
-    would need the previous frames (~27 MB more held for the life of the
-    cycle) and the ``ens_*`` block would need the ensemble (~150 MB); the
-    ``g_*`` block is null at any point without a gauge, which is every
-    point this path serves. They are written as nulls and the design
-    imputes the training mean, so a clicked pixel gets a slightly blunter
-    number than a subscribed one — the alternative is holding a sixth of
-    the VM's memory against a question most cycles are never asked.
+    **The history and ensemble blocks ARE here** (review R4a,
+    2026-09-27). ``obs_prev10_mm_h`` / ``obs_prev20_mm_h`` /
+    ``obs_max_5km_prev10_mm_h`` come from the same ``station_features``
+    call, handed the previous frames the context now keeps; the ``ens_*``
+    block is read at ``product_pixel`` off grids the cycle reduced from the
+    ensemble before dropping it, bit-identical at every pixel to the
+    cycle's own point reduction. Until R4a they were written as nulls on
+    the belief that "the design imputes the training mean" — true only of
+    the old logistic. The shipped tree models have ``missing_type`` None on
+    those nodes, so a NaN read as 0 ("no previous rain, no ensemble rain")
+    and biased a clicked wet pixel's probability low. A context that lacks
+    one of them (:meth:`PostprocessContext.missing_families`) still leaves
+    that family null, as before, and the cycle says so in the log.
+
+    The ``g_*`` block is null at any point without a gauge, which is every
+    point this path serves — as it is at a served point without one.
 
     **The neighbour block IS here** (v2, S1), given ``lat`` / ``lon``: it
     is the one gauge-derived family that has a real answer at a place with
@@ -865,7 +993,15 @@ def score_point(
         bulk_vy=context.bulk_vy,
         bulk_vx=context.bulk_vx,
         stalled_share=context.stalled_share,
+        rain_prev10_mm_h=context.rain_prev10_mm_h,
+        rain_prev20_mm_h=context.rain_prev20_mm_h,
     )
+    if product_pixel is not None and context.ens_grids:
+        prow, pcol = int(product_pixel[0]), int(product_pixel[1])
+        for name, grid in context.ens_grids.items():
+            grid_features[name] = np.asarray(
+                [grid[prow, pcol]], dtype=np.float32,
+            )
     if lat is not None and lon is not None:
         try:
             grid_features.update(

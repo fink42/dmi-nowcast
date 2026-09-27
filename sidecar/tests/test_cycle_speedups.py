@@ -107,11 +107,15 @@ def _decoded_frames(out_dir: Path) -> dict[str, bytes]:
     }
 
 
+@pytest.mark.parametrize("backend", ["scipy", "cv2"])
 def test_render_reuses_the_cycle_fields_bit_identically(
     minimal_config: Config, textured_paths: list[Path],
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend: str,
 ) -> None:
     eng = _loop_engine(minimal_config, [5, 10, 15, 20, 25, 30, 45, 60])
+    # Review R4b: the render's fallback advects with the cycle's backend,
+    # so reuse is bit-identical under either one.
+    eng.config.forecast.advection_backend = backend
     monkeypatch.setattr(compute_mod, "run_ensemble", _make_fake_run_ensemble([]))
     monkeypatch.setattr(render_mod, "datetime", _FixedNow)
     captured: dict = {}
@@ -131,7 +135,9 @@ def test_render_reuses_the_cycle_fields_bit_identically(
         captured["rain_now"], captured["vy"], captured["vx"],
         horizons_minutes=render_mod.loop_horizons_minutes(captured["frame_age_min"]),
         dt_minutes=captured["dt_min"],
+        backend=backend,
     ))
+    assert captured["advection_backend"] == backend
     for lead, exp in zip(render_mod.LOOP_FORECAST_LEADS_MIN, expected):
         assert np.array_equal(fields[lead], exp, equal_nan=True), lead
     # And rendering without them (the fallback path) gives the same loop.

@@ -41,6 +41,22 @@ positive vy = downward/south, positive vx = rightward/east. pysteps stacks
 ``np.stack([vx, vy])``), so we pass ``np.stack([vx, vy])`` with
 ``vel_timestep=1`` and horizons expressed in frames.
 
+**Two interpolation backends** (review R4b, 2026-09-27). ``"scipy"`` is
+the vendored extrapolator exactly as upstream wrote it
+(``scipy.ndimage.map_coordinates``, float64 trajectories). ``"cv2"`` runs
+the SAME scheme — the same midpoint rule, the same sub-steps, the same
+per-call re-initialisation of the velocity increment — through
+``cv2.remap`` on float32 maps (``BORDER_REPLICATE`` when sampling the
+velocity, which is ``map_coordinates``' ``mode="nearest"``;
+NaN for the field, with scipy's rule that a sample is NaN only when a
+NaN or off-grid neighbour carries weight). It is NOT bit-identical: remap
+quantises the sub-pixel position to 1/32 px and works in float32, which
+moves individual values by hundredths of a mm/h, and it is ~9x faster on
+the native grid. Callers choose with ``backend=``; ``None`` reads
+:data:`DEFAULT_BACKEND`. The sidecar passes its
+``forecast.advection_backend`` config key, so the choice rolls back
+without a deploy.
+
 **NaN semantics (unchanged, and load-bearing).** Sources outside the grid
 come back NaN — genuinely unknown data, not zero rain, because the
 composite's coverage edge is a real edge. NaN (nodata) inside the field
@@ -66,6 +82,15 @@ _MAX_SUBSTEP_FRAMES = 1.0
 _MAX_SUBSTEPS = 64
 
 _extrapolate_fn = None
+
+#: The interpolation backends :func:`advect_field` and
+#: :func:`advect_field_series` accept.
+BACKENDS = ("scipy", "cv2")
+
+#: Backend used when a caller passes ``backend=None``. Stays ``"scipy"``
+#: (the upstream scheme) so every caller that does not choose keeps its
+#: exact historical output; the live cycle chooses explicitly.
+DEFAULT_BACKEND = "scipy"
 
 
 def _semilagrangian():
@@ -112,6 +137,7 @@ def advect_field(
     *,
     horizon_minutes: float,
     dt_minutes: float = 10.0,
+    backend: str | None = None,
 ) -> np.ndarray:
     """Semi-Lagrangian backward advection of the full field.
 
@@ -138,7 +164,7 @@ def advect_field(
         scale = -scale
     fld = _as_float(field)
     velocity = _velocity_stack(vy, vx)
-    return next(iter(_integrate(fld, velocity, [scale])))
+    return next(iter(_integrate(fld, velocity, [scale], _resolve(backend))))
 
 
 def advect_field_series(
@@ -148,6 +174,7 @@ def advect_field_series(
     *,
     horizons_minutes: Sequence[float] | Iterable[float],
     dt_minutes: float = 10.0,
+    backend: str | None = None,
 ) -> Iterator[np.ndarray]:
     """Advect ``field`` to several horizons in one integration pass.
 
@@ -171,13 +198,24 @@ def advect_field_series(
     if any(b < a for a, b in zip(horizons, horizons[1:])):
         raise ValueError("horizons_minutes must be non-decreasing")
     scales = [h / float(dt_minutes) for h in horizons]
-    return _integrate(_as_float(field), _velocity_stack(vy, vx), scales)
+    return _integrate(
+        _as_float(field), _velocity_stack(vy, vx), scales, _resolve(backend),
+    )
+
+
+def _resolve(backend: str | None) -> str:
+    """Validate ``backend`` eagerly (``None`` → :data:`DEFAULT_BACKEND`)."""
+    name = DEFAULT_BACKEND if backend is None else str(backend)
+    if name not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
+    return name
 
 
 def _integrate(
     field: np.ndarray,
     velocity: np.ndarray,
     scales: Sequence[float],
+    backend: str = "scipy",
 ) -> Iterator[np.ndarray]:
     """Yield ``field`` advected to each scale (in frames), non-decreasing."""
     if not np.any(np.isfinite(field)):
@@ -187,7 +225,9 @@ def _integrate(
             yield np.full_like(field, np.nan)
         return
 
-    extrapolate = _semilagrangian()
+    extrapolate = (
+        _Cv2Extrapolator(velocity) if backend == "cv2" else _semilagrangian()
+    )
     displacement = None
     reached = 0.0
     for scale in scales:
@@ -222,6 +262,128 @@ def _integrate(
         )
         reached = scale
         yield warped[-1]
+
+
+class _Cv2Extrapolator:
+    """The vendored ``semilagrangian.extrapolate``, on ``cv2.remap``.
+
+    Implements exactly the call forms :func:`_integrate` makes —
+    ``(None, velocity, timesteps=[cumulative…], displacement_prev=…,
+    return_displacement=True)`` to carry the trajectory and
+    ``(field, velocity, timesteps=[increment], …)`` to warp — with the
+    upstream arithmetic step for step (``n_iter = 1``, ``vel_timestep =
+    1``, bilinear): per call, the velocity increment is initialised from
+    the velocity at the displacement reached so far (or the raw velocity
+    when there is none), then for every timestep increment ``td``::
+
+        inc  = v(x + d - inc / 2) * td      # midpoint
+        d   -= inc
+        inc  = v(x + d) * td                # seeds the next increment
+
+    The last re-sample of a call is skipped: upstream computes it and
+    throws it away, because the next call re-initialises the increment
+    from ``displacement_prev``.
+
+    Displacements are float32 ``(2, h, w)`` in pysteps' order
+    (``[0] = x``, ``[1] = y``), so the object is interchangeable with the
+    vendored function inside :func:`_integrate`. One instance per
+    integration: it owns the float32 velocity planes and the pixel grid.
+    """
+
+    def __init__(self, velocity: np.ndarray) -> None:
+        import cv2
+
+        self._cv2 = cv2
+        self._vx = np.ascontiguousarray(velocity[0], dtype=np.float32)
+        self._vy = np.ascontiguousarray(velocity[1], dtype=np.float32)
+        h, w = self._vx.shape
+        self._gx, self._gy = np.meshgrid(
+            np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32),
+        )
+
+    def _sample_velocity(self, dx: np.ndarray, dy: np.ndarray):
+        cv2 = self._cv2
+        map_x = self._gx + dx
+        map_y = self._gy + dy
+        ix = cv2.remap(self._vx, map_x, map_y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REPLICATE)
+        iy = cv2.remap(self._vy, map_x, map_y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REPLICATE)
+        return ix, iy
+
+    def __call__(
+        self,
+        precip,
+        velocity,
+        timesteps,
+        outval=np.nan,
+        displacement_prev=None,
+        vel_timestep=1.0,
+        **_ignored,
+    ):
+        if float(vel_timestep) != 1.0:
+            raise ValueError("the cv2 backend supports vel_timestep = 1 only")
+        steps = [float(t) for t in timesteps]
+        tds = [steps[0]] + [b - a for a, b in zip(steps, steps[1:])]
+        if displacement_prev is None:
+            dx = np.zeros_like(self._vx)
+            dy = np.zeros_like(self._vy)
+            ix = self._vx * np.float32(tds[0])
+            iy = self._vy * np.float32(tds[0])
+        else:
+            dx = np.array(displacement_prev[0], dtype=np.float32)
+            dy = np.array(displacement_prev[1], dtype=np.float32)
+            ix, iy = self._sample_velocity(dx, dy)
+            ix *= np.float32(tds[0])
+            iy *= np.float32(tds[0])
+        for i, td in enumerate(tds):
+            t32 = np.float32(td)
+            ix, iy = self._sample_velocity(
+                dx - ix * np.float32(0.5), dy - iy * np.float32(0.5),
+            )
+            ix *= t32
+            iy *= t32
+            dx -= ix
+            dy -= iy
+            if i + 1 < len(tds):
+                ix, iy = self._sample_velocity(dx, dy)
+                ix *= t32
+                iy *= t32
+        displacement = np.stack([dx, dy])
+        if precip is None:
+            return None, displacement
+        if not (isinstance(outval, float) and math.isnan(outval)):
+            raise ValueError("the cv2 backend supports outval = NaN only")
+        return self._warp(precip, dx, dy)[np.newaxis], displacement
+
+    def _warp(self, precip, dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
+        """Bilinear warp with ``map_coordinates``' NaN semantics.
+
+        A plain ``cv2.remap`` with a NaN border value multiplies the
+        out-of-grid neighbour by its weight even when that weight is 0,
+        so a sample sitting exactly on the last row or column — or on any
+        pixel next to interior nodata — would come back NaN where scipy
+        returns the value. Instead the field is warped with NaN (and the
+        border) as 0 alongside a validity plane, and a sample is NaN
+        exactly when a NaN or off-grid neighbour carries positive weight
+        (the smallest non-zero bilinear weight at remap's 1/32 px
+        resolution is 1/1024, far above the 1e-4 tolerance).
+        """
+        cv2 = self._cv2
+        src = np.asarray(precip)
+        values = np.ascontiguousarray(src, dtype=np.float32)
+        finite = np.isfinite(values)
+        if not finite.all():
+            values = np.where(finite, values, np.float32(0.0))
+        map_x = self._gx + dx
+        map_y = self._gy + dy
+        warped = cv2.remap(values, map_x, map_y, cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+        weight = cv2.remap(finite.astype(np.float32), map_x, map_y,
+                           cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+        warped[weight < np.float32(1.0 - 1e-4)] = np.nan
+        return warped.astype(src.dtype, copy=False)
 
 
 def _substeps(reached: float, target: float) -> tuple[list[float], float]:

@@ -90,6 +90,11 @@ Modifications from upstream
    `_verbosity.VERBOSE` is set: upstream's banner, method table, AR
    correlation tables and per-timestep progress lines went to the
    service log on every cycle. No numeric effect.
+10. `nowcasts/steps.py` — the upstream `np.random.seed(config.seed)` before
+    the noise initialisation is removed. Nothing on the STEPS path draws
+    from the global RNG (members use their own `RandomState`s seeded from
+    `config.seed`), so the call only reseeded process-wide state for
+    every other caller. No numeric effect (2026-09-27, review R4b).
 
 Modifications 5-7 are peak-memory changes; together with 4 they took a
 calibration-corpus worker from 2591 MB / 13.65 s per event to 1649 MB /

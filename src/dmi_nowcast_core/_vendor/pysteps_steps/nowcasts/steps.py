@@ -750,9 +750,14 @@ class StepsNowcaster:
 
         # Initialize the noise generator if the noise_method is provided
         if self.__config.noise_method is not None:
-            np.random.seed(
-                self.__config.seed
-            )  # Set the random seed for reproducibility
+            # VENDORING MODIFICATION 10 (no numeric effect): upstream calls
+            # ``np.random.seed(self.__config.seed)`` here, reseeding the
+            # process-wide global RNG on every forecast. Nothing on this
+            # path draws from it — the noise and motion perturbations use
+            # the per-member ``RandomState`` objects seeded from
+            # ``config.seed`` below, and the "auto" noise adjustment gets
+            # the seed explicitly — so the call only clobbered global
+            # state for every other caller in the process.
             init_noise, generate_noise = noise.get_method(self.__config.noise_method)
             self.__params.noise_generator = generate_noise
 

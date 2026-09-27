@@ -61,6 +61,7 @@ def render_frames(
     disc_motion_bearing_from: str,
     basemap: Any = None,
     forecast_fields: Mapping[int, np.ndarray] | None = None,
+    advection_backend: str | None = None,
 ) -> tuple[bytes, float]:
     """Render the animated PNG + per-frame PNGs + manifest.
 
@@ -75,6 +76,11 @@ def render_frames(
     same horizons, so the same arrays this function would integrate
     (bit-identical; ~5 s of native-grid advection saved per cycle). Missing
     or incomplete → the loop is advected here, as before.
+
+    ``advection_backend`` is the cycle's ``forecast.advection_backend``
+    (``None`` = the core default), so the fallback integrates with the same
+    interpolator as the reused fields and the two paths stay bit-identical
+    under either backend (review R4b).
     """
     t0 = time.perf_counter()
     now_utc = datetime.now(timezone.utc)
@@ -118,6 +124,7 @@ def render_frames(
             rain_now, vy, vx,
             horizons_minutes=loop_horizons_minutes(frame_age_min),
             dt_minutes=dt_min,
+            backend=advection_backend,
         )
     for lead, field in zip(LOOP_FORECAST_LEADS_MIN, advected):
         ts = now_utc + timedelta(minutes=lead)
