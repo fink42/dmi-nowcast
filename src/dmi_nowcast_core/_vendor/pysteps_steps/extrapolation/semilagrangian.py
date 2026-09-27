@@ -15,7 +15,57 @@ import time
 import warnings
 
 import numpy as np
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates as _scipy_map_coordinates
+
+from .. import parallel
+
+#: Grids smaller than this many output pixels are interpolated in one call;
+#: the 432x496 STEPS grid (214k) stays whole — its members already run in
+#: parallel — and the 1728x1984 native grid (3.4M) is split.
+_ROW_CHUNK_MIN_PIXELS = 1 << 18
+
+
+def map_coordinates(input, coordinates, **kwargs):
+    """``scipy.ndimage.map_coordinates``, split into row blocks on the pool.
+
+    VENDORING MODIFICATION 8 (performance, bit-identical output). Every
+    output pixel of ``map_coordinates`` is a function of its own coordinate
+    pair and the (unchanged) input alone, so interpolating blocks of rows
+    separately — into slices of one preallocated output of the dtype scipy
+    itself would allocate (``input.dtype``) — gives the same array element
+    for element. scipy releases the GIL inside the interpolation, so the
+    blocks run concurrently. Falls back to the single call for small grids,
+    non-float inputs, spline prefiltering (it would run once per block),
+    an explicit ``output``, or inside another pool task.
+    """
+    arr = np.asarray(input)
+    coords = coordinates
+    n_workers = parallel.workers()
+    if (
+        n_workers <= 1
+        or parallel.in_worker()
+        or "output" in kwargs
+        or kwargs.get("prefilter", True) and kwargs.get("order", 3) > 1
+        or not isinstance(coords, (list, tuple))
+        or len(coords) != 2
+        or arr.dtype.kind != "f"
+    ):
+        return _scipy_map_coordinates(input, coords, **kwargs)
+    ys, xs = np.asarray(coords[0]), np.asarray(coords[1])
+    if ys.ndim != 2 or ys.shape != xs.shape or ys.size < _ROW_CHUNK_MIN_PIXELS:
+        return _scipy_map_coordinates(input, coords, **kwargs)
+    out = np.empty(ys.shape, dtype=arr.dtype)
+    n_blocks = min(ys.shape[0], 2 * n_workers)
+    bounds = np.linspace(0, ys.shape[0], n_blocks + 1).astype(int)
+
+    def block(b):
+        r0, r1 = bounds[b], bounds[b + 1]
+        _scipy_map_coordinates(
+            arr, [ys[r0:r1], xs[r0:r1]], output=out[r0:r1], **kwargs
+        )
+
+    parallel.run_each(block, n_blocks)
+    return out
 
 
 def extrapolate(

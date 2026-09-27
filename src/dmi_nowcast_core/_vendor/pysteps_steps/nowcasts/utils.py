@@ -24,12 +24,10 @@ from scipy.ndimage import binary_dilation, distance_transform_cdt
 
 from .. import extrapolation
 
-try:
-    import dask
-
-    DASK_IMPORTED = True
-except ImportError:
-    DASK_IMPORTED = False
+# VENDORING MODIFICATION 8 (performance, bit-identical output): the dask
+# branches in ``nowcast_main_loop`` run on the persistent pool instead.
+from .. import parallel
+from .._verbosity import vprint as print  # noqa: A001 — VENDORING MODIFICATION 9
 
 
 def binned_timesteps(timesteps):
@@ -539,11 +537,10 @@ def nowcast_main_loop(
                             np.asarray(precip_forecast_ep[0], dtype=np.float32)
                         )
 
-                if DASK_IMPORTED and ensemble and num_ensemble_members > 1:
-                    res = []
-                    for i in range(precip_forecast_ip.shape[0]):
-                        res.append(dask.delayed(worker1)(i))
-                    dask.compute(*res, num_workers=num_workers)
+                if ensemble and num_ensemble_members > 1 and num_workers > 1:
+                    parallel.run_each(
+                        worker1, precip_forecast_ip.shape[0], max_workers=num_workers,
+                    )
                 else:
                     for i in range(precip_forecast_ip.shape[0]):
                         worker1(i)
@@ -580,11 +577,10 @@ def nowcast_main_loop(
                     **extrap_kwargs_,
                 )
 
-            if DASK_IMPORTED and ensemble and num_ensemble_members > 1:
-                res = []
-                for i in range(precip_forecast_new.shape[0]):
-                    res.append(dask.delayed(worker2)(i))
-                dask.compute(*res, num_workers=num_workers)
+            if ensemble and num_ensemble_members > 1 and num_workers > 1:
+                parallel.run_each(
+                    worker2, precip_forecast_new.shape[0], max_workers=num_workers,
+                )
             else:
                 for i in range(precip_forecast_new.shape[0]):
                     worker2(i)

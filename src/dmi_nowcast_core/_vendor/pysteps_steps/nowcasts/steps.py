@@ -30,12 +30,12 @@ from ..postprocessing import probmatching
 from ..timeseries import autoregression, correlation
 from ..utils.check_norain import check_norain, check_previous_radar_obs
 
-try:
-    import dask
-
-    DASK_IMPORTED = True
-except ImportError:
-    DASK_IMPORTED = False
+# VENDORING MODIFICATION 8 (performance, bit-identical output): the dask
+# branches below are replaced by the module-level thread pool in
+# ``..parallel`` (dask is not shipped, so upstream ran every member
+# serially). ``num_workers`` keeps its upstream meaning.
+from .. import parallel
+from .._verbosity import vprint as print  # noqa: A001 — VENDORING MODIFICATION 9
 
 
 @dataclass(frozen=True)
@@ -706,8 +706,6 @@ class StepsNowcaster:
             True if np.any(~np.isfinite(self.__precip)) else False
         )
 
-        res = []
-
         def __extrapolate_single_field(precip, i):
             # Extrapolate a single precipitation field using the velocity field
             return self.__params.extrapolation_method(
@@ -718,22 +716,21 @@ class StepsNowcaster:
                 **extrap_kwargs,
             )[-1]
 
-        for i in range(self.__config.ar_order):
-            if (
-                not DASK_IMPORTED
-            ):  # If Dask is not available, perform sequential extrapolation
-                self.__precip[i, :, :] = __extrapolate_single_field(self.__precip, i)
-            else:
-                # If Dask is available, accumulate delayed computations for parallel execution
-                res.append(dask.delayed(__extrapolate_single_field)(self.__precip, i))
-
-        # If Dask is available, perform the parallel computation
-        if DASK_IMPORTED and res:
-            num_workers_ = min(self.__params.num_ensemble_workers, len(res))
-            self.__precip = np.stack(
-                list(dask.compute(*res, num_workers=num_workers_))
-                + [self.__precip[-1, :, :]]
+        # VENDORING MODIFICATION 8: the ar_order fields are independent, so
+        # they are computed in parallel (in place of dask) and then written
+        # back — reading ``self.__precip`` only before any write, exactly as
+        # upstream's dask branch did.
+        if self.__params.num_ensemble_workers > 1:
+            fields = parallel.run_each(
+                lambda i: __extrapolate_single_field(self.__precip, i),
+                self.__config.ar_order,
+                max_workers=self.__params.num_ensemble_workers,
             )
+            for i, fld in enumerate(fields):
+                self.__precip[i, :, :] = fld
+        else:
+            for i in range(self.__config.ar_order):
+                self.__precip[i, :, :] = __extrapolate_single_field(self.__precip, i)
 
         print("Extrapolation complete and precipitation fields aligned.")
 
@@ -1086,16 +1083,14 @@ class StepsNowcaster:
             self.__apply_ar_model_to_cascades(j, state, params)
             precip_forecast_out[j] = self.__recompose_and_apply_mask(j, state, params)
 
-        # Use Dask for parallel execution if available
-        if (
-            DASK_IMPORTED
-            and params["n_ens_members"] > 1
-            and params["num_ensemble_workers"] > 1
-        ):
-            res = []
-            for j in range(params["n_ens_members"]):
-                res.append(dask.delayed(worker)(j))
-            dask.compute(*res, num_workers=params["num_ensemble_workers"])
+        # VENDORING MODIFICATION 8: members in parallel on the persistent
+        # pool (in place of dask). Each member owns its random generators and
+        # its state slots, so the result is identical to the serial loop.
+        if params["n_ens_members"] > 1 and params["num_ensemble_workers"] > 1:
+            parallel.run_each(
+                worker, params["n_ens_members"],
+                max_workers=params["num_ensemble_workers"],
+            )
         else:
             for j in range(params["n_ens_members"]):
                 worker(j)

@@ -1,6 +1,7 @@
 import numpy as np
 
 from .. import utils
+from .._verbosity import vprint as print  # noqa: A001 — VENDORING MODIFICATION 9
 
 
 def check_norain(

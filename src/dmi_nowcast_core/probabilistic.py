@@ -123,6 +123,7 @@ def run_ensemble(
     seed: int = 42,
     downsample_factor: int = 4,
     pixel_scale_m: float = 500.0,
+    num_workers: int | None = None,
 ) -> np.ndarray:
     """Run pysteps STEPS. Returns ``(n_ens_members, n_timesteps, h, w)`` in mm/h.
 
@@ -142,6 +143,13 @@ def run_ensemble(
     ``pixel_scale_m`` is the native radar grid scale (500 m on DMI);
     needed so velocity perturbation gets a sensible km/pixel after the
     downsample.
+
+    ``num_workers`` is how many members run at once, on the vendored
+    subset's one persistent thread pool (``_vendor.pysteps_steps.parallel``;
+    ``None`` = that pool's size, 4 by default). Every member owns its random
+    generators and its state, so the output is identical to the serial run
+    (``num_workers=1``) for the same ``seed`` — pinned by
+    ``tests/test_probabilistic_parallel.py``.
     """
     if len(dbz_frames) < 3:
         raise ValueError(f"STEPS needs at least 3 input frames; got {len(dbz_frames)}")
@@ -184,6 +192,7 @@ def run_ensemble(
         km_per_pixel = pixel_scale_m / 1000.0
 
     try:
+        from ._vendor.pysteps_steps import parallel as ps_parallel
         from ._vendor.pysteps_steps.nowcasts import steps as ps_steps
     except ImportError as exc:  # noqa: BLE001
         raise EnsembleUnavailable(
@@ -202,6 +211,9 @@ def run_ensemble(
         kmperpixel=km_per_pixel,
         timestep=timestep_min,
         seed=seed,
+        num_workers=(
+            ps_parallel.workers() if num_workers is None else max(1, int(num_workers))
+        ),
     )
     return db_to_rain(forecast_db)
 

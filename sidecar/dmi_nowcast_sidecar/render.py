@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import structlog
@@ -27,6 +27,18 @@ _log = structlog.get_logger(__name__)
 # Lead 0 closes the frame-age gap so the loop transitions smoothly from
 # "obs" to "now".
 LOOP_FORECAST_LEADS_MIN: tuple[int, ...] = (0, 5, 10, 15, 20, 25, 30)
+
+
+def loop_horizons_minutes(frame_age_min: float) -> list[float]:
+    """Advection horizons (minutes from RADAR-FRAME time) of the loop's
+    forecast frames: the frame age plus each loop lead.
+
+    The one expression both :func:`render_frames` and its caller use, so
+    the caller can tell — by exact float equality — whether the fields its
+    own advection series already produced are the loop's frames.
+    """
+    age = max(0.0, frame_age_min)
+    return [age + float(lead) for lead in LOOP_FORECAST_LEADS_MIN]
 
 
 def render_frames(
@@ -48,12 +60,21 @@ def render_frames(
     disc_motion_speed_kmh: float,
     disc_motion_bearing_from: str,
     basemap: Any = None,
+    forecast_fields: Mapping[int, np.ndarray] | None = None,
 ) -> tuple[bytes, float]:
     """Render the animated PNG + per-frame PNGs + manifest.
 
     Returns ``(apng_bytes, render_ms)``. The manifest and per-frame PNGs
     land in ``out_dir`` as a side effect — the bytes are returned only
     for callers who also want to expose the APNG over HTTP.
+
+    ``forecast_fields`` maps each loop lead (:data:`LOOP_FORECAST_LEADS_MIN`)
+    to its already-advected field. The cycle passes the fields its own
+    per-lead series produced when that series' first horizons are exactly
+    :func:`loop_horizons_minutes` — same field, same flow, same ``dt_min``,
+    same horizons, so the same arrays this function would integrate
+    (bit-identical; ~5 s of native-grid advection saved per cycle). Missing
+    or incomplete → the loop is advected here, as before.
     """
     t0 = time.perf_counter()
     now_utc = datetime.now(timezone.utc)
@@ -88,11 +109,16 @@ def render_frames(
     # 0-min lead advects by frame_age so playback lands on "now". One
     # ascending series = one trajectory integration for the whole loop.
     last_lead = LOOP_FORECAST_LEADS_MIN[-1]
-    advected = advect_field_series(
-        rain_now, vy, vx,
-        horizons_minutes=[max(0.0, frame_age_min) + float(lead) for lead in LOOP_FORECAST_LEADS_MIN],
-        dt_minutes=dt_min,
-    )
+    if forecast_fields is not None and all(
+        lead in forecast_fields for lead in LOOP_FORECAST_LEADS_MIN
+    ):
+        advected = [forecast_fields[lead] for lead in LOOP_FORECAST_LEADS_MIN]
+    else:
+        advected = advect_field_series(
+            rain_now, vy, vx,
+            horizons_minutes=loop_horizons_minutes(frame_age_min),
+            dt_minutes=dt_min,
+        )
     for lead, field in zip(LOOP_FORECAST_LEADS_MIN, advected):
         ts = now_utc + timedelta(minutes=lead)
         if lead == 0:

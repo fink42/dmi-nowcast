@@ -102,6 +102,12 @@ _LANDMARKS: tuple[tuple[str, float, float], ...] = (
 )
 
 
+#: zlib level for every PNG this module writes. PNG is lossless, so the
+#: pixels are identical at any level; ``optimize=True`` (level 9) cost
+#: ~5x the encode time of level 6 for ~2 % smaller loop frames (measured
+#: 2026-09-27: eleven 500x500 frames 640 -> 122 ms, 2169 -> 2214 KB).
+PNG_COMPRESS_LEVEL = 6
+
 _COLORMAP_STOPS = np.array([
     [0.05,   0,   0, 255],   # very light: deep blue
     [0.20,   0, 150, 255],   # light:      sky blue
@@ -148,9 +154,32 @@ _RING_COLOUR_RGBA = (80, 80, 80, 153)  # ~60 % opaque dark gray
 _CROSSHAIR_COLOUR_RGBA = (80, 80, 80, 120)
 
 
+#: Rows colour-mapped per block by :func:`_apply_colormap`. Affects peak
+#: memory only: every step is elementwise, so the result is identical.
+_COLORMAP_BLOCK_ROWS = 128
+
+
 def _apply_colormap(rain_mm_h: np.ndarray) -> np.ndarray:
     """Map rain rate (mm/h) → RGBA uint8. Transparent below ``_RENDER_FLOOR_MM_H``;
-    a log-space alpha ramp fades light rain so the overlay isn't a solid wash."""
+    a log-space alpha ramp fades light rain so the overlay isn't a solid wash.
+
+    A 2-D field is mapped a block of rows at a time into one uint8 output.
+    The per-pixel arithmetic is unchanged (and elementwise), so the bytes
+    are the same; the float temporaries shrink from ~120 MB to ~5 MB on
+    the native 1728x1984 grid, which matters now that the national
+    overlays are encoded several at a time.
+    """
+    arr = np.asarray(rain_mm_h)
+    if arr.ndim != 2 or arr.shape[0] <= _COLORMAP_BLOCK_ROWS:
+        return _apply_colormap_block(arr)
+    out = np.empty((*arr.shape, 4), dtype=np.uint8)
+    for r0 in range(0, arr.shape[0], _COLORMAP_BLOCK_ROWS):
+        r1 = r0 + _COLORMAP_BLOCK_ROWS
+        out[r0:r1] = _apply_colormap_block(arr[r0:r1])
+    return out
+
+
+def _apply_colormap_block(rain_mm_h: np.ndarray) -> np.ndarray:
     stops = _COLORMAP_STOPS
     log_levels = np.log10(stops[:, 0])
     rgb_at_levels = stops[:, 1:4]
@@ -576,7 +605,7 @@ def render_overlay(
         basemap=basemap,
     )
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    img.save(buf, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
     return buf.getvalue()
 
 
@@ -670,7 +699,7 @@ def render_loop_png(
         loop=0,
         disposal=0,
         blend=0,
-        optimize=True,
+        compress_level=PNG_COMPRESS_LEVEL,
     )
     apng_bytes = buf.getvalue()
 
@@ -713,7 +742,7 @@ def _write_individual_frames(
         fname = f"frame_{i:02d}.png"
         target = out_dir / fname
         tmp = target.with_suffix(target.suffix + ".tmp")
-        pil.save(tmp, format="PNG", optimize=True)
+        pil.save(tmp, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
         os.replace(tmp, target)
         manifest_frames.append({
             "index": i,

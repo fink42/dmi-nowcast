@@ -82,7 +82,7 @@ from .push.postprocess import (
     point_key,
     score_point,
 )
-from .render import render_frames
+from .render import LOOP_FORECAST_LEADS_MIN, loop_horizons_minutes, render_frames
 from .strike_archive import StrikeArchive
 from .state_schema import (
     CalibrationBlock,
@@ -892,7 +892,8 @@ class CycleEngine:
                     )
                 }
             )
-            self._store.write(state)
+            # fsync + two renames: off the event loop.
+            await asyncio.to_thread(self._store.write, state)
             _log.info(
                 "cycle_ok",
                 cycle_ms=round(cycle_ms, 1),
@@ -948,10 +949,19 @@ class CycleEngine:
         latest = features_sorted[-4:]
         paths: list[Path] = []
         for feat in latest:
+            fresh = not (self._cache_dir / feat.filename).exists()
             try:
                 path = await self._client.download(feat, self._cache_dir)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("download_failed", filename=feat.filename, error=str(exc))
+                continue
+            # A frame that arrived this cycle is parsed once before it is
+            # archived: a truncated or corrupt payload must neither enter
+            # the corpus nor sit in the working cache, where ``download``
+            # would hand the same bad file back every cycle. Frames already
+            # cached passed this check when they arrived (and
+            # ``_parse_frames`` drops any that go bad later).
+            if fresh and not await asyncio.to_thread(self._frame_readable, path):
                 continue
             paths.append(path)
             if self._corpus is not None:
@@ -976,12 +986,58 @@ class CycleEngine:
             _log.warning("cache_evict_failed", error=str(exc))
         return paths
 
+    def _frame_readable(self, path: Path) -> bool:
+        """Parse ``path``; on failure drop it from the working cache and
+        return False. Blocking — call via ``asyncio.to_thread``."""
+        try:
+            parse_composite(path)
+        except Exception as exc:  # noqa: BLE001
+            self._drop_corrupt_frame(path, exc)
+            return False
+        return True
+
+    def _drop_corrupt_frame(self, path: Path, exc: BaseException) -> None:
+        """Log a frame that failed to parse and delete it — but only from
+        the service's own working cache. A path anywhere else (the corpus,
+        a test fixture, a replay's input) is never deleted: this service
+        does not own it. The file is gone after this, so the warning is
+        logged once per bad download rather than once per cycle."""
+        deleted = False
+        try:
+            if path.resolve().parent == self._cache_dir.resolve():
+                path.unlink(missing_ok=True)
+                deleted = True
+        except OSError as unlink_exc:  # noqa: BLE001
+            _log.warning("frame_delete_failed", path=str(path), error=str(unlink_exc))
+        _log.warning(
+            "frame_unreadable",
+            filename=path.name,
+            deleted=deleted,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    def _parse_frames(self, paths: list[Path]) -> list[RadarComposite]:
+        """Parse each frame on its own: one corrupt file costs that frame,
+        not the cycle. Sorted oldest → newest. Raises when fewer than two
+        readable frames remain (motion needs a pair)."""
+        composites: list[RadarComposite] = []
+        for p in paths:
+            try:
+                composites.append(parse_composite(p))
+            except Exception as exc:  # noqa: BLE001
+                self._drop_corrupt_frame(p, exc)
+        if len(composites) < 2:
+            raise RuntimeError(
+                f"not enough readable frames (got {len(composites)} of {len(paths)})"
+            )
+        composites.sort(key=lambda c: c.timestamp_utc)
+        return composites
+
     def _compute_sync(self, paths: list[Path], fetch_ms: float) -> State:
         """Blocking compute path — call from inside the ``"cycle"`` worker."""
         t_compute = time.perf_counter()
 
-        composites: list[RadarComposite] = [parse_composite(p) for p in paths]
-        composites.sort(key=lambda c: c.timestamp_utc)
+        composites: list[RadarComposite] = self._parse_frames(paths)
         composite_now = composites[-1]
         composite_prev = composites[-2]
 
@@ -1234,18 +1290,39 @@ class CycleEngine:
         # the extra one near-free, and the per-lead pairing below is
         # unchanged: the lead-0 field is consumed off an explicit iterator
         # first, so lead i still pairs with the field for lead i.
+        series_horizons = (
+            [frame_age_min]
+            + [lead + frame_age_min for lead in self.config.forecast.leads_min]
+        )
+        # The private loop render (below) wants the field at frame age +
+        # 0, 5, …, 30 min. When this series' first horizons are EXACTLY
+        # those (the shipped leads 5, 10, …, 30 make them so), the render
+        # takes the fields from here instead of integrating the same
+        # trajectory a second time — same field, same flow, same dt, same
+        # horizon sequence, so bit-identical arrays. Any other lead set
+        # leaves the render to advect for itself, as it always did.
+        loop_horizons = loop_horizons_minutes(frame_age_min)
+        render_fields: dict[int, np.ndarray] | None = (
+            {}
+            if not self.config.server.public_mode
+            and series_horizons[:len(loop_horizons)] == loop_horizons
+            else None
+        )
         advected = iter(advect_field_series(
             rain_now, vy, vx,
-            horizons_minutes=(
-                [frame_age_min]
-                + [lead + frame_age_min for lead in self.config.forecast.leads_min]
-            ),
+            horizons_minutes=series_horizons,
             dt_minutes=dt_min,
         ))
         forecast_now_field = next(advected)
-        for lead, field in zip(self.config.forecast.leads_min, advected):
+        if render_fields is not None:
+            render_fields[LOOP_FORECAST_LEADS_MIN[0]] = forecast_now_field
+        for i, (lead, field) in enumerate(
+            zip(self.config.forecast.leads_min, advected), start=1,
+        ):
             if collect_overlays:
                 overlay_fields[int(lead)] = field
+            if render_fields is not None and i < len(LOOP_FORECAST_LEADS_MIN):
+                render_fields[LOOP_FORECAST_LEADS_MIN[i]] = field
             disc = sample_disc(field, geo, lon, lat, radius_m=radius_m)
             disc_val = getattr(disc, f"{stat}_mm_h")
             mm_h = float(disc_val) if np.isfinite(disc_val) else 0.0
@@ -1330,6 +1407,7 @@ class CycleEngine:
                     disc_motion_speed_kmh=disc_speed_kmh,
                     disc_motion_bearing_from=bearing_compass,
                     basemap=self._basemap,
+                    forecast_fields=render_fields,
                 )
                 # APNG to disk too — served at /frames/loop.png so the HA
                 # image entity can fetch a single self-animating artifact.
@@ -1338,6 +1416,9 @@ class CycleEngine:
                 # A render failure shouldn't kill the cycle — state.json still
                 # gets written, the Lovelace card just won't have a fresh loop.
                 _log.warning("render_failed", error=str(exc))
+        # The loop fields are the render's alone (the per-lead overlays keep
+        # their own references); release them before the artifact writes.
+        render_fields = None
 
         # National artifacts (plan §A2). The in-memory products are published
         # for the /forecast lookup (plan §A3) even when the disk write fails —
@@ -1681,8 +1762,15 @@ class CycleEngine:
         # ``dt_min`` arrives sanitised (> 0) from ``_compute_sync``.
         timestep_min = float(dt_min)
         horizon_min = float(steps_cfg.horizon_min)
+        # The step COUNT comes from the nominal cadence, not the measured
+        # spacing: DMI stamps some frames at :01 s, so the measured dt is
+        # 9.983 / 10.0 / 10.017 min and ceil(90 / dt) flipped between 10
+        # and 9 steps from cycle to cycle (2026-09-27 review). The
+        # timestep itself stays the measured dt — the flow is in pixels
+        # per measured interval — so only the flipping cycles change, and
+        # only by dropping a timestep past the configured horizon.
         n_timesteps = max(
-            1, math.ceil(horizon_min / timestep_min - 1e-9),
+            1, math.ceil(horizon_min / _nominal_timestep_min(timestep_min) - 1e-9),
         )
 
         # ``run_ensemble`` wants velocity in pixels per STEPS timestep; the
@@ -2312,15 +2400,33 @@ def _read_points(
 
 
 def _bearing_from_deg(dy_per_min: float, dx_per_min: float) -> float:
-    """Compass bearing the rain is coming FROM (0° = from north)."""
-    # Motion vector (dy,dx) is image-space (dy positive = south). The
-    # "from" direction is the opposite of motion.
+    """Compass bearing the rain is coming FROM (0° = from north, 90° = from
+    east), the same convention as :func:`_bearing_compass_label`.
+
+    Motion ``(dy, dx)`` is image-space: +dy moves south, +dx moves east.
+    The heading the rain moves TOWARD is ``atan2(dx, -dy)`` (east = 90°);
+    the "from" bearing is the opposite, ``atan2(-dx, dy)``. So east-moving
+    rain comes from 270° (W) and south-moving rain from 0° (N).
+
+    Until 2026-09-27 this added a further 180°, reporting the heading
+    instead: east-moving rain read 90° while the compass label beside it
+    (and the loop's arrow caption) said W.
+    """
     if dy_per_min == 0 and dx_per_min == 0:
         return 0.0
-    angle = math.degrees(math.atan2(-dx_per_min, dy_per_min))
-    # atan2(-dx, dy) returns 0=south-bound, 90=west-bound, etc. Convert
-    # to compass-from convention: 0=from north.
-    return (angle + 180.0) % 360.0
+    return math.degrees(math.atan2(-dx_per_min, dy_per_min)) % 360.0
+
+
+def _nominal_timestep_min(dt_min: float) -> float:
+    """The nominal frame cadence behind a measured inter-frame spacing:
+    ``dt_min`` rounded to the nearest half minute (9.983 and 10.017 → 10.0).
+
+    DMI's frame timestamps jitter by a second (``:00`` vs ``:01``), which
+    is noise, not cadence. Anything below a quarter minute (a degenerate
+    spacing) is returned unchanged rather than rounded to zero.
+    """
+    nominal = round(float(dt_min) * 2.0) / 2.0
+    return nominal if nominal > 0 else float(dt_min)
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:

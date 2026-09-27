@@ -93,6 +93,7 @@ from dmi_nowcast_core.national import (
     DEFAULT_MOTION_FILL_SCALES_KM,
     NationalProducts,
 )
+from dmi_nowcast_core._vendor.pysteps_steps.parallel import run_each
 from dmi_nowcast_core.render import _apply_colormap
 
 _log = structlog.get_logger(__name__)
@@ -438,7 +439,8 @@ def write_national_artifacts(
     # the difference is not cosmetic.
     overlay_shape: tuple[int, int] | None = None
     overlay_start = len(artifacts)
-    for lead in sorted((overlay_fields_mm_h or {})):
+    overlay_leads = sorted((overlay_fields_mm_h or {}))
+    for lead in overlay_leads:
         field = np.asarray(overlay_fields_mm_h[lead])
         if field.ndim != 2:
             raise ValueError(
@@ -450,6 +452,19 @@ def write_national_artifacts(
                 f"{field.shape}, earlier leads had {overlay_shape}"
             )
         overlay_shape = field.shape
+    # Colour-map + encode every native-grid overlay up front, several at a
+    # time on the shared nowcast pool: ~70 ms of zlib each, and both numpy
+    # and zlib release the GIL. Each PNG depends on its own field only, so
+    # the bytes are exactly the serial ones; files are still written, and
+    # listed, in lead order below.
+    overlay_png = run_each(
+        lambda i: _encode_rgba_png(
+            _apply_colormap(np.asarray(overlay_fields_mm_h[overlay_leads[i]]))
+        ),
+        len(overlay_leads),
+    )
+    for lead, png in zip(overlay_leads, overlay_png):
+        field = np.asarray(overlay_fields_mm_h[lead])
         name = (f"overlay_now_{stamp}.png" if lead == 0
                 else f"overlay_{lead}min_{stamp}.png")
         observed = int(lead) == 0
@@ -458,7 +473,7 @@ def write_national_artifacts(
         )
         _emit(
             name,
-            _encode_rgba_png(_apply_colormap(field)),
+            png,
             {
                 "filename": name,
                 "product": "overlay",
@@ -771,12 +786,20 @@ def _build_manifest(
     }
 
 
+#: zlib level for every artifact PNG. Pixels are identical at any level
+#: (PNG is lossless). ``optimize=True`` meant level 9, which on the ten
+#: native-grid RGBA overlays of a wet cycle took 5.3 s for 11.7 MB; level 6
+#: took 0.68 s for 11.4 MB (the grayscale grids: 208 -> 34 ms, 238 -> 257
+#: KB). Measured 2026-09-27 on the 2026-09-08 18:00 cycle.
+PNG_COMPRESS_LEVEL = 6
+
+
 def _encode_gray_png(levels: np.ndarray) -> bytes:
     """uint8 (h, w) → grayscale PNG bytes."""
     from PIL import Image  # lazy, matching render.py's convention
 
     buf = io.BytesIO()
-    Image.fromarray(levels, "L").save(buf, format="PNG", optimize=True)
+    Image.fromarray(levels, "L").save(buf, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
     return buf.getvalue()
 
 
@@ -785,7 +808,7 @@ def _encode_rgba_png(rgba: np.ndarray) -> bytes:
     from PIL import Image
 
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
     return buf.getvalue()
 
 

@@ -28,7 +28,9 @@ Files vendored
 20 source files mirroring the upstream layout, plus minimal subpackage
 __init__.py files that import only the pieces we need (the upstream
 __init__.py files eagerly import all motion estimators including the
-compiled extensions, which is why we couldn't just re-use them).
+compiled extensions, which is why we couldn't just re-use them). Two
+local, non-upstream modules sit beside them: `parallel.py` and
+`_verbosity.py` (modifications 8 and 9 below).
 
 Modifications from upstream
 ---------------------------
@@ -66,6 +68,28 @@ Modifications from upstream
    `precip_forecast_prev`/`_new` stay float64, and `probabilistic.
    db_to_rain` casts the whole array to float32 as its first act anyway,
    so the same rounding happens on the same values, only sooner.
+
+8. `parallel.py` (new, not upstream) — one persistent module-level
+   thread pool. `nowcasts/steps.py` and `nowcasts/utils.py` use it in
+   place of their `dask.delayed` branches (dask is not shipped, so every
+   member used to run serially): the ensemble members, the ar_order
+   alignment advections and the per-member extrapolations run
+   concurrently when `num_workers > 1` (`probabilistic.run_ensemble`
+   passes the pool size, 4 by default, `DMI_NOWCAST_POOL_WORKERS`
+   overrides). `extrapolation/semilagrangian.py` splits `map_coordinates`
+   calls on large grids (the native 1728x1984 deterministic advection)
+   into row blocks on the same pool. Each task writes only its own member
+   or rows, and every member owns its random generators, so the output is
+   bitwise identical to the serial run for the same seed — pinned by
+   `tests/test_nowcast_parallel.py`, and by a 9-cycle golden replay of
+   2026-09-08 16:50-18:00 (2026-09-27, code review R3). Tasks never
+   resubmit to the pool (nested calls run serially), so it cannot
+   dead-lock.
+9. `_verbosity.py` (new) — `nowcasts/steps.py`, `nowcasts/utils.py` and
+   `utils/check_norain.py` import a `print` that is silent unless
+   `_verbosity.VERBOSE` is set: upstream's banner, method table, AR
+   correlation tables and per-timestep progress lines went to the
+   service log on every cycle. No numeric effect.
 
 Modifications 5-7 are peak-memory changes; together with 4 they took a
 calibration-corpus worker from 2591 MB / 13.65 s per event to 1649 MB /

@@ -291,3 +291,39 @@ def test_render_loop_png_clamps_too_short_duration():
                           home_lat=55.33, home_lon=10.32, radius_km=1.0)
     img = Image.open(io.BytesIO(png))
     assert img.n_frames == 2
+
+
+@pytest.mark.parametrize("shape", [(300, 211), (129, 64), (128, 5), (1, 1)])
+def test_apply_colormap_row_blocks_are_bit_identical(shape):
+    """The row-blocked colour map (peak-memory change) equals the one-shot
+    mapping byte for byte, NaN / inf / zero / negative included."""
+    from dmi_nowcast_core import render as R
+
+    rng = np.random.default_rng(3)
+    f = rng.gamma(0.5, 3.0, shape).astype(np.float32)
+    f[rng.random(shape) < 0.1] = np.nan
+    f[rng.random(shape) < 0.1] = 0.0
+    f.flat[0] = np.inf
+    if f.size > 1:
+        f.flat[1] = -1.0
+    got = R._apply_colormap(f)
+    assert got.dtype == np.uint8
+    assert np.array_equal(got, R._apply_colormap_block(f))
+
+
+def test_png_writes_are_lossless_at_the_chosen_level():
+    """``compress_level`` replaced ``optimize=True``: PNG is lossless, so the
+    decoded pixels are those of the optimize encoding."""
+    import io
+
+    from PIL import Image
+
+    from dmi_nowcast_core import render as R
+
+    rng = np.random.default_rng(9)
+    rgb = rng.integers(0, 256, (70, 90, 3), dtype=np.uint8)
+    a, b = io.BytesIO(), io.BytesIO()
+    Image.fromarray(rgb).save(a, format="PNG", optimize=True)
+    Image.fromarray(rgb).save(b, format="PNG", compress_level=R.PNG_COMPRESS_LEVEL)
+    assert np.array_equal(np.asarray(Image.open(a)), np.asarray(Image.open(b)))
+    assert np.array_equal(np.asarray(Image.open(b)), rgb)
