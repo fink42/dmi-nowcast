@@ -410,11 +410,16 @@ def gauge_truth_variants(
     *,
     variants: Sequence[Variant] = VARIANTS,
     log=None,
+    known_out: dict | None = None,
 ) -> tuple[dict[str, dict[str, dict[datetime, float]]], dict[str, datetime], int]:
     """Every variant's onsets, in one pass over the gauge archive.
 
     Returns ``(onsets[variant][station][instant] -> two-slot mm,
-    known_until[station], known slot count)``.
+    known_until[station], known slot count)``. ``known_out``, when given,
+    is filled with ``{station: KnownGrid}`` — the same for every variant
+    (which slots reported does not depend on the onset definition), and
+    what ``score_warnings`` needs to grade a warning ``unscorable``
+    (review R5). An out-parameter, as in ``threshold_sweep.gauge_truth``.
 
     The archive is read once, vectorised
     (``warning_score.gauge_truth_vectorised``), and each variant is then a
@@ -435,6 +440,11 @@ def gauge_truth_variants(
         Path(corpus_dir), start - pad, end + pad, list(station_ids),
         pad_min=GAUGE_PAD_MIN, log=log,
     )
+    if known_out is not None:
+        known_out.update({
+            station: series.known_grid()
+            for station, series in loaded.series.items()
+        })
     found: dict[str, dict[str, dict[datetime, float]]] = {
         variant.name: {
             station: dict(pairs)
@@ -535,6 +545,7 @@ def score_variant_lead(
     """
     coverage = shared["coverage"][int(lead)]
     known_until = shared["known_until"]
+    known_grids = shared.get("known_grids", {})
     results: list[ScoreResult] = []
     do_nothing: list[ScoreResult] = []
     shadow = 0
@@ -554,6 +565,9 @@ def score_variant_lead(
         }
         result = score_warnings(
             warnings_by_station.get(station, ()), instants, **common,
+            # Review R5: no claim over a gauge hole in the window or this
+            # VARIANT's dry lead-in is unscorable, out of every rate.
+            gauge_known=known_grids.get(station),
         )
         results.append(result)
         do_nothing.append(score_warnings((), instants, **common))
@@ -588,6 +602,8 @@ def score_variant_lead(
         "warnings": pooled["warnings"],
         "n_sent": pooled["n_sent"],
         "pending": pooled["pending"],
+        # Additive (review R5): no claim, gauge hole → out of every rate.
+        "unscorable": pooled.get("unscorable", 0),
         "hits": hits,
         "false_alarms": pooled["false_alarms"],
         "late": late,
@@ -750,9 +766,10 @@ def run(
             + ", ".join(f"{lead}@{thresholds[lead]}%" for lead in used)
         )
 
+    known_grids: dict = {}
     onsets, known_until, known_slots = gauge_truth_variants(
         Path(corpus_dir), station_ids, (window_from, window_to),
-        variants=variants, log=log,
+        variants=variants, log=log, known_out=known_grids,
     )
     if known_slots == 0:
         raise SweepError("the gauge store has no observations over this window")
@@ -769,6 +786,7 @@ def run(
         {s: tracks[s] for s in scored_stations}, scored_stations, used,
         onsets={},
         known_until=known_until,
+        known_grids=known_grids,
         coverage_gap_min=coverage_gap_min,
         tolerance_min=tolerance_min,
         dry_min=_variant(BASELINE_VARIANT).dry_min,
@@ -931,10 +949,10 @@ def render_markdown(payload: Mapping[str, Any]) -> str:
         out.append(f"## Lead {lead} min, warning at {threshold} %\n")
         out.append(
             "| variant | covered onsets | per station-day | TP | FP | FN | "
-            "late | precision | recall | F1 | do-nothing misses | shadowed | "
-            "shadow share | recall excl. shadowed |"
+            "late | unscorable | precision | recall | F1 | do-nothing misses | "
+            "shadowed | shadow share | recall excl. shadowed |"
         )
-        out.append("| --- |" + " ---: |" * 13)
+        out.append("| --- |" + " ---: |" * 14)
         rows = [c for c in cells if int(c["lead_min"]) == lead]
         rows.sort(key=lambda c: c["variant"])
         for cell in rows:
@@ -942,7 +960,8 @@ def render_markdown(payload: Mapping[str, Any]) -> str:
                 f"| {cell['variant']} | {cell['covered_onsets']:,} | "
                 f"{cell['onsets_per_station_day']:.2f} | {cell['hits']:,} | "
                 f"{cell['false_alarms']:,} | {cell['misses']:,} | "
-                f"{cell['late']:,} | {_fmt(cell['precision'])} | "
+                f"{cell['late']:,} | {cell.get('unscorable', 0):,} | "
+                f"{_fmt(cell['precision'])} | "
                 f"{_fmt(cell['recall'])} | {_fmt(cell['f1'])} | "
                 f"{cell['do_nothing_misses']:,} | "
                 f"{cell['shadowed_misses']:,} | "

@@ -686,6 +686,35 @@ def test_a_warning_whose_window_has_not_closed_is_pending_not_an_event() -> None
     assert population.excluded["pending_warnings"] == 1
 
 
+def test_a_false_alarm_over_a_gauge_hole_is_unscorable_not_an_event() -> None:
+    """Review R5: no claim, and the gauge never reported a slot of the
+    window — the gauge cannot grade it, so a reviewer is not shown it.
+    The same warning over a complete record stays a false alarm."""
+    rows = _steady(0.05, first=0, last=100) + _steady(0.9, first=110, last=200)
+    station = review.station_meta(STATION, "Fixture", 55.33, 10.32)
+    stamps = [
+        slot_end_of(DAY + timedelta(minutes=m), slot_min=10)
+        for m in range(10, 400, 10)
+    ]
+    # The warning fires on the 01:50 frame, sent 02:04: its window is
+    # (02:04, 02:44]; 02:30 is a slot the gauge never reported.
+    hole = {STATION: {DAY + timedelta(hours=2, minutes=30)}}
+    holed = review.build_population(
+        rows=rows, stations=[station],
+        truth=_truth_from_slots({STATION: (stamps, set())}, unknown=hole),
+        rule=_curve_rule(),
+    )
+    assert holed.excluded["unscorable_warnings"] == 1
+    assert "false_alarm" not in {r.event_class for r in holed.records}
+    whole = review.build_population(
+        rows=rows, stations=[station],
+        truth=_truth_from_slots({STATION: (stamps, set())}),
+        rule=_curve_rule(),
+    )
+    assert whole.excluded["unscorable_warnings"] == 0
+    assert [r.event_class for r in whole.records].count("false_alarm") == 1
+
+
 def test_a_dead_gauge_contributes_no_events() -> None:
     """A gauge stuck at zero makes every radar-wet slot a false alarm.
 
@@ -1538,8 +1567,12 @@ def test_the_nullable_contract_fields_are_really_null_when_unknown() -> None:
     # has none, and without one nothing here would be scored at all.
     rows = _steady(0.05, first=0, last=100) + _steady(0.9, first=110, last=200)
     station = review.station_meta(STATION, "Fixture", 55.33, 10.32)
+    # ``known_grids={}``: the pre-R5 grading. Over a silent gauge the
+    # warning is ``unscorable`` and never becomes a record; the nullable
+    # fields are what this pins, so the record is forced into existence.
     population = review.build_population(
         rows=rows, stations=[station], truth=silent, rule=_curve_rule(),
+        known_grids={},
         known_until={STATION: grid[-1]}, onsets={STATION: []},
     )
     record = population.by_class("false_alarm")[0]
@@ -1718,8 +1751,14 @@ def test_a_leave_one_month_out_rule_replays_each_month_under_its_own_threshold()
         rule_source=review.RULE_LOMO,
         fold_thresholds=review.fold_thresholds_of({(2026, 6): 50, (2026, 7): 90}),
     )
+    # ``known_grids={}``: the pre-R5 grading. This fixture's slot list is
+    # two disjoint days (not the contiguous grid a real ``StationSlots``
+    # is) and starts at the first frame, so the June warning's dry lead-in
+    # has no gauge behind it; what is pinned here is the per-month
+    # threshold, not the gauge's completeness.
     population = review.build_population(
         rows=june + july, stations=[station], truth=truth, rule=rule,
+        known_grids={},
     )
     sent = [record.sent_utc for record in population.records]
     assert len(sent) == 1

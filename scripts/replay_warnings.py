@@ -286,6 +286,7 @@ from dmi_nowcast_core.warning_score import (  # noqa: E402
     PRECIP_DUR_PARAM,
     PRECIP_PARAM,
     SLOT_MIN,
+    KnownGrid,
     ScoreResult,
     align_decision_table,
     decision_schema,  # noqa: F401 — re-exported for the replay tests
@@ -1721,6 +1722,40 @@ def merge_slots(
                 target[ts] = (wet, mm)
 
 
+def known_grid_of(
+    slots: Sequence[tuple[datetime, bool | None, float | None]],
+    *,
+    slot_min: int = SLOT_MIN,
+) -> KnownGrid | None:
+    """The station's :class:`KnownGrid` from a merged slot list.
+
+    ``slots`` is ``[(slot_end, wet, mm)]`` as :func:`merge_slots` leaves
+    it; a slot is known when ``wet`` is not ``None``. The grid spans the
+    first to the last slot end with one cell per ``slot_min``; a slot the
+    list does not hold at all (a day the replay never read) is unknown,
+    exactly as ``threshold_sweep.gauge_truth``'s grid treats a slot outside
+    the archive's reach. ``None`` for an empty list.
+    """
+    import numpy as np
+
+    if not slots:
+        return None
+    step = int(slot_min) * 60
+    stamps = [int(_as_utc_ts(ts)) for ts, _wet, _mm in slots]
+    first = min(stamps)
+    known = np.zeros((max(stamps) - first) // step + 1, dtype=bool)
+    for stamp, (_ts, wet, _mm) in zip(stamps, slots):
+        if wet is not None and (stamp - first) % step == 0:
+            known[(stamp - first) // step] = True
+    return KnownGrid(first, step, known)
+
+
+def _as_utc_ts(ts: datetime) -> float:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.timestamp()
+
+
 def score(
     decisions: Sequence[dict],
     slots_by_day: Sequence[
@@ -1806,6 +1841,9 @@ def score(
             onset_min_mm=onset_min_mm,
             known_until=known_until.get(sid),
             coverage=coverage_by_station.get(sid),
+            # Review R5: a warning with no claim over a gauge hole in its
+            # window or dry lead-in is unscorable, not a false alarm.
+            gauge_known=known_grid_of(slot_lists.get(sid, ())),
         )
         for sid in (p.id for p in points)
     }

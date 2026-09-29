@@ -30,8 +30,10 @@ Nothing here re-implements the rule or the scoring:
   onset slot and the next, dead gauges with >= 500 known slots and never
   wet excluded);
 * warnings are graded by ``warning_score.score_warnings`` with the sweep's
-  settings (tolerance 10, minimum useful lead 5, ``known_until`` and
-  ``coverage`` per station) and pooled with ``pooled_summary``.
+  settings (tolerance 10, minimum useful lead 5, ``known_until``,
+  ``coverage`` and the gauge's ``KnownGrid`` per station) and pooled with
+  ``pooled_summary``. A warning that claimed nothing over a gauge hole is
+  ``unscorable`` (review R5) — out of every rate, counted on its own.
 
 The pooled counts must reproduce the sweep's within 1 % (the sanity gate)
 before any other number is written.
@@ -90,11 +92,18 @@ SLOT_MIN = 10
 
 #: Expected pooled counts from the sweep at the shipped thresholds
 #: (thresholds_rp_trees_all/sweep.md). ``warnings`` is the SCORED count.
+#:
+#: Review R5 (unscorable grading, 2026-09-27): ``warnings`` excludes the
+#: new ``unscorable`` outcome, so each lead's value dropped from the
+#: sweep.md number (pre-R5: 15501 / 16282 / 15139 / 15131) by EXACTLY the
+#: unscorable count measured on the same replay (405 / 429 / 408 / 415 —
+#: the false alarms fell by the same amounts; hits, late, pending and
+#: misses are unchanged). A sweep re-run under R5 grading reports these.
 SWEEP_EXPECTED = {
-    20: {"warnings": 15501, "hits": 3074},
-    30: {"warnings": 16282, "hits": 4274},
-    45: {"warnings": 15139, "hits": 4817},
-    60: {"warnings": 15131, "hits": 5165},
+    20: {"warnings": 15096, "hits": 3074},
+    30: {"warnings": 15853, "hits": 4274},
+    45: {"warnings": 14731, "hits": 4817},
+    60: {"warnings": 14716, "hits": 5165},
 }
 GATE_TOLERANCE = 0.01
 
@@ -319,6 +328,7 @@ def analyse_station(
     leads: Sequence[int],
     thresholds: Mapping[int, int],
     *,
+    gauge_known: Any = None,
     tolerance_min: int = DEFAULT_TOLERANCE_MIN,
     dry_min: int = DEFAULT_DRY_MIN,
     onset_min_mm: float = DEFAULT_ONSET_MIN_MM,
@@ -356,6 +366,7 @@ def analyse_station(
             dry_min=int(dry_min), onset_min_mm=float(onset_min_mm),
             known_until=known_until, coverage=coverage,
             min_useful_lead_min=float(min_useful_lead_min),
+            gauge_known=gauge_known,
         )
         p = arrays[f"p{lead}"]
         valid_p = ~np.isnan(p)
@@ -370,7 +381,8 @@ def analyse_station(
                 "outcome": w.outcome,
                 "eta0": _opt(eta[i0]),
             }
-            if w.outcome == "pending":
+            if w.outcome in ("pending", "unscorable"):
+                # Neither graded: no reversal or ETA analysis to attach.
                 records.append(rec)
                 continue
             if w.onset_utc is not None:
@@ -447,6 +459,7 @@ def _work(station: str) -> tuple[str, dict]:
         s["known_until"].get(station),
         s["leads"],
         s["thresholds"],
+        gauge_known=s.get("known_grids", {}).get(station),
     )
 
 
@@ -639,7 +652,7 @@ def aggregate(results: Mapping[str, dict], leads: Sequence[int],
         report["leads"][str(lead)] = {
             "threshold_pct": int(thresholds[lead]),
             "gate": {k: pooled[k] for k in (
-                "warnings", "n_sent", "pending", "hits", "late",
+                "warnings", "n_sent", "pending", "unscorable", "hits", "late",
                 "false_alarms", "misses", "pending_onsets", "uncovered_onsets",
             )},
             "already_raining_consumed": sum(r["consumed"] for r in per),
@@ -699,13 +712,13 @@ def render_markdown(report: dict) -> str:
     L.append(f"**{'PASSED' if gate['passed'] else 'FAILED'}** — pooled counts vs "
              "`thresholds_rp_trees_all/sweep.md` at the shipped thresholds, tolerance 1 %.")
     L.append("")
-    L.append("| lead | thr | warnings (scored) | hits | late | false alarms | pending | misses | sweep warnings | sweep hits |")
-    L.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    L.append("| lead | thr | warnings (scored) | hits | late | false alarms | pending | unscorable | misses | sweep warnings | sweep hits |")
+    L.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for lead, e in report["leads"].items():
         g = e["gate"]
         exp = SWEEP_EXPECTED.get(int(lead), {})
         L.append(f"| {lead} | {e['threshold_pct']} % | {g['warnings']} | {g['hits']} | {g['late']} | "
-                 f"{g['false_alarms']} | {g['pending']} | {g['misses']} | "
+                 f"{g['false_alarms']} | {g['pending']} | {g.get('unscorable', 0)} | {g['misses']} | "
                  f"{exp.get('warnings', '–')} | {exp.get('hits', '–')} |")
     L.append("")
     if not gate["passed"]:
@@ -726,7 +739,8 @@ def render_markdown(report: dict) -> str:
              "ETA ≤ 1.5 min or observed ≥ 0.5 mm/h, fresh armed state at every coverage run, gap > 20 min).")
     L.append("- Truth and grading: `threshold_sweep.gauge_truth` (dry 60 min, ≥ 0.2 mm over the onset slot and the next, "
              "dead gauge = ≥ 500 known slots never wet) and `warning_score.score_warnings` "
-             "(window `(t0, t0 + lead + 10]`, minimum useful lead 5 min → `late`, `known_until` + coverage).")
+             "(window `(t0, t0 + lead + 10]`, minimum useful lead 5 min → `late`, `known_until` + coverage; "
+             "no claim over a gauge hole in the window or its 60-min dry lead-in → `unscorable`, out of every rate).")
     L.append("- **Onset resolution.** A gauge slot is 10 min stamped at its END; the onset used here is the slot "
              "end the scorer matched (the scorer's convention). The true first drop lies up to 10 min earlier, so "
              "every error is resolved to no better than ±5 min and is biased up to 10 min NEGATIVE. "
@@ -873,14 +887,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     stations = sorted(arrays)
     lo = min(int(a["radar"].min()) for a in arrays.values())
     hi = max(int(a["radar"].max()) for a in arrays.values())
+    known_grids: dict = {}
     onsets, known_until, _known_slots, dead = gauge_truth(
         Path(args.corpus_dir), stations, (to_dt(lo), to_dt(hi)),
         dry_min=DEFAULT_DRY_MIN, onset_min_mm=DEFAULT_ONSET_MIN_MM,
         min_known_slots=DEFAULT_MIN_KNOWN_SLOTS, log=log,
+        known_out=known_grids,
     )
     scored = [s for s in stations if s in known_until]
     log(f"{len(scored)} scored stations; replaying with {args.workers} workers")
     shared = {"arrays": arrays, "onsets": onsets, "known_until": known_until,
+              "known_grids": known_grids,
               "leads": leads, "thresholds": thresholds}
     results = run_all(shared, scored, int(args.workers), log=log)
     log("aggregating")

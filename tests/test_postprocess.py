@@ -603,6 +603,46 @@ class TestGaugeFeatures:
         )
         assert out["g_min_since_wet"][0] == pytest.approx(pp.GAUGE_SINCE_CAP_MIN)
 
+    def test_a_gauge_silent_beyond_the_cap_is_unknown_whatever_was_read(
+        self,
+    ) -> None:
+        """Review R5, the own-gauge twin of ``GaugeSlotTable.stats``.
+
+        The replay hands in a day plus six hours of slots, the cycle six
+        hours and a slot. A gauge whose last report is seven hours old used
+        to read ``g_min_since_wet`` 360 from the long read (known, dry for
+        the cap) and NaN from the short one; now both say unknown.
+        """
+        silent = [(420 + 10 * k, False, 0.0) for k in range(0, 100)]
+        unreported = [(10 * k, None, None) for k in range(1, 42)]
+        long_read = _slots(*(unreported + silent))
+        short_read = [
+            s for s in long_read
+            if s[0] >= _T0 - timedelta(minutes=pp.GAUGE_SINCE_CAP_MIN + self.LAG + 10)
+        ]
+        for slots in (long_read, short_read):
+            out = pp.station_gauge_features([slots], now_utc=_T0, lag_min=self.LAG)
+            assert out["g_known"][0] == pytest.approx(0.0)
+            for name in ("g_mm_10", "g_mm_30", "g_mm_60", "g_min_since_wet",
+                         "g_dry_60"):
+                assert math.isnan(float(out[name][0])), name
+
+    def test_the_cap_edge_is_the_neighbour_rules(self) -> None:
+        # A dry report ending exactly ``cap`` before the decision instant
+        # still makes the gauge known (``end >= now - cap``, as
+        # ``GaugeSlotTable.stats``); one slot older does not.
+        cap = pp.GAUGE_SINCE_CAP_MIN
+        for back, known in ((cap, True), (cap + 10, False)):
+            own = pp.station_gauge_features(
+                [_slots((back, False, 0.0))], now_utc=_T0, lag_min=self.LAG,
+            )["g_min_since_wet"][0]
+            table = pp.GaugeSlotTable.from_slots({"G": _slots((back, False, 0.0))})
+            neighbour = table.stats(_T0, self.LAG)["min_since_wet"][0]
+            if known:
+                assert own == pytest.approx(cap) and neighbour == pytest.approx(cap)
+            else:
+                assert math.isnan(float(own)) and math.isnan(float(neighbour))
+
     def test_a_naive_slot_end_is_a_bug_not_a_zone(self) -> None:
         with pytest.raises(ValueError, match="timezone-aware"):
             pp.station_gauge_features(

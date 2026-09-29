@@ -726,10 +726,14 @@ class FoldSet:
         self.n_days = len({stamp.date() for stamp in stamps})
         del stamps
         station_ids = sorted(tracks)
+        # ``{station: KnownGrid}`` (review R5): a warning with no claim
+        # over a gauge hole is graded unscorable, in the fit and the score.
+        known_grids: dict = {}
         onsets, known_until, known_slots, dead = gauge_truth(
             Path(corpus_dir), station_ids, window,
             dry_min=dry_min, onset_min_mm=onset_min_mm,
             min_known_slots=min_known_slots, log=log,
+            known_out=known_grids,
         )
         if known_slots == 0:
             raise SweepError("the gauge store has no observations over this window")
@@ -740,6 +744,7 @@ class FoldSet:
         del tracks
         self.onsets = onsets
         self.known_until = known_until
+        self.known_grids = known_grids
         self.dead = dead
         self.leads = usable
         self.window = window
@@ -782,6 +787,7 @@ def _fold_shared(
         sliced, stations, folds.leads,
         onsets=onsets,
         known_until=folds.known_until,
+        known_grids=getattr(folds, "known_grids", None),
         coverage_gap_min=coverage_gap_min,
         tolerance_min=tolerance_min,
         dry_min=dry_min,
@@ -810,8 +816,9 @@ def score_fold(
     per_day: dict[int, dict[str, int]] = {}
     n_sent = 0
 
-    #: Outcome name → the count it belongs to. Pending and uncovered are
-    #: in neither: they are out of every rate, so out of every block.
+    #: Outcome name → the count it belongs to. Pending, unscorable and
+    #: uncovered are in neither: they are out of every rate, so out of
+    #: every block.
     into = {
         "hit": "hits", "late": "late", "false_alarm": "false_alarms",
         "miss": "misses",
@@ -842,6 +849,7 @@ def score_fold(
             known_until=shared["known_until"].get(station),
             coverage=shared["coverage"][int(lead)].get(station, ()),
             min_useful_lead_min=shared["min_useful_lead_min"],
+            gauge_known=shared.get("known_grids", {}).get(station),
         )
         results.append(result)
         # A warning is stamped by when it was sent, an unclaimed onset by
@@ -1036,6 +1044,8 @@ def _summary_row(pooled: Mapping[str, Any], n_sent: int, station_days: int) -> d
         "warnings": int(pooled["warnings"]),
         "n_sent": int(pooled["n_sent"]),
         "pending": int(pooled["pending"]),
+        # Additive (review R5): no claim over a gauge hole, out of every rate.
+        "unscorable": int(pooled.get("unscorable", 0)),
         "hits": int(pooled["hits"]),
         "late": int(pooled["late"]),
         "false_alarms": int(pooled["false_alarms"]),
@@ -1360,10 +1370,10 @@ def _layer_c_markdown(report: Mapping[str, Any]) -> list[str]:
         lines.append(f"### Lead {lead} min")
         lines.append("")
         lines.append(
-            "| slice | warnings | hits | late | false alarms | misses | "
+            "| slice | warnings | hits | late | false alarms | unscorable | misses | "
             "precision | recall | F1 | CSI | warn/station-day | lead err p50 |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         rows: list[tuple[str, Mapping[str, Any]]] = [
             ("pooled out-of-fold", entry["out_of_fold"]),
         ]
@@ -1381,7 +1391,8 @@ def _layer_c_markdown(report: Mapping[str, Any]) -> list[str]:
         for label, row in rows:
             lines.append(
                 f"| {label} | {row['warnings']} | {row['hits']} | "
-                f"{row['late']} | {row['false_alarms']} | {row['misses']} | "
+                f"{row['late']} | {row['false_alarms']} | "
+                f"{row.get('unscorable', 0)} | {row['misses']} | "
                 f"{_fmt(row['precision'])} | {_fmt(row['recall'])} | "
                 f"{_fmt(row['f1'])} | {_fmt(row['csi'])} | "
                 f"{_fmt(row['warnings_per_station_day'])} | "

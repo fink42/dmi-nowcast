@@ -23,7 +23,9 @@ run this way must reproduce the sweep's counts EXACTLY (the sanity gate).
 Replay is ``eta_revision_study.replay_pushes`` (a line-for-line mirror of
 ``threshold_sweep.replay_station``); truth is ``threshold_sweep.
 gauge_truth``; grading is ``warning_score.score_warnings`` with the
-sweep's settings.
+sweep's settings, including the gauge's ``KnownGrid``: a warning that
+claimed nothing over a gauge hole is ``unscorable`` (review R5), out of
+every rate and counted in its own slot.
 
 Selection is leave-one-month-out: for each held-out month a family's
 parameters are chosen on the other months by "max F1 subject to precision
@@ -80,7 +82,13 @@ LEADS = (20, 30, 45, 60)
 SERVED_PCT = {20: 35, 30: 45, 45: 60, 60: 65}
 SWEEP_EXPECTED = ers.SWEEP_EXPECTED
 #: thresholds_onset_trees_all_low/sweep.md, lead 20 at 26 %.
-ONSET_EXPECTED = {"lead": 20, "pct": 26, "hits": 3111, "false_alarms": 6638,
+#:
+#: Review R5 (unscorable grading, 2026-09-27): ``false_alarms`` was 6638
+#: in sweep.md; the same replay under R5 grading moves exactly 267 of
+#: those warnings to ``unscorable`` (measured 2026-09-27: 6638 − 6371 = 267
+#: = the unscorable count), so the gate now expects 6371. Hits, late and misses
+#: are unchanged by construction.
+ONSET_EXPECTED = {"lead": 20, "pct": 26, "hits": 3111, "false_alarms": 6371,
                   "late": 281, "misses": 8660}
 
 ONSET_GRID = tuple(range(4, 41, 2))
@@ -89,8 +97,10 @@ B_GRID = tuple(range(35, 86, 5))
 BLEND_W = (0.25, 0.5, 0.75)
 BLEND_T = tuple(range(10, 71, 2))
 
-#: Count slots per (cell, day): hits, late, false alarms, pending, misses.
-N_SLOTS = 5
+#: Count slots per (cell, day): hits, late, false alarms, pending, misses,
+#: unscorable. Unscorable is appended LAST so the first five keep their
+#: positions (``_pr`` and older five-slot arrays read them by index).
+N_SLOTS = 6
 BOOTSTRAP_N = 500
 US_PER_DAY = 86_400_000_000
 
@@ -227,16 +237,19 @@ def join_onset(post: dict, onset: dict, leads: Sequence[int]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def score_station(arrays, onsets, known_until, cells, day0_us, n_days) -> dict:
-    """``{cell: int array (n_days, 5)}`` of hits/late/fa/pending/misses by UTC day.
+def score_station(arrays, onsets, known_until, cells, day0_us, n_days,
+                  gauge_known=None) -> dict:
+    """``{cell: int array (n_days, 6)}`` of hits/late/fa/pending/misses/unscorable by UTC day.
 
     Warnings are dated by their send instant, misses by the onset.
+    ``gauge_known`` is the station's ``KnownGrid`` (``None`` = nothing is
+    ever unscorable, the pre-R5 grading).
     """
     runs = ers.run_ids(arrays["radar"])
     radar_dt = [ers.to_dt(v) for v in arrays["radar"]]
     gen_dt = [ers.to_dt(v) for v in arrays["gen"]]
     gen, eta = arrays["gen"], arrays["eta"]
-    slot = {"hit": 0, "late": 1, "false_alarm": 2, "pending": 3}
+    slot = {"hit": 0, "late": 1, "false_alarm": 2, "pending": 3, "unscorable": 5}
     out = {}
     coverage_by_lead = {}
     for cell in cells:
@@ -255,6 +268,7 @@ def score_station(arrays, onsets, known_until, cells, day0_us, n_days) -> dict:
             dry_min=DEFAULT_DRY_MIN, onset_min_mm=DEFAULT_ONSET_MIN_MM,
             known_until=known_until, coverage=coverage_by_lead[lead],
             min_useful_lead_min=FIT_MIN_USEFUL_LEAD_MIN,
+            gauge_known=gauge_known,
         )
         counts = np.zeros((n_days, N_SLOTS), np.int32)
         for i, w in zip(pushes, res.warnings):
@@ -276,11 +290,12 @@ def _work(task):
     s = _SHARED
     cells = [c for c in s["cells"] if c[0] == lead]
     return score_station(s["arrays"][station], s["onsets"].get(station, ()),
-                         s["known_until"].get(station), cells, s["day0"], s["n_days"])
+                         s["known_until"].get(station), cells, s["day0"], s["n_days"],
+                         gauge_known=s.get("known_grids", {}).get(station))
 
 
 def run_cells(shared: dict, stations, leads, workers: int, log) -> dict:
-    """``{cell: (n_days, 5)}`` summed over stations."""
+    """``{cell: (n_days, N_SLOTS)}`` summed over stations."""
     global _SHARED
     _SHARED = shared
     total = {c: np.zeros((shared["n_days"], N_SLOTS), np.int64) for c in shared["cells"]}
@@ -302,12 +317,13 @@ def run_cells(shared: dict, stations, leads, workers: int, log) -> dict:
 
 
 def metrics(c: np.ndarray) -> dict:
-    """Pooled metrics from a 5-slot count vector."""
-    h, late, fa, pend, miss = (int(x) for x in c)
+    """Pooled metrics from a 5- or 6-slot count vector (slot 5 = unscorable)."""
+    h, late, fa, pend, miss = (int(x) for x in c[:5])
+    unscorable = int(c[5]) if len(c) > 5 else 0
     sk = skill_scores(h, fa, miss, late)
     return {"warnings": h + late + fa, "hits": h, "late": late, "false_alarms": fa,
-            "pending": pend, "misses": miss, "precision": sk["precision"],
-            "recall": sk["recall"], "f1": sk["f1"]}
+            "pending": pend, "unscorable": unscorable, "misses": miss,
+            "precision": sk["precision"], "recall": sk["recall"], "f1": sk["f1"]}
 
 
 def _pr(c: np.ndarray) -> tuple[float, float]:
@@ -341,7 +357,7 @@ def lomo(daily: Mapping[tuple, np.ndarray], served_cell: tuple, family_cells: Se
          day_month: np.ndarray) -> dict:
     """Leave-one-month-out: pick on the other months, score the held-out one.
 
-    Returns the OOF per-day counts (n_days, 5) and the pick per month.
+    Returns the OOF per-day counts (n_days, N_SLOTS) and the pick per month.
     """
     months = sorted(set(day_month.tolist()))
     oof = np.zeros_like(daily[served_cell])
@@ -409,6 +425,10 @@ def render_markdown(r: dict) -> str:
     for g in r["sanity_gate"]["rows"]:
         L.append(f"| {g['check']} | {g['expected']} | {g['got']} |")
     L.append("")
+    unsc = r["sanity_gate"].get("unscorable")
+    if unsc:
+        L += ["Unscorable warnings (no claim, gauge hole in the window or its dry lead-in; "
+              "out of every count above): " + ", ".join(f"{k}: {v}" for k, v in unsc.items()) + ".", ""]
     if not r["sanity_gate"]["passed"]:
         return "\n".join(L + ["The gate failed; no other number is reported."]) + "\n"
 
@@ -419,8 +439,8 @@ def render_markdown(r: dict) -> str:
           "Served thresholds were themselves fitted on the full window (in-sample), which favours served.", ""]
     for lead, e in r["leads"].items():
         L += [f"### Lead {lead} min", "",
-              "| rule | warnings | hits | late | false alarms | misses | precision | recall | F1 | warnings / station-day | Δprecision [95 % CI] | Δrecall [95 % CI] | months beating served in training |",
-              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |"]
+              "| rule | warnings | hits | late | false alarms | unscorable | misses | precision | recall | F1 | warnings / station-day | Δprecision [95 % CI] | Δrecall [95 % CI] | months beating served in training |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |"]
         for fam, x in e["oof"].items():
             m = x["pooled"]
             if fam == "served":
@@ -434,7 +454,7 @@ def render_markdown(r: dict) -> str:
                      f"[{ci['d_recall_ci'][0]:+.3f}, {ci['d_recall_ci'][1]:+.3f}]")
                 ok = f"{sum(p['beats_served_in_train'] for p in x['picks'].values())}/{len(x['picks'])}"
             L.append(f"| {x['label']} | {m['warnings']} | {m['hits']} | {m['late']} | {m['false_alarms']} | "
-                     f"{m['misses']} | {_f(m['precision'])} | {_f(m['recall'])} | {_f(m['f1'])} | "
+                     f"{m.get('unscorable', 0)} | {m['misses']} | {_f(m['precision'])} | {_f(m['recall'])} | {_f(m['f1'])} | "
                      f"{_f(x['per_station_day'], 2)} | {d[0]} | {d[1]} | {ok} |")
         L.append("")
         for fam, x in e["oof"].items():
@@ -525,10 +545,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     stations = sorted(post)
     lo = min(int(a["radar"].min()) for a in post.values())
     hi = max(int(a["radar"].max()) for a in post.values())
+    known_grids: dict = {}
     onsets, known_until, _slots, dead = gauge_truth(
         Path(args.corpus_dir), stations, (ers.to_dt(lo), ers.to_dt(hi)),
         dry_min=DEFAULT_DRY_MIN, onset_min_mm=DEFAULT_ONSET_MIN_MM,
-        min_known_slots=DEFAULT_MIN_KNOWN_SLOTS, log=log)
+        min_known_slots=DEFAULT_MIN_KNOWN_SLOTS, log=log, known_out=known_grids)
     scored = [s for s in stations if s in known_until]
     day0 = lo - lo % US_PER_DAY
     n_days = int((hi + (60 + DEFAULT_TOLERANCE_MIN) * ers.US_PER_MIN - day0) // US_PER_DAY) + 1
@@ -543,29 +564,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                  or (c[1] == "onset" and c[0] == ONSET_EXPECTED["lead"] and c[2] == ONSET_EXPECTED["pct"])]
     log(f"{len(scored)} scored stations, {len(cells)} cells, {n_days} days; {args.workers} workers")
     shared = {"arrays": post, "onsets": onsets, "known_until": known_until,
-              "cells": cells, "day0": day0, "n_days": n_days}
+              "known_grids": known_grids, "cells": cells, "day0": day0, "n_days": n_days}
     daily = run_cells(shared, scored, leads, int(args.workers), log)
 
     # --- sanity gate: exact ------------------------------------------------
     gate = []
+    #: Additive (review R5): warnings the gate cells hold out as unscorable.
+    gate_unscorable = {}
     for lead in leads:
         m = metrics(daily[(lead, "served", 0, SERVED_PCT[lead])].sum(0))
+        gate_unscorable[f"served {lead} min @ {SERVED_PCT[lead]} %"] = m["unscorable"]
         for key in ("warnings", "hits"):
             gate.append({"check": f"served {lead} min @ {SERVED_PCT[lead]} % {key}",
                          "expected": SWEEP_EXPECTED[lead][key], "got": m[key]})
     oc = (ONSET_EXPECTED["lead"], "onset", ONSET_EXPECTED["pct"], 0)
     if oc in daily:
         m = metrics(daily[oc].sum(0))
+        gate_unscorable["onset 20 min @ 26 %"] = m["unscorable"]
         for key in ("hits", "false_alarms", "late", "misses"):
             gate.append({"check": f"onset 20 min @ 26 % {key}", "expected": ONSET_EXPECTED[key],
                          "got": m[key]})
     passed = all(g["expected"] == g["got"] for g in gate)
     log(f"sanity gate {'PASSED' if passed else 'FAILED'}: {gate}")
+    log(f"gate cells' unscorable warnings: {gate_unscorable}")
 
     report = {"generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
               "join": join, "onset_load": onset_counts, "dead_gauges": list(dead),
               "stations_scored": len(scored), "station_days": int(station_days),
-              "sanity_gate": {"passed": passed, "rows": gate}, "leads": {},
+              "sanity_gate": {"passed": passed, "rows": gate, "unscorable": gate_unscorable},
+              "leads": {},
               "settings": {"served_pct": SERVED_PCT, "onset_grid": ONSET_GRID, "a_grid": A_GRID,
                            "b_grid": B_GRID, "blend": bool(args.blend), "bootstrap_n": BOOTSTRAP_N}}
     if passed and not args.gate_only:

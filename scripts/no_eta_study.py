@@ -19,8 +19,9 @@ Nothing re-implements the rule or the truth:
   "consumed" row has its observed rate set above the raining-now cut so the
   engine's own already-raining branch consumes the arm silently;
 * warning truth is ``threshold_sweep.gauge_truth`` + ``warning_score.
-  score_warnings`` with the sweep's settings, pooled by ``pooled_summary``
-  / ``skill_scores``;
+  score_warnings`` with the sweep's settings (including the gauge's
+  ``KnownGrid``: no claim over a gauge hole = ``unscorable``, review R5,
+  out of every rate), pooled by ``pooled_summary`` / ``skill_scores``;
 * probability truth (a) is Layer B's: ``decision_rows.build_gauge_grid``
   and ``GaugeGrid.outcome`` (wet within ``(t, t + L]``), reliability by
   ``benchmark_report.reliability_table``;
@@ -245,8 +246,12 @@ def _month_key_us(us: int) -> int:
 
 
 def score_cell_station(arrays, onsets, known_until, lead, t1, kind, param, *,
-                       runs, radar_dt, gen_dt, want_pushes=False):
-    """Per-month counts ``{month: [hits, late, fa, pending, misses]}``."""
+                       runs, radar_dt, gen_dt, want_pushes=False, gauge_known=None):
+    """Per-month counts ``{month: [hits, late, fa, pending, misses, unscorable]}``.
+
+    ``gauge_known`` is the station's ``KnownGrid`` (``None`` = the pre-R5
+    grading, nothing unscorable).
+    """
     va = variant_arrays(arrays, lead, t1, kind, param)
     pushes, consumed = ers.replay_pushes(va, lead, int(t1), runs=runs,
                                          radar_dt=radar_dt, gen_dt=gen_dt)
@@ -261,16 +266,17 @@ def score_cell_station(arrays, onsets, known_until, lead, t1, kind, param, *,
         dry_min=DEFAULT_DRY_MIN, onset_min_mm=DEFAULT_ONSET_MIN_MM,
         known_until=known_until, coverage=coverage,
         min_useful_lead_min=FIT_MIN_USEFUL_LEAD_MIN,
+        gauge_known=gauge_known,
     )
     counts: dict[int, list[int]] = {}
-    slot = {"hit": 0, "late": 1, "false_alarm": 2, "pending": 3}
+    slot = {"hit": 0, "late": 1, "false_alarm": 2, "pending": 3, "unscorable": 5}
     for i, w in zip(pushes, res.warnings):
         m = _month_key_us(int(gen[i]))
-        counts.setdefault(m, [0, 0, 0, 0, 0])[slot[w.outcome]] += 1
+        counts.setdefault(m, [0] * N_COUNTS)[slot[w.outcome]] += 1
     for o in res.onsets:
         if o.outcome == "miss":
             d = o.onset_utc
-            counts.setdefault(d.year * 12 + d.month - 1, [0, 0, 0, 0, 0])[4] += 1
+            counts.setdefault(d.year * 12 + d.month - 1, [0] * N_COUNTS)[4] += 1
     out = {"counts": counts, "consumed": consumed}
     if want_pushes:
         out["pushes"] = [
@@ -279,6 +285,10 @@ def score_cell_station(arrays, onsets, known_until, lead, t1, kind, param, *,
         ]
     return out
 
+
+#: Per-month count slots: hits, late, false alarms, pending, misses,
+#: unscorable (review R5; appended last so the first five keep their place).
+N_COUNTS = 6
 
 _SHARED: dict | None = None
 
@@ -296,6 +306,7 @@ def _work(task):
             arrays, s["onsets"].get(station, ()), s["known_until"].get(station),
             *cell, runs=runs, radar_dt=radar_dt, gen_dt=gen_dt,
             want_pushes=(cell in want),
+            gauge_known=s.get("known_grids", {}).get(station),
         )
     return station, out
 
@@ -319,18 +330,18 @@ def run_cells(shared, stations, cells, want, workers, log):
 
 def pooled_counts(per_station: Mapping[str, dict], exclude_month: int | None = None,
                   only_month: int | None = None) -> dict:
-    tot = np.zeros(5, np.int64)
+    tot = np.zeros(N_COUNTS, np.int64)
     for r in per_station.values():
         for m, c in r["counts"].items():
             if exclude_month is not None and m == exclude_month:
                 continue
             if only_month is not None and m != only_month:
                 continue
-            tot += np.asarray(c)
-    h, late, fa, pend, miss = (int(x) for x in tot)
+            tot[:len(c)] += np.asarray(c)
+    h, late, fa, pend, miss, unsc = (int(x) for x in tot)
     sk = skill_scores(h, fa, miss, late)
     return {"warnings": h + late + fa, "hits": h, "late": late, "false_alarms": fa,
-            "pending": pend, "misses": miss, "precision": sk["precision"],
+            "pending": pend, "unscorable": unsc, "misses": miss, "precision": sk["precision"],
             "recall": sk["recall"], "f1": sk["f1"], "csi": sk["csi"]}
 
 
@@ -348,7 +359,7 @@ def lomo(by_cell, cells: Sequence[tuple], param_of, months) -> dict:
     ``param_of(cell)`` is the 1-D parameter the plateau is read on. Returns
     the pooled out-of-fold counts plus the pick per month.
     """
-    tot = np.zeros(5, np.int64)
+    tot = np.zeros(N_COUNTS, np.int64)
     picks = {}
     for m in months:
         cand = []
@@ -362,11 +373,11 @@ def lomo(by_cell, cells: Sequence[tuple], param_of, months) -> dict:
         picks[m] = param_of(cell)
         held = pooled_counts(by_cell[cell], only_month=m)
         tot += np.array([held["hits"], held["late"], held["false_alarms"],
-                         held["pending"], held["misses"]])
-    h, late, fa, pend, miss = (int(x) for x in tot)
+                         held["pending"], held["misses"], held["unscorable"]])
+    h, late, fa, pend, miss, unsc = (int(x) for x in tot)
     sk = skill_scores(h, fa, miss, late)
     return {"warnings": h + late + fa, "hits": h, "late": late, "false_alarms": fa,
-            "pending": pend, "misses": miss, "precision": sk["precision"],
+            "pending": pend, "unscorable": unsc, "misses": miss, "precision": sk["precision"],
             "recall": sk["recall"], "f1": sk["f1"], "csi": sk["csi"],
             "picks": {f"{m // 12}-{m % 12 + 1:02d}": v for m, v in picks.items()}}
 
@@ -716,11 +727,12 @@ def render_markdown(r) -> str:
     g = r["sanity_gate"]
     L.append(f"**{'PASSED' if g['passed'] else 'FAILED'}** — the served rule replayed at the shipped "
              "thresholds must reproduce the sweep's scored warnings and hits exactly.")
-    L += ["", "| lead | thr | warnings | hits | late | false alarms | misses | pending | sweep warnings | sweep hits |",
-          "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    L += ["", "| lead | thr | warnings | hits | late | false alarms | misses | pending | unscorable | sweep warnings | sweep hits |",
+          "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for x in g["rows"]:
         L.append(f"| {x['lead']} | {x['threshold']} % | {x['warnings']} | {x['hits']} | {x['late']} | "
-                 f"{x['false_alarms']} | {x['misses']} | {x['pending']} | {x['expected_warnings']} | {x['expected_hits']} |")
+                 f"{x['false_alarms']} | {x['misses']} | {x['pending']} | {x.get('unscorable', 0)} | "
+                 f"{x['expected_warnings']} | {x['expected_hits']} |")
     L.append("")
     if not g["passed"]:
         return "\n".join(L) + "\n"
@@ -903,14 +915,16 @@ def main(argv=None):
     stations = sorted(arrays)
     lo = min(int(a["radar"].min()) for a in arrays.values())
     hi = max(int(a["radar"].max()) for a in arrays.values())
+    known_grids: dict = {}
     onsets, known_until, _slots, dead = gauge_truth(
         Path(args.corpus_dir), stations, (ers.to_dt(lo), ers.to_dt(hi)),
         dry_min=DEFAULT_DRY_MIN, onset_min_mm=DEFAULT_ONSET_MIN_MM,
-        min_known_slots=DEFAULT_MIN_KNOWN_SLOTS, log=log,
+        min_known_slots=DEFAULT_MIN_KNOWN_SLOTS, log=log, known_out=known_grids,
     )
     scored = [s for s in stations if s in known_until]
     log(f"{len(scored)} scored stations")
-    shared = {"arrays": arrays, "onsets": onsets, "known_until": known_until}
+    shared = {"arrays": arrays, "onsets": onsets, "known_until": known_until,
+              "known_grids": known_grids}
 
     # ---------------- baseline pushes -------------------------------------
     base_cells = [(lead, thr[lead], "served", 0) for lead in leads]
@@ -923,7 +937,7 @@ def main(argv=None):
         ok = pc["warnings"] == exp["warnings"] and pc["hits"] == exp["hits"]
         passed &= ok
         gate_rows.append({"lead": lead, "threshold": thr[lead], **{k: pc[k] for k in (
-            "warnings", "hits", "late", "false_alarms", "misses", "pending")},
+            "warnings", "hits", "late", "false_alarms", "misses", "pending", "unscorable")},
             "expected_warnings": exp["warnings"], "expected_hits": exp["hits"], "pass": ok})
         log(f"gate lead {lead}: {pc['warnings']}/{pc['hits']} vs {exp['warnings']}/{exp['hits']}")
     report: dict[str, Any] = {"sanity_gate": {"passed": bool(passed), "rows": gate_rows},

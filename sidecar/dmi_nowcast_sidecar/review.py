@@ -1632,6 +1632,7 @@ def build_population(
     onsets: Mapping[str, Sequence[datetime]] | None = None,
     known_until: Mapping[str, datetime] | None = None,
     dead: Sequence[str] = (),
+    known_grids: Mapping[str, Any] | None = None,
     window_min: int = DEFAULT_WINDOW_MIN,
     allow_feature_gap: bool = False,
     min_known_slots: int = DEFAULT_MIN_KNOWN_SLOTS,
@@ -1651,6 +1652,11 @@ def build_population(
 
     ``pending`` is dropped entirely — DMI backfills late reports, so the
     label can still move and a human reviewing it learns nothing.
+    ``unscorable`` (review R5: no claim, a gauge hole in the window or its
+    dry lead-in) is dropped the same way and counted in ``excluded``; the
+    per-station ``KnownGrid`` comes from ``truth.series`` unless
+    ``known_grids`` overrides it (``{}`` = the pre-R5 grading, nothing
+    unscorable), as ``onsets`` / ``known_until`` override theirs.
     ``uncovered`` is kept, labelled ``control``, because the coverage rule
     removes it from POD's denominator and nothing else ever audits that.
     """
@@ -1709,6 +1715,10 @@ def build_population(
 
     excluded: dict[str, int] = {
         "pending_warnings": 0,
+        # Additive (review R5): no claim over a gauge hole in the window or
+        # its dry lead-in — the gauge cannot grade it, so neither can a
+        # reviewer; dropped like pending.
+        "unscorable_warnings": 0,
         "pending_onsets": 0,
         "feature_gap_events": 0,
         "stations_without_gauge": 0,
@@ -1743,6 +1753,11 @@ def build_population(
             known_until=known_until.get(station_id),
             coverage=coverage.get(station_id, ()),
             min_useful_lead_min=rule.min_useful_lead_min,
+            gauge_known=(
+                known_grids.get(station_id) if known_grids is not None
+                else truth.series[station_id].known_grid()
+                if station_id in truth.series else None
+            ),
         )
         by_generated = {
             _as_utc(row.generated_at): (record, row)
@@ -1751,6 +1766,9 @@ def build_population(
         for outcome in result.warnings:
             if outcome.outcome == "pending":
                 excluded["pending_warnings"] += 1
+                continue
+            if outcome.outcome == "unscorable":
+                excluded["unscorable_warnings"] += 1
                 continue
             record = _warning_record(
                 outcome=outcome,
@@ -1852,7 +1870,8 @@ def build_population(
     }
     say(
         f"review population: {len(kept)} event(s) over {len(traces)} station(s); "
-        f"{excluded['pending_warnings']} pending warning(s) and "
+        f"{excluded['pending_warnings']} pending warning(s), "
+        f"{excluded['unscorable_warnings']} unscorable warning(s) and "
         f"{excluded['pending_onsets']} pending onset(s) dropped; "
         f"{len(gap_days)} feature-gap day(s) "
         f"({'kept' if allow_feature_gap else 'excluded'})"

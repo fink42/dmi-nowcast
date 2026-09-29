@@ -1578,7 +1578,15 @@ def station_gauge_features(
     a wet slot older than the cap is capped to it, which is the same
     number a caller that never read it would produce. That is what lets
     the replay hand in a whole day of slots and the cycle hand in six
-    hours, and still write the same row.
+    hours, and still write the same row. The same holds for a gauge that
+    has been SILENT longer than the cap (review R5, the rule
+    :meth:`GaugeSlotTable.stats` applies to neighbours): the point counts
+    as reporting only for slots ending at or after
+    ``now − GAUGE_SINCE_CAP_MIN``. Before, an older report the caller
+    happened to read made it "known, dry for the cap" —
+    ``g_min_since_wet`` 360 in the replay and NaN live for the same
+    instant. Every other column's window lies inside the cap, so only
+    that one can move.
 
     Returns ``{column: float32 array of shape (n_points,)}`` with NaN for
     every unknown — except ``g_known``, which is 0 or 1 and never NaN: it
@@ -1587,6 +1595,7 @@ def station_gauge_features(
     """
     now = _slot_utc(now_utc)
     horizon = now - timedelta(minutes=float(lag_min))
+    cap_start = now - timedelta(minutes=GAUGE_SINCE_CAP_MIN)
     n = len(slots)
     out = {
         name: np.full(n, np.nan, dtype=np.float32)
@@ -1616,7 +1625,11 @@ def station_gauge_features(
         for end, wet, mm in visible:
             back = (horizon - end).total_seconds() / 60.0
             if wet is not None:
-                known_any = True
+                # Only a slot the cap can see makes the gauge "known"
+                # (review R5, as GaugeSlotTable.stats): the answer must not
+                # depend on how far back the caller's read reached.
+                if end >= cap_start:
+                    known_any = True
                 if back < GAUGE_DRY_WINDOW_MIN:
                     known_in_dry_window = True
                     wet_in_dry_window = wet_in_dry_window or bool(wet)
